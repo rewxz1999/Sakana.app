@@ -1,0 +1,177 @@
+@import 'tailwindcss';
+
+/* 将运行时切换的 CSS 变量映射为 Tailwind 工具类 */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-elev1: var(--elev1);
+  --color-elev2: var(--elev2);
+  --color-elev3: var(--elev3);
+  --color-text: var(--text);
+  --color-dim: var(--dim);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-border: var(--border);
+  --color-danger: var(--danger);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+}
+
+/* ============ 主题预设（方案 3.6-1：预设多套配色） ============ */
+:root,
+:root[data-theme='midnight'] {
+  /* 白蓝 · 浅色（默认主题） */
+  --bg: #eef2f9;
+  --elev1: #ffffff;
+  --elev2: #e9eef8;
+  --elev3: #dfe7f3;
+  --text: #1c2433;
+  --dim: #4a566e;
+  --faint: #8b96ad;
+  --accent: #2f6bff;
+  --accent-soft: #e3ecff;
+  --border: #d4deee;
+  --danger: #d64545;
+  --ok: #2f9e63;
+  --warn: #c07a1a;
+  color-scheme: light;
+}
+:root[data-theme='sakura'] {
+  /* 樱色 · 浅色 */
+  --bg: #faf6f8;
+  --elev1: #ffffff;
+  --elev2: #f4edf1;
+  --elev3: #ece2e8;
+  --text: #2c2430;
+  --dim: #6f6370;
+  --faint: #a79ba8;
+  --accent: #e8548a;
+  --accent-soft: rgba(232, 84, 138, 0.12);
+  --border: rgba(44, 36, 48, 0.1);
+  --danger: #d64545;
+  --ok: #2f9e63;
+  --warn: #cf8a1d;
+  color-scheme: light;
+}
+:root[data-theme='obsidian'] {
+  /* 曜石黑 · 深色 */
+  --bg: #0c0d0f;
+  --elev1: #15161a;
+  --elev2: #1d1e24;
+  --elev3: #272932;
+  --text: #ececf0;
+  --dim: #9b9ba6;
+  --faint: #5f606b;
+  --accent: #27cfa5;
+  --accent-soft: rgba(39, 207, 165, 0.14);
+  --border: rgba(236, 236, 240, 0.08);
+  --danger: #f06a6a;
+  --ok: #4ecb8c;
+  --warn: #ecc05c;
+  color-scheme: dark;
+}
+:root[data-theme='matcha'] {
+  /* 抹茶绿 · 浅色 */
+  --bg: #f5f8f3;
+  --elev1: #ffffff;
+  --elev2: #edf3ea;
+  --elev3: #e0e9dc;
+  --text: #28301f;
+  --dim: #667060;
+  --faint: #9da796;
+  --accent: #4c9a5a;
+  --accent-soft: rgba(76, 154, 90, 0.13);
+  --border: rgba(40, 48, 31, 0.1);
+  --danger: #cf4b4b;
+  --ok: #3c8f5f;
+  --warn: #c08a2a;
+  color-scheme: light;
+}
+:root[data-theme='sunset'] {
+  /* 落日橙 · 深色 */
+  --bg: #1d1516;
+  --elev1: #261b1d;
+  --elev2: #2f2225;
+  --elev3: #3b2b2e;
+  --text: #f4e9e7;
+  --dim: #b6a09e;
+  --faint: #7d6b69;
+  --accent: #f0814e;
+  --accent-soft: rgba(240, 129, 78, 0.15);
+  --border: rgba(244, 233, 231, 0.09);
+  --danger: #ef6a6a;
+  --ok: #53c487;
+  --warn: #e9b44e;
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family:
+    'Segoe UI',
+    'Microsoft YaHei',
+    'PingFang SC',
+    'Noto Sans SC',
+    system-ui,
+    sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;  transition: background-color 0.35s ease, color 0.35s ease;
+}
+
+input,
+textarea,
+.selectable {
+  user-select: text;
+}
+
+/* 窗口拖动区域 */
+.drag-region {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--faint) 45%, transparent);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--dim) 60%, transparent);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 视频元素无边框 */
+video {
+  outline: none;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+/*
+ * 全屏控制栏悬浮窗（透明 BrowserWindow）：
+ * 页面必须整体透明，否则窗口会用不透明底色把整屏画面盖住。
+ */
+html.sakana-overlay,
+html.sakana-overlay body,
+html.sakana-overlay #root {
+  background: transparent !important;
+}

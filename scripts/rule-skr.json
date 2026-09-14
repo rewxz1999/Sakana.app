@@ -1,0 +1,40 @@
+{
+  "id": "skr-skrsks",
+  "name": "樱之空",
+  "version": "1.0",
+  "baseUrl": "https://skr.skrcc.cc:666/",
+  "search": {
+    "type": "xpath",
+    "method": "GET",
+    "url": "https://skr.skrcc.cc:666/vodsearch/@keyword-------------/",
+    "headers": "{}",
+    "query": "{}",
+    "bodyType": "",
+    "listXPath": "//li[contains(@class,\"searchlist_item\")]",
+    "itemNameXPath": "//h4[contains(@class,\"vodlist_title\")]/a/text()",
+    "itemLinkXPath": "//h4[contains(@class,\"vodlist_title\")]/a",
+    "listJsonPath": "",
+    "itemNameJsonPath": "",
+    "itemSourceJsonPath": ""
+  },
+  "episodes": {
+    "type": "xpath",
+    "method": "GET",
+    "url": "",
+    "headers": "{}",
+    "query": "{}",
+    "bodyType": "",
+    "responseFormat": "",
+    "linesXPath": "//div[contains(@class,\"play_list_box\")]",
+    "episodesXPath": ".//div[@id=\"playlistbox\"]/ul/li/a",
+    "linesJsonPath": "",
+    "lineNameJsonPath": "",
+    "episodesJsonPath": "",
+    "episodeNameJsonPath": "",
+    "vars": {},
+    "playUrlTemplate": "",
+    "playQuery": {}
+  },
+  "enabled": true,
+  "createdAt": 0
+}

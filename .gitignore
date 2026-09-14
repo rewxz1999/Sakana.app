@@ -1,0 +1,49 @@
+# ---- 依赖与构建产物 ----
+node_modules/
+out/
+dist/
+release/
+*.tsbuildinfo
+# 本地依赖缓存（含 electron 压缩包、libmpv dll 等，体积巨大且可重新下载）
+.npm-cache/
+.electron-cache/
+.cache/
+
+# ---- 大体积运行时不入库（用 npm run {libvlc,libmpv,ffmpeg,aria2}:fetch 获取） ----
+resources/libvlc/
+resources/libmpv/
+resources/ffmpeg/
+resources/aria2/*.exe
+resources/aria2/*.zip
+resources/ffmpeg/*.zip
+resources/libvlc/*.zip
+resources/libmpv/*.zip
+# N-API 原生插件的编译产物（源码在 native/mpv/src）
+native/mpv/build/
+
+# ---- 安全：绝不入库的凭据与本地配置 ----
+# 注意：.npmrc 只含国内镜像地址（无凭据），因此**保留入库**，方便其他人直接安装依赖
+.env
+.env.*
+*.local
+*.key
+*.pem
+*.pfx
+*.p12
+secrets.json
+**/credentials.json
+
+# ---- 审计报告与内部文档（用户要求：不上传代码审计） ----
+docs/代码审计.md
+
+# ---- 运行期数据、诊断输出与临时文件 ----
+data/
+logs/
+*.log
+.cap*.log
+.tmp-*
+.testmedia/
+.shots/
+.tstest/
+.DS_Store
+Thumbs.db

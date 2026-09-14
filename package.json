@@ -1,0 +1,123 @@
+{
+  "name": "sakana",
+  "version": "0.2.4",
+  "description": "Sakana - 番剧管理及播放桌面客户端",
+  "main": "./out/main/index.js",
+  "author": "Sakana Team",
+  "license": "MIT",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "dist": "electron-vite build && electron-builder --win",
+    "dist:dir": "electron-vite build && electron-builder --win --dir",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
+    "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
+    "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "aria2:fetch": "node scripts/fetch-aria2.js",
+    "ffmpeg:fetch": "node scripts/fetch-ffmpeg.js",
+    "libvlc:fetch": "node scripts/fetch-libvlc.js",
+    "libmpv:fetch": "node scripts/fetch-libmpv.js",
+    "mpv:build": "node-gyp rebuild --directory native/mpv"
+  },
+  "build": {
+    "appId": "com.sakana.app",
+    "productName": "Sakana",
+    "copyright": "Copyright © 2026 Sakana",
+    "directories": {
+      "output": "release",
+      "buildResources": "resources"
+    },
+    "files": [
+      "!src/**",
+      "!scripts/**",
+      "!native/**",
+      "!release/**",
+      "!**/*.map",
+      "!**/*.md",
+      "!electron.vite.config.*",
+      "!tsconfig*.json",
+      "!.npm-cache/**",
+      "!.vscode/**"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/libvlc",
+        "to": "libvlc"
+      },
+      {
+        "from": "resources/libmpv",
+        "to": "libmpv"
+      },
+      {
+        "from": "native/mpv/build/Release/sakana_mpv.node",
+        "to": "native/sakana_mpv.node"
+      },
+      {
+        "from": "resources/ffmpeg",
+        "to": "ffmpeg"
+      },
+      {
+        "from": "resources/aria2",
+        "to": "aria2"
+      },
+      {
+        "from": "resources/icon.png",
+        "to": "icon.png"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "resources/icon.png",
+      "artifactName": "Sakana-${version}-setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Sakana"
+    }
+  },
+  "dependencies": {
+    "axios": "^1.20.0",
+    "dayjs": "^1.11.23",
+    "electron-vlc-player": "^1.0.2",
+    "fast-xml-parser": "^5.11.1",
+    "framer-motion": "^13.1.1",
+    "htmlparser2": "^12.0.0",
+    "https-proxy-agent": "^9.1.0",
+    "iconv-lite": "^0.7.3",
+    "jsonpath-plus": "^10.4.0",
+    "lucide-react": "^1.37.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.3",
+    "socks-proxy-agent": "^10.1.0",
+    "xpath": "^0.0.34",
+    "xpath-html": "^1.0.3",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^26.4.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^5.2.0",
+    "7zip-bin": "^5.2.0",
+    "electron": "^44.0.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^7.3.6"
+  }
+}
