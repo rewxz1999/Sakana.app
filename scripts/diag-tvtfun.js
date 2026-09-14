@@ -203,6 +203,11 @@ const state = { mediaHits: [], endpoints: [], notes: [] }
     console.log('\n--- "protected" 在播放页 HTML 中的上下文 ---')
     console.log(short(pageHtml.slice(Math.max(0, pdIdx - 500), pdIdx + 500), 1100))
   }
+  console.log('\n播放页 HTML 里是否泄漏解析器 token（age_/wuzhoupai/titok/toutiao）:')
+  for (const tok of ['age_', 'wuzhoupai', 'titok', 'toutiao', 'v16-']) {
+    const n = pageHtml.split(tok).length - 1
+    console.log(`  ${tok}: ${n} 次`)
+  }
 
   // ---------------------------------------------------------------- 4. JS chunk
   hr('4) 播放页引用的 JS chunk：查找取流接口')
@@ -396,7 +401,7 @@ const state = { mediaHits: [], endpoints: [], notes: [] }
   const listRes = await get(`${BASE}/api/videos/?pageSize=8`)
   const listJson = parseJson(bodyOf(listRes.res))
   const listVideos = listJson?.data?.videos || listJson?.data || []
-  const checked = (Array.isArray(listVideos) ? listVideos : []).slice(0, 6)
+  const checked = (Array.isArray(listVideos) ? listVideos : []).slice(0, 30)
   for (const lv of checked) {
     if (!lv?.id) continue
     const dr = await get(`${BASE}/api/videos/${lv.id}`)
@@ -538,6 +543,7 @@ const state = { mediaHits: [], endpoints: [], notes: [] }
 
   // ---------------------------------------------------------------- 5i. 解析出的真实流 + 可播性
   hr('5i) 用 Cookie 解析真实流地址，并验证可播性 / 防盗链')
+  let streamData = null
   for (let i = 0; i < 3; i++) {
     const r = await get(rp, { Cookie: setCookie })
     console.log(
@@ -547,7 +553,7 @@ const state = { mediaHits: [], endpoints: [], notes: [] }
     if (i === 0 && r.res?.status === 200) {
       const j = parseJson(bodyOf(r.res))
       console.log('  （由解析结果反推：服务端其实只校验 tvt-pt Cookie，X-Play-Ctx 不是必需的）')
-      var streamData = j?.data
+      streamData = j?.data ?? null
     }
   }
   const stream = streamData?.url
@@ -631,25 +637,46 @@ const state = { mediaHits: [], endpoints: [], notes: [] }
     }
   }
 
-  hr('摘要')
-  console.log(
-    JSON.stringify(
-      {
-        searchOk: true,
-        videoId: first.id,
-        slug,
-        playSourceNames: playSources.map((p) => p.name),
-        episodeUrlField: playSources[0]?.episodes?.[0]?.url,
-        playPageUrl: rulePlayUrl,
-        playPageBytes: pageHtml.length,
-        apiPathsInHtml: apisInHtml,
-        mediaHitsInStaticText: media,
-        snippetEndpoints: uniq(state.endpoints).slice(0, 40)
-      },
-      null,
-      2
-    )
-  )
+  hr('结论')
+  console.log(`根因（TvTFun「剧集能解析、嗅探不到视频流」）：
+  1) 规则本身没有错：搜索/详情/播放页 URL 全部与站点自己的规范一致
+     - 搜索/详情 API 结构见上；episodes[*].url 恒为字符串 "protected"（无直链）
+     - 规则生成的 https://www.tvtfun.net/video/${slug}/play?source=N&episode=M
+       与详情页 HTML 里的 <a href> 逐字节一致（站点自己就是 ?source=<线路序号>&episode=<集序号>）
+  2) 播放页 HTML（${pageHtml.length}B）里没有任何媒体地址：它是 Next.js SPA 外壳，
+     无 player_aaaa / __NUXT__ / __INITIAL_STATE__，也没有 m3u8/mp4 直链
+     → 应用侧「播放页 HTML 直出」这条路必然失败（已实测 findMediaUrl 无命中）
+  3) 真实地址只有一个来源：
+     GET /api/videos/resolve-play-url?episodeId=<每集 id>
+     该请求的凭证是播放页响应下发的 HttpOnly Cookie:
+       set-cookie: tvt-pt=<时间戳>.<签名>; Path=/; Max-Age=21600; Secure; HttpOnly
+     实测：只带这个 Cookie、不带任何其它头 → HTTP 200，返回
+       {"data":{"url":"https://v16-tts-video-download.titok-inc.com/.../oYfKdNA…/","type":"mp4",
+                 "headers":{...},"source":"parser"}}
+     （即 X-Play-Ctx 并非必需——服务端只校验 tvt-pt）
+  4) ★ 应用永远发不出这个请求：
+     播放器的解析组件 n$ 只有在 sessionStorage["tvt-play-gesture"]==="1" 时才会挂载：
+        if(!p) return jsx(nG,{poster:o,onActivate:()=>g(true)})
+     而唯一写入该标记的地方是那个播放按钮的 onClick，其第一行是
+        if (!e.nativeEvent.isTrusted) return;      // 合成点击（element.click()）直接被丢弃
+     应用的 AUTO_PLAY_SCRIPT 用的是 el.click()，isTrusted=false → 被丢弃
+     → n$ 永不挂载 → /api/videos/resolve-play-url 永不请求 → 播放器永不创建 <video>
+     → 网络层（webRequest/CDP）22~40 秒内一个媒体请求都看不到，与现象完全吻合
+  5) 媒体本身可播、无防盗链：解析出的 MP4 地址
+       - 无 Referer / 带解析器 Referer / 带站点 Referer 均 HTTP 206 video/mp4，头 4 字节 ftypisom
+       - 注意它是**无扩展名**的 MP4，因此：
+         · MEDIA_EXT_RE（按扩展名）匹配不到 → 只能靠 webRequest 的 resourceType==='media' 分支捕获
+         · CDP 的 #EXTM3U/<MPD 响应体判据对它无效
+  6) 结论：这不是规则能修的问题（规则字段无法注入 JS / 请求头 / Cookie）。
+     修复点在嗅探层（ruleWebview.ts / ruleProbe.ts，本次不允许改动），最小方案二选一：
+     a) 在加载播放页前用 CDP 预置 sessionStorage：Page.addScriptToEvaluateOnNewDocument
+        执行 sessionStorage.setItem('tvt-play-gesture','1')
+        → React 读取到 '1'，n$ 直接挂载并带 Cookie 请求 resolve-play-url（无需真实点击）
+     b) 用真实输入事件代替 el.click()：wc.sendInputEvent / CDP Input.dispatchMouseEvent
+        在播放按钮坐标上做 mouseMove→mouseDown→mouseUp（isTrusted=true）
+        注意 b) 还需同时满足 document.visibilityState==='visible' 与 rAF 帧计数>0
+     预期效果：resolve-play-url 返回 200 → ArtPlayer 用该 mp4 建 <video> →
+     现有 webRequest(resourceType==='media') 分支即可捕获，嗅探在数秒内命中。`)
 })().catch((e) => {
   console.error('脚本异常:', e)
   process.exit(1)

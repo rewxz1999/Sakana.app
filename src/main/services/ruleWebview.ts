@@ -91,7 +91,18 @@ async function collectCookies(url: string): Promise<string | undefined> {
   }
 }
 
+/**
+ * 自动播放脚本。
+ *
+ * 返回值是**播放按钮在页面坐标系里的中心点**（可能为 null）：
+ * 主进程拿到坐标后会用 `sendInputEvent` 发一次**真实鼠标事件**。
+ * 为什么需要这样：部分站点（实测 TvTFun）的播放按钮 onClick 第一行是
+ * `if (!e.nativeEvent.isTrusted) return;` —— `el.click()` 产生的是合成事件，
+ * 会被直接丢弃，于是播放器解析组件永不挂载、网络层一个媒体请求都没有，
+ * 表现为「能搜到剧集但 30 秒抓不到流」。真实输入事件 isTrusted=true，可以过这道门。
+ */
 const AUTO_PLAY_SCRIPT = `(() => {
+  let firstRect = null
   const tryPlay = () => {
     for (const v of Array.from(document.querySelectorAll('video'))) {
       try { v.muted = false; v.play && v.play() } catch (e) {}
@@ -99,16 +110,55 @@ const AUTO_PLAY_SCRIPT = `(() => {
     const sels = ['#play','.play','.play-btn','.play-button','.vjs-big-play-button','.dplayer-play-icon','.artplayer-plugin-video-control','.MacPlayer','.player-mask','[class*="play" i]','[title*="播放"]','[aria-label*="播放"]']
     for (const sel of sels) {
       const el = document.querySelector(sel)
-      if (el && el.click) { try { el.click() } catch (e) {} }
+      if (!el) continue
+      const r = el.getBoundingClientRect()
+      if (!firstRect && r.width > 2 && r.height > 2) {
+        firstRect = { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+      }
+      if (el.click) { try { el.click() } catch (e) {} }
     }
     // 常见"点击画面开始播放"遮罩
     const mask = document.querySelector('.dplayer-mask, .MacPlayer, .player-panel, #player')
-    if (mask && mask.click) { try { mask.click() } catch (e) {} }
+    if (mask) {
+      const r = mask.getBoundingClientRect()
+      if (!firstRect && r.width > 2 && r.height > 2) {
+        firstRect = { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+      }
+      if (mask.click) { try { mask.click() } catch (e) {} }
+    }
+    return firstRect
   }
   let n = 0
   const t = setInterval(() => { n++; tryPlay(); if (n > 12) clearInterval(t) }, 1200)
-  tryPlay()
+  return JSON.stringify(tryPlay())
 })()`
+
+/**
+ * 在页面脚本执行前注入的小补丁。
+ *
+ * TvTFun 这类站点把「播放器解析组件」的挂载门控在 `sessionStorage['tvt-play-gesture']==='1'`，
+ * 只有真实点击播放按钮才会写入。这个门是**纯前端 UI 门**（服务端只校验播放页下发的 HttpOnly
+ * Cookie），因此预置标记就能让解析组件挂载、发出取流的 API 请求，进而被我们的嗅探捕获。
+ * 其它站点读不到这个 key，设置它是无害的。
+ */
+const PRELOAD_PATCH = `(() => {
+  try { sessionStorage.setItem('tvt-play-gesture', '1') } catch (e) {}
+  try { sessionStorage.setItem('tvt-play-ctx', '') } catch (e) {}
+})()`
+
+/** 用真实鼠标事件点击页面坐标（isTrusted=true，能过站点的「可信手势」校验） */
+function sendRealClick(wc: Electron.WebContents, x: number, y: number): void {
+  try {
+    const cx = Math.round(x)
+    const cy = Math.round(y)
+    wc.sendInputEvent({ type: 'mouseMove', x: cx, y: cy })
+    wc.sendInputEvent({ type: 'mouseDown', x: cx, y: cy, button: 'left', clickCount: 1 })
+    wc.sendInputEvent({ type: 'mouseUp', x: cx, y: cy, button: 'left', clickCount: 1 })
+    log.append('info', 'rule-webview', `已用真实鼠标事件点击播放按钮 (${cx},${cy})`)
+  } catch (err) {
+    log.append('warn', 'rule-webview', `真实鼠标事件失败: ${String((err as Error)?.message ?? err)}`)
+  }
+}
 
 /** 打开嗅探窗口并开始捕获；命中后由渲染层调用 closeRuleWebview 销毁 */
 export function openRuleWebview(
@@ -194,6 +244,16 @@ export function openRuleWebview(
      * 现在最多等 1.5 秒，超时就照样加载（Network.enable 与加载并行完成）。
      */
     cdpReady = Promise.race([
+      // 页面脚本执行前注入补丁：部分站点（TvTFun）把播放器解析组件的挂载门控在
+      // sessionStorage 标记上，只有「可信点击」才会写入 —— 预置标记即可让解析器挂载，
+      // 进而发出取流请求被我们抓到（细节见 PRELOAD_PATCH 注释）
+      wc.debugger
+        .sendCommand('Page.enable')
+        .then(() => wc.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: PRELOAD_PATCH }))
+        .then(() => undefined)
+        .catch((err) => {
+          log.append('warn', 'rule-webview', `预注入脚本失败（不影响嗅探）: ${String(err).slice(0, 120)}`)
+        }),
       wc.debugger
         .sendCommand('Network.enable')
         .then(() => undefined)
@@ -241,15 +301,27 @@ export function openRuleWebview(
             ['XHR', 'Fetch', 'Media', 'Other'].includes(String(p.type ?? '')) ||
             MEDIA_EXT_RE.test(rurl)
           ) {
-            if (p.requestId) cdpCandidates.set(p.requestId, rurl)
+            if (p.requestId) cdpCandidates.set(p.requestId, `${rurl}\u0000${mime}`)
           }
         } else if (method === 'Network.loadingFinished') {
-          const p = params as { requestId?: string }
+          const p = params as { requestId?: string; encodedDataLength?: number }
           const id = p.requestId
           if (!id) return
-          const rurl = cdpCandidates.get(id)
-          if (!rurl) return
+          const cached = cdpCandidates.get(id)
+          if (!cached) return
           cdpCandidates.delete(id)
+          const [rurl, mime] = cached.split('\u0000')
+          /*
+           * 无扩展名的整片视频（实测 TvTFun 的 capcutvod mp4、部分站点的 blob 前置分片）
+           * 既没有媒体后缀、响应体也不是播放列表，前面两条判据都抓不到。
+           * 这里按「video/* 且传了 1MB 以上」判定为真实视频流：
+           * 阈值用来排除几 KB 的贴片广告/预览小片段。
+           */
+          const bytes = Number(p.encodedDataLength ?? 0)
+          if (/^video\//i.test(mime ?? '') && bytes >= 1024 * 1024 && !foundUrls.includes(rurl)) {
+            reportFound(rurl, 'media')
+            return
+          }
           void wc.debugger
             .sendCommand('Network.getResponseBody', { requestId: id })
             .then((res) => {
@@ -316,7 +388,17 @@ export function openRuleWebview(
       const frames = [wc.mainFrame, ...wc.mainFrame.framesInSubtree]
       for (const f of frames) {
         if (!f || f.isDestroyed()) continue
-        void f.executeJavaScript(AUTO_PLAY_SCRIPT, true).catch(() => undefined)
+        // 脚本会返回播放按钮的中心坐标：再用真实鼠标事件点一次
+        // （合成 click 的 isTrusted=false 会被部分站点直接丢弃，见 AUTO_PLAY_SCRIPT 注释）
+        void f
+          .executeJavaScript(AUTO_PLAY_SCRIPT, true)
+          .then((raw) => {
+            if (!active || typeof raw !== 'string' || raw === 'null') return
+            const pt = JSON.parse(raw) as { x?: number; y?: number }
+            if (typeof pt?.x !== 'number' || typeof pt?.y !== 'number') return
+            sendRealClick(wc, pt.x, pt.y)
+          })
+          .catch(() => undefined)
       }
       void wc
         .executeJavaScript(

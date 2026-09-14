@@ -113,6 +113,10 @@ resources/           # 内置运行时（libvlc / libmpv / ffmpeg / aria2，体�
 - galgame 空态使用导航栏自定义背景图（未设置时回落原深色渐变）。
 - 全屏详情页返回按钮向右让位；番剧详情页「返回」在来自搜索列表时回到搜索列表。
 - 规则侧：新增 ezdmw 线路 XPath 修正（`//x[1]` 语义坑）；XPath 引擎支持联合表达式逐分支求值与轴步命名空间。
+- **TvTFun 抓不到流已修复（实测通过）**：该站的播放器解析组件被 `sessionStorage['tvt-play-gesture']` 门控，而写入它的播放按钮 `onClick` 首行是 `if(!e.nativeEvent.isTrusted) return;` —— 我们过去用 `el.click()` 发的是合成事件，被直接丢弃，于是播放器永不挂载、网络层一个媒体请求都没有（表现为「能搜到剧集但 30 秒抓不到流」）。修法两条并用：
+  1. 通过 CDP `Page.addScriptToEvaluateOnNewDocument` 在页面脚本执行前预置该标记（该门只是前端 UI 门，服务端只校验播放页下发的 HttpOnly Cookie）；
+  2. 自动播放改为「查出播放按钮坐标后用 `sendInputEvent` 发真实鼠标事件」，`isTrusted=true` 可以过同类站点的可信手势校验。
+  另补强捕获判据：CDP 里 `video/*` 且单次传输 ≥1MB 的响应直接判定为视频流，解决**无扩展名整片 MP4**（既无媒体后缀、响应体也不是播放列表）抓不到的问题。实测：捕获 → 直连播放成功（1440s）。诊断脚本 `scripts/diag-tvtfun.js` 可复现全部证据。
 
 ### 0.2.3
 

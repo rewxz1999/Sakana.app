@@ -26,9 +26,8 @@ import { useTools } from '@/stores/tools'
 import { useWatchProgress } from '@/stores/watchProgress'
 import { fmtDateTime, timeAgo } from '@/lib/format'
 import { Ring } from '@/components/Ring'
-import { DownloadTaskList } from '@/components/DownloadTaskList'
+import { Badge, Button, EmptyState, ProgressBar, Select, Spinner } from '@/components/ui'
 import { CoverImage } from '@/components/CoverImage'
-import { Badge, EmptyState, ProgressBar, Select, Spinner } from '@/components/ui'
 import { toast } from '@/stores/app'
 
 const RING_COLORS = ['#e8548a', '#5b8cff', '#27cfa5', '#f0a14e', '#a78bfa', '#f06a6a', '#4c9a5a', '#e8b04b']
@@ -478,14 +477,27 @@ export function DashboardPage() {
         <div className="col-span-3 rounded-xl border border-border bg-elev1 p-4">
           <div className="mb-3 flex items-center justify-between">
             <span className="flex items-center gap-1.5 text-sm font-semibold">
-              <Download size={14} className="text-accent" /> 正在下载
+              <Download size={14} className="text-accent" /> 下载概览
             </span>
             <Badge tone={activeDownloads.length > 0 ? 'accent' : 'neutral'}>
               {activeDownloads.length > 0 ? `${activeDownloads.length} 个任务进行中` : '空闲'}
             </Badge>
           </div>
-          <div className="max-h-[260px] overflow-y-auto pr-1">
-            <DownloadTaskList limit={6} />
+          {/*
+            v0.2.4：下载卡片（含逐条进度）统一放到订阅页，仪表盘只留一个概览 + 入口。
+            产品要求「仅下载的内容只在订阅页面出现下载卡片」，避免同一批任务在多个页面重复出现。
+          */}
+          <div className="flex flex-col gap-2 py-2 text-xs text-dim">
+            <div className="text-faint">
+              {activeDownloads.length > 0
+                ? '下载任务与进度详情请到「订阅」页查看。'
+                : '当前没有进行中的下载任务。'}
+            </div>
+            <div>
+              <Button variant="soft" size="sm" onClick={() => navigate('/subs')}>
+                前往订阅页查看下载
+              </Button>
+            </div>
           </div>
         </div>
       </div>

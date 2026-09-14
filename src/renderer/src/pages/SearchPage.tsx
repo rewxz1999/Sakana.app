@@ -139,7 +139,8 @@ export function SearchPage() {
   const openItem = (item: MarkItem): void => {
     const id = item.link || (item.subjectId != null ? String(item.subjectId) : '')
     if (!id) return
-    navigate(`/subject/${id}`)
+    // 带上来源标记：详情页据此把「返回」变成回到搜索列表（v0.2.4 导航链）
+    navigate(`/subject/${id}`, { state: { from: 'search' } })
   }
 
   /** 加入 / 移出某个列表（列表行点击与标记弹窗共用） */
@@ -360,7 +361,7 @@ export function SearchPage() {
                         setDragSubject(null)
                         setDragOver(false)
                       }}
-                      onClick={() => navigate(`/subject/${item.id}`)}
+                      onClick={() => navigate(`/subject/${item.id}`, { state: { from: 'search' } })}
                       className="group flex cursor-grab items-center gap-3 rounded-xl border border-border bg-elev1 p-2.5 transition-colors hover:border-accent active:cursor-grabbing"
                     >
                       <GripVertical
