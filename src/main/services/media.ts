@@ -340,10 +340,12 @@ export function convertSubtitleToVtt(path: string): string {
 
 // ---------------- 图片代理 ----------------
 
-/** 按图床域名选择 Referer（lain.bgm.tv 主站 / lain.bangumi.pro 镜像） */
+/** 按图床域名选择 Referer（lain.bgm.tv 主站 / 镜像站自己的图床） */
 function refererFor(target: string): string | undefined {
   try {
     const host = new URL(target).hostname.toLowerCase()
+    // 镜像图床（lain.bangumi.vip 等）实测不带 Referer 也放行，带上更稳妥
+    if (host.includes('bangumi.vip')) return 'https://bangumi.vip/'
     if (host.includes('bangumi.pro')) return 'https://bangumi.pro/'
     if (host.includes('bangumi.lol')) return 'https://bangumi.lol/'
     // 自建反代（Cloudflare Worker）自己会带正确的上游 Referer，本地不必再补

@@ -795,11 +795,12 @@ export interface AppSettings {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   theme: 'sakura',
-  bangumiBase: 'https://bangumi.pro',
-  bangumiMirrors: ['https://bangumi.pro', 'https://bangumi.lol', 'https://api.bgm.tv'],
+  // bangumi.pro 已被墙，改用同款镜像 bangumi.vip（结构与 bangumi.pro 一致）
+  bangumiBase: 'https://bangumi.vip',
+  bangumiMirrors: ['https://bangumi.vip', 'https://bangumi.lol', 'https://api.bgm.tv'],
   dataSources: {
-    main: 'https://bangumi.pro',
-    mirrors: ['https://bangumi.pro', 'https://bangumi.lol', 'https://api.bgm.tv']
+    main: 'https://bangumi.vip',
+    mirrors: ['https://bangumi.vip', 'https://bangumi.lol', 'https://api.bgm.tv']
   },
   proxy: { enabled: false, type: 'http', host: '127.0.0.1', port: 7890, username: '', password: '' },
   screenshotDir: '',

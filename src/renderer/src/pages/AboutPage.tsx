@@ -8,7 +8,7 @@ import { Button } from '@/components/ui'
 import { Card, SubPage } from '@/components/SettingsShell'
 
 /** 版本号兜底（正常情况下由主进程 app.getVersion() 提供，避免多处硬编码漂移） */
-const APP_VERSION_FALLBACK = '0.2.4'
+const APP_VERSION_FALLBACK = '0.2.5'
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (

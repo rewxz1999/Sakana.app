@@ -84,6 +84,25 @@ resources/           # 内置运行时（libvlc / libmpv / ffmpeg / aria2，体�
 
 ## 更新记录
 
+### 0.2.5
+
+- **数据源切换到 `bangumi.vip`**（`bangumi.pro` 已被墙）：该站与 bangumi.pro 同款，
+  `/calendar`、`/subject/<id>`、`/subject_search/<kw>?cat=2` 的结构完全一致，现有网页解析器直接复用。
+  - **老安装自动迁移**：启动时把 `bangumi.vip` 补进镜像列表首位（只改默认值的话，已装用户永远拿不到新镜像）。
+  - 自动剔除已确认不可达的 `bangumi.pro`（少发无用请求，实测能明显降低连接被重置的概率）。
+- **新增离屏浏览器取数**（`services/offscreenFetch.ts`）：bangumi.vip 前置 Anubis 的 PoW 机器人校验，
+  主进程 axios 只会拿到 14KB 的挑战页。现在网页镜像改为「axios 先试 → 拿到校验页就用离屏真实浏览器
+  重新**导航**打开并读 DOM」，校验自动通过（应用内实测 1~14 秒）后拿到真正的服务端渲染 HTML。
+  之所以用导航而不是页面内 `fetch`：实测同一站点导航已通过校验、紧接着的 fetch 仍可能被判未授权。
+- **镜像竞速修正**：`requestBest` 过去用 `Promise.allSettled`，会被最慢的镜像拖住（有过校验要十几秒），
+  现在改为**首个成功立即返回**；网络被重置（`ECONNRESET` 等）时自动隔 3 秒重试一次。
+- 「测试连接」也走真实取数路径（含离屏浏览器），不再把 bangumi.vip 这类需要校验的站点误判为失败。
+- 图片 Referer 规则补上 `lain.bangumi.vip`（实测无 Referer 也放行）。
+- 自检工具：`scripts/diag-mirror-webview.cjs`（验证带机器人校验的镜像能否在真实浏览器里取到数据）、
+  `SAKANA_OFFSCREEN_TEST=<url>`（在应用进程内验证离屏取数）。
+- 实测：番剧表缓存刷新为 **7 天 / 111 条真实番剧**（图片来自 `lain.bangumi.vip`）；搜索页 32KB、条目详情页 129KB 均正常取得。
+- AniBase 备用源的调研结论存档在 `docs/备用数据源调研.md`（其搜索接口对第三方封闭，暂不接入）。
+
 ### 0.2.4（紧急更新补充）
 
 > 上一版 0.2.4 有三个必须立刻处理的问题，以下是补充修复。

@@ -1497,6 +1497,28 @@ if (!gotLock) {
     }
 
     // 规则引擎自检（SAKANA_RULE_TEST=关键词）：依次用默认规则搜索并打印结果后退出
+    // 离屏浏览器取数自检（SAKANA_OFFSCREEN_TEST=<url>）：
+    // 用来验证「带机器人校验的镜像站能否在应用进程内取到真实页面」。
+    // 之所以单独做成一个模式：同一个地址在纯净 Electron 探针里能开、
+    // 在应用进程里却可能被重置，必须能在应用自身环境里复现与定位。
+    if (process.env.SAKANA_OFFSCREEN_TEST) {
+      const target = process.env.SAKANA_OFFSCREEN_TEST
+      setTimeout(() => {
+        void (async () => {
+          const { offscreenGet } = await import('./services/offscreenFetch')
+          try {
+            const t = await offscreenGet(target)
+            const title = /<title>([\s\S]{0,60}?)<\/title>/.exec(t)?.[1] ?? ''
+            console.log(`[offscreen-test] ✅ ${t.length} 字节 标题=${title.replace(/\s+/g, ' ').trim()}`)
+          } catch (err) {
+            console.log(`[offscreen-test] ❌ ${String((err as Error)?.message ?? err)}`)
+          }
+          markQuitting()
+          app.quit()
+        })()
+      }, 3000)
+    }
+
     if (process.env.SAKANA_RULE_TEST) {
       const kw = process.env.SAKANA_RULE_TEST
       setTimeout(() => {

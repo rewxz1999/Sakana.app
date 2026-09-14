@@ -15,7 +15,9 @@ import type {
 } from '@shared/types'
 import { log } from '../log'
 import { BROWSER_UA, buildProxyAgents, getSettings } from '../net'
+import { store } from '../store'
 import { parseCalendar, parseRatingOnly, parseSearchPage, parseSubjectPage } from './bangumiHtml'
+import { offscreenGet } from './offscreenFetch'
 
 const TTL_CALENDAR = 30 * 60 * 1000
 const TTL_SUBJECT = 7 * 24 * 3600 * 1000
@@ -36,8 +38,30 @@ function isApiHost(host: string): boolean {
   return host.startsWith('api.') || host.includes('api.bgm')
 }
 
-/** 已被墙的公共镜像：只在没有自建反代时才尝试（避免每次都白等一个必失败的请求） */
+/** 已被墙的公共镜像：默认跳过（用户实测 bangumi.pro 已不可达，请求它只是白等） */
 const DEAD_MIRRORS = ['bangumi.pro']
+
+/** 连接被重置 / 中断（中间设备或站点限流导致），值得隔几秒重试一次 */
+function isNetworkReset(err: unknown): boolean {
+  const e = err as { code?: string; message?: string } | undefined
+  const s = `${e?.code ?? ''} ${e?.message ?? ''}`
+  return /ECONNRESET|ECONNABORTED|ERR_CONNECTION_RESET|socket hang up|EPIPE|ETIMEDOUT|timeout/i.test(s)
+}
+
+/**
+ * 是否是 JS 机器人校验页（Anubis / Cloudflare）。
+ * bangumi.vip 的校验页只有 14KB、标题是「正在确认你是不是机器人！」，
+ * 直连拿到它时必须改用离屏浏览器重新打开。
+ */
+function looksLikeChallenge(text: string): boolean {
+  if (!text) return true
+  return (
+    text.length < 20000 &&
+    /正在确认你是不是机器人|Just a moment|challenges\.cloudflare|within\.website\/x\/cmd\/anubis|Checking your browser/i.test(
+      text
+    )
+  )
+}
 
 /**
  * 自建反代（Cloudflare Worker）：配置过的自定义 API 地址一律按 API 语义请求
@@ -111,6 +135,49 @@ class BangumiService {
 
   init(): void {
     mkdirSync(this.cacheDir, { recursive: true })
+    this.migrateMirrors()
+  }
+
+  /**
+   * 一次性迁移：把 bangumi.vip 提到镜像列表首位。
+   *
+   * 老安装的 settings.json 里存着 `bangumi.pro`（已不可达），
+   * 如果只改 DEFAULT_SETTINGS，已装用户永远拿不到新镜像 —— 表现为「番剧表一直空白」。
+   * 用户自己填过的自建反代/自定义镜像保持不动，只是把可用镜像补到最前面。
+   */
+  private migrateMirrors(): void {
+    try {
+      const s = getSettings() as unknown as {
+        bangumiBase?: string
+        bangumiMirrors?: string[]
+        dataSources?: { main?: string; mirrors?: string[] }
+        anibaseVipMigrated?: boolean
+      }
+      if (s.anibaseVipMigrated) return
+      const VIP = 'https://bangumi.vip'
+      const list = Array.isArray(s.bangumiMirrors) && s.bangumiMirrors.length > 0 ? s.bangumiMirrors : []
+      if (!list.includes(VIP)) {
+        const next = [VIP, ...list.filter((m) => m && m !== VIP)]
+        store.set('settings', {
+          ...(s as Record<string, unknown>),
+          bangumiMirrors: next,
+          bangumiBase: s.bangumiBase && s.bangumiBase.includes('bangumi.pro') ? VIP : s.bangumiBase || VIP,
+          dataSources: {
+            main:
+              s.dataSources?.main && s.dataSources.main.includes('bangumi.pro')
+                ? VIP
+                : s.dataSources?.main || VIP,
+            mirrors: next
+          },
+          anibaseVipMigrated: true
+        })
+        log.append('info', 'bangumi', `已把镜像 ${VIP} 加入数据源列表（原列表：${list.join(', ') || '空'}）`)
+      } else {
+        store.set('settings', { ...(s as Record<string, unknown>), anibaseVipMigrated: true })
+      }
+    } catch (err) {
+      log.append('warn', 'bangumi', `镜像迁移失败（忽略）: ${String((err as Error)?.message ?? err)}`)
+    }
   }
 
   private mirrors(): string[] {
@@ -122,7 +189,9 @@ class BangumiService {
     const normalized = list.map((m) => m.replace(/\/+$/, ''))
     // 自建反代永远排第一（并行请求里它最快，且是唯一可控的通道）
     const all = custom ? [custom, ...normalized] : normalized
-    const alive = custom ? all.filter((m) => !DEAD_MIRRORS.some((d) => m.includes(d))) : all
+    // bangumi.pro 已确认不可达：无条件剔除。实测启动瞬间并发请求过多时，
+    // 连带把可用镜像的连接也一起被中间设备重置，少发无用请求能显著提高成功率。
+    const alive = all.filter((m) => !DEAD_MIRRORS.some((d) => m.includes(d)))
     return [...new Set(alive)]
   }
 
@@ -148,43 +217,100 @@ class BangumiService {
   }
 
   /**
+   * 取一个镜像的响应。
+   *
+   * v0.2.5 起网页镜像有两条路：
+   * - 先 axios 直连（快，适合没有前置校验的站点）；
+   * - 若拿到的是机器人校验页（bangumi.vip 用的 Anubis PoW 页只有 14KB 且标题是
+   *   「正在确认你是不是机器人！」），改用**离屏真实浏览器**重新打开该地址 ——
+   *   导航会自动完成校验并返回真正的服务端渲染 HTML。
+   */
+  private async fetchMirror(url: string, isApi: boolean): Promise<string> {
+    const axiosOnce = async (): Promise<string> => {
+      const res = await axios.get(url, {
+        timeout: REQUEST_TIMEOUT,
+        responseType: 'text',
+        headers: { 'User-Agent': BROWSER_UA, Accept: '*/*' },
+        ...buildProxyAgents(getSettings().proxy)
+      })
+      if (res.status !== 200) throw new Error(`HTTP ${res.status}`)
+      return res.data as string
+    }
+
+    let text: string | null = null
+    let directError: unknown = null
+    try {
+      text = await axiosOnce()
+    } catch (err) {
+      directError = err
+    }
+    // 连接被重置时先缓一下重试一次：实测启动瞬间并发请求过多会被中间设备重置，
+    // 隔几秒再来一次通常就通了（比直接把整个数据源判死更符合真实情况）
+    if (!text && isNetworkReset(directError)) {
+      await new Promise((r) => setTimeout(r, 3000))
+      try {
+        text = await axiosOnce()
+        directError = null
+      } catch (err) {
+        directError = err
+      }
+    }
+    if (text && !looksLikeChallenge(text)) return text
+
+    // API 源在浏览器里打开只会看到 JSON 文本，没有校验问题也用不着绕；这里只救网页镜像
+    if (isApi) {
+      if (text) return text
+      throw directError ?? new Error('请求失败')
+    }
+    // 网页镜像：交给离屏浏览器（会自动完成机器人校验，应用内实测约 14 秒）
+    const viaBrowser = await offscreenGet(url, { waitMs: 30000 })
+    return viaBrowser
+  }
+
+  /**
    * 并行尝试所有镜像，返回第一个成功响应。
    * api 镜像走 JSON 路径，网页镜像走 HTML 路径。
    */
   private async requestBest(paths: { api: string; web: string }): Promise<{ text: string; mirror: string }> {
     const attempts = this.mirrors().map(async (mirror) => {
       let url: string
+      let isApi = false
       try {
         const u = new URL(mirror)
         // 自建反代虽然域名可能不含 api.，但它代理的就是 API 主机 → 走 /v0 JSON 路径
-        url = isApiHost(u.hostname) || isCustomApiBase(mirror)
-          ? `${mirror}${paths.api}`
-          : `${mirror}${paths.web}`
+        isApi = isApiHost(u.hostname) || isCustomApiBase(mirror)
+        url = isApi ? `${mirror}${paths.api}` : `${mirror}${paths.web}`
       } catch {
         url = `${mirror}${paths.web}`
       }
       try {
-        const res = await axios.get(url, {
-          timeout: REQUEST_TIMEOUT,
-          responseType: 'text',
-          headers: { 'User-Agent': BROWSER_UA, Accept: '*/*' },
-          ...buildProxyAgents(getSettings().proxy)
-        })
-        if (res.status === 200) return { text: res.data as string, mirror }
-        throw new Error(`HTTP ${res.status}`)
+        return { text: await this.fetchMirror(url, isApi), mirror }
       } catch (err) {
         const e = err as { code?: string; message?: string }
         const reason = e?.code === 'ECONNABORTED' ? '超时' : (e?.message ?? String(err))
         throw new Error(`${mirror}: ${reason}`)
       }
     })
-    const settled = await Promise.allSettled(attempts)
-    const success = settled.find((r) => r.status === 'fulfilled')
-    if (success && success.status === 'fulfilled') return success.value
-    const tried = settled
-      .filter((r): r is PromiseRejectedResult => r.status === 'rejected')
-      .map((r) => String(r.reason?.message ?? r.reason))
-    throw makeSourceError('ALL_DOWN', `所有 bangumi 镜像均不可访问`, tried)
+    /*
+     * 真正的竞速：**第一个成功就立刻返回**，不等其余镜像。
+     * 过去用 Promise.allSettled，会被最慢的那条路拖住 ——
+     * 网页镜像要走离屏浏览器过机器人校验（应用内实测 ~14 秒），
+     * 于是「最快镜像 1 秒拿到数据」也会被拖到 14 秒后才用上，
+     * 表现就是番剧表迟迟不出来、甚至超时。
+     */
+    return await new Promise<{ text: string; mirror: string }>((resolve, reject) => {
+      let pending = attempts.length
+      const errors: string[] = []
+      for (const p of attempts) {
+        p.then((v) => resolve(v)).catch((err) => {
+          errors.push(String((err as Error)?.message ?? err))
+          pending -= 1
+          if (pending === 0) {
+            reject(makeSourceError('ALL_DOWN', `所有 bangumi 镜像均不可访问`, errors))
+          }
+        })
+      }
+    })
   }
 
   async calendar(force = false): Promise<CalendarResult> {
@@ -329,25 +455,22 @@ class BangumiService {
       this.mirrors().map(async (mirror): Promise<MirrorTestResult> => {
         const start = Date.now()
         let url: string
+        let isApi = false
         try {
           const u = new URL(mirror)
-          url = isApiHost(u.hostname) ? `${mirror}/v0/calendar` : `${mirror}/calendar`
+          isApi = isApiHost(u.hostname) || isCustomApiBase(mirror)
+          url = isApi ? `${mirror}/v0/calendar` : `${mirror}/calendar`
         } catch {
           url = `${mirror}/calendar`
         }
         try {
-          const res = await axios.get(url, {
-            timeout: 8000,
-            responseType: 'text',
-            headers: { 'User-Agent': BROWSER_UA },
-            ...buildProxyAgents(getSettings().proxy)
-          })
-          let ok = false
-          if (res.status === 200) {
-            const text = res.data as string
-            ok = isApiMirror(mirror) ? text.trim().startsWith('[') : text.includes('coverList')
-          }
-          return { url: mirror, ok, ms: Date.now() - start, error: ok ? undefined : `HTTP ${res.status} 或响应格式不符` }
+          /*
+           * 走与真实取数完全相同的路径（含「被机器人校验时改用离屏浏览器」），
+           * 否则 bangumi.vip 这类站点在测试里会被判失败 —— 明明应用能正常用它。
+           */
+          const text = await this.fetchMirror(url, isApi)
+          const ok = isApi ? text.trim().startsWith('[') : text.includes('coverList')
+          return { url: mirror, ok, ms: Date.now() - start, error: ok ? undefined : '响应格式不符（可能需要校验或该地址不是番组计划镜像）' }
         } catch (err) {
           const e = err as { message?: string }
           return { url: mirror, ok: false, ms: Date.now() - start, error: e?.message ?? String(err) }
