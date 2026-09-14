@@ -446,6 +446,112 @@ const state = { mediaHits: [], endpoints: [], notes: [] }
     }
   }
 
+  // ---------------------------------------------------------------- 5g. source/episode 参数语义
+  hr('5g) 播放页 source / episode 参数语义（规则 playQuery 是否拼对）')
+  console.log(`线路列表：${playSources.map((p, i) => `[${i}] ${p.name} fromCode=${p.fromCode} id=${p.id}`).join('\n           ')}`)
+  for (const q of ['source=0&episode=0', 'source=1&episode=0', 'source=source-1&episode=0', `source=${playSources[0]?.id}&episode=0`]) {
+    const u = `${BASE}/video/${slug}/play?${q}`
+    const r = await get(u)
+    const b = bodyOf(r.res)
+    // 找被标为选中的线路按钮（class 含 primary）与集数按钮
+    const activeLine = (b.match(/title="(线路[A-Z])"[^>]*class="([^"]*)"/g) || []).concat(
+      b.match(/class="([^"]*primary[^"]*)"[^>]*title="(线路[A-Z])"/g) || []
+    )
+    const lines = [...b.matchAll(/<button[^>]*>([^<]*)<\/button>/g)].map((m) => m[1]).slice(0, 8)
+    console.log(`\nGET ${u}\n  → HTTP ${r.res.status} ${b.length}B`)
+    console.log('  含「线路A/B/D」的按钮片段: ' + short((b.match(/[^>]{0,120}线路[ABD][^<]{0,40}/g) || []).slice(0, 3).join(' || '), 400))
+  }
+  console.log('\n站点自己的播放页链接格式（从详情页 /video/<slug> 里找 href）：')
+  const detailPage = await get(`${BASE}/video/${slug}`, { Accept: 'text/html' })
+  const dhtml = bodyOf(detailPage.res)
+  const hrefs = uniq(
+    (dhtml.match(/\/video\/[^"'\\\s<]*play[^"'\\\s<]*/g) || []).map((h) => h.replace(/\\u0026/g, '&'))
+  )
+  console.log(`  详情页 HTTP ${detailPage.res?.status} ${dhtml.length}B`)
+  hrefs.slice(0, 12).forEach((h) => console.log('  ' + h))
+  if (!hrefs.length) console.log('  （详情页 HTML 里没有 play 链接，说明是客户端路由跳转）')
+  // 客户端路由跳转的写法：找 router.push 附近的 source/episode
+  console.log('\n各 chunk 中 "episode" / "source" 字面量与路由跳转代码：')
+  for (const js of scripts) {
+    const r = await get(js, { Accept: '*/*' })
+    if (!r.ok) continue
+    const code = bodyOf(r.res)
+    if (!/play\?source|episode:|\?episode=/.test(code)) continue
+    for (const re of [/play\?source[^"'`]{0,80}/g, /[^"'`]{0,90}episode:[^,;)]{0,60}/g]) {
+      const hits = uniq(code.match(re) || []).slice(0, 4)
+      hits.forEach((h) => console.log(`  [${js.split('/').pop()}] ` + short(h.replace(/\s+/g, ' '), 180)))
+    }
+  }
+
+  // ---------------------------------------------------------------- 5h. Cookie + 伪造凭证
+  hr('5h) 带播放页下发的 tvt-pt Cookie + 伪造凭证（判断服务端到底校验什么）')
+  const p2 = await get(rulePlayUrl, { Accept: 'text/html' })
+  const setCookie = (p2.res?.headers?.['set-cookie'] || []).map((c) => c.split(';')[0]).join('; ')
+  console.log('播放页 set-cookie → ' + setCookie)
+  const combos2 = [
+    ['Cookie(tvt-pt) 单独', { Cookie: setCookie }],
+    ['Cookie + 无 X-Play-Ctx 之外的真实头', { Cookie: setCookie, 'X-Play-Ctx': '' }],
+    ['Cookie + 伪造 ctx {f:60,...}', {
+      Cookie: setCookie,
+      'X-Play-Ctx': mk({ f: 60, v: 1, w: 1280, hgt: 720, p: 1 })
+    }],
+    ['Cookie + 伪造 ctx + Referer/Origin', {
+      Cookie: setCookie,
+      'X-Play-Ctx': mk({ f: 60, v: 1, w: 1280, hgt: 720, p: 1 }),
+      Referer: rulePlayUrl,
+      Origin: BASE,
+      Accept: 'application/json'
+    }],
+    ['Cookie + 空 base64 ctx', { Cookie: setCookie, 'X-Play-Ctx': mk({}) }]
+  ]
+  for (const [label, h] of combos2) {
+    const r = await get(rp, h)
+    if (!r.ok) {
+      console.log(`\n${label} → 失败 ${r.err}`)
+      continue
+    }
+    const b = bodyOf(r.res)
+    console.log(`\n${label}\n  → HTTP ${r.res.status} ${b.length}B ${r.res.headers['content-type']}`)
+    console.log('  body: ' + short(b.replace(/\s+/g, ' '), 600))
+  }
+
+  // ---------------------------------------------------------------- 5i. 解析出的真实流 + 可播性
+  hr('5i) 用 Cookie 解析真实流地址，并验证可播性 / 防盗链')
+  const rr = await get(rp, { Cookie: setCookie, Referer: rulePlayUrl, Origin: BASE })
+  const rj = parseJson(bodyOf(rr.res))
+  console.log('GET ' + rp + '  (Cookie: tvt-pt=…)\n→ HTTP ' + rr.res?.status)
+  console.log('  ' + short(bodyOf(rr.res).replace(/\s+/g, ' '), 700))
+  const stream = rj?.data?.url
+  if (stream) {
+    const ref = rj?.data?.headers?.Referer
+    console.log('\n解析出的媒体地址: ' + stream)
+    console.log('服务端要求的 Referer: ' + ref)
+    for (const [label, h] of [
+      ['无 Referer', {}],
+      ['带服务端给的 Referer', ref ? { Referer: ref } : {}],
+      ['带站点 Referer', { Referer: `${BASE}/` }]
+    ]) {
+      if (label !== '无 Referer' && !Object.keys(h).length) continue
+      const started = Date.now()
+      const res = await axios.get(stream, {
+        headers: { 'User-Agent': UA, ...h },
+        responseType: 'arraybuffer',
+        validateStatus: () => true,
+        maxRedirects: 5,
+        timeout: 20000
+      })
+      const buf = Buffer.from(res.data || [])
+      const head = buf.slice(0, 64)
+      const isMp4 = head.slice(4, 8).toString('ascii') === 'ftyp'
+      console.log(
+        `  ${label}: HTTP ${res.status} ct=${res.headers['content-type']} bytes=${buf.length} ${Date.now() - started}ms` +
+          ` head=${JSON.stringify(head.slice(0, 12).toString('latin1'))}${isMp4 ? ' ← MP4 (ftyp)' : ''}`
+      )
+    }
+  } else {
+    console.log('（未取到流地址：data.type=' + (rj?.data?.type ?? '?') + '）')
+  }
+
   // ---------------------------------------------------------------- 6. 媒体可播性
   hr('6) 发现的媒体地址可播性探测（含 Referer 依赖）')
   const media = uniq(state.mediaHits)

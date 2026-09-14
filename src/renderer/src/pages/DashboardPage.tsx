@@ -201,12 +201,10 @@ export function DashboardPage() {
         : undefined
     navigate('/player', {
       /**
-       * 跳转参数逐项对齐 PlayerPage 的 PlayerState（interface PlayerState 只读以下字段，
-       * 多传/少传都不会生效）：mode / title / url / subjectId / ruleId / entry / vars / groups / referer。
-       *
-       * 另需说明：PlayerState 里没有「续播起始秒」（startSec 仅是 PlayerPage 内部 startTranscode 的参数），
-       * 所以 positionSec 无法传给播放页 —— 本次只做「回到原规则、原线路、原集」的跳转，
-       * 真正的秒级续播需要在播放页支持该参数后才能实现（不改 PlayerPage 的前提下无解）。
+       * 跳转参数逐项对齐 PlayerPage 的 PlayerState：
+       * mode / title / url / subjectId / ruleId / entry / vars / groups / referer / startSec。
+       * `startSec` 是 v0.2.4 新加的字段：播放页在本集真正开播后会自动跳到该秒数，
+       * 并给出「撤销跳转」提示，因此这里可以把上次的观看位置一并带过去。
        */
       state: {
         mode: 'rule',
@@ -218,7 +216,8 @@ export function DashboardPage() {
         vars,
         groups,
         // PlayerPage 用 referer 打开播放页网页视图；拿不到规则时留空（undefined 语义＝回退规则站点）
-        referer: rule?.baseUrl
+        referer: rule?.baseUrl,
+        startSec: p.positionSec > 0 ? p.positionSec : undefined
       }
     })
   }
@@ -247,7 +246,9 @@ export function DashboardPage() {
         title: entry.title,
         folder,
         subjectId: entry.subjectId ?? sub?.subjectId,
-        episode
+        episode,
+        // 本地文件同样支持断点续播（v0.2.4 播放页会在开播后跳到该位置）
+        startSec: p && p.positionSec > 0 ? p.positionSec : undefined
       }
     })
   }
