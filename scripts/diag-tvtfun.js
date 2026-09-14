@@ -471,15 +471,36 @@ const state = { mediaHits: [], endpoints: [], notes: [] }
   hrefs.slice(0, 12).forEach((h) => console.log('  ' + h))
   if (!hrefs.length) console.log('  （详情页 HTML 里没有 play 链接，说明是客户端路由跳转）')
   // 客户端路由跳转的写法：找 router.push 附近的 source/episode
-  console.log('\n各 chunk 中 "episode" / "source" 字面量与路由跳转代码：')
+  console.log('\n全站 chunk 中所有 searchParams.get("…") 读取的参数名：')
+  const paramNames = new Map()
   for (const js of scripts) {
     const r = await get(js, { Accept: '*/*' })
     if (!r.ok) continue
     const code = bodyOf(r.res)
-    if (!/play\?source|episode:|\?episode=/.test(code)) continue
-    for (const re of [/play\?source[^"'`]{0,80}/g, /[^"'`]{0,90}episode:[^,;)]{0,60}/g]) {
-      const hits = uniq(code.match(re) || []).slice(0, 4)
-      hits.forEach((h) => console.log(`  [${js.split('/').pop()}] ` + short(h.replace(/\s+/g, ' '), 180)))
+    for (const re of [/\.get\("([a-zA-Z_][a-zA-Z0-9_]*)"\)/g, /searchParams\["([a-zA-Z_]+)"\]/g]) {
+      let m
+      while ((m = re.exec(code))) {
+        const k = m[1]
+        if (!paramNames.has(k)) paramNames.set(k, js.split('/').pop())
+      }
+    }
+  }
+  console.log('  ' + [...paramNames.entries()].map(([k, f]) => `${k}(${f})`).join(', '))
+  console.log('\n在 chunk 中查找 tvt-play-gesture / sessionStorage 的写入点：')
+  for (const js of scripts) {
+    const r = await get(js, { Accept: '*/*' })
+    if (!r.ok) continue
+    const code = bodyOf(r.res)
+    for (const tok of ['tvt-play-gesture', 'sessionStorage.setItem']) {
+      let idx = -1
+      let n = 0
+      while ((idx = code.indexOf(tok, idx + 1)) >= 0 && n < 3) {
+        n++
+        console.log(
+          `  [${js.split('/').pop()} ${tok}] @${idx}: ` +
+            short(code.slice(Math.max(0, idx - 220), idx + 220).replace(/\s+/g, ' '), 460)
+        )
+      }
     }
   }
 
@@ -517,39 +538,69 @@ const state = { mediaHits: [], endpoints: [], notes: [] }
 
   // ---------------------------------------------------------------- 5i. 解析出的真实流 + 可播性
   hr('5i) 用 Cookie 解析真实流地址，并验证可播性 / 防盗链')
-  const rr = await get(rp, { Cookie: setCookie, Referer: rulePlayUrl, Origin: BASE })
-  const rj = parseJson(bodyOf(rr.res))
-  console.log('GET ' + rp + '  (Cookie: tvt-pt=…)\n→ HTTP ' + rr.res?.status)
-  console.log('  ' + short(bodyOf(rr.res).replace(/\s+/g, ' '), 700))
-  const stream = rj?.data?.url
+  for (let i = 0; i < 3; i++) {
+    const r = await get(rp, { Cookie: setCookie })
+    console.log(
+      `  第 ${i + 1} 次「只带 tvt-pt Cookie、不带 X-Play-Ctx」→ HTTP ${r.res?.status}  ` +
+        short(bodyOf(r.res).replace(/\s+/g, ' '), 200)
+    )
+    if (i === 0 && r.res?.status === 200) {
+      const j = parseJson(bodyOf(r.res))
+      console.log('  （由解析结果反推：服务端其实只校验 tvt-pt Cookie，X-Play-Ctx 不是必需的）')
+      var streamData = j?.data
+    }
+  }
+  const stream = streamData?.url
   if (stream) {
-    const ref = rj?.data?.headers?.Referer
+    const ref = streamData?.headers?.Referer
     console.log('\n解析出的媒体地址: ' + stream)
     console.log('服务端要求的 Referer: ' + ref)
+    console.log('（type=' + streamData.type + ', source=' + streamData.source + '）')
     for (const [label, h] of [
       ['无 Referer', {}],
       ['带服务端给的 Referer', ref ? { Referer: ref } : {}],
       ['带站点 Referer', { Referer: `${BASE}/` }]
     ]) {
-      if (label !== '无 Referer' && !Object.keys(h).length) continue
       const started = Date.now()
-      const res = await axios.get(stream, {
-        headers: { 'User-Agent': UA, ...h },
-        responseType: 'arraybuffer',
-        validateStatus: () => true,
-        maxRedirects: 5,
-        timeout: 20000
-      })
-      const buf = Buffer.from(res.data || [])
-      const head = buf.slice(0, 64)
-      const isMp4 = head.slice(4, 8).toString('ascii') === 'ftyp'
-      console.log(
-        `  ${label}: HTTP ${res.status} ct=${res.headers['content-type']} bytes=${buf.length} ${Date.now() - started}ms` +
-          ` head=${JSON.stringify(head.slice(0, 12).toString('latin1'))}${isMp4 ? ' ← MP4 (ftyp)' : ''}`
-      )
+      try {
+        // 只要前 64KB 就够判断可播性；该 CDN 会忽略 Range，因此读到首块立即断开，
+        // 避免为验证而下 700MB 整片。
+        const res = await axios.get(stream, {
+          headers: { 'User-Agent': UA, Range: 'bytes=0-65535', ...h },
+          responseType: 'stream',
+          validateStatus: () => true,
+          maxRedirects: 5,
+          timeout: 20000
+        })
+        const first = await new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('首块超时')), 15000)
+          res.data.once('data', (chunk) => {
+            clearTimeout(t)
+            resolve(chunk)
+          })
+          res.data.once('error', (e) => {
+            clearTimeout(t)
+            reject(e)
+          })
+        })
+        try {
+          res.data.destroy()
+        } catch {
+          /* ignore */
+        }
+        const head = Buffer.from(first).slice(0, 16)
+        const isMp4 = head.slice(4, 8).toString('ascii') === 'ftyp'
+        console.log(
+          `  ${label}: HTTP ${res.status} ct=${res.headers['content-type']} clen=${res.headers['content-length']} ` +
+            `首块=${Buffer.from(first).length}B ${Date.now() - started}ms head=${JSON.stringify(head.toString('latin1'))}` +
+            `${isMp4 ? '  ← 确认是 MP4 (ftyp)' : ''}`
+        )
+      } catch (e) {
+        console.log(`  ${label}: 失败 ${e.message}`)
+      }
     }
   } else {
-    console.log('（未取到流地址：data.type=' + (rj?.data?.type ?? '?') + '）')
+    console.log('（未取到流地址）')
   }
 
   // ---------------------------------------------------------------- 6. 媒体可播性

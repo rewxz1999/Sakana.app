@@ -986,6 +986,8 @@ if (!gotLock) {
           const { openSmallWindow } = await import('./window')
           const hashes = [
             '/stattool',
+            // v0.2.4：新增搜索页（收藏页的搜索框已迁到这里），纳入小窗口自检以免路由级错误漏网
+            '/search',
             '/rules',
             '/shortcuts',
             '/player-settings',
