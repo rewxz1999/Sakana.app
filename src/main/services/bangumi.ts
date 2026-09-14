@@ -151,9 +151,9 @@ class BangumiService {
         bangumiBase?: string
         bangumiMirrors?: string[]
         dataSources?: { main?: string; mirrors?: string[] }
-        anibaseVipMigrated?: boolean
+        mirrorVipMigrated?: boolean
       }
-      if (s.anibaseVipMigrated) return
+      if (s.mirrorVipMigrated) return
       const VIP = 'https://bangumi.vip'
       const list = Array.isArray(s.bangumiMirrors) && s.bangumiMirrors.length > 0 ? s.bangumiMirrors : []
       if (!list.includes(VIP)) {
@@ -169,11 +169,11 @@ class BangumiService {
                 : s.dataSources?.main || VIP,
             mirrors: next
           },
-          anibaseVipMigrated: true
+          mirrorVipMigrated: true
         })
         log.append('info', 'bangumi', `已把镜像 ${VIP} 加入数据源列表（原列表：${list.join(', ') || '空'}）`)
       } else {
-        store.set('settings', { ...(s as Record<string, unknown>), anibaseVipMigrated: true })
+        store.set('settings', { ...(s as Record<string, unknown>), mirrorVipMigrated: true })
       }
     } catch (err) {
       log.append('warn', 'bangumi', `镜像迁移失败（忽略）: ${String((err as Error)?.message ?? err)}`)
