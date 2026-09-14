@@ -1048,6 +1048,13 @@ export function PlayerPage() {
         case 'setAspect':
           changeAspect(a.aspect)
           break
+        /*
+         * v0.2.5 修：小窗口下控制栏也由悬浮窗绘制，而悬浮窗的「全屏播放」按钮发的是
+         * toggleFullscreen —— 这里过去没有对应分支，点了完全没反应（用户反馈「播放器全屏按钮没反应」）。
+         */
+        case 'toggleFullscreen':
+          toggleFullscreen()
+          break
         case 'exitFullscreen':
           void api.window.setFullscreen(false)
           break

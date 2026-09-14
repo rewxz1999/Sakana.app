@@ -58,7 +58,7 @@ import {
 import { toolService } from './services/tools'
 import { listSubscriptions, mutateSubscriptions } from './services/subsStore'
 import { hidePanelNow } from './tray'
-import { getMainWindow, openSmallWindow } from './window'
+import { focusedOrMain, getMainWindow, openSmallWindow } from './window'
 import {
   galApplyYmgal as galApplyYmgalFn,
   galImport as galImportFn,
@@ -82,7 +82,8 @@ import { ensureSaveDirs } from './services/saveDirs'
 import { clearCache, clearJunk, getCacheBytes, pickDirectory, pickNavBgImage, setCacheDir } from './services/settingsExt'
 
 function focused(): BrowserWindow | undefined {
-  return BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
+  // focusedOrMain 会排除离屏取数窗口：否则对话框可能被挂到一个不可见的窗口上
+  return focusedOrMain() ?? undefined
 }
 
 function addSubHistory(kind: SubHistoryItem['kind'], title: string, detail: string): void {

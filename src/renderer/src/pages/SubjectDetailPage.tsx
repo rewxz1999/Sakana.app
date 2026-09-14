@@ -10,7 +10,6 @@ import {
   Download,
   ExternalLink,
   FilePlay,
-  FolderOpen,
   Heart,
   Play,
   Rss,
@@ -145,6 +144,9 @@ export function SubjectDetailPage() {
    * 本地播放（单个文件）：播放页的本地模式以「文件夹」为单位建立播放列表
    * （见 PlayerPage 的 mode: 'local' 分支：folder 扫描列表 + episode 定位集数），
    * 因此这里取所选文件的目录，并用 listVideos 定位该文件的集序号后再跳转。
+   *
+   * v0.2.5：详情页只保留这一个本地播放入口（原先还有一个「从文件夹播放」，
+   * 与这里的功能重叠：本方法本来就会用文件所在文件夹建立列表）。
    */
   const playLocalFile = async (): Promise<void> => {
     const picked = await api.dialog.pickVideo()
@@ -165,7 +167,7 @@ export function SubjectDetailPage() {
     const index = listed.data.findIndex((f) => samePath(f.path, filePath))
     const target = index >= 0 ? listed.data[index] : undefined
     if (!target) {
-      toast.warn('未能定位该视频文件（可能不是受支持的视频格式），可改用「从文件夹播放」')
+      toast.warn('未能识别该视频文件（可能不是受支持的视频格式），请换一个文件')
       return
     }
     if (target.episode == null && index > 0) {
@@ -179,36 +181,6 @@ export function SubjectDetailPage() {
         subjectId,
         episode: target.episode ?? undefined
       }
-    })
-  }
-
-  /** 从文件夹播放：整个文件夹（递归）作为播放列表 */
-  const playLocalFolder = async (): Promise<void> => {
-    const picked = await api.dialog.pickVideoDir()
-    if (!picked.ok) {
-      toast.error(picked.error)
-      return
-    }
-    if (!picked.data) return // 用户取消
-    const folder = picked.data
-    setLocalBusy(true)
-    const listed = await api.media.listVideos(folder)
-    setLocalBusy(false)
-    if (!listed.ok) {
-      toast.error(listed.error)
-      return
-    }
-    if (listed.data.length === 0) {
-      toast.warn('该文件夹内没有找到视频文件')
-      return
-    }
-    // 播放页会自行扫描该文件夹（按集数 → 文件名排序），此处排序仅用于给出可预期的提示
-    const sorted = listed.data
-      .slice()
-      .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN', { numeric: true }))
-    toast.success(`已载入 ${sorted.length} 个视频，从「${sorted[0].name}」开始播放`)
-    navigate('/player', {
-      state: { mode: 'local', title: playerTitle, folder, subjectId }
     })
   }
 
@@ -404,19 +376,10 @@ export function SubjectDetailPage() {
             variant="soft"
             icon={FilePlay}
             loading={localBusy}
-            title="选择一个本地视频文件播放"
+            title="选择一个本地视频文件播放（同文件夹内的其它视频会作为播放列表）"
             onClick={() => void playLocalFile()}
           >
             本地播放
-          </Button>
-          <Button
-            variant="outline"
-            icon={FolderOpen}
-            loading={localBusy}
-            title="选择文件夹，文件夹内的视频会按集数加入播放列表"
-            onClick={() => void playLocalFolder()}
-          >
-            从文件夹播放
           </Button>
           <Button variant="soft" icon={Rss} onClick={() => setMikanOpen(true)}>
             订阅

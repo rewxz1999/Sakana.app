@@ -1,4 +1,5 @@
-import { Minus, X } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Copy, Minus, Square, X } from 'lucide-react'
 import { api } from '@/lib/api'
 
 function WinBtn({
@@ -25,8 +26,16 @@ function WinBtn({
   )
 }
 
-/** 自定义标题栏（方案 1：窗口可拖动；v0.2.4 起窗口只有小窗/全屏两种尺寸，去掉最大化） */
+/** 自定义标题栏（方案 1：窗口可拖动；v0.2.5 恢复自由缩放与最大化按钮） */
 export function TitleBar() {
+  const [isMax, setIsMax] = useState(false)
+
+  // 最大化状态由主进程广播：双击标题栏 / 系统快捷键同样会改变状态
+  useEffect(() => {
+    void api.window.isMaximized().then(setIsMax)
+    return api.window.onMaximizeChange(setIsMax)
+  }, [])
+
   return (
     <div className="drag-region relative z-40 flex h-9 shrink-0 items-center justify-between border-b border-border bg-elev1 pl-3 pr-1.5">
       <div className="flex items-center gap-2">
@@ -38,10 +47,10 @@ export function TitleBar() {
         <WinBtn title="最小化" onClick={() => void api.window.minimize()}>
           <Minus size={13} />
         </WinBtn>
-        {/*
-          v0.2.4：主窗口锁定为「初始小窗 / 全屏」两种尺寸，最大化按钮已无意义
-          （点了不会有任何反应，反而像坏了），因此不再渲染，只保留最小化与关闭。
-        */}
+        {/* v0.2.5：窗口恢复自由缩放，最大化按钮也一并回来 */}
+        <WinBtn title={isMax ? '还原' : '最大化'} onClick={() => void api.window.maximizeToggle()}>
+          {isMax ? <Copy size={11} className="-scale-x-100" /> : <Square size={11} />}
+        </WinBtn>
         <WinBtn title="关闭" danger onClick={() => void api.window.close()}>
           <X size={14} />
         </WinBtn>

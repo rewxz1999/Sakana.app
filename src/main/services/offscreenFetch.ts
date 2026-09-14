@@ -19,6 +19,32 @@ const CHALLENGE_RE =
 
 let win: BrowserWindow | null = null
 let busy: Promise<unknown> = Promise.resolve()
+let idleTimer: NodeJS.Timeout | null = null
+
+/** 空闲多久自动关掉离屏窗口：留着能省一次机器人校验，但也不能永久挂着一个窗口 */
+const IDLE_CLOSE_MS = 5 * 60 * 1000
+
+/**
+ * 是否是本模块创建的离屏辅助窗口。
+ *
+ * 必须能被识别出来：它同样是 BrowserWindow，会出现在 `BrowserWindow.getAllWindows()` 中，
+ * 于是会被「第二个实例」「对话框父窗口」「自检模式取窗口」等逻辑误当成主窗口 ——
+ * 实测症状是：全屏自检测到的是这个离屏窗口（host=null），`second-instance` 会把镜像站页面
+ * 当成主窗口去 show/focus。
+ */
+export function isOffscreenWindow(w: BrowserWindow | null | undefined): boolean {
+  return !!win && !win.isDestroyed() && w === win
+}
+
+function scheduleIdleClose(): void {
+  if (idleTimer) clearTimeout(idleTimer)
+  idleTimer = setTimeout(() => {
+    idleTimer = null
+    closeOffscreen()
+  }, IDLE_CLOSE_MS)
+  // 不因为这个定时器而阻止进程退出
+  idleTimer.unref?.()
+}
 
 function ensureWindow(): BrowserWindow {
   if (win && !win.isDestroyed()) return win
@@ -101,6 +127,8 @@ export async function offscreenGet(
       true
     )) as string
     log.append('info', 'offscreen', `取数成功 ${url.slice(0, 90)}（${content.length} 字节，${Date.now() - started}ms）`)
+    // 每次用完都重置空闲计时：长时间不再取数就把这个窗口收掉，避免它一直占着一个 BrowserWindow
+    scheduleIdleClose()
     return content
   })
   // 无论成功失败都把队列接下去，避免一次失败卡死后续请求

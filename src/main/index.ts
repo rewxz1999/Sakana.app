@@ -7,9 +7,10 @@ import { bangumi } from './services/bangumi'
 import { mikan } from './services/mikan'
 import { downloadManager } from './services/downloader/manager'
 import { registerMediaProtocols } from './services/media'
+import { CH } from '@shared/channels'
 import { ensureDefaultRules } from './services/rules'
 import { createTray, destroyTray, markQuitting } from './tray'
-import { createMainWindow } from './window'
+import { createMainWindow, getMainWindow, realWindows } from './window'
 import { ruleEpisodes, ruleSearch } from './services/rules'
 import { convertSubtitleToVtt, listVideos } from './services/media'
 import { initLiveServer, stopAllLive } from './services/transcode'
@@ -195,7 +196,8 @@ if (!gotLock) {
     void import('./services/updater').then((m) => m.scheduleAutoCheck())
 
     app.on('second-instance', () => {
-      const wins = BrowserWindow.getAllWindows()
+      // 只看业务窗口：离屏取数窗口也是 BrowserWindow，误选它会把镜像站页面当成主窗口弹出来
+      const wins = realWindows()
       const main = wins.find((w) => !w.webContents.getURL().includes('#/tray'))
       if (main) {
         if (main.isMinimized()) main.restore()
@@ -236,7 +238,7 @@ if (!gotLock) {
                     (w) => r.id.toLowerCase().includes(w) || r.name.toLowerCase().includes(w)
                   )
             )
-          const win = BrowserWindow.getAllWindows()[0]
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
           let ok = 0
           let fail = 0
           const ruleLimit = Number(process.env.SAKANA_ONLINE_MAX_RULES ?? 5)
@@ -417,7 +419,7 @@ if (!gotLock) {
           const file = process.env.SAKANA_MPV_TEST!
           const { mpvAttach, mpvPlay, mpvGetState, mpvDestroy, mpvAvailable, mpvEventCounts, mpvResetEventCounts } =
             await import('./services/mpv')
-          const win = BrowserWindow.getAllWindows()[0]
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
           console.log(`[mpv-test] 运行时可用=${mpvAvailable()}`)
           if (!win) {
             console.log('[mpv-test] 无主窗口')
@@ -482,7 +484,7 @@ if (!gotLock) {
           const { startLive, stopLive, initLiveServer } = await import('./services/transcode')
           const { engineAttach, enginePlay, engineGetState, engineDetach, activeEngine } =
             await import('./services/playerEngine')
-          const win = BrowserWindow.getAllWindows()[0]
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
           await initLiveServer()
           const relay = startLive(file, { mode: 'vcopy' })
           console.log(`[live-test] 内核=${activeEngine()} 中转地址=${relay.url}`)
@@ -525,7 +527,7 @@ if (!gotLock) {
           const { engineAttach, engineGetState, enginePlay, engineDetach, activeEngine } =
             await import('./services/playerEngine')
           const { desktopCapturer, screen } = await import('electron')
-          const win = BrowserWindow.getAllWindows()[0]
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
           const bounds = { x: 0, y: 60, width: 960, height: 480 }
           if (!win) {
             console.log('[pixel-test] 无主窗口')
@@ -700,7 +702,7 @@ if (!gotLock) {
       const folder = process.env.SAKANA_PLAYERUI_TEST
       setTimeout(() => {
         void (async () => {
-          const win = BrowserWindow.getAllWindows()[0]
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
           if (!win) {
             console.log('[playerui] 无主窗口')
             markQuitting()
@@ -790,6 +792,38 @@ if (!gotLock) {
             console.log(
               `[playerui] 退出全屏后: 窗口=${JSON.stringify(win.getBounds())} host=${JSON.stringify(await hostRect())} 视频窗口=${await videoRect()}`
             )
+
+            /*
+             * 按钮链路自检（v0.2.5）：用户反馈「点播放器全屏按钮没反应」。
+             * 小窗口下控制栏由悬浮窗绘制，按钮点下去是往主窗口发 overlayAction，
+             * 所以这里直接模拟那条动作，验证「按下按钮 → 真的全屏」这一段是通的；
+             * 同时检查悬浮窗是否跟随主窗口缩放（不跟随会导致按钮位置与命中区域错位）。
+             */
+            try {
+              const { overlayWindow } = await import('./services/playerOverlay')
+              const before = win.getBounds()
+              // ① 缩放主窗口 → 悬浮窗应跟随
+              win.setSize(before.width + 160, before.height + 120)
+              await new Promise((r) => setTimeout(r, 700))
+              const after = win.getBounds()
+              const ow = overlayWindow()
+              const ob = ow?.getBounds()
+              const followed =
+                !!ob && Math.abs(ob.width - after.width) <= 2 && Math.abs(ob.height - after.height) <= 2
+              console.log(
+                `[playerui] 窗口缩放跟随: 主窗口=${after.width}x${after.height} 悬浮窗=${ob ? `${ob.width}x${ob.height}` : '无'} 跟随=${followed}`
+              )
+              // ② 模拟悬浮窗上的「全屏播放」按钮
+              win.webContents.send(CH.overlayAction, { type: 'toggleFullscreen' })
+              await new Promise((r) => setTimeout(r, 1500))
+              console.log(`[playerui] 按钮动作 toggleFullscreen → 全屏=${win.isFullScreen()}`)
+              // ③ 再点一次应退出全屏
+              win.webContents.send(CH.overlayAction, { type: 'toggleFullscreen' })
+              await new Promise((r) => setTimeout(r, 1500))
+              console.log(`[playerui] 再次点击 → 全屏=${win.isFullScreen()}（应为 false）`)
+            } catch (err) {
+              console.log(`[playerui] 按钮链路自检失败: ${String(err).slice(0, 140)}`)
+            }
           }
           // ① 屏幕抓取（用户实际所见，包含原生子窗口）
           try {
@@ -1179,7 +1213,7 @@ if (!gotLock) {
     if (process.env.SAKANA_SUBS_TEST) {
       setTimeout(() => {
         void (async () => {
-          const win = BrowserWindow.getAllWindows()[0]
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
           const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
           if (!win) {
             console.log('[subs-test] 无主窗口')
@@ -1331,7 +1365,7 @@ if (!gotLock) {
       setTimeout(() => {
         void (async () => {
           const { startRuleProbe } = await import('./services/ruleProbe')
-          const win = BrowserWindow.getAllWindows()[0]
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
           console.log('[probe-test] 隔离测试：无分区窗口能否加载页面…')
           const bare = new BrowserWindow({ show: false, width: 800, height: 600, webPreferences: { sandbox: false } })
           try {
@@ -1361,7 +1395,7 @@ if (!gotLock) {
       setTimeout(() => {
         void (async () => {
           const { attachVlc, destroyVlc, getVlcState, vlcPlay } = await import('./services/vlc')
-          const win = BrowserWindow.getAllWindows()[0]
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
           if (!win) {
             console.log('[vlc-test] 无窗口')
             markQuitting()
@@ -1464,7 +1498,7 @@ if (!gotLock) {
             }
           }
           // 渲染层探测：真实 <video> 元素加载协议 URL（假视频内容应得到解码错误码 3/4 而非网络错误码 2）
-          const win = BrowserWindow.getAllWindows()[0]
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
           if (win && videos[0]) {
             await new Promise<void>((resolve) => {
               if (!win.webContents.isLoading()) return resolve()

@@ -18,6 +18,44 @@ import { log } from '../log'
 
 let overlayWin: BrowserWindow | null = null
 let ownerWin: BrowserWindow | null = null
+/** 跟随主窗口尺寸/位置的监听器解绑函数（悬浮窗销毁时必须解绑，否则会泄漏监听） */
+let followDisposers: (() => void)[] = []
+
+function stopFollowing(): void {
+  for (const off of followDisposers) {
+    try {
+      off()
+    } catch {
+      /* ignore */
+    }
+  }
+  followDisposers = []
+}
+
+/**
+ * 让悬浮窗跟随主窗口的移动与缩放。
+ *
+ * v0.2.5 起主窗口恢复自由缩放：不跟随的话，窗口拉大后悬浮窗仍是旧尺寸，
+ * 控制栏按钮的实际位置与命中区域错位 —— 表现为「点了全屏按钮没反应」。
+ */
+function startFollowing(owner: BrowserWindow): void {
+  stopFollowing()
+  const sync = (): void => syncBounds()
+  owner.on('resize', sync)
+  owner.on('move', sync)
+  owner.on('maximize', sync)
+  owner.on('unmaximize', sync)
+  owner.on('enter-full-screen', sync)
+  owner.on('leave-full-screen', sync)
+  followDisposers = [
+    () => owner.off('resize', sync),
+    () => owner.off('move', sync),
+    () => owner.off('maximize', sync),
+    () => owner.off('unmaximize', sync),
+    () => owner.off('enter-full-screen', sync),
+    () => owner.off('leave-full-screen', sync)
+  ]
+}
 
 function rendererUrl(): string {
   return join(__dirname, '../renderer/index.html')
@@ -34,6 +72,7 @@ export function showOverlay(owner: BrowserWindow): void {
     syncBounds()
     return
   }
+  startFollowing(owner)
   const ownerBounds = owner.getBounds()
   overlayWin = new BrowserWindow({
     parent: owner,
@@ -87,6 +126,7 @@ export function syncBounds(): void {
 
 /** 关闭并销毁悬浮窗 */
 export function destroyOverlay(): void {
+  stopFollowing()
   if (overlayWin && !overlayWin.isDestroyed()) {
     overlayWin.destroy()
   }

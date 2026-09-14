@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { CH } from '@shared/channels'
 import { log } from './log'
+import { closeOffscreen, isOffscreenWindow } from './services/offscreenFetch'
 import { askCloseBehavior, isQuitting } from './tray'
 
 let mainWindow: BrowserWindow | null = null
@@ -12,6 +13,25 @@ const smallWindows = new Map<string, BrowserWindow>()
 
 export function getMainWindow(): BrowserWindow | null {
   return mainWindow
+}
+
+/**
+ * 业务窗口列表（排除离屏取数等辅助窗口）。
+ *
+ * 为什么需要：`BrowserWindow.getAllWindows()` 会把离屏取数窗口也算进去，
+ * 于是「第二个实例把主窗口提前」「对话框父窗口」这类逻辑可能选到那个不可见的窗口。
+ */
+export function realWindows(): BrowserWindow[] {
+  return BrowserWindow.getAllWindows().filter((w) => !isOffscreenWindow(w))
+}
+
+/** 焦点窗口（排除辅助窗口）→ 主窗口 → 任意业务窗口 */
+export function focusedOrMain(): BrowserWindow | null {
+  const focused = BrowserWindow.getFocusedWindow()
+  if (focused && !isOffscreenWindow(focused)) return focused
+  const main = getMainWindow()
+  if (main && !main.isDestroyed()) return main
+  return realWindows()[0] ?? null
 }
 
 export function isSmallWindow(win: BrowserWindow): boolean {
@@ -149,13 +169,11 @@ export function createMainWindow(): BrowserWindow {
     height: 640,
     minWidth: 760,
     minHeight: 520,
-    // v0.2.4：窗口尺寸只保留「初始小窗」与「全屏」两种，禁止用户自由拉伸
-    //（自由拉伸会让页面在极端比例下错位）。
-    // ⚠️ 必须保留 resizable: true —— Windows 上 Chromium 不允许「不可缩放」的窗口进入全屏，
-    // setFullScreen() 会被静默忽略，表现就是「点了全屏没反应」。用户拖拽缩放改由
-    // will-resize 事件拦截（见下方），程序化全屏不受影响。
+    // v0.2.5：恢复自由缩放（用户要求「可以自由调节应用窗口大小」），并保留全屏能力。
+    // 历史教训：不要用 resizable:false 或 will-resize 去锁尺寸 —— Windows 上 Chromium
+    // 不允许「不可缩放」的窗口进入全屏，setFullScreen() 会被静默忽略（点了全屏没反应）。
     resizable: true,
-    maximizable: false,
+    maximizable: true,
     fullscreenable: true,
     frame: false, // 方案 1：无边框 + 自定义标题栏（可拖动）
     show: false,
@@ -170,18 +188,6 @@ export function createMainWindow(): BrowserWindow {
   })
 
   win.once('ready-to-show', () => win.show())
-  /*
-   * 拦截用户拖拽缩放（等效于 resizable:false，但不影响全屏）。
-   * will-resize 只在用户手动拉伸时触发，setBounds/setFullScreen 等程序化调用不会走这里。
-   */
-  win.on('will-resize', (e) => {
-    e.preventDefault()
-  })
-  // 同理：最大化按钮已隐藏，这里再兜一层（例如双击标题栏、Win+↑ 触发系统最大化）
-  win.on('maximize', () => {
-    win.unmaximize()
-    win.webContents.send(CH.evWinMaximize, false)
-  })
   // 关闭询问：最小化至托盘 / 直接退出 / 取消
   win.on('close', (e) => {
     if (isQuitting()) return
@@ -193,6 +199,11 @@ export function createMainWindow(): BrowserWindow {
   win.on('leave-full-screen', () => win.webContents.send(CH.evWinFullscreen, false))
   win.on('closed', () => {
     if (mainWindow === win) mainWindow = null
+    /*
+     * 主窗口关掉时一并收掉离屏取数窗口：
+     * 否则它会让 `window-all-closed` 永远不触发，应用退不干净。
+     */
+    closeOffscreen()
   })
   applyIcon(win)
   mainWindow = win
