@@ -15,6 +15,7 @@ import type { LocalSubFile, LocalVideoFile } from '@shared/types'
 import { parseEpisode } from '../lib/parse'
 import { log } from '../log'
 import { BROWSER_UA, getSettings } from '../net'
+import { rewriteImageUrl } from './bangumi'
 import { liveStream } from './transcode'
 
 const VIDEO_EXTS = new Set([
@@ -345,6 +346,8 @@ function refererFor(target: string): string | undefined {
     const host = new URL(target).hostname.toLowerCase()
     if (host.includes('bangumi.pro')) return 'https://bangumi.pro/'
     if (host.includes('bangumi.lol')) return 'https://bangumi.lol/'
+    // 自建反代（Cloudflare Worker）自己会带正确的上游 Referer，本地不必再补
+    if (host.endsWith('.workers.dev')) return undefined
     if (host.includes('bgm.tv')) return 'https://bgm.tv/'
   } catch {
     /* ignore */
@@ -352,7 +355,9 @@ function refererFor(target: string): string | undefined {
   return undefined
 }
 
-async function fetchImageWithCache(target: string): Promise<Response> {
+async function fetchImageWithCache(rawTarget: string): Promise<Response> {
+  // 配了自建图片反代时，官方图床地址改写到反代域名（Worker 按路径转发）
+  const target = rewriteImageUrl(rawTarget)
   const existing = inflight.get(target)
   if (existing) return existing
   const p = (async () => {

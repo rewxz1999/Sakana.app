@@ -84,6 +84,17 @@ resources/           # 内置运行时（libvlc / libmpv / ffmpeg / aria2，体�
 
 ## 更新记录
 
+### 0.2.4（紧急更新补充）
+
+> 上一版 0.2.4 有三个必须立刻处理的问题，以下是补充修复。
+
+- **数据源自建反代（Cloudflare Worker）**：`bangumi.pro` 被墙、`bangumi.lol` 超时、直连 `api.bgm.tv` 也不稳，公共镜像等于全灭。现在「设置 → 数据源配置」新增**自建反代**两个字段：
+  - **API 反代地址**（Worker 的 `API_HOST`）：作为**最高优先级数据源**，并**强制**按 `/v0/…` JSON 路径请求（不要求域名以 `api.` 开头，Workers 域名通常不是），同时自动跳过已知被墙的 `bangumi.pro`；
+  - **图片反代地址**（Worker 的 `IMG_HOST`）：把 `lain.bgm.tv` 封面按原路径改写到你的域名（图片在主进程拉取，不受同源策略限制）。
+  - Worker 源码与三步部署说明随仓库提供：`deploy/bangumi-proxy-worker.js`、`deploy/bangumi-proxy-README.md`。该 Worker 自身也会改写 API 响应里的图片地址，所以图片字段是冗余保险。**只代理 API 与图片，不要代理 bgm.tv 网页**，否则服务器 IP 有被封风险。
+- **修复窗口 / 播放器无法全屏**：上一版用 `resizable: false` 禁止自由拉伸，但 **Windows 上 Chromium 不允许不可缩放的窗口进入全屏**（`setFullScreen()` 被静默忽略），应用窗口与播放器都受影响。现改为 `resizable: true` + `will-resize` 拦截用户拖拽缩放（并拦截系统最大化），实测全屏恢复正常（`全屏=true`、画面正常、退出后回到 983×642）。
+- **安装包随仓库发布**：`Sakana-0.2.4-setup.exe` 已作为 GitHub Release 资产上传（GitHub 单文件上限 100MB，所以走 Release 而不是塞进 git 历史）：<https://github.com/rewxz1999/Sakana.app/releases>
+
 ### 0.2.4
 
 **播放器**

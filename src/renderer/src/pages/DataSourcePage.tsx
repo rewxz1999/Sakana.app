@@ -27,6 +27,8 @@ export function DataSourcePage() {
   const { settings, save, loaded } = useSettings()
   const [main, setMain] = useState('')
   const [mirrors, setMirrors] = useState<string[]>([])
+  const [customApi, setCustomApi] = useState('')
+  const [customImg, setCustomImg] = useState('')
   const [results, setResults] = useState<{ url: string; ok: boolean; ms: number; error?: string }[] | null>(null)
   const [testing, setTesting] = useState(false)
 
@@ -35,6 +37,8 @@ export function DataSourcePage() {
     const d = derive(settings)
     setMain(d.main)
     setMirrors(d.mirrors)
+    setCustomApi(settings.bangumiCustomApi ?? '')
+    setCustomImg(settings.bangumiCustomImg ?? '')
   }, [loaded, settings])
 
   const updateMirror = (i: number, value: string): void => {
@@ -63,17 +67,26 @@ export function DataSourcePage() {
 
   const doSave = (): void => {
     const clean = mirrors.map((s) => s.trim()).filter(Boolean)
-    if (clean.length === 0) {
-      toast.warn('请至少保留一个数据源')
+    const api = customApi.trim().replace(/\/+$/, '')
+    if (clean.length === 0 && !api) {
+      toast.warn('请至少保留一个数据源（或填写自建反代地址）')
       return
     }
-    let m = main.trim() || clean[0]
-    if (!clean.includes(m)) m = clean[0]
+    let m = main.trim() || clean[0] || api
+    // 填了自建反代就把它设为主数据源：公共镜像（bangumi.pro / bangumi.lol / api.bgm.tv）目前都可能不可达
+    if (api) m = api
+    else if (!clean.includes(m)) m = clean[0]
     const list = [m, ...clean.filter((s) => s !== m)]
-    save({ dataSources: { main: m, mirrors: list }, bangumiBase: m, bangumiMirrors: list })
+    save({
+      dataSources: { main: m, mirrors: list },
+      bangumiBase: m,
+      bangumiMirrors: list,
+      bangumiCustomApi: api,
+      bangumiCustomImg: customImg.trim().replace(/\/+$/, '')
+    })
     setMain(m)
     setMirrors(list)
-    toast.success('数据源已保存')
+    toast.success(api ? '已保存，并使用自建反代作为主数据源' : '数据源已保存')
   }
 
   return (
@@ -87,6 +100,43 @@ export function DataSourcePage() {
         </Button>
       }
     >
+      {/*
+        自建反代（Cloudflare Worker）：公共镜像被墙后的唯一可靠通道。
+        两个地址分别对应 Worker 里的 API_HOST / IMG_HOST 变量。
+      */}
+      <Card
+        title="自建反代（推荐，Cloudflare Worker）"
+        desc="公共镜像失败时使用；部署方法见仓库 deploy/bangumi-proxy-README.md"
+      >
+        <div className="flex flex-col gap-3">
+          <label className="flex flex-col gap-1.5">
+            <span className="text-[11px] text-faint">
+              API 反代地址（Worker 的 API_HOST，如 https://api.yourdomain.com）
+            </span>
+            <Input
+              value={customApi}
+              onChange={(e) => setCustomApi(e.target.value)}
+              placeholder="https://api.yourdomain.com"
+            />
+          </label>
+          <label className="flex flex-col gap-1.5">
+            <span className="text-[11px] text-faint">
+              图片反代地址（Worker 的 IMG_HOST，如 https://img.yourdomain.com）
+            </span>
+            <Input
+              value={customImg}
+              onChange={(e) => setCustomImg(e.target.value)}
+              placeholder="https://img.yourdomain.com"
+            />
+          </label>
+          <div className="text-[11px] leading-relaxed text-faint">
+            填写 API 反代后，它会被**强制**当作 API 源使用（走 <code className="font-mono">/v0/…</code> JSON 路径，
+            不要求域名以 <code className="font-mono">api.</code> 开头），并自动跳过已知被墙的 bangumi.pro。
+            图片反代会把 <code className="font-mono">lain.bgm.tv</code> 的封面按原路径改写过去。两项留空即维持原公共镜像链。
+          </div>
+        </div>
+      </Card>
+
       {/* 当前主数据源 */}
       <Card title="当前主数据源" desc="日历、条目详情与搜索优先使用该地址">
         <div className="flex flex-col gap-2">

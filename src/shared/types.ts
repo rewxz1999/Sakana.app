@@ -778,6 +778,19 @@ export interface AppSettings {
    * 可选字段：旧设置文件缺省该键时按「开启」处理（见 adFilter.adFilterEnabled）。
    */
   hlsAdFilter?: boolean
+  /**
+   * 自建反代（Cloudflare Worker，见 deploy/bangumi-proxy-README.md）。
+   *
+   * bangumi.pro / bangumi.lol 已被墙、api.bgm.tv 直连也不稳，公共镜像随时可能全灭，
+   * 因此允许用户填自己的反代域名：
+   * - `bangumiCustomApi`：API 反代地址（Worker 的 API_HOST），会作为**最高优先级**镜像，
+   *   并强制按 v0 API 路径（`/v0/...`）请求，不再依赖域名里是否含 `api.`；
+   * - `bangumiCustomImg`：图片反代地址（Worker 的 IMG_HOST），
+   *   命中 `lain.bgm.tv` 等官方图床时按原路径改写过去。
+   * 两者留空则维持原有的公共镜像链。
+   */
+  bangumiCustomApi?: string
+  bangumiCustomImg?: string
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -805,7 +818,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   language: 'zh',
   autoCheckUpdate: false,
   galgameDetect: false,
-  hlsAdFilter: true
+  hlsAdFilter: true,
+  bangumiCustomApi: '',
+  bangumiCustomImg: ''
 }
 
 // ---------------- 工具数据导出 ----------------

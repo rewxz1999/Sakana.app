@@ -36,6 +36,53 @@ function isApiHost(host: string): boolean {
   return host.startsWith('api.') || host.includes('api.bgm')
 }
 
+/** 已被墙的公共镜像：只在没有自建反代时才尝试（避免每次都白等一个必失败的请求） */
+const DEAD_MIRRORS = ['bangumi.pro']
+
+/**
+ * 自建反代（Cloudflare Worker）：配置过的自定义 API 地址一律按 API 语义请求
+ * （`/v0/...` 路径），不要求域名必须以 `api.` 开头 —— Workers 域名/自定义域名常常不是。
+ */
+function isCustomApiBase(mirror: string): boolean {
+  const custom = (getSettings().bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
+  return Boolean(custom) && mirror.replace(/\/+$/, '') === custom
+}
+
+/**
+ * 该镜像应按 API（`/v0/...` JSON）还是网页（HTML）语义解析。
+ *
+ * 过去用 `mirror.includes('api.')` 做字符串匹配：自建反代的域名往往不含 `api.`
+ * （例如 `https://bgm-proxy.xxx.workers.dev`），于是请求按 JSON 走、解析却按 HTML 走，
+ * 结果必然「解析为空」—— 这是接入自建反代时最先踩到的坑。
+ * 这里统一按 URL 主机名判断，并显式认下配置过的自建反代。
+ */
+function isApiMirror(mirror: string): boolean {
+  if (isCustomApiBase(mirror)) return true
+  try {
+    return isApiHost(new URL(mirror).hostname)
+  } catch {
+    return mirror.includes('api.')
+  }
+}
+
+/**
+ * 把官方图床地址改写到自建图片反代（Worker 的 IMG_HOST）。
+ * Worker 按**路径**转发（`/pic/cover/l/xxx.jpg`），所以只替换 origin，路径保留。
+ */
+export function rewriteImageUrl(url: string): string {
+  const custom = getSettings().bangumiCustomImg?.trim().replace(/\/+$/, '')
+  if (!custom || !url) return url
+  try {
+    const u = new URL(url)
+    // 只改官方图床（lain.bgm.tv / bgm.tv 系），其它第三方图床保持原样
+    if (!/(^|\.)bgm\.tv$/i.test(u.hostname)) return url
+    const base = new URL(custom)
+    return `${base.origin}${u.pathname}${u.search}`
+  } catch {
+    return url
+  }
+}
+
 /**
  * bangumi 数据源（方案 3.10：镜像降级机制）
  * - 网页镜像（bangumi.pro / bangumi.lol / bgm.tv 网页版）：浏览器 UA + HTML 解析
@@ -68,10 +115,15 @@ class BangumiService {
 
   private mirrors(): string[] {
     const s = getSettings()
+    const custom = (s.bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
     const list = Array.isArray(s.bangumiMirrors) && s.bangumiMirrors.length > 0
       ? s.bangumiMirrors
       : [s.bangumiBase || 'https://bangumi.pro']
-    return [...new Set(list.map((m) => m.replace(/\/+$/, '')))]
+    const normalized = list.map((m) => m.replace(/\/+$/, ''))
+    // 自建反代永远排第一（并行请求里它最快，且是唯一可控的通道）
+    const all = custom ? [custom, ...normalized] : normalized
+    const alive = custom ? all.filter((m) => !DEAD_MIRRORS.some((d) => m.includes(d))) : all
+    return [...new Set(alive)]
   }
 
   private readCache<T>(key: string): CacheEntry<T> | null {
@@ -104,7 +156,10 @@ class BangumiService {
       let url: string
       try {
         const u = new URL(mirror)
-        url = isApiHost(u.hostname) ? `${mirror}${paths.api}` : `${mirror}${paths.web}`
+        // 自建反代虽然域名可能不含 api.，但它代理的就是 API 主机 → 走 /v0 JSON 路径
+        url = isApiHost(u.hostname) || isCustomApiBase(mirror)
+          ? `${mirror}${paths.api}`
+          : `${mirror}${paths.web}`
       } catch {
         url = `${mirror}${paths.web}`
       }
@@ -144,7 +199,7 @@ class BangumiService {
     try {
       const { text, mirror } = await this.requestBest({ api: '/v0/calendar', web: '/calendar' })
       let days: CalendarDay[]
-      if (mirror.includes('api.')) {
+      if (isApiMirror(mirror)) {
         const parsed = JSON.parse(text) as unknown
         if (!Array.isArray(parsed)) throw new Error('日历 JSON 格式异常')
         days = parsed as CalendarDay[]
@@ -180,7 +235,7 @@ class BangumiService {
         web: `/subject/${id}`
       })
       let detail: SubjectDetail | null
-      if (mirror.includes('api.')) {
+      if (isApiMirror(mirror)) {
         detail = this.normalizeSubject(JSON.parse(text) as Record<string, unknown>)
       } else {
         detail = parseSubjectPage(text, id)
@@ -211,7 +266,7 @@ class BangumiService {
         web: `/subject_search/${encodeURIComponent(keyword)}?cat=2`
       })
       let items: SearchResultItem[]
-      if (mirror.includes('api.')) {
+      if (isApiMirror(mirror)) {
         const list = (JSON.parse(text) as { data?: Record<string, unknown>[] })?.data ?? []
         items = list.map((raw) => this.normalizeItem(raw))
       } else {
@@ -251,7 +306,7 @@ class BangumiService {
             api: `/v0/subjects/${id}`,
             web: `/subject/${id}`
           })
-          const data = mirror.includes('api.')
+          const data = isApiMirror(mirror)
             ? (() => {
                 const s = JSON.parse(text) as { rating?: { score?: number; total?: number } }
                 const score = Number(s.rating?.score ?? 0)
@@ -290,7 +345,7 @@ class BangumiService {
           let ok = false
           if (res.status === 200) {
             const text = res.data as string
-            ok = url.includes('api.') ? text.trim().startsWith('[') : text.includes('coverList')
+            ok = isApiMirror(mirror) ? text.trim().startsWith('[') : text.includes('coverList')
           }
           return { url: mirror, ok, ms: Date.now() - start, error: ok ? undefined : `HTTP ${res.status} 或响应格式不符` }
         } catch (err) {

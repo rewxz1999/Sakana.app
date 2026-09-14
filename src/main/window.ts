@@ -149,10 +149,12 @@ export function createMainWindow(): BrowserWindow {
     height: 640,
     minWidth: 760,
     minHeight: 520,
-    // v0.2.4：窗口尺寸只保留「初始小窗」与「全屏」两种。
-    // 允许自由拉伸会让页面在极端比例下出现内容错位（用户反馈的显示 bug），
-    // 因此锁死尺寸与最大化：窗口仍可拖动、可通过标题栏按钮进出全屏。
-    resizable: false,
+    // v0.2.4：窗口尺寸只保留「初始小窗」与「全屏」两种，禁止用户自由拉伸
+    //（自由拉伸会让页面在极端比例下错位）。
+    // ⚠️ 必须保留 resizable: true —— Windows 上 Chromium 不允许「不可缩放」的窗口进入全屏，
+    // setFullScreen() 会被静默忽略，表现就是「点了全屏没反应」。用户拖拽缩放改由
+    // will-resize 事件拦截（见下方），程序化全屏不受影响。
+    resizable: true,
     maximizable: false,
     fullscreenable: true,
     frame: false, // 方案 1：无边框 + 自定义标题栏（可拖动）
@@ -168,13 +170,24 @@ export function createMainWindow(): BrowserWindow {
   })
 
   win.once('ready-to-show', () => win.show())
+  /*
+   * 拦截用户拖拽缩放（等效于 resizable:false，但不影响全屏）。
+   * will-resize 只在用户手动拉伸时触发，setBounds/setFullScreen 等程序化调用不会走这里。
+   */
+  win.on('will-resize', (e) => {
+    e.preventDefault()
+  })
+  // 同理：最大化按钮已隐藏，这里再兜一层（例如双击标题栏、Win+↑ 触发系统最大化）
+  win.on('maximize', () => {
+    win.unmaximize()
+    win.webContents.send(CH.evWinMaximize, false)
+  })
   // 关闭询问：最小化至托盘 / 直接退出 / 取消
   win.on('close', (e) => {
     if (isQuitting()) return
     e.preventDefault()
     void askCloseBehavior(win)
   })
-  win.on('maximize', () => win.webContents.send(CH.evWinMaximize, true))
   win.on('unmaximize', () => win.webContents.send(CH.evWinMaximize, false))
   win.on('enter-full-screen', () => win.webContents.send(CH.evWinFullscreen, true))
   win.on('leave-full-screen', () => win.webContents.send(CH.evWinFullscreen, false))
