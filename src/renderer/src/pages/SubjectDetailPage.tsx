@@ -619,7 +619,14 @@ function RulePlayModal({
         entry,
         vars,
         groups,
-        referer: rule.baseUrl
+        referer: rule.baseUrl,
+        /*
+         * v0.2.7：必须把「当前是第几线路第几集」一并带进去。
+         * 过去只带播放页地址，播放器内部 ruleCurrent 为 null 就默认按第 1 集算 ——
+         * 于是用户在看第 3 集时左上角显示第 1 集，自动连播还会从第 1 集往后跳（用户反馈的「跳回第二集」）。
+         */
+        startLine: groupIdx,
+        startEp: epIdx
       }
     })
   }

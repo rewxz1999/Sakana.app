@@ -803,12 +803,26 @@ export interface AppSettings {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   theme: 'sakura',
-  // bangumi.pro 已被墙，改用同款镜像 bangumi.vip（结构与 bangumi.pro 一致）
-  bangumiBase: 'https://bangumi.vip',
-  bangumiMirrors: ['https://bangumi.vip', 'https://bangumi.lol', 'https://api.bgm.tv'],
+  /*
+   * v0.2.7：默认改用自建反代（用户已部署 Cloudflare Worker）。
+   * 与官方 v0 的两处差异见 bangumi.ts 的注释：
+   * - 每日放送在 `/calendar`（不是 `/v0/calendar`），直接返回本应用需要的 7 天 JSON；
+   * - 搜索是 `POST /v0/search/subjects`（不是 GET）。
+   * 图片由反代自己改写成 `/img/...`，图片反代字段主要用于兜底。
+   */
+  bangumiBase: 'https://sankana-bangumi.de5.net/api',
+  bangumiMirrors: [
+    'https://sankana-bangumi.de5.net/api',
+    'https://bangumi.vip',
+    'https://bangumi.lol'
+  ],
   dataSources: {
-    main: 'https://bangumi.vip',
-    mirrors: ['https://bangumi.vip', 'https://bangumi.lol', 'https://api.bgm.tv']
+    main: 'https://sankana-bangumi.de5.net/api',
+    mirrors: [
+      'https://sankana-bangumi.de5.net/api',
+      'https://bangumi.vip',
+      'https://bangumi.lol'
+    ]
   },
   proxy: { enabled: false, type: 'http', host: '127.0.0.1', port: 7890, username: '', password: '' },
   screenshotDir: '',
@@ -828,8 +842,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoCheckUpdate: false,
   galgameDetect: false,
   hlsAdFilter: true,
-  bangumiCustomApi: '',
-  bangumiCustomImg: ''
+  // 自建反代（默认启用，可在「设置 → 数据源配置」改回公共镜像）
+  bangumiCustomApi: 'https://sankana-bangumi.de5.net/api',
+  bangumiCustomImg: 'https://sankana-bangumi.de5.net/img'
 }
 
 // ---------------- 工具数据导出 ----------------

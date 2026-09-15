@@ -151,7 +151,27 @@ class BangumiService {
         bangumiBase?: string
         bangumiMirrors?: string[]
         dataSources?: { main?: string; mirrors?: string[] }
+        bangumiCustomApi?: string
+        bangumiCustomImg?: string
         mirrorVipMigrated?: boolean
+        proxyMigrated?: boolean
+      }
+      /*
+       * v0.2.7：把自建反代设为默认主数据源（用户已部署 Cloudflare Worker）。
+       * 用户自己填过自定义反代就不覆盖，只补默认值。
+       */
+      const PROXY_API = 'https://sankana-bangumi.de5.net/api'
+      const PROXY_IMG = 'https://sankana-bangumi.de5.net/img'
+      if (!s.proxyMigrated && !(s.bangumiCustomApi ?? '').trim()) {
+        store.set('settings', {
+          ...(s as Record<string, unknown>),
+          bangumiCustomApi: PROXY_API,
+          bangumiCustomImg: PROXY_IMG,
+          proxyMigrated: true
+        })
+        log.append('info', 'bangumi', `已启用自建反代作为默认主数据源：${PROXY_API}`)
+        // 重新读一次：下面的镜像迁移基于最新设置
+        Object.assign(s, { bangumiCustomApi: PROXY_API, proxyMigrated: true })
       }
       if (s.mirrorVipMigrated) return
       const VIP = 'https://bangumi.vip'
@@ -217,6 +237,21 @@ class BangumiService {
   }
 
   /**
+   * 自建反代的「每日放送」路径与官方不同（v0.2.7）。
+   *
+   * 实测用户的 Cloudflare Worker 反代：
+   * - `GET  {反代}/calendar`              → 直接返回本应用需要的 7 天 JSON（与官方 v0 结构一致）
+   * - `GET  {反代}/v0/calendar`           → 404
+   * - `GET  {反代}/v0/subjects/:id`       → 200（与官方一致）
+   * - `POST {反代}/v0/search/subjects`    → 200（**搜索是 POST**，GET 会 404）
+   * 所以这里给「自建反代」单独一套放送路径，其余接口沿用官方 v0 路径。
+   */
+  private calendarPathFor(mirror: string, paths: { api: string; web: string; customApi?: string }): string {
+    if (isCustomApiBase(mirror)) return paths.customApi ?? paths.web
+    return isApiHost(new URL(mirror).hostname) ? paths.api : paths.web
+  }
+
+  /**
    * 取一个镜像的响应。
    *
    * v0.2.5 起网页镜像有两条路：
@@ -271,15 +306,39 @@ class BangumiService {
    * 并行尝试所有镜像，返回第一个成功响应。
    * api 镜像走 JSON 路径，网页镜像走 HTML 路径。
    */
-  private async requestBest(paths: { api: string; web: string }): Promise<{ text: string; mirror: string }> {
+  private async requestBest(paths: {
+    api: string
+    web: string
+    /** 自建反代专用的路径（缺省时用 api 路径） */
+    customApi?: string
+  }): Promise<{ text: string; mirror: string }> {
+    /*
+     * v0.2.7：配了自建反代就**优先单独使用它**。
+     *
+     * 之前是把反代和公共镜像放在一起竞速，结果反代经常输给「已经预热好的网页镜像」
+     * （实测 bangumi.vip 命中缓存只要 26ms，反代首包要几百毫秒~3 秒），
+     * 于是「设为默认主数据源」形同虚设。现在改成：先只用反代，失败再回退到镜像竞速。
+     */
+    const custom = (getSettings().bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
+    if (custom) {
+      const url = `${custom}${this.calendarPathFor(custom, paths)}`
+      try {
+        const text = await this.fetchMirror(url, true)
+        return { text, mirror: custom }
+      } catch (err) {
+        const e = err as { code?: string; message?: string }
+        const reason = e?.code === 'ECONNABORTED' ? '超时' : (e?.message ?? String(err))
+        log.append('warn', 'bangumi', `自建反代失败，回退公共镜像：${reason}`)
+      }
+    }
     const attempts = this.mirrors().map(async (mirror) => {
       let url: string
       let isApi = false
       try {
         const u = new URL(mirror)
-        // 自建反代虽然域名可能不含 api.，但它代理的就是 API 主机 → 走 /v0 JSON 路径
+        // 自建反代虽然域名可能不含 api.，但它代理的就是 API 主机 → 走 JSON 路径
         isApi = isApiHost(u.hostname) || isCustomApiBase(mirror)
-        url = isApi ? `${mirror}${paths.api}` : `${mirror}${paths.web}`
+        url = isApi ? `${mirror}${this.calendarPathFor(mirror, paths)}` : `${mirror}${paths.web}`
       } catch {
         url = `${mirror}${paths.web}`
       }
@@ -323,7 +382,12 @@ class BangumiService {
       // 本会话尚未更新过：联网一次，成功即标记会话新鲜；失败回退缓存（带 stale 标记）
     }
     try {
-      const { text, mirror } = await this.requestBest({ api: '/v0/calendar', web: '/calendar' })
+      const { text, mirror } = await this.requestBest({
+        api: '/v0/calendar',
+        web: '/calendar',
+        // 自建反代的每日放送在 /calendar，且直接返回本应用需要的 7 天 JSON
+        customApi: '/calendar'
+      })
       let days: CalendarDay[]
       if (isApiMirror(mirror)) {
         const parsed = JSON.parse(text) as unknown
@@ -387,17 +451,14 @@ class BangumiService {
       return { items: cache.data }
     }
     try {
-      const { text, mirror } = await this.requestBest({
-        api: `/v0/search/subjects/${encodeURIComponent(keyword)}?limit=24&responseGroup=small`,
-        web: `/subject_search/${encodeURIComponent(keyword)}?cat=2`
-      })
-      let items: SearchResultItem[]
-      if (isApiMirror(mirror)) {
-        const list = (JSON.parse(text) as { data?: Record<string, unknown>[] })?.data ?? []
-        items = list.map((raw) => this.normalizeItem(raw))
-      } else {
-        items = parseSearchPage(text)
-      }
+      /*
+       * v0.2.7：API 源必须用 **POST** 搜索。
+       * 官方 v0 与自建反代的搜索接口都是 `POST /v0/search/subjects?limit=N`，
+       * body 为 `{"keyword":"..."}`；此前这里写成 GET（`/v0/search/subjects/关键词?limit=24`），
+       * 对 API 源一律 404 —— 也就是说「API 镜像搜索从来没成功过」，
+       * 一旦主数据源换成 API 型反代，搜索就会整体失效。
+       */
+      const items = await this.searchRace(keyword)
       this.writeCache(key, items)
       return { items }
     } catch (err) {
@@ -477,6 +538,57 @@ class BangumiService {
         }
       })
     )
+  }
+
+  /**
+   * 搜索竞速（v0.2.7）：API 源走 POST JSON，网页镜像走 GET 搜索页，
+   * 与 requestBest 一样「第一个成功就返回」。
+   */
+  private async searchRace(keyword: string): Promise<SearchResultItem[]> {
+    const enc = encodeURIComponent(keyword)
+    /** API 源搜索：v0 与自建反代都要求 POST + JSON body */
+    const viaApi = async (base: string): Promise<SearchResultItem[]> => {
+      const res = await axios.post(
+        `${base}/v0/search/subjects?limit=24&responseGroup=small`,
+        { keyword },
+        {
+          timeout: REQUEST_TIMEOUT,
+          headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json', Accept: 'application/json' },
+          ...buildProxyAgents(getSettings().proxy)
+        }
+      )
+      if (res.status !== 200) throw new Error(`${base}: HTTP ${res.status}`)
+      const list = (res.data as { data?: Record<string, unknown>[] })?.data ?? []
+      return list.map((raw) => this.normalizeItem(raw))
+    }
+    // 与 requestBest 一致：配了自建反代就优先单独用它（见那里的注释）
+    const custom = (getSettings().bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
+    if (custom) {
+      try {
+        return await viaApi(custom)
+      } catch (err) {
+        log.append('warn', 'bangumi', `自建反代搜索失败，回退镜像：${String((err as Error)?.message ?? err)}`)
+      }
+    }
+    const attempts = this.mirrors().map(async (mirror) => {
+      const isApi = isApiMirror(mirror)
+      if (isApi) return await viaApi(mirror)
+      const text = await this.fetchMirror(`${mirror}/subject_search/${enc}?cat=2`, false)
+      return parseSearchPage(text)
+    })
+    return await new Promise<SearchResultItem[]>((resolve, reject) => {
+      let pending = attempts.length
+      const errors: string[] = []
+      for (const p of attempts) {
+        p.then((v) => resolve(v)).catch((err) => {
+          errors.push(String((err as Error)?.message ?? err))
+          pending -= 1
+          if (pending === 0) {
+            reject(makeSourceError('ALL_DOWN', '所有 bangumi 数据源搜索均失败', errors))
+          }
+        })
+      }
+    })
   }
 
   private normalizeItem(raw: Record<string, unknown>): SearchResultItem {

@@ -158,11 +158,29 @@ export function PlayerPage() {
   const [rulePageUrl, setRulePageUrl] = useState(state.url ?? '')
   const [ruleProbeFailed, setRuleProbeFailed] = useState(false)
   const [ruleProbing, setRuleProbing] = useState(false)
-  // 进来时如果带着线路/集序号（切集或继续观看），直接认为「正在放这一集」，
-  // 否则选集列表没有高亮、自动连播也会从第 1 集算起（v0.2.6 修）
-  const [ruleCurrent, setRuleCurrent] = useState<{ line: number; ep: number } | null>(
-    state.startLine != null && state.startEp != null ? { line: state.startLine, ep: state.startEp } : null
-  )
+  /**
+   * 进来时确认「正在放第几集」：
+   * 1. 优先用跳转参数带进来的 startLine/startEp（规则页选集、继续观看、播放器内切集都会带）；
+   * 2. 没带就按播放页地址在剧集列表里反查（v0.2.7 兜底）——
+   *    过去漏带参数时播放器会默认按第 1 集算，于是「看第 3 集却显示第 1 集」，
+   *    自动连播也会从第 1 集往后跳（用户反馈的「第 3 集播完跳到第 2 集」）。
+   */
+  const [ruleCurrent, setRuleCurrent] = useState<{ line: number; ep: number } | null>(() => {
+    if (state.startLine != null && state.startEp != null) {
+      return { line: state.startLine, ep: state.startEp }
+    }
+    const target = (state.url ?? '').split('?')[0].replace(/\/+$/, '')
+    if (!target) return null
+    const groups = state.groups ?? []
+    for (let li = 0; li < groups.length; li++) {
+      const eps = groups[li]?.episodes ?? []
+      for (let ei = 0; ei < eps.length; ei++) {
+        const link = (eps[ei]?.link ?? '').split('?')[0].replace(/\/+$/, '')
+        if (link && link === target) return { line: li, ep: ei }
+      }
+    }
+    return null
+  })
   const [vlcVolume, setVlcVolume] = useState(100)
   const [vlcMuted, setVlcMuted] = useState(false)
   const [vlcSubs, setVlcSubs] = useState<{ id: number; label: string }[]>([])
@@ -235,7 +253,10 @@ export function PlayerPage() {
         : switching
           ? { kind: 'loading', text: '切换中' }
           : vlcState === 'trying' || preparing
-            ? { kind: 'loading', text: '加载中' }
+            ? // 规则模式挂载到开始嗅探之间还有一个「解析播放页」的阶段，单独给出文案（v0.2.7）
+              state.mode === 'rule'
+              ? { kind: 'loading' as PlayStatus, text: '准备播放源' }
+              : { kind: 'loading' as PlayStatus, text: '加载中' }
             : playing
               ? { kind: 'playing', text: '播放中' }
               : { kind: 'idle', text: '已暂停' }
@@ -1352,21 +1373,33 @@ export function PlayerPage() {
   ])
 
   /**
-   * 选集数据单独推送（低频）：只在选集列表或当前集变化时发送，
-   * 不跟着每秒多次的进度推送走，避免无谓的大数组传输。
+   * 选集数据单独推送（低频）：不跟着每秒多次的进度推送走，避免无谓的大数组传输。
+   *
+   * v0.2.7 修「选集按钮点了没反应」：悬浮窗是**异步创建**的，而这里原先只在挂载时推一次，
+   * 推送很可能早于悬浮窗就绪 → 悬浮窗拿不到选集数据 → 点按钮后浮层渲染为空，看起来像没响应。
+   * 现在首推之后加两次延时补推，并跟着浮层开合再推一次。
    */
   useEffect(() => {
     if (!overlayActive || state.mode !== 'rule') return
-    const groups = state.groups ?? []
-    api.overlay.setEpisodes({
-      lines: groups.map((g, i) => ({
-        name: g.lineName ?? `线路 ${i + 1}`,
-        episodes: g.episodes.map((e, j) => e.name || `第 ${j + 1} 集`)
-      })),
-      currentLine: ruleCurrent?.line ?? 0,
-      currentEp: ruleCurrent?.ep ?? 0
-    })
-  }, [overlayActive, state.mode, state.groups, ruleCurrent])
+    const push = (): void => {
+      const groups = state.groups ?? []
+      api.overlay.setEpisodes({
+        lines: groups.map((g, i) => ({
+          name: g.lineName ?? `线路 ${i + 1}`,
+          episodes: g.episodes.map((e, j) => e.name || `第 ${j + 1} 集`)
+        })),
+        currentLine: ruleCurrent?.line ?? 0,
+        currentEp: ruleCurrent?.ep ?? 0
+      })
+    }
+    push()
+    const t1 = window.setTimeout(push, 1200)
+    const t2 = window.setTimeout(push, 3500)
+    return () => {
+      window.clearTimeout(t1)
+      window.clearTimeout(t2)
+    }
+  }, [overlayActive, state.mode, state.groups, ruleCurrent, showEpisodes])
 
   // 播放历史记录（方案 3.2 历史 + 继续观看）
   const recordWatch = useCallback(() => {

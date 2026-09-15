@@ -5,6 +5,7 @@ import {
   BookmarkCheck,
   BookmarkPlus,
   Check,
+  ChevronLeft,
   GripVertical,
   History,
   Pencil,
@@ -15,7 +16,7 @@ import {
   X
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
-import type { MarkItem, MarkList, SearchResultItem } from '@shared/types'
+import type { MarkItem, SearchResultItem } from '@shared/types'
 import { api } from '@/lib/api'
 import { yearOf } from '@/lib/format'
 import { HISTORY_LIMIT, defaultListName, useMarks } from '@/stores/marks'
@@ -35,6 +36,30 @@ import { ImageCarousel } from '@/components/ImageCarousel'
 
 /** 拖拽载荷 MIME：只带最小字段，避免把整个搜索结果对象（含长 summary）塞进 dataTransfer */
 const DRAG_MIME = 'application/x-sakana-subject'
+
+/**
+ * 是否小型配置窗口：由主进程启动参数（--sakana-small）在 preload 里决定，
+ * 本次进程生命周期内不会变化，所以模块加载时读一次即可，
+ * 不必在每次渲染里穿透 bridge 对象取值。
+ */
+const SMALL = api.window.isSmallWindow
+
+/**
+ * 左侧书签列宽度：始终是「竖列」形态，只随窗口大小收窄。
+ * 小窗口（约 760×560）下若继续用 190px，主区域只剩 ~570px，
+ * 搜索结果行会变得拥挤，所以收窄到 150px；两档都不低于 140px，
+ * 保证「名称 + 条目数」仍能读出来。
+ */
+const COLUMN_WIDTH = SMALL ? 'w-[150px]' : 'w-[190px]'
+
+/**
+ * 内容列表底部留白：底部展示位（轮播）是浮在内容之上的绝对定位元素，
+ * 不留白就会出现「滚到底也看不到最后一条」的情况。
+ */
+const LIST_BOTTOM_PAD = 'pb-40'
+
+/** 主区域视图：搜索结果为默认视图，点书签后切到该书签的条目视图（不再用弹窗承载） */
+type MainView = 'search' | 'bookmark'
 
 interface DragSubject {
   subjectId: number
@@ -96,7 +121,10 @@ export function SearchPage() {
   const [searching, setSearching] = useState(false)
   const [searched, setSearched] = useState(false)
 
-  /** 当前书签 = 拖拽落点；点击任一书签也会把它设为当前 */
+  /** 主区域当前展示什么：搜索结果，还是某个书签的条目 */
+  const [view, setView] = useState<MainView>('search')
+
+  /** 当前书签 = 拖拽落点 + 主区域正在展示的书签（点书签时两者一起切，用户不会看到"高亮的"和"看到的"不是一本） */
   const [currentListId, setCurrentListId] = useState<string | null>(null)
   const [dragSubject, setDragSubject] = useState<DragSubject | null>(null)
   const [dragOver, setDragOver] = useState(false)
@@ -105,10 +133,6 @@ export function SearchPage() {
   const [pickFor, setPickFor] = useState<SearchResultItem | null>(null)
   const [pickOpen, setPickOpen] = useState(false)
   const [newListName, setNewListName] = useState('')
-
-  // 书签弹窗（点击书签后弹出其中的条目列表）；同样把内容与开关分开存
-  const [detailListId, setDetailListId] = useState<string | null>(null)
-  const [detailOpen, setDetailOpen] = useState(false)
 
   // 添加 / 重命名书签共用同一个弹窗：两者都只是「给一个名字」，没必要做两套 UI
   const [editOpen, setEditOpen] = useState(false)
@@ -142,24 +166,23 @@ export function SearchPage() {
     if (!lists.some((l) => l.id === currentListId)) setCurrentListId(lists[0].id)
   }, [lists, currentListId])
 
-  // 弹窗里展示的书签按 id 实时推导：条目增删、改名都会立刻反映，而不是打开时的快照
-  const detailList: MarkList | null = useMemo(
-    () => lists.find((l) => l.id === detailListId) ?? null,
-    [lists, detailListId]
-  )
-  const detailGroups = useMemo(() => {
-    if (!detailList) return [] as [string, MarkItem[]][]
+  /**
+   * 主区域条目列表按当前书签实时推导：增删条目、重命名都会立刻反映，
+   * 而不是打开时的快照（v0.2.6 弹窗时代就是这么做的，这里保留同一份数据来源）。
+   */
+  const currentGroups = useMemo(() => {
+    if (!currentList) return [] as [string, MarkItem[]][]
     const sorted = items
-      .filter((it) => it.listId === detailList.id)
+      .filter((it) => it.listId === currentList.id)
       .sort((a, b) => b.addedAt - a.addedAt)
     return groupByDate(sorted)
-  }, [items, detailList])
-  const detailCount = useMemo(
-    () => detailGroups.reduce((n, [, arr]) => n + arr.length, 0),
-    [detailGroups]
+  }, [items, currentList])
+  const currentCount = useMemo(
+    () => currentGroups.reduce((n, [, arr]) => n + arr.length, 0),
+    [currentGroups]
   )
 
-  const doSearch = async (kw: string) => {
+  const doSearch = async (kw: string): Promise<void> => {
     const q = kw.trim()
     if (!q) {
       setResults([])
@@ -169,6 +192,8 @@ export function SearchPage() {
     setQuery(q)
     setSearching(true)
     setSearched(true)
+    // 用户敲了关键词就是想看结果：把主区域从「书签条目」切回搜索结果视图
+    setView('search')
     // 先在输入时就记入历史：即使数据源全挂，用户也不该丢掉刚敲的关键词
     pushHistory(q)
     const r = await api.bangumi.search(q)
@@ -187,7 +212,7 @@ export function SearchPage() {
     navigate(`/subject/${id}`, { state: { from: 'search' } })
   }
 
-  /** 加入 / 移出某个书签（书签弹窗行点击与快速标记弹窗共用） */
+  /** 加入 / 移出某个书签（快速标记弹窗行点击用） */
   const toggleInList = (listId: string, subject: DragSubject): void => {
     const name = lists.find((l) => l.id === listId)?.name ?? ''
     const existing = items.find((it) => it.listId === listId && it.subjectId === subject.subjectId)
@@ -280,11 +305,13 @@ export function SearchPage() {
     toast.success('已重命名书签')
   }
 
-  /** 点击书签：既把它设为拖拽落点，又弹出其中的条目列表 */
+  /**
+   * 点击书签：选中它（同时成为拖拽落点），并把主区域切到「书签条目」视图。
+   * v0.2.7 起不再弹出 Modal —— 弹窗会盖住搜索结果，而这里的条目本来就更适合占满主区域。
+   */
   const openBookmark = (id: string): void => {
     setCurrentListId(id)
-    setDetailListId(id)
-    setDetailOpen(true)
+    setView('bookmark')
   }
 
   const confirmRemoveList = (id: string, name: string, count: number): void => {
@@ -330,10 +357,14 @@ export function SearchPage() {
 
   const markedCountOf = (listId: string): number => items.filter((it) => it.listId === listId).length
 
+  // 主区域是否有需要避让底部展示位的内容
+  const hasListContent =
+    view === 'bookmark' ? currentCount > 0 : results.length > 0
+
   return (
     <div className="flex h-full flex-col">
       {/* 顶部搜索框（回车或点击右侧按钮触发）+ 右上角「添加书签」 */}
-      <div className="border-b border-border bg-elev1/70 px-5 py-3 backdrop-blur">
+      <div className="border-b border-border bg-elev1/70 px-4 py-3 backdrop-blur sm:px-5">
         <div className="flex items-center gap-3">
           <div className="relative min-w-0 flex-1">
             <div className="relative mx-auto max-w-xl">
@@ -343,7 +374,7 @@ export function SearchPage() {
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') void doSearch(query)
                 }}
-                placeholder="搜索番剧，回车开始搜索；结果可拖到右侧书签…"
+                placeholder="搜索番剧，回车开始搜索；结果可拖到左侧书签…"
                 className="h-10 w-full rounded-xl border border-border bg-elev1 pl-4 pr-24 text-sm outline-none transition-colors placeholder:text-faint focus:border-accent"
               />
               <div className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
@@ -373,7 +404,7 @@ export function SearchPage() {
       </div>
 
       {/* 搜索历史：始终显示在结果上方，点击即重新搜索 */}
-      <div className="flex items-center gap-2 border-b border-border bg-elev1/40 px-5 py-2">
+      <div className="flex items-center gap-2 border-b border-border bg-elev1/40 px-4 py-2 sm:px-5">
         <span className="flex shrink-0 items-center gap-1 text-[11px] text-faint">
           <History size={12} /> 搜索历史
         </span>
@@ -409,15 +440,224 @@ export function SearchPage() {
         ) : null}
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-        {/* 搜索结果：相对定位，右下角承载底部展示位（轮播） */}
-        <div className="relative min-h-0 flex-1 overflow-hidden">
+      {/* 主体：左侧书签竖列（固定宽度、独立滚动）+ 右侧主区域（搜索 / 书签内容二选一） */}
+      <div className="flex min-h-0 flex-1">
+        {/*
+          书签列：整列都是拖拽落点，落点 = 当前选中的书签。
+          这里**不**用任何 lg:/sm: 断点切换方向 —— 产品要求小窗口下也保持「左侧竖列」，
+          一旦退化成底部横排，窄窗口里书签会挤成一排看不清的标签。
+        */}
+        <aside
+          onDragOver={(e) => {
+            if (!dragSubject) return
+            e.preventDefault()
+            e.dataTransfer.dropEffect = 'copy'
+            if (!dragOver) setDragOver(true)
+          }}
+          onDragLeave={(e) => {
+            if (e.currentTarget.contains(e.relatedTarget as Node | null)) return
+            setDragOver(false)
+          }}
+          onDrop={onDrop}
+          className={`flex ${COLUMN_WIDTH} min-h-0 shrink-0 flex-col border-r border-border bg-elev1/50 transition-shadow ${
+            dragOver ? 'ring-2 ring-inset ring-accent' : ''
+          }`}
+        >
+          <div className="flex shrink-0 items-center justify-between gap-1 border-b border-border px-2 py-2">
+            <span className="flex min-w-0 items-center gap-1 text-xs font-semibold">
+              <Bookmark size={13} className="shrink-0 text-accent" />
+              <span className="truncate">书签</span>
+            </span>
+            <div className="flex shrink-0 items-center gap-0.5">
+              <span className="text-[11px] text-faint tabular-nums">{lists.length}</span>
+              <IconButton title="添加书签" onClick={openCreate}>
+                <Plus size={14} />
+              </IconButton>
+            </div>
+          </div>
+
+          {/* 滑动列表：书签多到超出列高时在这里滚动，列头与落点提示始终留在视口内 */}
+          <div className="min-h-0 flex-1 space-y-1 overflow-y-auto overflow-x-hidden p-1.5">
+            {lists.map((l) => {
+              const active = currentList?.id === l.id
+              const count = markedCountOf(l.id)
+              return (
+                <div
+                  key={l.id}
+                  className={`group relative rounded-lg border transition-colors ${
+                    active ? 'border-accent bg-accent-soft' : 'border-transparent hover:bg-elev2'
+                  }`}
+                >
+                  <button
+                    type="button"
+                    className="flex w-full min-w-0 items-center gap-1.5 px-2 py-1.5 text-left"
+                    title={`查看「${l.name}」中的条目 · 创建于 ${dayjs(l.createdAt).format('YYYY-MM-DD')}`}
+                    onClick={() => openBookmark(l.id)}
+                  >
+                    {active ? (
+                      <BookmarkCheck size={13} className="shrink-0 text-accent" />
+                    ) : (
+                      <Bookmark size={13} className="shrink-0 text-faint" />
+                    )}
+                    <span className="min-w-0 flex-1">
+                      <span
+                        className={`block truncate text-xs font-medium ${active ? 'text-accent' : ''}`}
+                      >
+                        {l.name}
+                      </span>
+                      <span className="block text-[10px] text-faint tabular-nums">{count} 条</span>
+                    </span>
+                  </button>
+
+                  {/*
+                    重命名 / 删除：窄列里常驻两个按钮会把书名挤没，
+                    所以做成悬停浮现的浮层（focus-within 让键盘 Tab 也能用），
+                    浮层带不透明底色，盖住的是名称尾部而不是叠加出重影。
+                  */}
+                  <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 rounded-lg bg-elev1/95 px-0.5 opacity-0 shadow-sm transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+                    <IconButton
+                      title="重命名书签"
+                      className="h-7 w-7"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        openRename(l.id, l.name)
+                      }}
+                    >
+                      <Pencil size={12} />
+                    </IconButton>
+                    <IconButton
+                      title="删除书签"
+                      // ! 前缀是有意的：IconButton 基类带了 hover:text-text，不加 important 覆盖不掉
+                      className="h-7 w-7 hover:!text-danger"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        confirmRemoveList(l.id, l.name, count)
+                      }}
+                    >
+                      <Trash2 size={12} />
+                    </IconButton>
+                  </div>
+                </div>
+              )
+            })}
+
+            {lists.length === 0 ? (
+              // 列只有 150~190px 宽，EmptyState 的大图标 + 长文案会撑破列宽，这里用紧凑版空态
+              <div className="px-2 py-6 text-center">
+                <Bookmark size={18} className="mx-auto text-faint" />
+                <div className="mt-2 text-[11px] leading-relaxed text-faint">还没有书签</div>
+                <Button
+                  variant="soft"
+                  size="sm"
+                  icon={BookmarkPlus}
+                  className="mt-2"
+                  onClick={openCreate}
+                >
+                  添加
+                </Button>
+              </div>
+            ) : null}
+          </div>
+
+          {/* 底部提示：拖拽进行中换成落点说明，平时说明当前落点是哪个书签 */}
           <div
-            className={`h-full overflow-y-auto px-5 py-4 ${
-              results.length > 0 ? 'pb-40' : ''
+            className={`shrink-0 border-t border-border px-2 py-1.5 text-[10px] leading-snug ${
+              dragSubject ? 'bg-accent-soft text-accent' : 'text-faint'
             }`}
           >
-            {searching && results.length === 0 ? (
+            <span className="line-clamp-2">
+              {dragSubject
+                ? `松手加入「${currentList?.name ?? '新建书签'}」`
+                : `落点：${currentList?.name ?? '—'}`}
+            </span>
+          </div>
+        </aside>
+
+        {/* 主区域：相对定位，绝对定位的底部展示位（轮播）挂在这里 */}
+        <div className="relative min-w-0 min-h-0 flex-1 overflow-hidden">
+          <div
+            className={`h-full overflow-y-auto overflow-x-hidden px-3 py-4 sm:px-5 ${
+              hasListContent ? LIST_BOTTOM_PAD : ''
+            }`}
+          >
+            {view === 'bookmark' ? (
+              currentList ? (
+                <div>
+                  {/* 书签内容视图标题：书名 + 条目数 + 返回搜索结果 */}
+                  <div className="mb-3 flex min-w-0 items-center gap-2">
+                    <span className="line-clamp-1 min-w-0 text-sm font-semibold">
+                      {currentList.name}
+                    </span>
+                    <span className="shrink-0 text-xs text-faint tabular-nums">
+                      {currentCount} 条
+                    </span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      icon={ChevronLeft}
+                      className="ml-auto shrink-0"
+                      onClick={() => setView('search')}
+                    >
+                      返回搜索
+                    </Button>
+                  </div>
+
+                  {currentGroups.length === 0 ? (
+                    <div className="py-12 text-center text-[11px] leading-relaxed text-faint">
+                      「{currentList.name}」还没有条目
+                      <br />
+                      把左侧搜索结果拖到书签列，或点结果行右侧的书签按钮
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      {currentGroups.map(([date, groupItems]) => (
+                        <div key={date}>
+                          <div className="mb-2 flex items-center gap-2">
+                            <span className="text-[11px] font-medium text-dim tabular-nums">
+                              {date}
+                            </span>
+                            <span className="text-[10px] text-faint">{groupItems.length} 条</span>
+                          </div>
+                          <div className="space-y-1.5">
+                            {groupItems.map((it) => (
+                              <div
+                                key={it.id}
+                                onClick={() => openItem(it)}
+                                className="group flex cursor-pointer items-center gap-2.5 rounded-lg border border-border bg-elev1 p-2 transition-colors hover:border-accent"
+                              >
+                                <CoverImage
+                                  src={it.cover}
+                                  className="h-14 w-10 shrink-0 rounded-md"
+                                />
+                                <div className="min-w-0 flex-1">
+                                  <div className="line-clamp-2 text-xs font-medium leading-snug">
+                                    {it.title}
+                                  </div>
+                                  <div className="text-[10px] text-faint tabular-nums">
+                                    {dayjs(it.addedAt).format('HH:mm')}
+                                  </div>
+                                </div>
+                                <IconButton
+                                  title="移除该条目"
+                                  className="shrink-0 hover:!text-danger"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    removeMark(it.id)
+                                    toast.info('已移除该条目')
+                                  }}
+                                >
+                                  <X size={13} />
+                                </IconButton>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : null
+            ) : searching && results.length === 0 ? (
               <div className="flex items-center justify-center gap-2 py-14 text-xs text-faint">
                 <Spinner size={16} /> 正在搜索…
               </div>
@@ -484,6 +724,7 @@ export function SearchPage() {
                               : '加入书签'
                           }
                           active={marked}
+                          className="shrink-0"
                           onClick={(e) => {
                             e.stopPropagation()
                             setPickFor(item)
@@ -507,12 +748,12 @@ export function SearchPage() {
               <EmptyState
                 icon={Search}
                 title="搜索番剧"
-                desc="输入关键词后回车开始搜索，结果可直接拖到右侧书签；点击书签可查看其中的条目"
+                desc="输入关键词后回车开始搜索，结果可直接拖到左侧书签列；点击书签即在此处查看其中的条目"
               />
             )}
           </div>
 
-          {/* 底部展示位：自制小广告窗，定时轮播 + 右键菜单管理 */}
+          {/* 底部展示位：自制小广告窗，定时轮播 + 右键菜单管理（小窗口下缩一档，别把结果列表挤没） */}
           <ImageCarousel
             images={showcase}
             onUpload={() => void uploadShowcase()}
@@ -524,217 +765,14 @@ export function SearchPage() {
               clearShowcase()
               toast.info('已清空展示图片')
             }}
-            className="absolute bottom-4 right-4 h-[110px] w-[240px] sm:h-[124px] sm:w-[320px]"
+            className={
+              SMALL
+                ? 'absolute bottom-3 right-3 h-[96px] w-[200px]'
+                : 'absolute bottom-4 right-4 h-[110px] w-[240px] sm:h-[124px] sm:w-[320px]'
+            }
           />
         </div>
-
-        {/* 书签栏：宽屏在右侧，窄屏落到下方；整块都是拖拽落点 */}
-        <aside
-          onDragOver={(e) => {
-            if (!dragSubject) return
-            e.preventDefault()
-            e.dataTransfer.dropEffect = 'copy'
-            if (!dragOver) setDragOver(true)
-          }}
-          onDragLeave={(e) => {
-            if (e.currentTarget.contains(e.relatedTarget as Node | null)) return
-            setDragOver(false)
-          }}
-          onDrop={onDrop}
-          className={`flex max-h-[50%] min-h-0 w-full shrink-0 flex-col border-t border-border bg-elev1/50 transition-shadow lg:max-h-none lg:w-72 lg:border-l lg:border-t-0 ${
-            dragOver ? 'ring-2 ring-inset ring-accent' : ''
-          }`}
-        >
-          <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3">
-            <span className="flex items-center gap-1.5 text-sm font-semibold">
-              <Bookmark size={14} className="text-accent" /> 书签
-            </span>
-            <div className="flex items-center gap-1">
-              <span className="text-[11px] text-faint tabular-nums">
-                {lists.length} 个 · {items.length} 条
-              </span>
-              <IconButton title="添加书签" onClick={openCreate}>
-                <Plus size={14} />
-              </IconButton>
-            </div>
-          </div>
-
-          {/* 书签列表：一个条目代表一个书签，点击即弹出其中的条目列表 */}
-          <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto p-2">
-            {lists.map((l) => {
-              const active = currentList?.id === l.id
-              const count = markedCountOf(l.id)
-              return (
-                <div
-                  key={l.id}
-                  className={`group flex items-center gap-1 rounded-lg border px-2 py-1.5 transition-colors ${
-                    active ? 'border-accent bg-accent-soft' : 'border-transparent hover:bg-elev2'
-                  }`}
-                >
-                  <button
-                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                    title={`查看「${l.name}」中的条目`}
-                    onClick={() => openBookmark(l.id)}
-                  >
-                    {active ? (
-                      <BookmarkCheck size={13} className="shrink-0 text-accent" />
-                    ) : (
-                      <Bookmark size={13} className="shrink-0 text-faint" />
-                    )}
-                    <div className="min-w-0 flex-1">
-                      <div
-                        className={`line-clamp-1 text-xs font-medium ${active ? 'text-accent' : ''}`}
-                      >
-                        {l.name}
-                      </div>
-                      <div className="text-[10px] text-faint tabular-nums">
-                        {count} 条 · {dayjs(l.createdAt).format('YYYY-MM-DD')}
-                      </div>
-                    </div>
-                  </button>
-                  <IconButton
-                    title="重命名书签"
-                    className="shrink-0"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      openRename(l.id, l.name)
-                    }}
-                  >
-                    <Pencil size={12} />
-                  </IconButton>
-                  <IconButton
-                    title="删除书签"
-                    className="shrink-0 hover:text-danger"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      confirmRemoveList(l.id, l.name, count)
-                    }}
-                  >
-                    <Trash2 size={12} />
-                  </IconButton>
-                </div>
-              )
-            })}
-            {lists.length === 0 ? (
-              <EmptyState
-                icon={Bookmark}
-                title="还没有书签"
-                desc="点右上角「添加书签」新建一个，然后把左侧搜索结果拖进来，或点结果右侧的书签按钮"
-              >
-                <Button variant="soft" size="sm" icon={BookmarkPlus} onClick={openCreate}>
-                  添加书签
-                </Button>
-              </EmptyState>
-            ) : null}
-          </div>
-
-          {/* 底部提示：拖拽进行中换成落点说明，平时说明当前书签是谁 */}
-          {dragSubject ? (
-            <div className="flex shrink-0 items-center gap-1.5 border-t border-border bg-accent-soft px-4 py-2 text-[11px] text-accent">
-              <BookmarkCheck size={12} />
-              拖到这里加入「{currentList?.name ?? '新建书签'}」
-            </div>
-          ) : (
-            <div className="shrink-0 border-t border-border px-4 py-2 text-[11px] leading-relaxed text-faint">
-              当前落点：{currentList?.name ?? '—'}。点击书签查看其中的条目，可重命名或删除。
-            </div>
-          )}
-        </aside>
       </div>
-
-      {/* 书签弹窗：点击书签后弹出该书的条目列表（按标记日期分组） */}
-      <Modal
-        open={detailOpen}
-        onClose={() => setDetailOpen(false)}
-        title={detailList ? `书签 · ${detailList.name}` : '书签'}
-        width={480}
-      >
-        {detailList ? (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between gap-2 rounded-xl border border-border bg-elev2/50 px-3 py-2.5">
-              <div className="min-w-0">
-                <div className="line-clamp-1 text-sm font-medium">{detailList.name}</div>
-                <div className="text-[11px] text-faint tabular-nums">
-                  {detailCount} 条 · 创建于 {dayjs(detailList.createdAt).format('YYYY-MM-DD')}
-                </div>
-              </div>
-              <div className="flex shrink-0 items-center gap-1.5">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  icon={Pencil}
-                  onClick={() => openRename(detailList.id, detailList.name)}
-                >
-                  重命名
-                </Button>
-                <Button
-                  variant="danger"
-                  size="sm"
-                  icon={Trash2}
-                  onClick={() => confirmRemoveList(detailList.id, detailList.name, detailCount)}
-                >
-                  删除
-                </Button>
-              </div>
-            </div>
-
-            {detailGroups.length === 0 ? (
-              <div className="py-10 text-center text-[11px] leading-relaxed text-faint">
-                「{detailList.name}」还没有条目
-                <br />
-                把左侧搜索结果拖到右侧书签栏，或点结果行右侧的书签按钮
-              </div>
-            ) : (
-              <div className="space-y-4">
-                {detailGroups.map(([date, groupItems]) => (
-                  <div key={date}>
-                    <div className="mb-2 flex items-center gap-2">
-                      <span className="text-[11px] font-medium text-dim tabular-nums">{date}</span>
-                      <span className="text-[10px] text-faint">{groupItems.length} 条</span>
-                    </div>
-                    <div className="space-y-1.5">
-                      {groupItems.map((it) => (
-                        <div
-                          key={it.id}
-                          onClick={() => openItem(it)}
-                          className="group flex cursor-pointer items-center gap-2.5 rounded-lg border border-border bg-elev1 p-2 transition-colors hover:border-accent"
-                        >
-                          <CoverImage src={it.cover} className="h-12 w-9 shrink-0 rounded-md" />
-                          <div className="min-w-0 flex-1">
-                            <div className="line-clamp-2 text-xs font-medium leading-snug">
-                              {it.title}
-                            </div>
-                            <div className="text-[10px] text-faint tabular-nums">
-                              {dayjs(it.addedAt).format('HH:mm')}
-                            </div>
-                          </div>
-                          <IconButton
-                            title="移除该条目"
-                            className="shrink-0 hover:text-danger"
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              removeMark(it.id)
-                              toast.info('已移除该条目')
-                            }}
-                          >
-                            <X size={13} />
-                          </IconButton>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* 弹窗会盖住搜索结果，所以提醒用户：关闭本窗口后仍可拖拽加入 */}
-            <div className="border-t border-border pt-3 text-[11px] leading-relaxed text-faint">
-              点击条目进入番剧详情；关闭本窗口后可继续把搜索结果拖到右侧书签栏，落点就是「
-              {detailList.name}」。
-            </div>
-          </div>
-        ) : null}
-      </Modal>
 
       {/* 添加 / 重命名书签：都能在这里改名字，回车即确认 */}
       <Modal
@@ -760,10 +798,7 @@ export function SearchPage() {
             <Button variant="ghost" onClick={() => setEditOpen(false)}>
               取消
             </Button>
-            <Button
-              icon={editMode === 'create' ? Plus : Check}
-              onClick={submitEdit}
-            >
+            <Button icon={editMode === 'create' ? Plus : Check} onClick={submitEdit}>
               {editMode === 'create' ? '创建书签' : '保存'}
             </Button>
           </div>
@@ -862,8 +897,8 @@ export function SearchPage() {
         onConfirm={() => {
           if (!pendingDelete) return
           removeList(pendingDelete.id)
-          // 正在查看这个书签时，弹窗里的内容已经不存在了，直接关掉避免留下空壳
-          if (detailListId === pendingDelete.id) setDetailOpen(false)
+          // 主区域正在展示这个书签时，内容已经不存在了：切回搜索结果，避免留下一块空白视图
+          if (view === 'bookmark' && currentList?.id === pendingDelete.id) setView('search')
           toast.info(`已删除「${pendingDelete.name}」`)
         }}
         onClose={() => setDeleteOpen(false)}

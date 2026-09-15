@@ -11,7 +11,7 @@ import { Card, SubPage } from '@/components/SettingsShell'
 import appIcon from '@/assets/app-icon.png'
 
 /** 版本号兜底（正常情况下由主进程 app.getVersion() 提供，避免多处硬编码漂移） */
-const APP_VERSION_FALLBACK = '0.2.6'
+const APP_VERSION_FALLBACK = '0.2.7'
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (

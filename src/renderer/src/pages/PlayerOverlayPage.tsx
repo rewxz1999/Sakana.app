@@ -193,6 +193,26 @@ export default function PlayerOverlay(): React.ReactElement {
         v0.2.6：选集浮层 —— 半透明浮在画面上，打开时不再改动播放内容区域。
         点空白处关闭（回到纯播放画面）。
       */}
+      {/*
+        v0.2.7：选集数据还没到（悬浮窗比数据晚就绪）时给一个明确的加载态 ——
+        否则点「选集」后什么都没出现，看起来就像按钮没反应。
+      */}
+      {state?.showEpisodes && !episodes ? (
+        <div className="absolute inset-0 z-40 flex bg-black/35 backdrop-blur-[2px]">
+          <div className="ml-auto flex h-full w-[380px] max-w-[70vw] flex-col items-center justify-center gap-2 border-l border-white/10 bg-black/72 backdrop-blur-md">
+            <span className="text-xs text-white/80">正在读取选集…</span>
+            <button
+              className="rounded-lg bg-white/10 px-3 py-1 text-[11px] text-white/80 hover:bg-white/20"
+              onPointerDown={(e) => {
+                e.stopPropagation()
+                send({ type: 'toggleEpisodes' })
+              }}
+            >
+              关闭
+            </button>
+          </div>
+        </div>
+      ) : null}
       {state?.showEpisodes && episodes ? (
         <div
           className="absolute inset-0 z-40 flex bg-black/35 backdrop-blur-[2px]"

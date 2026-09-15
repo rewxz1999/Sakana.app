@@ -216,7 +216,10 @@ export function DashboardPage() {
         groups,
         // PlayerPage 用 referer 打开播放页网页视图；拿不到规则时留空（undefined 语义＝回退规则站点）
         referer: rule?.baseUrl,
-        startSec: p.positionSec > 0 ? p.positionSec : undefined
+        startSec: p.positionSec > 0 ? p.positionSec : undefined,
+        // v0.2.7：连带「第几线路第几集」，否则播放器会以为是第 1 集（标题显示与自动连播都会错位）
+        startLine: line,
+        startEp: ep
       }
     })
   }
