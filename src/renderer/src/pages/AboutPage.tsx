@@ -79,7 +79,12 @@ export function AboutPage() {
     else if (r.data) toast.error(r.data)
   }
 
-  const mainSource = settings.dataSources?.main || settings.bangumiBase || 'https://bangumi.pro'
+  /*
+   * 配了自建反代时它才是真正在用的数据源，镜像站此时完全不参与请求。
+   * 过去这里只显示 dataSources.main（= 镜像站 1），会让人误以为仍在走公共镜像。
+   */
+  const customApi = (settings.bangumiCustomApi ?? '').trim()
+  const mainSource = customApi || settings.dataSources?.main || settings.bangumiBase || 'https://bangumi.pro'
   const mirrorCount = settings.dataSources?.mirrors?.length ?? settings.bangumiMirrors.length
 
   return (
@@ -102,11 +107,14 @@ export function AboutPage() {
 
       {/* 数据来源 */}
       <Card title="数据来源" desc="番剧数据与 galgame 数据来源">
-        <Row label="当前数据源">{mainSource}</Row>
+        <Row label="当前数据源">
+          {mainSource}
+          {customApi ? '（自建反代 · 唯一数据源）' : ''}
+        </Row>
         <div className="border-t border-border" />
-        <Row label="镜像站数量">{mirrorCount} 个</Row>
+        <Row label="镜像站数量">{mirrorCount} 个{customApi ? '（已配置反代，当前不使用）' : ''}</Row>
         <div className="border-t border-border" />
-        <Row label="番剧数据">Bangumi（bangumi.pro 等镜像站 / api.bgm.tv）</Row>
+        <Row label="番剧数据">Bangumi（自建反代 / bangumi.vip 等镜像站 / api.bgm.tv）</Row>
         <div className="border-t border-border" />
         <Row label="galgame 数据">月幕 galgame（ymgal.games）、VNDB</Row>
         <div className="border-t border-border" />

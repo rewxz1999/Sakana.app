@@ -65,6 +65,9 @@ export interface SubjectDetail {
   infobox: { key: string; value: string }[]
   eps?: number
   volumes?: number
+  /** v0 接口给的平台（TV / WEB / 剧场版…）与总集数，详情页会显示（v0.2.7） */
+  platform?: string
+  totalEpisodes?: number
 }
 
 export interface SubjectResult {

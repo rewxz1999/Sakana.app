@@ -32,7 +32,6 @@ import { fmtDateTime } from '@/lib/format'
 import { Badge, Button, ConfirmModal, EmptyState, Modal, ProgressBar, Spinner } from '@/components/ui'
 import { CoverImage } from '@/components/CoverImage'
 
-const INFOBOX_KEYS = new Set(['动画制作', '制作', '导演', '脚本', '音乐', '放送开始', '话数', '官网', '官方网站', '类型', '原作', '系列构成', '人物设定', '美术监督', '摄影监督', '声优', '主要声优', '发售日'])
 
 /** 时间戳 → YYYY-MM-DD（用于看完时间手动修改） */
 function finishDateStr(ts: number | null | undefined): string {
@@ -61,6 +60,28 @@ function progressText(s: { watchedCount: number; lastEpisode: number | null; per
   if (s.lastEpisode != null) parts.push(`上次看到第 ${s.lastEpisode} 集${pct}`)
   else if (pct) parts.push(`${s.percent}%`)
   return parts.join(' · ')
+}
+
+/**
+ * 详细信息取值的兜底格式化（v0.2.7）。
+ * bgm 的 infobox `value` 可能是字符串，也可能是 `[{v:"..."}]` 这种对象数组；
+ * 直接把数组塞进 JSX 会让 React 抛 "Objects are not valid as a React child" 而白屏。
+ * 主进程已统一压平，这里再兜一层，避免任何来源（含网页镜像解析）漏网。
+ */
+function infoText(v: unknown): string {
+  if (Array.isArray(v)) {
+    return v
+      .map((item) => {
+        if (item && typeof item === 'object') {
+          const o = item as { v?: unknown; k?: unknown }
+          return String(o.v ?? o.k ?? '')
+        }
+        return String(item ?? '')
+      })
+      .filter((s) => s.length > 0)
+      .join('、')
+  }
+  return v === null || v === undefined ? '' : String(v)
 }
 
 export function SubjectDetailPage() {
@@ -206,10 +227,46 @@ export function SubjectDetailPage() {
   })()
   const finalWatchedAt = watchedAt ?? autoWatchedAt
 
-  const infobox = useMemo(() => {
-    if (!detail) return []
-    return detail.infobox.filter((row) => INFOBOX_KEYS.has(row.key))
+  /**
+   * 详细信息行（v0.2.7 重做）。
+   *
+   * 过去是一个只有 17 个键的**精确匹配白名单**（`动画制作/导演/放送开始/…`），
+   * 而 bgm 的 infobox 实际有 40~60 个键，且同一含义有多种写法：
+   * 「製作」（繁体，很多番剧的制作公司字段）、「别名」「放送星期」「播放电视台」「分镜」「演出」
+   * 「总作画监督」「色彩设计」「音响监督」等全部被白名单丢掉 ——
+   * 用户看到的「制作信息/监督等信息加载不出来」就是这么来的（数据在，是我们没显示）。
+   *
+   * 现在改为**关键词匹配 + 优先级排序**：先按重要度展示常用的十来项，
+   * 其余折在「展开全部」里，既不丢信息也不把页面撑爆。
+   */
+  const { rows: infoRows, rest: infoRest } = useMemo(() => {
+    if (!detail) return { rows: [], rest: 0 }
+    const rows = [...detail.infobox]
+    // 数据源额外给的平台/总集数也补成一行（v0 的字段不在 infobox 里）
+    if (detail.platform && !rows.some((r) => r.key === '平台')) rows.unshift({ key: '平台', value: detail.platform })
+    if (detail.totalEpisodes && !rows.some((r) => r.key === '总集数'))
+      rows.push({ key: '总集数', value: String(detail.totalEpisodes) })
+    const score = (key: string): number => {
+      const rules: [RegExp, number][] = [
+        [/^(中文名|别名)$/, 0],
+        [/^(话数|总集数|平台|类型)$/, 1],
+        [/^(放送开始|上映|发售|播放结束)/, 2],
+        [/^(导演|监督|副导演)/, 3],
+        [/^(系列构成|脚本|分镜|演出)/, 4],
+        [/^(原作|原案|人物原案|人物设定)/, 5],
+        [/^(动画制作|製作|制作|音乐制作)/, 6],
+        [/^(音乐|主题歌)/, 7],
+        [/^(美术|色彩|摄影|作画|剪辑|音响|设定)/, 8],
+        [/^(官方网站|播放电视台|其他电视台|Copyright|©)/i, 9]
+      ]
+      for (const [re, n] of rules) if (re.test(key)) return n
+      return 99
+    }
+    const sorted = rows.slice().sort((a, b) => score(a.key) - score(b.key))
+    return { rows: sorted, rest: Math.max(0, sorted.length - 12) }
   }, [detail])
+  const [showAllInfo, setShowAllInfo] = useState(false)
+  const infoShown = showAllInfo ? infoRows : infoRows.slice(0, 12)
 
   const openRules = async () => {
     const r = await api.store.get('rules')
@@ -344,14 +401,24 @@ export function SubjectDetailPage() {
               </div>
             </div>
 
-            {infobox.length > 0 ? (
+            {infoRows.length > 0 ? (
               <div className="mt-6 rounded-xl border border-border bg-elev1/80 p-4 backdrop-blur">
-                <div className="mb-3 text-sm font-semibold">详细信息</div>
+                <div className="mb-3 flex items-center justify-between">
+                  <span className="text-sm font-semibold">详细信息</span>
+                  {infoRest > 0 ? (
+                    <button
+                      onClick={() => setShowAllInfo((v) => !v)}
+                      className="text-[11px] text-accent hover:underline"
+                    >
+                      {showAllInfo ? '收起' : `展开全部（还有 ${infoRest} 项）`}
+                    </button>
+                  ) : null}
+                </div>
                 <div className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
-                  {infobox.map((row) => (
-                    <div key={row.key} className="flex gap-2 text-[13px]">
+                  {infoShown.map((row) => (
+                    <div key={row.key + infoText(row.value)} className="flex gap-2 text-[13px]">
                       <span className="w-20 shrink-0 text-faint">{row.key}</span>
-                      <span className="min-w-0 flex-1 text-dim">{row.value}</span>
+                      <span className="min-w-0 flex-1 break-words text-dim">{infoText(row.value)}</span>
                     </div>
                   ))}
                 </div>

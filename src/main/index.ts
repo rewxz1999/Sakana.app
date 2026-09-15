@@ -1022,6 +1022,8 @@ if (!gotLock) {
             '/stattool',
             // v0.2.4：新增搜索页（收藏页的搜索框已迁到这里），纳入小窗口自检以免路由级错误漏网
             '/search',
+            // v0.2.7：番剧详情页也纳入 —— 数据源换成自建反代后，这里最容易出现「信息缺字段」
+            '/subject/400602',
             '/rules',
             '/shortcuts',
             '/player-settings',
@@ -1078,7 +1080,9 @@ if (!gotLock) {
                       overflowX:b?Math.max(0,b.scrollWidth-b.clientWidth):-1,
                       overflowY:b?Math.max(0,b.scrollHeight-b.clientHeight):-1,
                       badges:txt('[class*="rounded-full"]',6),
-                      heads:txt('[class*="font-semibold"]',8)
+                      heads:txt('[class*="font-semibold"]',8),
+                      // 详情页核对用：把正文前 600 字带出来，能直接看到上映日期/导演/製作等是否渲染
+                      text:(b?(b.innerText||'').replace(/\\s+/g,' ').slice(0,600):'')
                     })})()`
                 )
               )

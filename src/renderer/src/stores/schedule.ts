@@ -44,9 +44,18 @@ export const useSchedule = create<ScheduleState>((set, get) => ({
         stale: !!r.data.stale,
         loading: false
       })
-      // 一次性预取整周评分：切换星期时不再发起请求，UI 切换更流畅
-      const allIds = r.data.days.flatMap((d) => d.items.map((i) => i.id))
-      if (allIds.length > 0) void get().loadRatings(allIds)
+      /*
+       * 只补「没有评分」的条目（v0.2.7）。
+       *
+       * 过去这里把整周 111 个 id 全部丢给评分补全 → 主进程会对每个 id 单独请求一次条目接口。
+       * 换了自建反代之后，这一波并发会把反代打到 503，表现就是「很多番剧详情加载不出来」。
+       * 而放送数据本身**已经带评分**（反代返回的 104/111 条都带 score），根本不需要补。
+       */
+      const missingIds = r.data.days
+        .flatMap((d) => d.items)
+        .filter((i) => !i.rating || i.rating.score == null)
+        .map((i) => i.id)
+      if (missingIds.length > 0) void get().loadRatings(missingIds)
     } else {
       set({
         error: { kind: 'NETWORK', message: r.error, tried: [] },

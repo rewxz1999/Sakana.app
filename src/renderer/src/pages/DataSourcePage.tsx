@@ -141,10 +141,19 @@ export function DataSourcePage() {
       <Card title="当前主数据源" desc="日历、条目详情与搜索优先使用该地址">
         <div className="flex flex-col gap-2">
           <div className="break-all rounded-lg border border-accent/30 bg-accent-soft px-3 py-2.5 font-mono text-xs text-accent">
-            {main.trim() || '（未设置）'}
+            {(customApi.trim() || main).trim() || '（未设置）'}
           </div>
-          <div className="text-[11px] text-faint">
-            共 {mirrors.filter(Boolean).length} 个数据源；主数据源失败时会按下面的镜像顺序自动回退。
+          <div className="text-[11px] leading-relaxed text-faint">
+            {customApi.trim() ? (
+              <>
+                已配置 API 反代，它被强制作为唯一数据源（走 <code className="font-mono">/v0/…</code> 与{' '}
+                <code className="font-mono">/calendar</code>），下面的 {mirrors.filter(Boolean).length} 个镜像站
+                <span className="text-dim">不会</span>被使用 ——
+                反代失败时应用会提示你手动切换，而不会在后台偷偷换源。清空「API 反代地址」即可回到镜像站。
+              </>
+            ) : (
+              <>共 {mirrors.filter(Boolean).length} 个数据源；主数据源失败时会按下面的镜像顺序自动回退。</>
+            )}
           </div>
         </div>
       </Card>

@@ -113,6 +113,49 @@ export function rewriteImageUrl(url: string): string {
 }
 
 /**
+ * 把 bgm v0 的 infobox 压成「一定可渲染」的 `{key, value: string}` 列表。
+ *
+ * v0 的 `value` 有两种形态：
+ * - 字符串：`{"key":"导演","value":"斎藤圭一郎"}`（多数）
+ * - **对象数组**：`{"key":"别名","value":[{"v":"Frieren…"},{"v":"葬送的芙莉蓮"}]}`
+ *   （实测 400602 的 41 条里有 1 条是数组，`别名`/`链接`/`放送星期` 常见）
+ *
+ * 过去类型标注成 `value: string` 就直接丢给 React 渲染，数组命中时 React 会抛
+ * "Objects are not valid as a React child"，整张详情页白屏 ——
+ * 这也是「详情加载不出来」的一种。这里统一转字符串：
+ * 数组按 `、` 连接，元素取 `v`（缺省取 `k`），并去掉重复与空值。
+ */
+function normalizeInfobox(raw: unknown): { key: string; value: string }[] {
+  if (!Array.isArray(raw)) return []
+  const out: { key: string; value: string }[] = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue
+    const key = String((entry as { key?: unknown }).key ?? '').trim()
+    if (!key) continue
+    const v = (entry as { value?: unknown }).value
+    let value = ''
+    if (Array.isArray(v)) {
+      const parts = v
+        .map((item) => {
+          if (item === null || item === undefined) return ''
+          if (typeof item === 'object') {
+            const o = item as { v?: unknown; k?: unknown }
+            return String(o.v ?? o.k ?? '').trim()
+          }
+          return String(item).trim()
+        })
+        .filter((s) => s.length > 0)
+      value = Array.from(new Set(parts)).join('、')
+    } else if (v !== null && v !== undefined) {
+      value = String(v).trim()
+    }
+    if (!value) continue
+    out.push({ key, value })
+  }
+  return out
+}
+
+/**
  * bangumi 数据源（方案 3.10：镜像降级机制）
  * - 网页镜像（bangumi.pro / bangumi.lol / bgm.tv 网页版）：浏览器 UA + HTML 解析
  *   （这些站有 Cloudflare 防护，且不提供 JSON API）
@@ -141,6 +184,18 @@ class BangumiService {
   init(): void {
     mkdirSync(this.cacheDir, { recursive: true })
     this.migrateMirrors()
+    /*
+     * 启动时把「实际会用哪个数据源」写进运行日志。
+     * 排查「明明配了反代却还在用镜像」这类问题时，一眼就能看出运行时读到的是什么。
+     */
+    const custom = (getSettings().bangumiCustomApi ?? '').trim()
+    log.append(
+      'info',
+      'bangumi',
+      custom
+        ? `数据源：仅使用自建反代 ${custom}`
+        : `数据源：公共镜像 ${this.mirrors().join(', ') || '(空)'}`
+    )
   }
 
   /**
@@ -160,6 +215,7 @@ class BangumiService {
         bangumiCustomImg?: string
         mirrorVipMigrated?: boolean
         proxyMigrated?: boolean
+        proxyMainMigrated?: boolean
       }
       /*
        * v0.2.7：把自建反代设为默认主数据源（用户已部署 Cloudflare Worker）。
@@ -177,6 +233,30 @@ class BangumiService {
         log.append('info', 'bangumi', `已启用自建反代作为默认主数据源：${PROXY_API}`)
         // 重新读一次：下面的镜像迁移基于最新设置
         Object.assign(s, { bangumiCustomApi: PROXY_API, proxyMigrated: true })
+      }
+      /*
+       * v0.2.7：把「当前主数据源」的显示与实际取数对齐。
+       *
+       * 配了反代之后，日历/详情/搜索一律只走反代（`requestBest` 提前返回），
+       * 但 `dataSources.main` / `bangumiBase` 还停在 bangumi.vip，
+       * 于是「关于」「数据源配置」「番剧表底栏」都显示成公共镜像 ——
+       * 排查数据源问题时会被这行字直接带偏。
+       * 这里把主数据源改成反代地址，但**保留**镜像列表，用户清空反代即可切回。
+       * 单独一个标记位，已装用户也能补上这次迁移（上面的 proxyMigrated 不会再执行）。
+       */
+      const customNow = (s.bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
+      if (customNow && !s.proxyMainMigrated) {
+        store.set('settings', {
+          ...(s as Record<string, unknown>),
+          bangumiBase: customNow,
+          dataSources: {
+            main: customNow,
+            mirrors: s.dataSources?.mirrors ?? s.bangumiMirrors ?? []
+          },
+          proxyMainMigrated: true
+        })
+        Object.assign(s, { bangumiBase: customNow, proxyMainMigrated: true })
+        log.append('info', 'bangumi', `主数据源显示已改为自建反代：${customNow}`)
       }
       if (s.mirrorVipMigrated) return
       const VIP = 'https://bangumi.vip'
@@ -212,7 +292,13 @@ class BangumiService {
       ? s.bangumiMirrors
       : [s.bangumiBase || 'https://bangumi.pro']
     const normalized = list.map((m) => m.replace(/\/+$/, ''))
-    // 自建反代永远排第一（并行请求里它最快，且是唯一可控的通道）
+    /*
+     * 自建反代排第一。
+     *
+     * ⚠️ v0.2.7 起这只影响「测试连接」时的展示顺序：`requestBest` 在配了反代时
+     * 会直接返回、根本不会走到这里的竞速，所以反代与公共镜像不再并存竞速
+     * （用户要求：只用自己的反代，加载不出来就提示手动切换）。
+     */
     const all = custom ? [custom, ...normalized] : normalized
     // bangumi.pro 已确认不可达：无条件剔除。实测启动瞬间并发请求过多时，
     // 连带把可用镜像的连接也一起被中间设备重置，少发无用请求能显著提高成功率。
@@ -284,10 +370,18 @@ class BangumiService {
     } catch (err) {
       directError = err
     }
-    // 连接被重置时先缓一下重试一次：实测启动瞬间并发请求过多会被中间设备重置，
-    // 隔几秒再来一次通常就通了（比直接把整个数据源判死更符合真实情况）
-    if (!text && isNetworkReset(directError)) {
-      await new Promise((r) => setTimeout(r, 3000))
+    /*
+     * 重试两次（v0.2.7）：自建反代在并发下会瞬时返回 5xx / 429，
+     * 或者连接被中间设备重置。这些都是一过性的，隔一会儿再来通常就通了 ——
+     * 直接报错给用户会表现为「很多番剧详情加载不出来」。退避 1.2s → 3s。
+     */
+    for (const backoff of [1200, 3000]) {
+      if (text) break
+      const msg = String((directError as { message?: string })?.message ?? directError ?? '')
+      const retryable = isNetworkReset(directError) || /\b(5\d\d|429)\b/.test(msg)
+      if (!retryable) break
+      log.append('info', 'bangumi', `请求失败将重试（${msg.slice(0, 60)}）: ${url.slice(0, 80)}`)
+      await new Promise((r) => setTimeout(r, backoff))
       try {
         text = await axiosOnce()
         directError = null
@@ -425,7 +519,13 @@ class BangumiService {
   }
 
   async subject(id: number): Promise<SubjectResult> {
-    const key = `subject-${id}`
+    /*
+     * v0.2.7：缓存键加版本后缀 —— 详情映射补了 date/platform/total_episodes，
+     * 沿用旧键会让用户一直看到「缺上映日期」的历史缓存。
+     * 现在再进一位到 subject3-：自建反代此前命中旧版 API 形态（无 infobox/tags/platform），
+     * 已经落盘的那些残缺详情必须在升级后立刻失效，否则用户仍会看到「详细信息为空」。
+     */
+    const key = `subject3-${id}`
     const cache = this.readCache<SubjectDetail>(key)
     if (cache && Date.now() - cache.fetchedAt < TTL_SUBJECT) {
       return { fromCache: true, data: cache.data }
@@ -433,7 +533,19 @@ class BangumiService {
     try {
       const { text, mirror } = await this.requestBest({
         api: `/v0/subjects/${id}`,
-        web: `/subject/${id}`
+        web: `/subject/${id}`,
+        /*
+         * v0.2.7 关键修复：自建反代的详情必须显式走 `/v0/subjects/:id`。
+         *
+         * 此前这里没传 customApi，`calendarPathFor` 便回退到网页路径 `/subject/:id` ——
+         * 反代在该路径上返回的是**旧版 API 形态**（`{id,url,type,name,air_date,eps,rating}`，
+         * 实测 2192B），它天生没有 infobox / tags / platform / total_episodes。
+         * 于是 JSON 解析成功、页面看着「有数据」（标题、评分、日期、集数都在），
+         * 但「详细信息 / 类型标签 / 制作信息 / 监督 / 上映日期」整块消失 ——
+         * 用户反馈的「用反代很多番剧详情加载不出来」正是这个原因（不是反代缺数据）。
+         * 带 /v0/ 前缀时同一反代返回 5368B 完整 v0 数据（infobox 41 条、tags 30 个）。
+         */
+        customApi: `/v0/subjects/${id}`
       })
       let detail: SubjectDetail | null
       if (isApiMirror(mirror)) {
@@ -496,13 +608,23 @@ class BangumiService {
       }
     }
     let i = 0
-    const workers = Array.from({ length: Math.min(4, missing.length) }, async () => {
+    /*
+     * 并发从 4 降到 2、并在每个请求之间留一点间隔（v0.2.7）。
+     * 自建反代通常是个人的 Worker/NestJS 服务，扛不住「一次几十上百个并发」——
+     * 实测会把后续请求打成 503，表现就是「很多番剧详情加载不出来」。
+     * 另外渲染层现在只对「没有评分」的条目请求补全（放送数据本身多半带评分），
+     * 正常情况下这里根本不会被调用。
+     */
+    const workers = Array.from({ length: Math.min(2, missing.length) }, async () => {
       while (i < missing.length) {
         const id = missing[i++]
+        await new Promise((r) => setTimeout(r, 120))
         try {
           const { text, mirror } = await this.requestBest({
             api: `/v0/subjects/${id}`,
-            web: `/subject/${id}`
+            web: `/subject/${id}`,
+            // 同 subject()：自建反代必须走 /v0/，否则拿到的是缺字段的旧版 API 形态
+            customApi: `/v0/subjects/${id}`
           })
           const data = isApiMirror(mirror)
             ? (() => {
@@ -531,7 +653,14 @@ class BangumiService {
         try {
           const u = new URL(mirror)
           isApi = isApiHost(u.hostname) || isCustomApiBase(mirror)
-          url = isApi ? `${mirror}/v0/calendar` : `${mirror}/calendar`
+          /*
+           * v0.2.7 修：自建反代的日历在 `/calendar`（`/v0/calendar` 是 404）。
+           * 过去这里对 API 型地址一律拼 `/v0/calendar`，于是「测试连接」把
+           * 明明能用的自建反代报成失败。改走与真实取数一致的 calendarPathFor。
+           */
+          url = isApi
+            ? `${mirror}${this.calendarPathFor(mirror, { api: '/v0/calendar', web: '/calendar', customApi: '/calendar' })}`
+            : `${mirror}/calendar`
         } catch {
           url = `${mirror}/calendar`
         }
@@ -621,18 +750,31 @@ class BangumiService {
   }
 
   private normalizeSubject(raw: Record<string, unknown>): SubjectDetail {
+    /*
+     * v0.2.7 修：v0 接口的放送日期字段名是 `date`，不是 `air_date`。
+     * 过去只读 `air_date`，于是「API 型数据源」的条目详情一律没有上映日期
+     * （用户反馈「上映日期等信息加载不出来」）。两者都读，兼容两种命名。
+     */
+    const airDate = raw.air_date ?? raw.date
     return {
       id: Number(raw.id ?? 0),
       name: String(raw.name ?? ''),
       name_cn: String(raw.name_cn ?? ''),
       summary: String(raw.summary ?? ''),
-      air_date: raw.air_date ? String(raw.air_date) : null,
+      air_date: airDate ? String(airDate) : null,
       images: (raw.images as SubjectDetail['images']) ?? null,
       rating: (raw.rating as SubjectDetail['rating']) ?? null,
-      tags: Array.isArray(raw.tags) ? (raw.tags as { name: string; count?: number }[]) : [],
-      infobox: Array.isArray(raw.infobox) ? (raw.infobox as { key: string; value: string }[]) : [],
+      tags: Array.isArray(raw.tags)
+        ? (raw.tags as { name?: unknown; count?: unknown }[])
+            .map((t) => ({ name: String(t?.name ?? ''), count: t?.count != null ? Number(t.count) : undefined }))
+            .filter((t) => t.name.length > 0)
+        : [],
+      // v0 的 infobox value 可能是字符串或对象数组，必须压平后再交给渲染层
+      infobox: normalizeInfobox(raw.infobox),
       eps: raw.eps != null ? Number(raw.eps) : undefined,
-      volumes: raw.volumes != null ? Number(raw.volumes) : undefined
+      volumes: raw.volumes != null ? Number(raw.volumes) : undefined,
+      platform: raw.platform ? String(raw.platform) : undefined,
+      totalEpisodes: raw.total_episodes != null ? Number(raw.total_episodes) : undefined
     }
   }
 }
