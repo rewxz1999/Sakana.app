@@ -91,17 +91,22 @@ function isApiMirror(mirror: string): boolean {
 
 /**
  * 把官方图床地址改写到自建图片反代（Worker 的 IMG_HOST）。
- * Worker 按**路径**转发（`/pic/cover/l/xxx.jpg`），所以只替换 origin，路径保留。
+ * Worker 按**路径**转发（`/pic/cover/l/xxx.jpg`），所以拼接时要保留反代地址自带的路径前缀。
+ *
+ * ⚠️ v0.2.7 修：过去这里用的是 `base.origin`，把反代地址里的 `/img` 前缀丢掉了 ——
+ * 于是所有 `lain.bgm.tv` 封面都请求到 `https://反代/pic/...`（404），表现为「图片加载不出来」。
+ * 实测：丢掉前缀 → 404；带上 `/img` → 200 image/jpeg。
  */
 export function rewriteImageUrl(url: string): string {
-  const custom = getSettings().bangumiCustomImg?.trim().replace(/\/+$/, '')
+  const custom = (getSettings().bangumiCustomImg ?? '').trim().replace(/\/+$/, '')
   if (!custom || !url) return url
   try {
     const u = new URL(url)
-    // 只改官方图床（lain.bgm.tv / bgm.tv 系），其它第三方图床保持原样
+    // 只改官方图床（lain.bgm.tv / bgm.tv 系），其它地址（含反代自己的 /img）保持原样
     if (!/(^|\.)bgm\.tv$/i.test(u.hostname)) return url
     const base = new URL(custom)
-    return `${base.origin}${u.pathname}${u.search}`
+    const prefix = base.pathname.replace(/\/+$/, '') // 例如 "/img"
+    return `${base.origin}${prefix}${u.pathname}${u.search}`
   } catch {
     return url
   }
@@ -313,11 +318,12 @@ class BangumiService {
     customApi?: string
   }): Promise<{ text: string; mirror: string }> {
     /*
-     * v0.2.7：配了自建反代就**优先单独使用它**。
+     * v0.2.7：配了自建反代就**只用它**（用户要求：反代加载不出来时提示手动切换镜像，而不是自动回退）。
      *
-     * 之前是把反代和公共镜像放在一起竞速，结果反代经常输给「已经预热好的网页镜像」
+     * 之前把反代和公共镜像放在一起竞速，结果反代经常输给「已经预热好的网页镜像」
      * （实测 bangumi.vip 命中缓存只要 26ms，反代首包要几百毫秒~3 秒），
-     * 于是「设为默认主数据源」形同虚设。现在改成：先只用反代，失败再回退到镜像竞速。
+     * 于是「设为默认主数据源」形同虚设；后来改成优先-回退，但仍然会在用户不知情的情况下换源。
+     * 现在改为：有反代就用反代，失败直接把错误抛给界面（错误文案里写明去「设置 → 数据源配置」手动切换）。
      */
     const custom = (getSettings().bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
     if (custom) {
@@ -328,7 +334,12 @@ class BangumiService {
       } catch (err) {
         const e = err as { code?: string; message?: string }
         const reason = e?.code === 'ECONNABORTED' ? '超时' : (e?.message ?? String(err))
-        log.append('warn', 'bangumi', `自建反代失败，回退公共镜像：${reason}`)
+        log.append('error', 'bangumi', `自建反代不可用: ${reason}`)
+        throw makeSourceError(
+          'ALL_DOWN',
+          `自建反代不可用（${reason}）。请到「设置 → 数据源配置」检查反代地址，或手动切换到其它镜像站`,
+          [`${custom}: ${reason}`]
+        )
       }
     }
     const attempts = this.mirrors().map(async (mirror) => {
@@ -561,13 +572,19 @@ class BangumiService {
       const list = (res.data as { data?: Record<string, unknown>[] })?.data ?? []
       return list.map((raw) => this.normalizeItem(raw))
     }
-    // 与 requestBest 一致：配了自建反代就优先单独用它（见那里的注释）
+    // 与 requestBest 一致：配了自建反代就只用它，失败直接提示用户手动切换镜像（不再自动回退）
     const custom = (getSettings().bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
     if (custom) {
       try {
         return await viaApi(custom)
       } catch (err) {
-        log.append('warn', 'bangumi', `自建反代搜索失败，回退镜像：${String((err as Error)?.message ?? err)}`)
+        const reason = String((err as Error)?.message ?? err)
+        log.append('error', 'bangumi', `自建反代搜索失败: ${reason}`)
+        throw makeSourceError(
+          'ALL_DOWN',
+          `自建反代搜索不可用（${reason}）。请到「设置 → 数据源配置」检查反代地址，或手动切换到其它镜像站`,
+          [`${custom}: ${reason}`]
+        )
       }
     }
     const attempts = this.mirrors().map(async (mirror) => {

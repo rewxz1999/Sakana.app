@@ -119,6 +119,7 @@ export function SearchPage() {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<SearchResultItem[]>([])
   const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState('')
   const [searched, setSearched] = useState(false)
 
   /** 主区域当前展示什么：搜索结果，还是某个书签的条目 */
@@ -198,9 +199,14 @@ export function SearchPage() {
     pushHistory(q)
     const r = await api.bangumi.search(q)
     setSearching(false)
-    if (r.ok) setResults(r.data.items)
-    else {
+    if (r.ok) {
+      setResults(r.data.items)
+      // 数据源返回了「全部不可达」之类的说明（例如自建反代挂了）时，
+      // 把原因留在页面上，方便用户照着文案去「数据源配置」里切换（v0.2.7）
+      setSearchError(r.data.error ? r.data.error.message : '')
+    } else {
       setResults([])
+      setSearchError(r.error)
       toast.error(r.error)
     }
   }
@@ -742,7 +748,11 @@ export function SearchPage() {
               <EmptyState
                 icon={Search}
                 title="没有搜索到结果"
-                desc="换个关键词试试；若一直失败，可到设置里检查数据源是否可用"
+                desc={
+                  searchError
+                    ? `${searchError}\n可点下方按钮检查/切换数据源`
+                    : '换个关键词试试；若一直失败，可到设置里检查数据源是否可用'
+                }
               />
             ) : (
               <EmptyState

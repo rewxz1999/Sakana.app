@@ -9,6 +9,7 @@ import { useSettings } from '@/stores/app'
 import { fmtDateTime, weekdayDate, WEEKDAY_CN } from '@/lib/format'
 import { AnimeCard } from '@/components/AnimeCard'
 import { Button, EmptyState, Modal } from '@/components/ui'
+import { api } from '@/lib/api'
 import { toast } from '@/stores/app'
 
 function SkeletonCard() {
@@ -178,25 +179,52 @@ export function SchedulePage() {
         <span>图片与数据本地缓存，减少重复请求</span>
       </div>
 
-      {/* 方案 3.10：全部镜像不可达时提示 */}
-      <Modal open={showVpnDialog} onClose={() => setShowVpnDialog(false)} title="无法连接数据源" width={430}>
+      {/*
+        数据源不可达提示（v0.2.7）。
+        现在默认只使用自建反代、失败**不会**自动回退公共镜像（用户要求），
+        所以这里必须给出一个明确的出口：直接打开「数据源配置」让用户切镜像或改反代地址。
+      */}
+      <Modal open={showVpnDialog} onClose={() => setShowVpnDialog(false)} title="无法连接数据源" width={470}>
         <div className="text-sm leading-relaxed text-dim">
-          所有配置的 bangumi 镜像站均不可访问（{settings.bangumiMirrors.join('、')}）。
-          <br />
-          <br />
-          是否开启 VPN 代理，或自行配置代理以连接 bangumi 主站？
+          {settings.bangumiCustomApi ? (
+            <>
+              自建反代不可用：<span className="break-all font-mono text-[12px]">{settings.bangumiCustomApi}</span>
+              <br />
+              <br />
+              应用默认只使用这个反代（避免在你不知情的情况下换源）。可以：
+              <br />· 到「设置 → 数据源配置」检查反代地址是否写对、Worker 是否还在运行；
+              <br />· 或把反代地址清空 / 改成其它镜像站，手动切换数据源。
+            </>
+          ) : (
+            <>
+              所有配置的 bangumi 镜像站均不可访问（{settings.bangumiMirrors.join('、')}）。
+              <br />
+              <br />
+              是否开启 VPN 代理，或自行配置代理以连接 bangumi 主站？
+            </>
+          )}
         </div>
-        <div className="mt-5 flex justify-end gap-2">
+        <div className="mt-5 flex flex-wrap justify-end gap-2">
           <Button variant="ghost" onClick={() => setShowVpnDialog(false)}>
             稍后再说
           </Button>
           <Button
+            variant="outline"
             onClick={() => {
               setShowVpnDialog(false)
               navigate('/settings')
             }}
           >
             去配置代理
+          </Button>
+          <Button
+            onClick={() => {
+              setShowVpnDialog(false)
+              // 数据源配置是小窗口页面（与设置页里的入口一致）
+              void api.window.openSmall('/datasource', { width: 760, height: 620, title: '数据源配置' })
+            }}
+          >
+            切换镜像站
           </Button>
         </div>
       </Modal>
