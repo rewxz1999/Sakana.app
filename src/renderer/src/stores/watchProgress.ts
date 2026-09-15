@@ -37,8 +37,10 @@ interface ProgressState {
       episodeName?: string
     }
   ) => void
-  /** 上报播放位置（节流由调用方负责） */
-  setPosition: (id: string, positionSec: number, durationSec: number) => void
+  /** 上报播放位置（节流由调用方负责）；episodeKey 用于按集分别记录 */
+  setPosition: (id: string, positionSec: number, durationSec: number, episodeKey?: string) => void
+  /** 指定集数的断点（没有记录返回 0） */
+  positionOf: (id: string, episodeKey: string) => number
   /** 已观看集数集合（键为 `${groupIndex}:${episodeIndex}`） */
   watchedSet: (id: string) => Set<string>
   remove: (id: string) => void
@@ -87,34 +89,44 @@ export const useWatchProgress = create<ProgressState>((set, get) => ({
     const prev = items.find((i) => i.id === base.id)
     const key = epKey(base.groupIndex, base.episodeIndex)
     const watched = prev?.watched ?? []
+    const sameEpisode = prev?.episodeIndex === base.episodeIndex && prev?.groupIndex === base.groupIndex
     const next: WatchProgressItem = {
       ...(prev ?? { watched: [], positionSec: 0, durationSec: 0 }),
       ...base,
       watched: watched.includes(key) ? watched : [...watched, key],
-      // 换集时位置归零，交给播放器随后上报真实进度
-      positionSec: prev && prev.episodeIndex === base.episodeIndex ? prev.positionSec : 0,
+      // 换集时「整部番剧的断点」归零，具体每集的位置记在 positions 里（见 types 注释）
+      positionSec: sameEpisode ? (prev?.positionSec ?? 0) : 0,
+      durationSec: sameEpisode ? (prev?.durationSec ?? 0) : 0,
       updatedAt: Date.now()
     }
     const list = [next, ...items.filter((i) => i.id !== base.id)].slice(0, MAX_ITEMS)
     set({ items: list })
     persist(list)
   },
-  setPosition: (id, positionSec, durationSec) => {
+  setPosition: (id, positionSec, durationSec, episodeKey) => {
     const items = get().items
     const idx = items.findIndex((i) => i.id === id)
     if (idx < 0) return
     const cur = items[idx]
-    if (
-      Math.abs(cur.positionSec - positionSec) < 1 &&
-      Math.abs((cur.durationSec ?? 0) - (durationSec ?? 0)) < 1
-    ) {
-      return
-    }
-    const next = { ...cur, positionSec, durationSec, updatedAt: Date.now() }
+    // 同时写「整部番剧的当前断点」与「该集自己的断点」
+    const key = episodeKey ?? epKey(cur.groupIndex, cur.episodeIndex)
+    const positions = { ...(cur.positions ?? {}) }
+    const durations = { ...(cur.durations ?? {}) }
+    const prevPos = positions[key] ?? 0
+    const prevDur = durations[key] ?? 0
+    if (Math.abs(prevPos - positionSec) < 1 && Math.abs(prevDur - durationSec) < 1) return
+    positions[key] = positionSec
+    durations[key] = durationSec
+    const next = { ...cur, positionSec, durationSec, positions, durations, updatedAt: Date.now() }
     const list = [...items]
     list[idx] = next
     set({ items: list })
     persist(list)
+  },
+  /** 指定集数的断点（没有记录返回 0） */
+  positionOf: (id, episodeKey) => {
+    const item = get().items.find((i) => i.id === id)
+    return item?.positions?.[episodeKey] ?? 0
   },
   watchedSet: (id) => {
     const item = get().items.find((i) => i.id === id)

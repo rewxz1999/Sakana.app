@@ -1553,6 +1553,141 @@ if (!gotLock) {
       }, 3000)
     }
 
+    /*
+     * 自动连播自检（SAKANA_EPISODE_TEST=<关键词>）：真实复现「播完第 1 集是否跳到第 2 集」。
+     *
+     * 为什么要做成自检：用户反馈「自动连播总是跳到最后一集」，而这个行为只有在
+     * 「播到本集末尾」那一刻才会发生 —— 手动等到 24 分钟不现实，所以这里
+     * 直接在播放器里 seek 到结尾前 8 秒，然后观察接下来切到了哪一集。
+     * 判定依据取自悬浮窗渲染的标题/副标题（那里写着当前集名）。
+     */
+    if (process.env.SAKANA_EPISODE_TEST) {
+      const kw = process.env.SAKANA_EPISODE_TEST
+      setTimeout(() => {
+        void (async () => {
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
+          if (!win) return
+          const { ruleEpisodes, rulePlay, ruleSearch } = await import('./services/rules')
+          const rules = store.get<import('@shared/types').PlayRule[]>('rules', [])
+          const rule =
+            rules.find((r) => r.enabled && r.name.toLowerCase().includes((process.env.SAKANA_EPISODE_RULE ?? 'aafun').toLowerCase())) ??
+            rules.find((r) => r.enabled)
+          if (!rule) {
+            console.log('[episode-test] 没有可用规则')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const s = await ruleSearch(rule.id, kw)
+          if (!s.items.length) {
+            console.log(`[episode-test] 搜索无结果（${rule.name} / ${kw}）`)
+            markQuitting()
+            app.quit()
+            return
+          }
+          const ep = await ruleEpisodes(rule.id, s.items[0])
+          const g = ep.groups[0]
+          if (!g || g.episodes.length < 3) {
+            console.log(`[episode-test] 剧集不足（${g?.episodes.length ?? 0} 集）`)
+            markQuitting()
+            app.quit()
+            return
+          }
+          console.log(
+            `[episode-test] ${rule.name} 命中 ${g.episodes.length} 集，前 3 集：${g.episodes.slice(0, 3).map((e) => e.name).join(' / ')}`
+          )
+          const play = await rulePlay(rule.id, s.items[0], 0, 0, g.episodes[0].link, ep.vars)
+          const devUrl = process.env['ELECTRON_RENDERER_URL']
+          const state = {
+            mode: 'rule',
+            title: s.items[0].name || '自检',
+            url: play.url,
+            ruleId: rule.id,
+            entry: s.items[0],
+            vars: ep.vars,
+            groups: ep.groups,
+            referer: rule.baseUrl,
+            startLine: 0,
+            startEp: 0
+          }
+          console.log(`[episode-test] 播放页 ${play.url.slice(0, 110)}`)
+          // 渲染层日志转发：自动连播的判定与切换过程都在渲染层，必须能看见
+          win.webContents.on('console-message', (...args: unknown[]) => {
+            const d =
+              typeof args[1] === 'object' && args[1] !== null
+                ? (args[1] as { level?: string; message?: string })
+                : { level: String(args[1]), message: String(args[2]) }
+            const msg = String(d.message ?? '')
+            if (/自动连播|切集|player\]/.test(msg)) console.log(`[renderer] ${msg.slice(0, 200)}`)
+          })
+          /*
+           * 状态注入：file:// 源下 Chromium 不保留 sessionStorage，所以把状态 base64 后
+           * 作为 URL 参数传给播放页（渲染层只在参数存在时读取，正常运行完全不受影响）。
+           */
+          const b64 = Buffer.from(JSON.stringify(state), 'utf8').toString('base64')
+          const hash = `/player?ts=${encodeURIComponent(b64)}`
+          if (!app.isPackaged && devUrl) await win.loadURL(`${devUrl}#${hash}`)
+          else await win.loadFile(join(__dirname, '../renderer/index.html'), { hash })
+          await new Promise((r) => setTimeout(r, 2500))
+
+          const readEpisode = async (): Promise<string> => {
+            try {
+              const { overlayWindow } = await import('./services/playerOverlay')
+              const ow = overlayWindow()
+              if (!ow || ow.isDestroyed()) return '(无悬浮窗)'
+              const text = (await ow.webContents.executeJavaScript(
+                `(document.body.innerText||'').replace(/\\s+/g,' ').slice(0,120)`,
+                true
+              )) as string
+              // 一并读出播放页当前持有的路由状态（线路/集序号/是否自动连播），
+              // 这样「到底请求了第几集」一目了然，不用靠猜
+              const navState = (await win.webContents
+                .executeJavaScript(`JSON.stringify((history.state&&history.state.usr)||{})`, true)
+                .catch(() => '{}')) as string
+              let brief = ''
+              try {
+                const st = JSON.parse(navState) as { startLine?: number; startEp?: number; auto?: boolean; url?: string }
+                brief = ` nav=${st.startLine ?? '-'}:${st.startEp ?? '-'} ${String(st.url ?? '').slice(-14)}`
+              } catch {
+                /* ignore */
+              }
+              return text + brief
+            } catch {
+              return '(读取失败)'
+            }
+          }
+          const { engineGetState, engineSeekSec } = await import('./services/playerEngine')
+          // 等待探流 + 开播
+          for (let i = 0; i < 12; i++) {
+            await new Promise((r) => setTimeout(r, 5000))
+            const st = engineGetState()
+            const ui = await readEpisode()
+            console.log(`[episode-test] 等待开播 ${(i + 1) * 5}s: ${JSON.stringify(st)} | UI=${ui.slice(0, 60)}`)
+            if (st?.playing && st.length > 60000) break
+          }
+          const before = engineGetState()
+          if (!before || before.length <= 0) {
+            console.log('[episode-test] ❌ 未能开播，无法验证自动连播')
+            markQuitting()
+            app.quit()
+            return
+          }
+          console.log(`[episode-test] 本集时长 ${Math.round(before.length / 1000)}s，跳到结尾前 8 秒观察自动连播`)
+          engineSeekSec(before.length / 1000 - 8)
+          for (let i = 0; i < 14; i++) {
+            await new Promise((r) => setTimeout(r, 5000))
+            const ui = await readEpisode()
+            const st = engineGetState()
+            console.log(
+              `[episode-test] 观察 ${(i + 1) * 5}s: time=${st ? Math.round(st.time / 1000) : '?'}s len=${st ? Math.round(st.length / 1000) : '?'}s UI=${ui.slice(0, 70)}`
+            )
+          }
+          markQuitting()
+          app.quit()
+        })()
+      }, 5000)
+    }
+
     if (process.env.SAKANA_RULE_TEST) {
       const kw = process.env.SAKANA_RULE_TEST
       setTimeout(() => {

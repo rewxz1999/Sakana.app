@@ -39,8 +39,8 @@ export function LogsPage() {
   return (
     <SubPage
       icon={FileText}
-      title="错误日志"
-      desc="网络请求失败、下载器异常等错误记录，可复制用于反馈"
+      title="运行日志"
+      desc="应用启动、网络请求、下载器与播放器的运行记录，可复制用于反馈（最多保留最近 1000 条）"
       maxWidth="max-w-4xl"
       actions={
         <>

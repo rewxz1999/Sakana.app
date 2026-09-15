@@ -364,13 +364,13 @@ export function SettingsPage() {
         <UpdateSection version={appVersion} />
 
         {/* 诊断与关于 */}
-        <Section title="诊断与关于" desc="错误日志与应用信息">
+        <Section title="诊断与关于" desc="运行日志与应用信息">
           <div className="flex flex-col">
             <OpenRow
               icon={FileText}
-              title="错误日志"
+              title="运行日志"
               desc="网络请求失败、下载器异常等错误记录，可复制用于反馈"
-              onOpen={() => openSmall('/logs', 760, 560, '错误日志')}
+              onOpen={() => openSmall('/logs', 760, 560, '运行日志')}
             />
             <RowDivider />
             <OpenRow

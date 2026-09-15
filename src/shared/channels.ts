@@ -76,6 +76,8 @@ export const CH = {
   overlayHide: 'overlay:hide',
   overlaySetSpace: 'overlay:set-interactive',
   overlayState: 'overlay:state',
+  // v0.2.6：选集数据单独走一条低频通道（状态推送是每秒多次的，不适合塞大数组）
+  overlayEpisodes: 'overlay:episodes',
   overlayAction: 'overlay:action',
   overlayPoke: 'overlay:poke',
   // 内置组件探测（libVLC / FFmpeg / aria2 是否随包内置）

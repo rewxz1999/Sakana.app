@@ -113,6 +113,8 @@ const api: SakanaApi = {
     setInteractive: (interactive) => call(CH.overlaySetSpace, interactive),
     // 高频消息用 send：状态下行、动作上行、鼠标唤出
     pushState: (state) => ipcRenderer.send(CH.overlayState, state),
+    setEpisodes: (payload) => ipcRenderer.send(CH.overlayEpisodes, payload),
+    onEpisodes: (cb) => subscribe(CH.overlayEpisodes, cb),
     poke: () => ipcRenderer.send(CH.overlayPoke),
     action: (action) => ipcRenderer.send(CH.overlayAction, action),
     onState: (cb) => subscribe(CH.overlayState, cb),

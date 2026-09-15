@@ -37,6 +37,7 @@ import { api } from '@/lib/api'
 import { fmtDuration, localSubUrl, localVideoUrl } from '@/lib/format'
 import { useLibrary } from '@/stores/library'
 import { epKey, localKey, onlineKey, useWatchProgress } from '@/stores/watchProgress'
+import { enterPlayer, whenPlayerGone } from '@/lib/playerSession'
 import { matchShortcut, useShortcuts } from '@/stores/shortcuts'
 import { toast, useSettings } from '@/stores/app'
 import { Badge, Spinner } from '@/components/ui'
@@ -58,6 +59,25 @@ interface PlayerState {
   referer?: string
   /** 从「继续观看」跳进来时的续播时间点（秒） */
   startSec?: number
+  /**
+   * 播放器内切集时用「重新挂载」的方式（v0.2.6）：带上当前线路/集序号，
+   * 让新挂载的播放页知道自己在放第几集（否则选集列表高亮与自动连播都会错位）。
+   */
+  startLine?: number
+  startEp?: number
+  /** 已经预解析好的播放页地址：切集时直接用，省掉一次 rules.play */
+  prefetchedUrl?: string
+  /** 自动连播：不要对目标集做断点续播（应该从头播） */
+  noResume?: boolean
+  /**
+   * 重新挂载用的键（v0.2.6）。
+   *
+   * react-router 里 navigate 到**同一个路由**不会重新挂载组件，只更新 location.state ——
+   * 于是「切集」变成只改状态：旧的嗅探/内核状态全部残留，实测表现为切集后卡在 0 秒。
+   * 这里给每次切集一个变化的值，配合 App.tsx 里的 `key` 让它真正重新挂载，
+   * 从而和「从规则页进选集」走完全一样的初始化流程。
+   */
+  playKey?: number
 }
 
 const HIDE_DELAY = 5000
@@ -73,6 +93,34 @@ export function PlayerPage() {
   // 自检/调试入口：?folder=<路径> 可直接以本地模式打开播放器（SAKANA_PLAYERUI_TEST 使用）
   const query = new URLSearchParams(location.search)
   const queryFolder = query.get('folder')
+  /**
+   * 自检专用的状态注入通道（两种，按优先级）：
+   * 1. URL 参数 `?ts=<base64(JSON)>` —— 主进程没法直接给 react-router 传 state，
+   *    而 file:// 源下 Chromium 不保留 sessionStorage，所以以 URL 参数为主；
+   * 2. sessionStorage 的 `sakana-test-state`（dev URL 下可用）。
+   * 正常运行时两者都不会出现，对用户行为零影响；
+   * 自动连播自检（SAKANA_EPISODE_TEST）靠它在真实播放器里复现「播完是否跳到下一集」。
+   */
+  const injectedState = ((): PlayerState | null => {
+    const raw = query.get('ts')
+    if (raw) {
+      try {
+        const bin = atob(raw)
+        const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0))
+        return JSON.parse(new TextDecoder().decode(bytes)) as PlayerState
+      } catch {
+        /* 参数损坏则忽略 */
+      }
+    }
+    try {
+      const stored = sessionStorage.getItem('sakana-test-state')
+      if (!stored) return null
+      sessionStorage.removeItem('sakana-test-state')
+      return JSON.parse(stored) as PlayerState
+    } catch {
+      return null
+    }
+  })()
   const state: PlayerState = queryFolder
     ? {
         mode: 'local',
@@ -80,7 +128,7 @@ export function PlayerPage() {
         folder: queryFolder,
         episode: undefined
       }
-    : baseState
+    : (injectedState ?? baseState)
   const addWatch = useLibrary((s) => s.addWatch)
 
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -109,8 +157,12 @@ export function PlayerPage() {
   const [ruleStreamUrl, setRuleStreamUrl] = useState<string | null>(null)
   const [rulePageUrl, setRulePageUrl] = useState(state.url ?? '')
   const [ruleProbeFailed, setRuleProbeFailed] = useState(false)
-  const [ruleCurrent, setRuleCurrent] = useState<{ line: number; ep: number } | null>(null)
   const [ruleProbing, setRuleProbing] = useState(false)
+  // 进来时如果带着线路/集序号（切集或继续观看），直接认为「正在放这一集」，
+  // 否则选集列表没有高亮、自动连播也会从第 1 集算起（v0.2.6 修）
+  const [ruleCurrent, setRuleCurrent] = useState<{ line: number; ep: number } | null>(
+    state.startLine != null && state.startEp != null ? { line: state.startLine, ep: state.startEp } : null
+  )
   const [vlcVolume, setVlcVolume] = useState(100)
   const [vlcMuted, setVlcMuted] = useState(false)
   const [vlcSubs, setVlcSubs] = useState<{ id: number; label: string }[]>([])
@@ -136,6 +188,8 @@ export function PlayerPage() {
   const ruleStreamRef = useRef<string | null>(null)
   const probeCancelRef = useRef<(() => void) | null>(null)
   const pokeRef = useRef<(() => void) | null>(null)
+  /** 当前播放页地址（重试嗅探时要用，state 里读不到最新值） */
+  const rulePageUrlRef = useRef('')
   /** 网页嗅探进行中：期间不自动隐藏控制条（否则用户无法点击退出） */
   const probingRef = useRef(false)
   /** 当前是否已进入播放（用于判断直连失败并切换到 FFmpeg 中转） */
@@ -150,6 +204,20 @@ export function PlayerPage() {
   const resumeDoneRef = useRef('')
   /** 自动连播是否已经触发（防止 time 事件高频重复触发） */
   const autoNextRef = useRef('')
+  /** 上次自动连播的时间：两次之间强制间隔，避免异常信号把整季快进完 */
+  const lastAutoNextRef = useRef(0)
+  /** 本集开播时间戳（毫秒）：进度兜底判定需要「已播够久」才允许连播 */
+  const playStartedAtRef = useRef(0)
+  /**
+   * 是否还在等「本集真正开播」（v0.2.6）。
+   *
+   * 关键修复：换集是重新挂载播放页，但内核还持有**上一集**的媒体 ——
+   * 它会继续上报旧媒体的 time/length（例如 1440/1440）以及 ended，
+   * 于是新页面刚挂载就以为「已经播完」，自动连播被反复触发、一路快进到最后一集
+   * （实测日志：0:0→0:1→0:2→…→0:8）。这里在收到本集自己的 playing 之前，
+   * 一律忽略时间与结束事件。
+   */
+  const awaitingStartRef = useRef(true)
   /** 播放进度上报节流 */
   const progressRef = useRef<{ key: string; at: number }>({ key: '', at: 0 })
   const progressApi = useWatchProgress()
@@ -172,6 +240,18 @@ export function PlayerPage() {
               ? { kind: 'playing', text: '播放中' }
               : { kind: 'idle', text: '已暂停' }
 
+  /**
+   * 直连播放失败时的补救（v0.2.6）。
+   *
+   * 实测发现：部分站点（aafun/moonci 的 `pan.wo.cn` 直链）给出的是**短时效/一次性地址** ——
+   * 抓到时可用，稍后再去取就返回 5XX/400（用 ffprobe 复验过）。
+   * 因此直连失败时不再直接把这条可能已过期的地址丢给 FFmpeg 中转，而是**先重新嗅探一次**
+   * 拿一条新鲜地址；只有重嗅也不成功才走中转。
+   */
+  const retriedCaptureRef = useRef(false)
+  /** 重嗅探的兜底计时器（超时就改走中转，并随卸载清理） */
+  const probeFallbackTimerRef = useRef<number | undefined>(undefined)
+
   /** 直连播放失败时：用内置 FFmpeg 带站点会话去取流并 remux，再交给播放器 */
   const startFfmpegRelay = async (url: string, referer?: string, cookies?: string) => {
     if (relayTriedRef.current) return
@@ -184,11 +264,16 @@ export function PlayerPage() {
     }
     relayRef.current = { sessionId: r.data.sessionId }
     void api.vlc.play(r.data.url)
+    /*
+     * 中转成功的判定要给足时间：FFmpeg 需要先连上源站、缓冲一段才会开始出数据，
+     * 24 分钟的长片在冷启动 + 慢 CDN 下超过 12 秒很常见。
+     * 这里放宽到 30 秒，期间界面仍是「加载中」。
+     */
     window.setTimeout(() => {
       if (!playingRef.current) {
         setVideoError('在线播放失败：该站点的视频流无法播放，请切换其它规则或退出')
       }
-    }, 12000)
+    }, 30000)
   }
   const subtitlesLoadedRef = useRef('')
 
@@ -304,6 +389,7 @@ export function PlayerPage() {
       relayRef.current = null
     }
     setRulePageUrl(pageUrl)
+    rulePageUrlRef.current = pageUrl
     setRuleStreamUrl(null)
     ruleStreamRef.current = null
     setRuleProbeFailed(false)
@@ -348,12 +434,31 @@ export function PlayerPage() {
         // referer 语义：undefined=未判定（回退规则站点）；''=经校验确定不带 Referer
         const refForPlay = ev.referer !== undefined ? ev.referer || undefined : state.referer
         void api.vlc.play(ev.url, refForPlay, ev.cookies)
-        // 直连 8 秒仍未开播 → 切换到 FFmpeg 中转（换一套取流实现）
+        // 直连 15 秒仍未开播 → 先用新地址重试（对付短时效直链），再不行才切 FFmpeg 中转
         window.setTimeout(() => {
-          if (!cancelled && !playingRef.current && !relayTriedRef.current) {
-            void startFfmpegRelay(ev.url, refForPlay, ev.cookies)
+          if (cancelled || playingRef.current || relayTriedRef.current) return
+          if (!retriedCaptureRef.current) {
+            retriedCaptureRef.current = true
+            const pageUrl = rulePageUrlRef.current || state.url
+            if (pageUrl) {
+              toast.info('视频流可能已过期，正在重新解析…')
+              console.log('[player] 直连未开播：重新嗅探获取新的直链')
+              startRuleProbe(pageUrl)
+              /*
+               * 重嗅探也要有上限：站点有时不再给出新地址（或直接限流），
+               * 那就退回到 FFmpeg 中转再试一次，而不是让用户一直盯着「捕捉视频流中」。
+               */
+              probeFallbackTimerRef.current = window.setTimeout(() => {
+                if (!cancelled && !playingRef.current && !relayTriedRef.current) {
+                  console.log('[player] 重嗅探超时，改走 FFmpeg 中转')
+                  void startFfmpegRelay(ev.url, refForPlay, ev.cookies)
+                }
+              }, 12000)
+              return
+            }
           }
-        }, 8000)
+          void startFfmpegRelay(ev.url, refForPlay, ev.cookies)
+        }, 15000)
       }
     })
     const offDone = api.ruleProbe.onDone((ev) => {
@@ -380,6 +485,7 @@ export function PlayerPage() {
       offDone()
       if (probeCancelRef.current) probeCancelRef.current()
       probeCancelRef.current = null
+      if (probeFallbackTimerRef.current) window.clearTimeout(probeFallbackTimerRef.current)
     }
   }
 
@@ -458,15 +564,16 @@ export function PlayerPage() {
     [progressKeyOf, current, duration]
   )
 
-  // 规则模式：选集切换（加载页 → 解析播放页 → 嗅探流 → 播放）
+  // 规则模式：选集切换
   /**
-   * 切集。
+   * 切集（v0.2.6 重做：与「规则页选集」走同一条路 —— 重新挂载播放页）。
    *
-   * 过去的实现有两个毛病：连点/快捷键重复触发会同时发多条解析请求（表现为「卡住」）；
-   * 切换过程中界面没有任何反馈（用户以为没响应）。现在：
-   * - `switchRef` 做互斥，同一时间只允许一次切换；
-   * - 立刻进入加载页（ruleProbing=true）并有超时兜底；
-   * - 命中预解析结果时跳过 `rules.play`，切集几乎无等待。
+   * 为什么要改成重新挂载：
+   * - 规则页（番剧详情 → 播放源 → 选集）之所以稳，是因为它每次都**重新进入播放页**：
+   *   内核重新 attach、嗅探窗口重新创建、状态全部干净；
+   * - 原地的「边播边切」要在旧流还在跑、旧嗅探刚拆掉的情况下再开一轮嗅探，
+   *   实测经常抓不到流或明显变慢（用户反馈的正是这一点）。
+   * 另外先暂停当前播放再切，避免旧流继续占着网络（用户建议，也确实更稳）。
    */
   const handleRuleEpisode = async (line: number, ep: number, opts?: { auto?: boolean }): Promise<void> => {
     if (!state.ruleId || !state.entry) return
@@ -476,13 +583,14 @@ export function PlayerPage() {
     try {
       setShowEpisodes(false)
       setVideoError(null)
-      setRuleProbeFailed(false)
-      setRuleProbing(true)
-      probingRef.current = true
+      // 先暂停当前播放：旧流继续拉流会和新一轮嗅探抢带宽
+      if (playing) void api.vlc.togglePause()
       reportPosition(true)
+
+      // 目标播放页地址：优先用预解析结果，否则现解析一次
       const key = `${line}:${ep}`
-      const cached = prefetchRef.current
       let pageUrl = ''
+      const cached = prefetchRef.current
       if (cached && cached.key === key && cached.pageUrl) {
         pageUrl = cached.pageUrl
       } else {
@@ -490,18 +598,35 @@ export function PlayerPage() {
         const r = await api.rules.play(state.ruleId, state.entry, line, ep, link, state.vars ?? {})
         if (!r.ok) {
           toast.error(`切换失败：${r.error}`)
-          setRuleProbing(false)
-          probingRef.current = false
           setVideoError(`切换剧集失败：${r.error}`)
           return
         }
         pageUrl = r.data.url
       }
       prefetchRef.current = null
-      autoNextRef.current = ''
-      setRuleCurrent({ line, ep })
-      rememberEpisode(line, ep)
-      startRuleProbe(pageUrl)
+
+      // 重新挂载播放页（与规则页选集的跳转参数完全一致，额外带上当前线路/集序号）
+      navigate('/player', {
+        replace: true,
+        state: {
+          mode: 'rule',
+          title: state.title,
+          url: pageUrl,
+          subjectId: state.subjectId,
+          ruleId: state.ruleId,
+          entry: state.entry,
+          vars: state.vars,
+          groups: state.groups,
+          referer: state.referer,
+          startLine: line,
+          startEp: ep,
+          prefetchedUrl: pageUrl,
+          // 自动连播到下一集时从头播；手动切集沿用该集自己的断点
+          noResume: !!opts?.auto,
+          // 让 App.tsx 上的 key 变化 → 真正重新挂载（同路由 navigate 默认不重挂载）
+          playKey: Date.now()
+        } satisfies PlayerState
+      })
     } finally {
       switchRef.current = false
       setSwitching(false)
@@ -517,25 +642,41 @@ export function PlayerPage() {
     const key = `${line}:${ep}`
     if (autoNextRef.current === key) return
     if (ep + 1 >= total) return
+    // 两次连播之间至少间隔 30 秒：即使内核异常地连续上报结束，也不会一路快进到最后一集
+    if (lastAutoNextRef.current && Date.now() - lastAutoNextRef.current < 30_000) return
     autoNextRef.current = key
+    lastAutoNextRef.current = Date.now()
+    console.log(`[player] 自动连播：当前 ${line}:${ep}（共 ${total} 集）→ 切到 ${line}:${ep + 1}`)
     toast.info('本集播放结束，正在自动播放下一集…')
     void handleRuleEpisode(line, ep + 1, { auto: true })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.mode, state.groups, ruleCurrent, handleRuleEpisode])
 
   /**
-   * 预加载下一集 + 自动连播判定（播放进度驱动）。
+   * 预加载下一集 + 自动连播判定。
    *
-   * - 距结束 40 秒内先解析下一集的播放页地址（纯 HTTP，很便宜），切集时可直接复用；
-   * - 进度到达结尾（或内核报 ended）时自动切下一集。两处都用 ref 去重，避免 time 事件高频重复触发。
+   * v0.2.6 修「播完总是跳到最后一集」：
+   * 旧实现只要 `current >= duration - 1.5` 就立刻连播，而内核刚开播时会短暂上报
+   * 一个很小的 duration（甚至分片长度），于是条件在开播瞬间就成立 —— 表现为自动连播
+   * 被反复触发、一路快进到最后一集。
+   * 现在改成：
+   * - **内核报 ended 才是主要信号**（最可靠，见下面的 ended 事件处理）；
+   * - 进度兜底必须同时满足：时长 ≥ 60 秒、已播到 80% 以上、且距离开播已超过 60 秒；
+   * - 同一集的连播只允许触发一次（autoNextRef），并且两次连播之间至少间隔 30 秒。
    */
   useEffect(() => {
     if (state.mode !== 'rule' || !ruleCurrent || duration <= 0 || !state.ruleId || !state.entry) return
     const line = ruleCurrent.line
     const ep = ruleCurrent.ep
     const total = state.groups?.[line]?.episodes.length ?? 0
-    // ① 自动连播
-    if (current >= duration - 1.5) {
+    // ① 自动连播（严格兜底判定）
+    const startedAt = playStartedAtRef.current
+    const watchedEnough =
+      startedAt > 0 &&
+      duration >= 60 &&
+      current >= duration * 0.8 &&
+      Date.now() - startedAt > 60_000
+    if (watchedEnough && current >= duration - 1.5) {
       autoNext()
       return
     }
@@ -543,7 +684,8 @@ export function PlayerPage() {
     if (ep + 1 >= total) return
     const key = `${line}:${ep + 1}`
     if (prefetchRef.current?.key === key) return
-    if (duration - current > PRELOAD_LEAD) return
+    // 只在「快播到结尾」或「已经播过半」时预解析，避免开播瞬间就发多余请求
+    if (duration - current > PRELOAD_LEAD || current < 30) return
     prefetchRef.current = { key, pageUrl: '' }
     const link = state.groups?.[line]?.episodes?.[ep + 1]?.link ?? ''
     void api.rules
@@ -575,40 +717,48 @@ export function PlayerPage() {
   }, [ruleProbing])
 
   /**
-   * 断点续播。
+   * 断点续播（v0.2.6 按集记录）。
    *
    * 谨慎点：
    * - 只在「本集第一次真正开播（playing=true 且时长已知）」时做一次，避免还没出画面就 seek 造成卡死；
    * - 目标位置必须大于 30 秒且距结尾还有 15 秒以上，否则不跳；
-   * - 跳转后右下角给出「撤销」提示，用户可一键回到开头。
+   * - 自动连播（noResume）进来的集数**不**续播，从头开始；
+   * - 跳转后右下角给出「撤销」提示（现在画在悬浮窗里，否则会被原生视频窗口盖住看不见）。
    */
   useEffect(() => {
     if (!playing || duration <= 0) return
+    if (state.noResume) return
     const id = progressKeyOf()
     if (!id) return
-    const stamp = `${id}#${ruleCurrent?.line ?? 0}:${ruleCurrent?.ep ?? currentIndex}`
+    const line = ruleCurrent?.line ?? 0
+    const ep = ruleCurrent?.ep ?? currentIndex
+    const stamp = `${id}#${line}:${ep}`
     if (resumeDoneRef.current === stamp) return
     resumeDoneRef.current = stamp
     const stored = progressApi.items.find((i) => i.id === id)
+    // 先看「这一集自己的断点」，没有再退回整部番剧的断点（兼容旧记录）
+    const perEpisode = state.mode === 'rule' ? progressApi.positionOf(id, epKey(line, ep)) : 0
     const explicit = state.startSec
     const target =
       explicit && explicit > RESUME_MIN_SEC
         ? explicit
-        : stored && stored.positionSec > RESUME_MIN_SEC
-          ? stored.positionSec
-          : 0
+        : perEpisode > RESUME_MIN_SEC
+          ? perEpisode
+          : stored && stored.positionSec > RESUME_MIN_SEC
+            ? stored.positionSec
+            : 0
     if (target <= 0 || target >= duration - 15) return
     setCurrent(target)
     void api.vlc.seek(target)
     setResumeHint({ at: Date.now(), target })
     toast.info(`已从上次位置 ${fmtDuration(target)} 继续播放`)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playing, duration, progressKeyOf, ruleCurrent, currentIndex, state.startSec])
+  }, [playing, duration, progressKeyOf, ruleCurrent, currentIndex, state.startSec, state.noResume])
 
-  // 撤销提示 12 秒后自动消失
+  // 撤销提示 10 秒后自动消失（用户反馈原来时间太短）
   useEffect(() => {
     if (!resumeHint) return
-    const t = window.setTimeout(() => setResumeHint(null), 12000)
+    const t = window.setTimeout(() => setResumeHint(null), 10000)
     return () => window.clearTimeout(t)
   }, [resumeHint])
 
@@ -641,9 +791,16 @@ export function PlayerPage() {
       void api.vlc.setPlaylist(files.map((f) => f.path))
       const f = files[currentIndex]
       if (f) void api.vlc.play(f.path)
-    } else if (state.url) {
-      void api.vlc.play(state.url)
+    } else if (state.mode === 'online') {
+      // 直连流模式：url 本身就是媒体地址
+      if (state.url) void api.vlc.play(state.url)
     }
+    /*
+     * rule 模式**不能**把 url 交给内核：那是**播放页 HTML 地址**，不是媒体地址
+     * （内核会当成一个无法解码的媒体，表现为 time/length 恒为 0 的「已暂停」）。
+     * 真实流由嗅探窗口捕获后再交给内核播放。
+     * 实测（v0.2.6 自动连播自检）过去这里会把 …/play/1-2.html 当媒体播，导致切集后黑屏卡住。
+     */
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vlcState, currentIndex, files.length, state.mode, state.url])
 
@@ -659,6 +816,10 @@ export function PlayerPage() {
         case 'playing':
           playingRef.current = true
           setPlaying(true)
+          // 本集真正开播了：这之后的时间/结束事件才算数
+          awaitingStartRef.current = false
+          // 记录本集开播时刻：自动连播的进度兜底要求「已经播够久」，避免刚开播就被判定为播完
+          playStartedAtRef.current = Date.now()
           recordWatch()
           // 记住「正在看第几集」，让剧集列表能高亮已看集数与最近进度
           if (state.mode === 'rule' && ruleCurrent) rememberEpisode(ruleCurrent.line, ruleCurrent.ep)
@@ -668,25 +829,35 @@ export function PlayerPage() {
           setTimeout(() => void refreshVlcSubs(), 300)
           break
         case 'paused':
+          if (awaitingStartRef.current) break
           setPlaying(false)
           reportPosition(true)
           break
         case 'stopped':
+          if (awaitingStartRef.current) break
           setPlaying(false)
           reportPosition(true)
           break
         case 'ended':
-          // 本集播完：规则模式自动连下一集；本地模式交给 libVLC 播放列表（主进程已下发 setPlaylist）
+          /*
+           * 本集播完：规则模式自动连下一集。
+           * 注意「本集」二字：换集后内核可能仍在报上一集的 ended，
+           * 那种事件必须丢掉，否则会出现「刚切过去就又被判定播完」的逐集快进（实测复现过）。
+           */
+          if (awaitingStartRef.current) break
           reportPosition(true)
           if (state.mode === 'rule') autoNext()
           break
         case 'time':
+          // 本集开播前的时间上报来自上一集的媒体，必须忽略（否则进度/连播判定全被污染）
+          if (awaitingStartRef.current) break
           if (typeof ev.time === 'number') {
             setCurrent(ev.time / 1000)
             if (typeof ev.length === 'number') setDuration(ev.length / 1000)
           }
           break
         case 'length':
+          if (awaitingStartRef.current) break
           if (typeof ev.length === 'number') setDuration(ev.length / 1000)
           break
         case 'playlistItem':
@@ -814,6 +985,27 @@ export function PlayerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [live?.sessionId])
 
+  /**
+   * 播放实例登记 + 离开时的内核处理（v0.2.6）。
+   *
+   * 切集是「重新挂载播放页」，React 会在同一次提交里卸载旧实例、挂载新实例：
+   * 新实例 attach 好内核之后，旧实例的清理才跑 —— 若此刻直接 detach，会把新实例刚准备好的
+   * 内核销毁，表现为「切集后抓到了流却一直黑屏/0 秒」。所以这里延迟 600ms 再判断，
+   * 只有确实没有任何播放实例存活时才释放内核。
+   */
+  useEffect(() => {
+    const leave = enterPlayer()
+    return () => {
+      leave()
+      whenPlayerGone(() => {
+        void api.ruleWebview.close()
+        void api.ruleProbe.stop()
+        void api.vlc.detach()
+        void api.overlay.hide()
+      }, 600)
+    }
+  }, [])
+
   /** 转码流拖动进度：防抖后重启 FFmpeg（从目标时间继续转码） */
   const seekLive = (t: number) => {
     if (!currentFile || !live) return
@@ -935,16 +1127,16 @@ export function PlayerPage() {
     [applyAspect, saveSettings]
   )
 
-  // ---------- 全屏控制栏悬浮窗 ----------
+  // ---------- 控制栏悬浮窗 ----------
   /**
-   * 原生视频窗口永远盖在网页之上，全屏后画面铺满整屏就会挡住页面里的控制栏，
-   * 所以全屏且没有抽屉占用空间时，控制栏改由独立的透明悬浮窗绘制（见 playerOverlay.ts）。
+   * 原生视频窗口永远盖在网页之上：页面里的控制栏、选集面板、详情面板都看不见。
    *
-   * v0.2.4 起不再只在全屏生效：小窗口时原生视频窗口同样盖在网页之上，
-   * 页面里的控制栏既看不见、又把画面挤小（用户反馈「小窗口播放画面填不满」）。
-   * 现在只要没打开抽屉，就把画面铺满整窗、控制栏交给悬浮窗，两种模式表现一致。
+   * v0.2.4：不再只在全屏生效 —— 小窗口下同样交给悬浮窗，否则控制栏会把画面挤小。
+   * v0.2.6：改为「只要用的是原生内核就一直接管」，因为选集与详情面板也搬进了悬浮窗：
+   * 打开它们时画面不再需要让位（用户反馈「打开播放列表不该改动播放内容页面」），
+   * 同时修掉「详情按钮点了没反应」——面板过去画在页面里，被原生视频窗口完全盖住了。
    */
-  const overlayActive = !showEpisodes && !showInfo
+  const overlayActive = vlcState !== 'fallback'
   useEffect(() => {
     if (overlayActive) void api.overlay.show()
     else void api.overlay.hide()
@@ -1035,9 +1227,23 @@ export function PlayerPage() {
           poke()
           break
         case 'toggleInfo':
-          setShowInfo(true)
-          void loadDetail()
+          setShowInfo((v) => !v)
+          if (!detail) void loadDetail()
           poke()
+          break
+        /** 选集浮层里点了某一集（v0.2.6：与规则页选集走同一套「重新挂载」逻辑） */
+        case 'selectEpisode':
+          void handleRuleEpisode(a.line, a.ep)
+          break
+        /** 断点续播提示：撤销跳转 → 回到开头 */
+        case 'undoResume':
+          setCurrent(0)
+          void api.vlc.seek(0)
+          setResumeHint(null)
+          toast.info('已回到本集开头')
+          break
+        case 'dismissResume':
+          setResumeHint(null)
           break
         case 'snapshot':
           void api.vlc.snapshot(state.title).then((r) => {
@@ -1109,13 +1315,21 @@ export function PlayerPage() {
       subIdx: vlcSubIdx,
       fullscreen,
       status: playStatus,
-      error: videoError ?? (ruleProbeFailed ? '未能捕获到视频流，请切换线路或退出' : null)
+      error: videoError ?? (ruleProbeFailed ? '未能捕获到视频流，请切换线路或退出' : null),
+      // v0.2.6：选集/详情/续播提示都交给悬浮窗绘制（页面里的浮层会被原生视频窗口盖住）
+      showEpisodes,
+      showInfo,
+      currentLine: line,
+      currentEp: ruleCurrent?.ep ?? 0,
+      subjectId: state.subjectId,
+      resume: resumeHint ? { target: resumeHint.target } : null
     })
   }, [
     overlayActive,
     state.title,
     state.mode,
     state.groups,
+    state.subjectId,
     ruleCurrent,
     currentFile,
     currentIndex,
@@ -1131,8 +1345,28 @@ export function PlayerPage() {
     fullscreen,
     playStatus,
     videoError,
-    ruleProbeFailed
+    ruleProbeFailed,
+    showEpisodes,
+    showInfo,
+    resumeHint
   ])
+
+  /**
+   * 选集数据单独推送（低频）：只在选集列表或当前集变化时发送，
+   * 不跟着每秒多次的进度推送走，避免无谓的大数组传输。
+   */
+  useEffect(() => {
+    if (!overlayActive || state.mode !== 'rule') return
+    const groups = state.groups ?? []
+    api.overlay.setEpisodes({
+      lines: groups.map((g, i) => ({
+        name: g.lineName ?? `线路 ${i + 1}`,
+        episodes: g.episodes.map((e, j) => e.name || `第 ${j + 1} 集`)
+      })),
+      currentLine: ruleCurrent?.line ?? 0,
+      currentEp: ruleCurrent?.ep ?? 0
+    })
+  }, [overlayActive, state.mode, state.groups, ruleCurrent])
 
   // 播放历史记录（方案 3.2 历史 + 继续观看）
   const recordWatch = useCallback(() => {
@@ -1972,11 +2206,12 @@ function VlcModeUI({
   const barCls = `z-30 shrink-0 transition-opacity duration-300 ${visible ? 'opacity-100' : 'pointer-events-none opacity-0'}`
   const topBarCls = `${barCls} flex h-14 items-center justify-between bg-gradient-to-b from-black/70 via-black/25 to-transparent px-2`
   /**
-   * 没有抽屉时画面铺满整窗（`fixed inset-0`），控制栏由透明悬浮窗绘制；
-   * 打开抽屉后回到常规布局（画面只占内容行），让抽屉可见可点。
-   * 组件内部同样用 overlayActive 决定要不要画页面内的控制栏，避免与悬浮窗重复。
+   * v0.2.6：本组件只在「原生内核可用」时渲染（fallback 走另一条 HTML5 分支），
+   * 而原生视频窗口永远盖在网页之上，页面里画的控制栏/抽屉都看不见。
+   * 因此这里恒为 true：页面内控制栏不再渲染，画面铺满整窗，
+   * 控制栏与选集/详情浮层统一由悬浮窗绘制。
    */
-  const overlayActive = !showEpisodes && !showInfo
+  const overlayActive = true
   const bottomBarCls = `${barCls} flex flex-col gap-1 bg-gradient-to-t from-black/75 via-black/30 to-transparent px-3 pb-2 pt-6`
 
   return (

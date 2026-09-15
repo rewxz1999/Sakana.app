@@ -255,6 +255,14 @@ export interface WatchProgressItem {
   filePath?: string
   positionSec: number
   durationSec: number
+  /**
+   * 每集各自的断点（v0.2.6）。
+   *
+   * 只用 positionSec 会串集：第 1 集看到 20 分钟，自动连播到第 2 集时会把「整部番剧的断点」
+   * 当成第 2 集的位置，一开播就跳到 20 分钟处。这里按集号分别记录，键同 watched（`线路:集`）。
+   */
+  positions?: Record<string, number>
+  durations?: Record<string, number>
   updatedAt: number
 }
 

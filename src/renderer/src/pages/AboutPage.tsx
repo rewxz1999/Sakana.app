@@ -6,9 +6,12 @@ import { useSettings } from '@/stores/app'
 import { toast } from '@/stores/app'
 import { Button } from '@/components/ui'
 import { Card, SubPage } from '@/components/SettingsShell'
+// 应用图标：resources/icon.png 只是打包资源，渲染层无法直接引用，
+// 因此把同一份图标复制为渲染层静态资源由 Vite 打包（与 sidebar-art.png 同一做法）。
+import appIcon from '@/assets/app-icon.png'
 
 /** 版本号兜底（正常情况下由主进程 app.getVersion() 提供，避免多处硬编码漂移） */
-const APP_VERSION_FALLBACK = '0.2.5'
+const APP_VERSION_FALLBACK = '0.2.6'
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -83,7 +86,15 @@ export function AboutPage() {
     <SubPage icon={Info} title="关于 Sakana" desc="版本、数据来源、目录与内置组件信息" maxWidth="max-w-xl">
       {/* 版本 */}
       <div className="flex flex-col items-center gap-1 py-2 text-center">
-        <span className="text-4xl">🐟</span>
+        {/* 原本这里是一个 🐟 emoji 占位，改用打包内的应用封面图标，保证与任务栏/安装包图标一致 */}
+        <img
+          src={appIcon}
+          alt="Sakana 应用图标"
+          width={80}
+          height={80}
+          draggable={false}
+          className="h-20 w-20 select-none rounded-2xl object-contain shadow-sm"
+        />
         <div className="text-base font-bold">Sakana</div>
         <div className="text-xs text-faint">版本 v{version}</div>
         <div className="text-[11px] text-faint">番剧管理及播放桌面客户端</div>

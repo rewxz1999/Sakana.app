@@ -2,9 +2,16 @@ import { randomUUID } from 'node:crypto'
 import type { LogEntry } from '@shared/types'
 import { store } from './store'
 
+/**
+ * 运行日志保留最近 1000 条，超出丢弃最旧的。
+ * - 该上限同时约束内存数组与持久化的 JSON（append 时先裁剪再 store.set），
+ *   因此存档文件不会随运行时长无限膨胀。
+ * - 1000 条足够覆盖一次完整播放/下载排障过程；更早的记录已无追溯价值，
+ *   继续保留只会让 userData/data/logs.json 与日志页渲染变慢。
+ */
 const MAX_ENTRIES = 1000
 
-/** 错误日志服务（方案 6：记录应用异常、网络失败、下载器错误，可复制） */
+/** 运行日志服务（方案 6：记录应用异常、网络失败、下载器错误，可复制） */
 class LogService {
   private entries: LogEntry[] = []
   private targets = new Set<(e: LogEntry) => void>()

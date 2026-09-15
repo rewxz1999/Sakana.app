@@ -41,6 +41,25 @@ function stopFollowing(): void {
 function startFollowing(owner: BrowserWindow): void {
   stopFollowing()
   const sync = (): void => syncBounds()
+  /**
+   * 主窗口失焦 / 最小化时把悬浮窗一并藏起来。
+   *
+   * 悬浮窗是 `alwaysOnTop('screen-saver')` 的置顶窗口 —— 用户切到别的应用后它依然浮在最上层
+   * （反馈里的「播放器退到后台了控制栏还在前台」就是它，出现次数少是因为多数时候控制栏刚好是隐藏态）。
+   * 重新获得焦点 / 还原窗口时再显示。
+   */
+  const hideForOwner = (): void => {
+    if (overlayWin && !overlayWin.isDestroyed()) overlayWin.hide()
+  }
+  const showForOwner = (): void => {
+    if (overlayWin && !overlayWin.isDestroyed()) overlayWin.showInactive()
+  }
+  owner.on('blur', hideForOwner)
+  owner.on('minimize', hideForOwner)
+  owner.on('hide', hideForOwner)
+  owner.on('focus', showForOwner)
+  owner.on('restore', showForOwner)
+  owner.on('show', showForOwner)
   owner.on('resize', sync)
   owner.on('move', sync)
   owner.on('maximize', sync)
@@ -48,6 +67,12 @@ function startFollowing(owner: BrowserWindow): void {
   owner.on('enter-full-screen', sync)
   owner.on('leave-full-screen', sync)
   followDisposers = [
+    () => owner.off('blur', hideForOwner),
+    () => owner.off('minimize', hideForOwner),
+    () => owner.off('hide', hideForOwner),
+    () => owner.off('focus', showForOwner),
+    () => owner.off('restore', showForOwner),
+    () => owner.off('show', showForOwner),
     () => owner.off('resize', sync),
     () => owner.off('move', sync),
     () => owner.off('maximize', sync),
@@ -143,6 +168,12 @@ export function setOverlayInteractive(interactive: boolean): void {
 export function pushOverlayState(state: unknown): void {
   if (!overlayWin || overlayWin.isDestroyed()) return
   overlayWin.webContents.send(CH.overlayState, state)
+}
+
+/** 播放页 → 悬浮窗：同步选集数据（低频） */
+export function pushOverlayEpisodes(payload: unknown): void {
+  if (!overlayWin || overlayWin.isDestroyed()) return
+  overlayWin.webContents.send(CH.overlayEpisodes, payload)
 }
 
 /** 播放页 → 悬浮窗：唤出控制栏（鼠标移动） */

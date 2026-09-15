@@ -37,7 +37,7 @@ const SMALL_WINDOW_TITLES: Record<string, string> = {
   '/rules': '规则管理',
   '/shortcuts': '播放器快捷键',
   '/datasource': '数据源配置',
-  '/logs': '错误日志',
+  '/logs': '运行日志',
   '/about': '关于 Sakana',
   '/save-dirs': '文件保存配置',
   '/nav-bg': '导航栏背景',
@@ -94,7 +94,7 @@ function AnimatedRoutes() {
         <Route path="/galgame/tools" element={<PageTransition><GalgameToolsPage /></PageTransition>} />
         <Route path="/downloads-win" element={<DownloadDetailPage />} />
         <Route path="/subject/:id" element={<PageTransition><SubjectDetailPage /></PageTransition>} />
-        <Route path="/player" element={<PlayerPage />} />
+        <Route path="/player" element={<PlayerRoute />} />
         <Route path="/overlay" element={<PlayerOverlayPage />} />
         <Route path="/tray" element={<TrayPanelPage />} />
         {/* 兜底：hash 不匹配任何路由时给出明确提示，避免窗口一片空白 */}
@@ -104,8 +104,22 @@ function AnimatedRoutes() {
   )
 }
 
-/** 未匹配路由的提示页（副窗口空白问题的可见化兜底） */
-function NotFoundPage() {
+/**
+ * 播放页路由包装：用 `playKey` 作为 React key。
+ *
+ * 为什么需要：react-router 里 navigate 到**同一个路由**（/player → /player）时组件不会重新挂载，
+ * 只会更新 location.state。而「播放器内切集」依赖一次干净的重建（内核重新 attach、
+ * 嗅探窗口重新创建），否则会出现旧状态残留、切集后卡在 0 秒。
+ * 切集时 state 里带一个新的 playKey，这里就会把 PlayerPage 整个重建一次，
+ * 效果与「从番剧详情页重新进入播放页」完全一致。
+ */
+function PlayerRoute() {
+  const location = useLocation()
+  const key = (location.state as { playKey?: number } | null)?.playKey ?? 'player'
+  return <PlayerPage key={key} />
+}
+
+/** 未匹配路由的提示页（副窗口空白问题的可见化兜底） */function NotFoundPage() {
   const location = useLocation()
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">

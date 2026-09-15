@@ -59,6 +59,26 @@ export interface OverlayState {
   status: { kind: PlayStatus; text: string }
   /** 失败原因，非空时悬浮窗显示可退出的错误条 */
   error?: string | null
+  /**
+   * v0.2.6：选集与详情面板改由悬浮窗绘制。
+   * 原生视频窗口永远盖在网页之上，画在页面里的抽屉根本看不见（用户反馈「详情点了没反应」），
+   * 所以这两个面板和状态栏一样走悬浮窗，做成半透明浮层盖在画面上。
+   */
+  showEpisodes: boolean
+  showInfo: boolean
+  currentLine: number
+  currentEp: number
+  /** 番剧 id：悬浮窗自己去拉详情，避免把大对象塞进高频状态推送 */
+  subjectId?: number
+  /** 断点续播提示（非空时悬浮窗右下角显示「撤销跳转」）：同样因为画在页面里会被视频盖住 */
+  resume?: { target: number } | null
+}
+
+/** 选集数据（低频变化，单独走一个通道；避免把大数组塞进每秒多次的状态推送） */
+export interface OverlayEpisodes {
+  lines: { name: string; episodes: string[] }[]
+  currentLine: number
+  currentEp: number
 }
 
 /** 悬浮窗 → 播放页 的控制栏动作 */
@@ -81,6 +101,11 @@ export type OverlayAction =
   | { type: 'toggleFullscreen' }
   | { type: 'exitFullscreen' }
   | { type: 'exitPlayer' }
+  /** 选集浮层里点了某一集 */
+  | { type: 'selectEpisode'; line: number; ep: number }
+  /** 断点续播提示上的两个按钮 */
+  | { type: 'undoResume' }
+  | { type: 'dismissResume' }
 
 /** 渲染层通过 window.sakana 访问的完整 API 契约（preload 实现） */
 export interface SakanaApi {
@@ -214,6 +239,9 @@ export interface SakanaApi {
     hide(): Promise<ApiResult<boolean>>
     setInteractive(interactive: boolean): Promise<ApiResult<boolean>>
     pushState(state: OverlayState): void
+    /** v0.2.6：推送选集数据（低频），供悬浮窗绘制半透明选集浮层 */
+    setEpisodes(payload: OverlayEpisodes): void
+    onEpisodes(cb: (payload: OverlayEpisodes) => void): () => void
     poke(): void
     action(action: OverlayAction): void
     onState(cb: (state: OverlayState) => void): () => void

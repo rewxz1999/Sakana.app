@@ -50,6 +50,7 @@ import {
 import {
   destroyOverlay,
   pokeOverlay,
+  pushOverlayEpisodes,
   pushOverlayState,
   sendOverlayAction,
   setOverlayInteractive,
@@ -395,6 +396,7 @@ export function registerIpc(): void {
     destroyOverlay()
     return true
   })
+  ipcMain.on(CH.overlayEpisodes, (_e, payload: unknown) => pushOverlayEpisodes(payload))
   ipcMain.handle(CH.overlaySetSpace, (_e, interactive: boolean) => {
     setOverlayInteractive(interactive)
     return true
@@ -572,7 +574,8 @@ export function registerIpc(): void {
       const ts = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
       return `[${ts}] [${e.level.toUpperCase()}] [${e.source}] ${e.message}`
     })
-    return lines.slice(-500).join('\n')
+    // 与 log.ts 的 1000 条上限保持一致，避免两处数字漂移导致「保存 1000 条却只看到 500 条」
+    return lines.slice(-1000).join('\n')
   })
   ipcMain.handle(CH.appDataPath, () => app.getPath('userData'))
   ipcMain.handle(CH.appVersion, () => app.getVersion())

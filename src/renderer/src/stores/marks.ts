@@ -5,6 +5,21 @@ import { api } from '@/lib/api'
 /** 搜索历史保留上限（产品要求 50 条） */
 export const HISTORY_LIMIT = 50
 
+/**
+ * 搜索页底部展示位（轮播图）的持久化键。
+ * 值为图片**绝对路径**数组，交给 sakana-img 协议加载；键名由产品方指定。
+ */
+export const SHOWCASE_KEY = 'searchShowcase'
+
+/**
+ * 持久化数据来自磁盘（旧版本、手工改动、写入中断都可能出现脏值），
+ * 逐项收窄成 string[]，避免把非法值喂给图片协议。
+ */
+function toPathList(v: unknown): string[] {
+  if (!Array.isArray(v)) return []
+  return v.filter((x): x is string => typeof x === 'string' && x.length > 0)
+}
+
 /** 标记一条番剧所需的最小字段：搜索结果里即可拿全，无需再请求详情 */
 export interface MarkSubjectInput {
   subjectId: number
@@ -16,6 +31,8 @@ interface MarksState {
   lists: MarkList[]
   items: MarkItem[]
   history: SearchHistoryItem[]
+  /** 搜索页底部展示位的图片路径（轮播），与列表/条目共用一次 load() */
+  showcase: string[]
   loaded: boolean
   load: () => Promise<void>
   createList: (name?: string) => MarkList
@@ -26,38 +43,46 @@ interface MarksState {
   isMarked: (listId: string, subjectId: number) => boolean
   pushHistory: (kw: string) => void
   clearHistory: () => void
+  /** 追加展示图片，返回真正新增的张数（已存在的会被忽略） */
+  addShowcase: (paths: string[]) => number
+  removeShowcase: (path: string) => void
+  clearShowcase: () => void
 }
 
 /**
- * 默认列表名「标记列表 N」：取现有同名序号的**最大值 +1**。
- * 若按列表数量命名，删掉中间某个列表后就会与既有名字重复，导致用户无法区分。
+ * 默认书签名「书签 N」：取现有同名序号的**最大值 +1**。
+ * 若按书签数量命名，删掉中间某个书签后就会与既有名字重复，导致用户无法区分。
+ * 同时兼容 v0.2.5 的旧前缀「标记列表 N」（当时的「标记区域」）：老数据升级后序号不倒退、不重名。
  */
 export function defaultListName(lists: MarkList[]): string {
   const used = new Set(lists.map((l) => l.name))
   let n = 1
   for (const l of lists) {
-    const m = /^标记列表\s*(\d+)$/.exec(l.name)
+    const m = /^(?:书签|标记列表)\s*(\d+)$/.exec(l.name)
     if (m) n = Math.max(n, Number(m[1]) + 1)
   }
-  while (used.has(`标记列表 ${n}`)) n += 1
-  return `标记列表 ${n}`
+  while (used.has(`书签 ${n}`)) n += 1
+  return `书签 ${n}`
 }
 
 export const useMarks = create<MarksState>((set, get) => ({
   lists: [],
   items: [],
   history: [],
+  showcase: [],
   loaded: false,
   load: async () => {
-    const [l, i, h] = await Promise.all([
+    const [l, i, h, s] = await Promise.all([
       api.store.get('markLists'),
       api.store.get('markItems'),
-      api.store.get('searchHistory')
+      api.store.get('searchHistory'),
+      api.store.get(SHOWCASE_KEY)
     ])
     set({
       lists: l.ok && Array.isArray(l.data) ? (l.data as MarkList[]) : [],
       items: i.ok && Array.isArray(i.data) ? (i.data as MarkItem[]) : [],
       history: h.ok && Array.isArray(h.data) ? (h.data as SearchHistoryItem[]) : [],
+      showcase: s.ok ? toPathList(s.data) : [],
       loaded: true
     })
   },
@@ -123,5 +148,31 @@ export const useMarks = create<MarksState>((set, get) => ({
   clearHistory: () => {
     set({ history: [] })
     void api.store.set('searchHistory', [])
+  },
+  // 同一张图重复加入只会让轮播停在同图上，因此按路径去重并返回真实新增数，让页面能给出准确提示
+  addShowcase: (paths) => {
+    const before = get().showcase
+    const seen = new Set(before)
+    const next = [...before]
+    for (const p of paths) {
+      if (typeof p !== 'string' || p.length === 0 || seen.has(p)) continue
+      seen.add(p)
+      next.push(p)
+    }
+    const added = next.length - before.length
+    if (added === 0) return 0
+    set({ showcase: next })
+    void api.store.set(SHOWCASE_KEY, next)
+    return added
+  },
+  removeShowcase: (path) => {
+    const next = get().showcase.filter((p) => p !== path)
+    set({ showcase: next })
+    void api.store.set(SHOWCASE_KEY, next)
+  },
+  // 只清展示列表，不动磁盘上的图片文件
+  clearShowcase: () => {
+    set({ showcase: [] })
+    void api.store.set(SHOWCASE_KEY, [])
   }
 }))
