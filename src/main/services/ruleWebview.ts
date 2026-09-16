@@ -4,7 +4,13 @@ import { log } from '../log'
 import { BROWSER_UA } from '../net'
 import { addProbeListeners } from './probeEvents'
 import { noteCapturedStream } from './playerInfo'
-import { MEDIA_EXT_RE, extractStreamFromHtml, notifyProbeHook, resolvePlayable } from './ruleProbe'
+import {
+  MEDIA_EXT_RE,
+  extractStreamCandidates,
+  notifyProbeHook,
+  rememberStream,
+  resolveFirstPlayable
+} from './ruleProbe'
 
 /**
  * Kazumi 式在线播放（useWebview）：
@@ -21,6 +27,18 @@ import { MEDIA_EXT_RE, extractStreamFromHtml, notifyProbeHook, resolvePlayable }
 let view: BrowserWindow | null = null
 let hostWin: BrowserWindow | null = null
 let active = false
+/**
+ * 嗅探窗口「代号」（v0.2.7 附加）。
+ *
+ * 关闭是**异步**的（IPC 侧 setImmediate，避免销毁窗口阻塞渲染层），
+ * 而渲染层在重试时会连续做两件事：先 close 上一次的窗口、紧接着 open 新窗口。
+ * 两个请求落在同一轮事件循环里，于是那条延迟的 close 会把**刚建好的新窗口**销毁掉：
+ * 日志表现是「打开网页视图嗅探」→ 立刻「target closed」→「CDP Network.enable 失败」，
+ * 结果是重试永远抓不到流、卡在「捕捉视频流中」直到超时 ——
+ * 这正是用户反馈的「所有规则下的播放都跑不通」。
+ * 每次 open 递增代号；延迟的 close 只允许关闭它当初看到的那个代号。
+ */
+let viewGen = 0
 /** 当前网页视图嗅探的监听注销函数 */
 let disposeListeners: (() => void) | null = null
 let foundUrls: string[] = []
@@ -172,6 +190,7 @@ export function openRuleWebview(
   foundUrls = []
   emitWin = mainWin
   hostWin = mainWin
+  const myGen = ++viewGen
 
   /*
    * 用「屏幕外可见的 BrowserWindow」而不是 WebContentsView。
@@ -341,13 +360,15 @@ export function openRuleWebview(
     log.append('warn', 'rule-webview', `CDP 不可用: ${String(err)}`)
   }
 
-  // 3) 播放页 HTML 直出地址（MacCMS player_aaaa 等）——校验可播后优先采用
-  void extractStreamFromHtml(url, referer).then(async (direct) => {
-    if (!active || !direct) return
-    const ok = await resolvePlayable(direct, referer)
+  // 3) 播放页 HTML 直出地址（MacCMS player_aaaa 等）——**多候选并行探测**后优先采用
+  void extractStreamCandidates(url, referer).then(async (candidates) => {
+    if (!active || candidates.length === 0) return
+    const ok = await resolveFirstPlayable(candidates, referer)
     if (!active || !ok) return
     // referer 空串 = 经校验确定不能带 Referer（很多 CDN 因 Referer 返回 400）
     reportFound(ok.url, 'direct', ok.referer ?? '')
+    // 记进会话直链缓存：同一集来回切、退出再进都能直接用，省掉整轮嗅探
+    rememberStream(url, ok.url, ok.referer ?? referer)
   })
 
   // 3b) 嵌套播放器：播放页 JS 常把真实播放页塞进 iframe（如 baimao 的 #hm_playfram），
@@ -366,48 +387,71 @@ export function openRuleWebview(
     for (const src of srcs.slice(0, 3)) {
       if (!active) return
       log.append('info', 'rule-webview', `发现内嵌播放器 iframe: ${src.slice(0, 120)}`)
-      const inner = await extractStreamFromHtml(src, referer || url)
-      if (!inner) continue
-      const okInner = await resolvePlayable(inner, referer)
+      const inner = await extractStreamCandidates(src, referer || url)
+      if (inner.length === 0) continue
+      const okInner = await resolveFirstPlayable(inner, referer)
       if (okInner) {
         reportFound(okInner.url, 'direct', okInner.referer ?? '')
+        rememberStream(url, okInner.url, okInner.referer ?? referer)
         return
       }
     }
   }
-  for (const d of [4000, 9000, 15000]) {
+  /*
+   * iframe 抽取的时机（v0.2.7 附加 提速）：
+   * 过去是 4000 / 9000 / 15000ms —— 而 iframe 的 src 通常**首屏 HTML 里就有**，
+   * 早一点抽就能早几秒拿到真实播放页地址。现在提前到 600 / 1800 / 4000 / 9000，
+   * 同时保留较晚的一次以覆盖「JS 动态插入 iframe」的站点。
+   */
+  for (const d of [600, 1800, 4000, 9000]) {
     setTimeout(() => {
       void digIframe()
     }, d)
   }
 
-  // 4) 页面加载完成后注入自动播放（含全部子框架，跨域 iframe 播放器也能点到）
-  wc.on('did-finish-load', () => {
-    const runAutoPlay = (): void => {
-      if (!active) return
-      const frames = [wc.mainFrame, ...wc.mainFrame.framesInSubtree]
-      for (const f of frames) {
-        if (!f || f.isDestroyed()) continue
-        // 脚本会返回播放按钮的中心坐标：再用真实鼠标事件点一次
-        // （合成 click 的 isTrusted=false 会被部分站点直接丢弃，见 AUTO_PLAY_SCRIPT 注释）
-        void f
-          .executeJavaScript(AUTO_PLAY_SCRIPT, true)
-          .then((raw) => {
-            if (!active || typeof raw !== 'string' || raw === 'null') return
-            const pt = JSON.parse(raw) as { x?: number; y?: number }
-            if (typeof pt?.x !== 'number' || typeof pt?.y !== 'number') return
-            sendRealClick(wc, pt.x, pt.y)
-          })
-          .catch(() => undefined)
-      }
-      void wc
-        .executeJavaScript(
-          `Array.from(document.querySelectorAll('iframe')).forEach(f=>{try{f.click()}catch(e){}})`,
-          true
-        )
+  /*
+   * 4) 注入自动播放（含全部子框架，跨域 iframe 播放器也能点到）。
+   *
+   * v0.2.7 附加（提速）：过去只在 `did-finish-load` 之后才开始点播放 ——
+   * 而 `did-finish-load` 要等**所有子资源**（广告图、统计脚本…）加载完，
+   * 慢站点上这一步就要好几秒。播放器的播放按钮在 DOM 就绪后通常已经存在，
+   * 所以现在 `dom-ready` 就先点几轮，`did-finish-load` 再补几轮，取两者中更早生效的。
+   */
+  const runAutoPlay = (): void => {
+    /*
+     * v0.2.7 附加：这里过去只判断全局 `active`，但**新一轮嗅探会把它重新置为 true**，
+     * 于是上一轮残留的定时器会拿着已销毁的 webContents 去读 `mainFrame` ——
+     * 主进程抛未捕获异常 `TypeError: Object has been destroyed`（日志实测出现过）。
+     * 必须连窗口/webContents 自身的存活一起判断。
+     */
+    if (!active || viewGen !== myGen || captureWin.isDestroyed() || wc.isDestroyed()) return
+    const frames = [wc.mainFrame, ...wc.mainFrame.framesInSubtree]
+    for (const f of frames) {
+      if (!f || f.isDestroyed()) continue
+      // 脚本会返回播放按钮的中心坐标：再用真实鼠标事件点一次
+      // （合成 click 的 isTrusted=false 会被部分站点直接丢弃，见 AUTO_PLAY_SCRIPT 注释）
+      void f
+        .executeJavaScript(AUTO_PLAY_SCRIPT, true)
+        .then((raw) => {
+          if (!active || typeof raw !== 'string' || raw === 'null') return
+          const pt = JSON.parse(raw) as { x?: number; y?: number }
+          if (typeof pt?.x !== 'number' || typeof pt?.y !== 'number') return
+          sendRealClick(wc, pt.x, pt.y)
+        })
         .catch(() => undefined)
     }
-    for (const d of [800, 2200, 4500, 8000, 12000]) setTimeout(runAutoPlay, d)
+    void wc
+      .executeJavaScript(
+        `Array.from(document.querySelectorAll('iframe')).forEach(f=>{try{f.click()}catch(e){}})`,
+        true
+      )
+      .catch(() => undefined)
+  }
+  wc.on('dom-ready', () => {
+    for (const d of [300, 1200, 2600, 5000]) setTimeout(runAutoPlay, d)
+  })
+  wc.on('did-finish-load', () => {
+    for (const d of [300, 1500, 4000, 9000]) setTimeout(runAutoPlay, d)
   })
 
   const loadOpts: Electron.LoadURLOptions = { userAgent: BROWSER_UA }
@@ -422,7 +466,8 @@ export function openRuleWebview(
 
   // 30 秒兜底：仍未命中则收尾（渲染层据此显示失败+退出）
   doneTimer = setTimeout(() => {
-    if (!active) return
+    // 代号必须还是自己：否则这是上一轮残留的兜底，会给新一轮发一个假的「结束」
+    if (!active || viewGen !== myGen) return
     const best = pickBest(foundUrls)
     emit({
       type: 'done',
@@ -434,6 +479,11 @@ export function openRuleWebview(
 
   log.append('info', 'rule-webview', `打开网页视图嗅探: ${url.slice(0, 120)}`)
   return true
+}
+
+/** 当前嗅探窗口的代号：调用方在**发关闭请求**时取一次，延迟执行时用它判断是否已被新窗口取代 */
+export function currentRuleWebviewGen(): number {
+  return viewGen
 }
 
 /** 更新嗅探窗口尺寸（屏幕外窗口，仅保持合理视口，不影响用户界面） */
@@ -456,8 +506,15 @@ export function setRuleWebviewBounds(bounds: {
 
 /** 关闭并销毁网页视图（命中流地址后立即调用：用完即毁）
  *  注意：不要同步销毁——页面仍在加载时 webContents.close() 会阻塞主进程，
- *  表现为"退出播放时界面卡死"。先停止加载并摘除视图，真正销毁放到下一个事件循环。 */
-export function closeRuleWebview(): void {
+ *  表现为"退出播放时界面卡死"。先停止加载并摘除视图，真正销毁放到下一个事件循环。
+ *
+ *  @param gen 调用方看到的代号（`currentRuleWebviewGen()`）。
+ *             传了就只关闭「同一个」窗口：延迟执行期间若已经打开了新窗口，这次关闭作废，
+ *             否则会把新窗口一起销毁（见 viewGen 注释）。
+ */
+export function closeRuleWebview(gen?: number): void {
+  if (gen !== undefined && gen !== viewGen) return
+  viewGen += 1 // 之后到达的旧 close 请求一律作废
   active = false
   if (disposeListeners) {
     try {

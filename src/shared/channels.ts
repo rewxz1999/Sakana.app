@@ -47,6 +47,15 @@ export const CH = {
   rulesSearch: 'rules:search',
   rulesEpisodes: 'rules:episodes',
   rulesPlay: 'rules:play',
+  /*
+   * v0.2.7 附加：直链会话缓存与预取 —— 用来加速「进入播放」与「播放器内切集」。
+   * - cachedStream：查某个播放页已缓存的直链（命中就跳过整轮嗅探）
+   * - prefetchStream：后台预取某个播放页的直链（只走 HTML 直出，不开窗口）
+   * - rememberStream：把刚嗅探到的直链记进缓存
+   */
+  rulesCachedStream: 'rules:cached-stream',
+  rulesPrefetchStream: 'rules:prefetch-stream',
+  rulesRememberStream: 'rules:remember-stream',
 
   // 媒体
   mediaListVideos: 'media:list-videos',

@@ -15,7 +15,7 @@ import type { LocalSubFile, LocalVideoFile } from '@shared/types'
 import { parseEpisode } from '../lib/parse'
 import { log } from '../log'
 import { BROWSER_UA, getSettings } from '../net'
-import { rewriteImageUrl } from './bangumi'
+import { rewriteImageUrl, unresizedImageUrl } from './bangumi'
 import { liveStream } from './transcode'
 
 const VIDEO_EXTS = new Set([
@@ -357,8 +357,45 @@ function refererFor(target: string): string | undefined {
   return undefined
 }
 
+/**
+ * 图片取数的并发闸门（v0.2.7 附加）。
+ *
+ * 番剧表一屏就有十几张卡片，收藏/搜索结果更多。过去它们是**一次性全部并发**打向图片反代，
+ * 实测反代在并发下会明显劣化（同图并发 4 时单张要 200 秒，并发 8 时 48 秒），
+ * 表现就是「卡片经常加载不出来」。这里限制同时最多 4 张在取，其余排队 ——
+ * 单张只要 0.6~1 秒，整体反而更快、更稳定。
+ */
+const IMG_CONCURRENCY = 4
+let imgInFlight = 0
+const imgQueue: (() => void)[] = []
+
+async function withImageSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (imgInFlight >= IMG_CONCURRENCY) {
+    await new Promise<void>((resolve) => imgQueue.push(resolve))
+  }
+  imgInFlight += 1
+  try {
+    return await fn()
+  } finally {
+    imgInFlight -= 1
+    const next = imgQueue.shift()
+    if (next) next()
+  }
+}
+
+/** 单次图片请求超时（毫秒）：卡住的图不能一直占着并发额度 */
+const IMG_TIMEOUT = 20000
+
+async function fetchImageOnce(target: string): Promise<Response> {
+  const headers: Record<string, string> = { 'User-Agent': BROWSER_UA }
+  const referer = refererFor(target)
+  if (referer) headers['Referer'] = referer
+  const res = await fetch(target, { headers, signal: AbortSignal.timeout(IMG_TIMEOUT) })
+  return res
+}
+
 async function fetchImageWithCache(rawTarget: string): Promise<Response> {
-  // 配了自建图片反代时，官方图床地址改写到反代域名（Worker 按路径转发）
+  // 配了自建图片反代时，官方图床地址改写到反代域名（Worker 按路径转发 + 按需缩放）
   const target = rewriteImageUrl(rawTarget)
   const existing = inflight.get(target)
   if (existing) return existing
@@ -375,11 +412,35 @@ async function fetchImageWithCache(rawTarget: string): Promise<Response> {
         headers: { 'Content-Type': type, 'Cache-Control': 'max-age=86400' }
       })
     }
-    const headers: Record<string, string> = { 'User-Agent': BROWSER_UA }
-    const referer = refererFor(target)
-    if (referer) headers['Referer'] = referer
-    const res = await fetch(target, { headers })
-    if (!res.ok) return new Response('upstream error', { status: res.status })
+    /*
+     * 取图：并发受限 + 超时 + 一次重试 + 缩放路径兜底（v0.2.7 附加）。
+     * 反代在并发下会瞬时 429/5xx 或变慢，过去一次失败就直接给界面 502 →
+     * 卡片永久显示占位图（CoverImage 的 onError 之后不再重试）。
+     */
+    const attempt = async (url: string): Promise<Response | null> => {
+      for (let i = 0; i < 2; i++) {
+        try {
+          const res = await withImageSlot(() => fetchImageOnce(url))
+          if (res.ok) return res
+          if (res.status < 500 && res.status !== 429) return null // 4xx：重试也没意义
+          await new Promise((r) => setTimeout(r, 500 + i * 700))
+        } catch (err) {
+          log.append('warn', 'img', `取图失败（第 ${i + 1} 次）${url.slice(0, 90)}: ${String((err as Error)?.message ?? err)}`)
+          await new Promise((r) => setTimeout(r, 500 + i * 700))
+        }
+      }
+      return null
+    }
+    let res = await attempt(target)
+    if (!res) {
+      // 缩放路径可能没被反代支持：退回原图路径再试一次（宁可慢一点也要有图）
+      const plain = unresizedImageUrl(target)
+      if (plain !== target) {
+        log.append('info', 'img', `缩放路径不可用，改取原图: ${plain.slice(0, 90)}`)
+        res = await attempt(plain)
+      }
+    }
+    if (!res) return new Response('upstream error', { status: 502 })
     let type = res.headers.get('content-type') ?? 'image/jpeg'
     if (!type.startsWith('image/')) type = 'image/jpeg'
     const buf = Buffer.from(await res.arrayBuffer())

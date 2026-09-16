@@ -411,6 +411,23 @@ export function mpvPlay(path: string, referer?: string, cookies?: string): void 
   // 新媒体的视频输出窗口会在首帧时重建，届时需要再挂一次
   pendingReparent = true
   const loaded = native.command(['loadfile', path, 'replace'])
+  /*
+   * ⚠️ v0.2.7 附加 修「抓到了视频流却一直不播 / 连播与选集之后再也播不出来」。
+   *
+   * mpv 的 `loadfile` **会继承当前的 `pause` 状态**（这是 mpv 的既有行为）。
+   * 而我们的切集流程是「先暂停当前播放 → 重新挂载播放页 → 抓到新流后交给内核」，
+   * 于是新一集载入后直接停在 0 秒：内核明明在取流（日志能看到 m3u8 请求与分片），
+   * UI 却是「已暂停 00:00」；15 秒看门狗判定「直连未开播」→ 重试 → 仍然暂停，
+   * 于是一旦发生过一次切集，后面每一次播放都起不来（用户反馈的「所有规则都跑不通」就是这个）。
+   * 载入成功后必须显式解除暂停。
+   */
+  if (loaded) {
+    try {
+      native.setProperty('pause', false)
+    } catch {
+      /* ignore */
+    }
+  }
   log.append(
     'info',
     'mpv',
@@ -430,6 +447,12 @@ export function mpvSetPlaylist(paths: string[]): void {
       /* ignore */
     }
   })
+  // 同上：loadfile 会继承 pause，整套播放列表必须显式开播
+  try {
+    native.setProperty('pause', false)
+  } catch {
+    /* ignore */
+  }
 }
 
 export function mpvTogglePause(): void {

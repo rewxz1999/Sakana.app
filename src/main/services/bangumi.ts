@@ -20,10 +20,27 @@ import { parseCalendar, parseRatingOnly, parseSearchPage, parseSubjectPage } fro
 import { offscreenGet } from './offscreenFetch'
 
 const TTL_CALENDAR = 30 * 60 * 1000
-const TTL_SUBJECT = 7 * 24 * 3600 * 1000
+/*
+ * 详情缓存（v0.2.7 附加：7 天 → 30 天）。
+ *
+ * 自建反代是个人的 Worker 服务，条目详情（infobox / 标签 / 制作信息）属于**几乎不变**的数据，
+ * 真正的压力来自「同一部番反复打开详情页 + 播放器详情面板再次请求」。
+ * 延长缓存是最省反代、又完全不削减详情的办法：数据仍是完整的 v0 详情，
+ * 只是不再频繁往返；用户手动「刷新」时走的是下面的 stale-while-revalidate。
+ */
+const TTL_SUBJECT = 30 * 24 * 3600 * 1000
 const TTL_SEARCH = 30 * 60 * 1000
-const TTL_RATING = 7 * 24 * 3600 * 1000
+const TTL_RATING = 30 * 24 * 3600 * 1000
 const REQUEST_TIMEOUT = 12000
+/**
+ * 自建反代的并发闸门（v0.2.7 附加）。
+ *
+ * 反代通常是单个 Worker，实测并发一高就返回 5xx/429，而 5xx 会让整页「详情加载不出来」——
+ * 用户的要求是「减少压力但不削减详情」，所以这里只限并发、不砍字段、不加降级。
+ */
+const MAX_PROXY_CONCURRENCY = 2
+let proxyInFlight = 0
+const proxyQueue: (() => void)[] = []
 
 interface CacheEntry<T> {
   fetchedAt: number
@@ -40,6 +57,43 @@ function isApiHost(host: string): boolean {
 
 /** 已被墙的公共镜像：默认跳过（用户实测 bangumi.pro 已不可达，请求它只是白等） */
 const DEAD_MIRRORS = ['bangumi.pro']
+
+/**
+ * 并发闸门：同一时刻最多 N 个请求在飞，其余排队。
+ * 只用于自建反代（公共镜像本来就允许并行竞速，且它们的压力与我们无关）。
+ */
+async function withProxySlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (proxyInFlight >= MAX_PROXY_CONCURRENCY) {
+    await new Promise<void>((resolve) => proxyQueue.push(resolve))
+  }
+  proxyInFlight += 1
+  try {
+    return await fn()
+  } finally {
+    proxyInFlight -= 1
+    const next = proxyQueue.shift()
+    if (next) next()
+  }
+}
+
+/**
+ * 单飞（single-flight）：完全相同的 URL 在同一时刻只发一次请求。
+ *
+ * 实测最典型的重复请求：番剧详情页与播放器的「详情」面板会同时请求同一部番，
+ * 以及切集时旧实例的收尾请求。合并后反代实际收到的请求数直接减半，而返回的数据一模一样
+ * （不削减详情）。
+ */
+const jsonInflight = new Map<string, Promise<string>>()
+
+function singleFlight(key: string, fn: () => Promise<string>): Promise<string> {
+  const existing = jsonInflight.get(key)
+  if (existing) return existing
+  const p: Promise<string> = fn().finally(() => {
+    jsonInflight.delete(key)
+  })
+  jsonInflight.set(key, p)
+  return p
+}
 
 /** 连接被重置 / 中断（中间设备或站点限流导致），值得隔几秒重试一次 */
 function isNetworkReset(err: unknown): boolean {
@@ -90,23 +144,62 @@ function isApiMirror(mirror: string): boolean {
 }
 
 /**
- * 把官方图床地址改写到自建图片反代（Worker 的 IMG_HOST）。
- * Worker 按**路径**转发（`/pic/cover/l/xxx.jpg`），所以拼接时要保留反代地址自带的路径前缀。
+ * 是否是 bgm 系图床（需要改写到自建图片反代的地址）。
+ *
+ * v0.2.7 附加修：过去只认 `*.bgm.tv`，而**收藏/订阅里存的封面全是镜像图床**
+ * （实测 12 条收藏、3 条订阅的封面都是 `https://lain.bangumi.pro/pic/cover/l/…`），
+ * 这些域名不在判定里 → 从不改写 → 直连已墙的 bangumi.pro → 封面一律不显示。
+ * 同一路径经图片反代取是 200 image/jpeg（实测 369KB / 500KB），所以只要认下来就能救回。
+ */
+function isBangumiImageHost(host: string): boolean {
+  const h = host.toLowerCase()
+  if (/(^|\.)bgm\.tv$/.test(h)) return true // lain.bgm.tv / bgm.tv
+  if (/^lain\.bangumi\./.test(h)) return true // lain.bangumi.pro / .vip / .lol（镜像站图床）
+  // 镜像站主域名的图床（少数条目直接引用主站路径）
+  return /(^|\.)bangumi\.(pro|vip|lol|top|tv|fun|cc|me|one|in|site|plus)$/.test(h)
+}
+
+/**
+ * 把 bgm 系图床地址改写到自建图片反代（Worker 的 IMG_HOST）。
+ *
+ * Worker 按**路径**转发（`/pic/cover/l/xxx.jpg`），并且支持**按需缩放**：
+ * `{IMG_HOST}/r/<宽>/pic/cover/l/xxx.jpg` 会在 Worker 侧缩放到指定宽度。
+ * 所以拼接时要保留反代地址自带的路径前缀（`/img`），并在路径前插入 `/r/<宽>`。
  *
  * ⚠️ v0.2.7 修：过去这里用的是 `base.origin`，把反代地址里的 `/img` 前缀丢掉了 ——
  * 于是所有 `lain.bgm.tv` 封面都请求到 `https://反代/pic/...`（404），表现为「图片加载不出来」。
  * 实测：丢掉前缀 → 404；带上 `/img` → 200 image/jpeg。
+ *
+ * ⚠️ v0.2.7 附加 修「番剧表 / 订阅 / 收藏的卡片经常加载不出来」：
+ * 这些卡片取的是 `large` 封面，实测原图 **916KB、单张 5~9 秒**，并发一高直接劣化到几十秒；
+ * 而同一张图走缩放路径 `/r/400/` 只有 **53KB、0.66 秒**（`/r/200/` 16KB）——
+ * 反代本来就支持缩放，是我们没走。现在统一改写为缩放路径，卡片/详情页画质完全够用。
  */
-export function rewriteImageUrl(url: string): string {
+export function rewriteImageUrl(url: string, width = 400): string {
   const custom = (getSettings().bangumiCustomImg ?? '').trim().replace(/\/+$/, '')
   if (!custom || !url) return url
   try {
     const u = new URL(url)
-    // 只改官方图床（lain.bgm.tv / bgm.tv 系），其它地址（含反代自己的 /img）保持原样
-    if (!/(^|\.)bgm\.tv$/i.test(u.hostname)) return url
+    // 只改 bgm 系图床（含镜像站图床），其它地址（含反代自己已带 /r/ 的地址）保持原样
+    if (!isBangumiImageHost(u.hostname)) return url
     const base = new URL(custom)
     const prefix = base.pathname.replace(/\/+$/, '') // 例如 "/img"
-    return `${base.origin}${prefix}${u.pathname}${u.search}`
+    // 已经是缩放路径就不要重复加前缀
+    const path = width <= 0 || /^\/r\/\d+\//.test(u.pathname) ? u.pathname : `/r/${width}${u.pathname}`
+    return `${base.origin}${prefix}${path}${u.search}`
+  } catch {
+    return url
+  }
+}
+
+/** 去掉缩放前缀（`/img/r/400/pic/…` → `/img/pic/…`）：缩放路径万一不可用时的兜底 */
+export function unresizedImageUrl(url: string): string {
+  const custom = (getSettings().bangumiCustomImg ?? '').trim().replace(/\/+$/, '')
+  if (!custom || !url) return url
+  try {
+    const base = new URL(custom)
+    if (!url.startsWith(base.origin)) return url
+    return url.replace(/\/r\/\d+\//, '/')
   } catch {
     return url
   }
@@ -423,7 +516,11 @@ class BangumiService {
     if (custom) {
       const url = `${custom}${this.calendarPathFor(custom, paths)}`
       try {
-        const text = await this.fetchMirror(url, true)
+        /*
+         * 单飞 + 并发闸门（v0.2.7 附加）：不改变取到的数据，只减少反代实际收到的请求数。
+         * URL 相同的并发调用合并成一次；同时最多 2 个请求在飞，避免把个人 Worker 打成 5xx。
+         */
+        const text = await singleFlight(url, () => withProxySlot(() => this.fetchMirror(url, true)))
         return { text, mirror: custom }
       } catch (err) {
         const e = err as { code?: string; message?: string }
@@ -530,30 +627,21 @@ class BangumiService {
     if (cache && Date.now() - cache.fetchedAt < TTL_SUBJECT) {
       return { fromCache: true, data: cache.data }
     }
+    /*
+     * v0.2.7 附加：过期缓存**先照常返回全部详情**，刷新放到后台静默做。
+     *
+     * 这样「打开详情页」永远不会因为反代慢/瞬时 5xx 而变成「信息加载不出来」——
+     * 用户看到的仍是完整详情（infobox/标签/制作信息一个都不少），
+     * 反代只在后台被请求一次（单飞去重），压力显著下降。
+     */
+    if (cache) {
+      void this.fetchSubject(id)
+        .then((fresh) => this.writeCache(key, fresh))
+        .catch((err) => log.append('warn', 'bangumi', `后台刷新详情失败 (#${id})，继续用缓存: ${String(err)}`))
+      return { fromCache: true, stale: true, data: cache.data }
+    }
     try {
-      const { text, mirror } = await this.requestBest({
-        api: `/v0/subjects/${id}`,
-        web: `/subject/${id}`,
-        /*
-         * v0.2.7 关键修复：自建反代的详情必须显式走 `/v0/subjects/:id`。
-         *
-         * 此前这里没传 customApi，`calendarPathFor` 便回退到网页路径 `/subject/:id` ——
-         * 反代在该路径上返回的是**旧版 API 形态**（`{id,url,type,name,air_date,eps,rating}`，
-         * 实测 2192B），它天生没有 infobox / tags / platform / total_episodes。
-         * 于是 JSON 解析成功、页面看着「有数据」（标题、评分、日期、集数都在），
-         * 但「详细信息 / 类型标签 / 制作信息 / 监督 / 上映日期」整块消失 ——
-         * 用户反馈的「用反代很多番剧详情加载不出来」正是这个原因（不是反代缺数据）。
-         * 带 /v0/ 前缀时同一反代返回 5368B 完整 v0 数据（infobox 41 条、tags 30 个）。
-         */
-        customApi: `/v0/subjects/${id}`
-      })
-      let detail: SubjectDetail | null
-      if (isApiMirror(mirror)) {
-        detail = this.normalizeSubject(JSON.parse(text) as Record<string, unknown>)
-      } else {
-        detail = parseSubjectPage(text, id)
-      }
-      if (!detail) throw new Error('详情页解析失败')
+      const detail = await this.fetchSubject(id)
       this.writeCache(key, detail)
       return { fromCache: false, data: detail }
     } catch (err) {
@@ -562,9 +650,33 @@ class BangumiService {
           ? (err as SourceError)
           : makeSourceError('NETWORK', String(err), [])
       log.append('warn', 'bangumi', `获取详情失败 (#${id}): ${error.message}`)
-      if (cache) return { fromCache: true, data: cache.data }
       return { fromCache: false, data: null, error }
     }
+  }
+
+  /** 拉取并归一化一部番剧的完整详情（v0 走 JSON，网页镜像走 HTML 解析） */
+  private async fetchSubject(id: number): Promise<SubjectDetail> {
+    const { text, mirror } = await this.requestBest({
+      api: `/v0/subjects/${id}`,
+      web: `/subject/${id}`,
+      /*
+       * v0.2.7 关键修复：自建反代的详情必须显式走 `/v0/subjects/:id`。
+       *
+       * 此前这里没传 customApi，`calendarPathFor` 便回退到网页路径 `/subject/:id` ——
+       * 反代在该路径上返回的是**旧版 API 形态**（`{id,url,type,name,air_date,eps,rating}`，
+       * 实测 2192B），它天生没有 infobox / tags / platform / total_episodes。
+       * 于是 JSON 解析成功、页面看着「有数据」（标题、评分、日期、集数都在），
+       * 但「详细信息 / 类型标签 / 制作信息 / 监督 / 上映日期」整块消失 ——
+       * 用户反馈的「用反代很多番剧详情加载不出来」正是这个原因（不是反代缺数据）。
+       * 带 /v0/ 前缀时同一反代返回 5368B 完整 v0 数据（infobox 41 条、tags 30 个）。
+       */
+      customApi: `/v0/subjects/${id}`
+    })
+    const detail: SubjectDetail | null = isApiMirror(mirror)
+      ? this.normalizeSubject(JSON.parse(text) as Record<string, unknown>)
+      : parseSubjectPage(text, id)
+    if (!detail) throw new Error('详情页解析失败')
+    return detail
   }
 
   async search(keyword: string): Promise<SearchResult> {

@@ -80,11 +80,11 @@ export function AboutPage() {
   }
 
   /*
-   * 配了自建反代时它才是真正在用的数据源，镜像站此时完全不参与请求。
-   * 过去这里只显示 dataSources.main（= 镜像站 1），会让人误以为仍在走公共镜像。
+   * 走反代时统一显示「Bangumi」（v0.2.7 附加：界面上不摊开反代地址）。
+   * 没配反代就显示当前镜像站地址 —— 那时用户确实需要知道自己在用哪面镜像。
    */
   const customApi = (settings.bangumiCustomApi ?? '').trim()
-  const mainSource = customApi || settings.dataSources?.main || settings.bangumiBase || 'https://bangumi.pro'
+  const mainSource = customApi ? 'Bangumi' : settings.dataSources?.main || settings.bangumiBase || 'Bangumi'
   const mirrorCount = settings.dataSources?.mirrors?.length ?? settings.bangumiMirrors.length
 
   return (
@@ -109,12 +109,12 @@ export function AboutPage() {
       <Card title="数据来源" desc="番剧数据与 galgame 数据来源">
         <Row label="当前数据源">
           {mainSource}
-          {customApi ? '（自建反代 · 唯一数据源）' : ''}
+          {customApi ? '（默认数据源 · 最高优先级）' : ''}
         </Row>
         <div className="border-t border-border" />
-        <Row label="镜像站数量">{mirrorCount} 个{customApi ? '（已配置反代，当前不使用）' : ''}</Row>
+        <Row label="镜像站数量">{mirrorCount} 个{customApi ? '（反代取不到数据时可手动切换）' : ''}</Row>
         <div className="border-t border-border" />
-        <Row label="番剧数据">Bangumi（自建反代 / bangumi.vip 等镜像站 / api.bgm.tv）</Row>
+        <Row label="番剧数据">Bangumi（番剧表 / 条目详情 / 搜索 / 封面图片）</Row>
         <div className="border-t border-border" />
         <Row label="galgame 数据">月幕 galgame（ymgal.games）、VNDB</Row>
         <div className="border-t border-border" />

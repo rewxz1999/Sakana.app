@@ -21,8 +21,14 @@ import { downloadManager } from './services/downloader/manager'
 import { aria2 } from './services/downloader/aria2'
 import { listVideos } from './services/media'
 import { ruleEpisodes, rulePlay, ruleSearch, rulesRepoImport, rulesRepoIndex } from './services/rules'
-import { startRuleProbe, stopRuleProbe } from './services/ruleProbe'
-import { closeRuleWebview, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
+import {
+  getCachedStreamOrWait,
+  prefetchStream,
+  rememberStream,
+  startRuleProbe,
+  stopRuleProbe
+} from './services/ruleProbe'
+import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
 import { mpvRuntimeAvailable } from './services/mpv'
 import { buildStreamInfo } from './services/playerInfo'
 import { checkUpdate, REPO_URL } from './services/updater'
@@ -241,6 +247,35 @@ export function registerIpc(): void {
     (_e, ruleId: string, entry, lineIndex: number, episodeIndex: number, episodeLink: string, vars: Record<string, string>) =>
       rulePlay(ruleId, entry, lineIndex, episodeIndex, episodeLink, vars)
   )
+  /*
+   * v0.2.7 附加：直链会话缓存（加速进入播放与切集）。
+   * 播放器优先用缓存直链，命中就跳过整轮嗅探；正在预取时会短暂等一下（最多 2.5 秒），
+   * 于是「详情页点选集 → 跳转播放页」这段路上预取就已经把直链准备好了。
+   */
+  ipcMain.handle(CH.rulesCachedStream, (_e, pageUrl: string) => getCachedStreamOrWait(pageUrl))
+  ipcMain.handle(CH.rulesRememberStream, (_e, pageUrl: string, url: string, referer?: string) => {
+    rememberStream(pageUrl, url, referer)
+    return true
+  })
+  ipcMain.handle(
+    CH.rulesPrefetchStream,
+    async (
+      _e,
+      ruleId: string,
+      entry,
+      lineIndex: number,
+      episodeIndex: number,
+      episodeLink: string,
+      vars: Record<string, string>
+    ) => {
+      // 先解析出该集的播放页地址（与真实播放同一条路），再做「直出解析 + 校验」入缓存
+      const play = await rulePlay(ruleId, entry, lineIndex, episodeIndex, episodeLink, vars)
+      if (!play?.url) return null
+      const stream = await prefetchStream(play.url, play.referer)
+      // 连播放页地址一起返回：切集时可直接复用，省掉一次 play 解析
+      return { pageUrl: play.url, url: stream?.url ?? null, referer: stream?.referer ?? play.referer }
+    }
+  )
   // 规则仓库导入（KazumiRules 镜像优先）
   ipcMain.handle(CH.rulesRepoIndex, () => rulesRepoIndex())
   ipcMain.handle(CH.rulesRepoImport, (_e, names: string[]) => rulesRepoImport(names))
@@ -276,8 +311,16 @@ export function registerIpc(): void {
     }
   )
   ipcMain.handle(CH.ruleWebviewClose, () => {
-    // 异步清理：销毁网页视图可能阻塞，退出播放时不能卡住渲染层
-    setImmediate(() => closeRuleWebview())
+    /*
+     * 异步清理：销毁网页视图可能阻塞，退出播放时不能卡住渲染层。
+     *
+     * v0.2.7 附加：必须带上「请求时看到的窗口代号」——
+     * 渲染层重试时会同一轮里先 close 再 open，延迟执行的 close 过去会把刚建好的
+     * 新嗅探窗口一起销毁（CDP 报 target closed），于是重试永远抓不到流。
+     * 带上代号后，这种「迟到的关闭」会被识别为针对旧窗口而作废。
+     */
+    const gen = currentRuleWebviewGen()
+    setImmediate(() => closeRuleWebview(gen))
     return true
   })
 

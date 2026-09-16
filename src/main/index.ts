@@ -1024,6 +1024,12 @@ if (!gotLock) {
             '/search',
             // v0.2.7：番剧详情页也纳入 —— 数据源换成自建反代后，这里最容易出现「信息缺字段」
             '/subject/400602',
+            /*
+             * v0.2.7 附加：收藏页纳入 —— 收藏里存的封面是镜像图床地址
+             * （`lain.bangumi.pro`），图片改写没覆盖到时整页封面全空，
+             * 靠 imgs/badImgs 两个计数就能直接判定。
+             */
+            '/favorites',
             '/rules',
             '/shortcuts',
             '/player-settings',
@@ -1081,6 +1087,14 @@ if (!gotLock) {
                       overflowY:b?Math.max(0,b.scrollHeight-b.clientHeight):-1,
                       badges:txt('[class*="rounded-full"]',6),
                       heads:txt('[class*="font-semibold"]',8),
+                      /*
+                       * 图片核对（v0.2.7 附加）：封面这类问题过去只能靠肉眼看，
+                       * 这里直接统计「有几张图真的解码出来了」（naturalWidth>0）以及失败数量 —
+                       * 收藏/订阅封面全部不显示时，这里会是 imgs=0 / badImgs=N。
+                       */
+                      imgs:Array.prototype.filter.call(document.images||[],function(i){return i.complete&&i.naturalWidth>0}).length,
+                      badImgs:Array.prototype.filter.call(document.images||[],function(i){return i.complete&&i.naturalWidth===0}).length,
+                      imgHosts:Array.from(new Set(Array.prototype.map.call(document.images||[],function(i){try{return new URL(i.src).host}catch(e){return i.src.slice(0,24)}}))).slice(0,4),
                       // 详情页核对用：把正文前 600 字带出来，能直接看到上映日期/导演/製作等是否渲染
                       text:(b?(b.innerText||'').replace(/\\s+/g,' ').slice(0,600):'')
                     })})()`

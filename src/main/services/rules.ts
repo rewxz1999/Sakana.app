@@ -494,7 +494,7 @@ export async function rulePlay(
   const def = rule.episodes
   if (def.type === 'xpath') {
     const url = resolveUrl(rule.baseUrl, episodeLink || entry.link || entry.source)
-    return { url }
+    return { url, referer: rule.baseUrl }
   }
   const v = {
     ...vars,
@@ -508,7 +508,7 @@ export async function rulePlay(
   const qs = Object.entries(def.playQuery ?? {})
     .map(([k, val]) => `${encodeURIComponent(k)}=${encodeURIComponent(fillTemplate(String(val), v))}`)
     .join('&')
-  return { url: qs ? `${url}${url.includes('?') ? '&' : '?'}${qs}` : url }
+  return { url: qs ? `${url}${url.includes('?') ? '&' : '?'}${qs}` : url, referer: rule.baseUrl }
 }
 
 /** 内置默认规则随应用更新（保留用户自定义规则，仅刷新 default- 前缀的内置规则） */

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Check, CirclePlus, Database, Link2, Save, Trash2, WifiOff } from 'lucide-react'
+import { DEFAULT_SETTINGS } from '@shared/types'
 import type { AppSettings } from '@shared/types'
 import { api } from '@/lib/api'
 import { useSettings } from '@/stores/app'
@@ -101,55 +102,89 @@ export function DataSourcePage() {
       }
     >
       {/*
-        自建反代（Cloudflare Worker）：公共镜像被墙后的唯一可靠通道。
-        两个地址分别对应 Worker 里的 API_HOST / IMG_HOST 变量。
+        v0.2.7 附加：这里**不再展示反代地址**（用户要求）。
+        应用默认就使用内置的反代（API + 图片）作为唯一数据源，
+        界面只需要说明「默认使用 API 反代地址 / 图片反代地址」即可；
+        地址本身归内置默认值管，需要改的时候再展开下面的高级项。
       */}
-      <Card
-        title="自建反代（推荐，Cloudflare Worker）"
-        desc="公共镜像失败时使用；部署方法见仓库 deploy/bangumi-proxy-README.md"
-      >
-        <div className="flex flex-col gap-3">
-          <label className="flex flex-col gap-1.5">
-            <span className="text-[11px] text-faint">
-              API 反代地址（Worker 的 API_HOST，如 https://api.yourdomain.com）
-            </span>
-            <Input
-              value={customApi}
-              onChange={(e) => setCustomApi(e.target.value)}
-              placeholder="https://api.yourdomain.com"
-            />
-          </label>
-          <label className="flex flex-col gap-1.5">
-            <span className="text-[11px] text-faint">
-              图片反代地址（Worker 的 IMG_HOST，如 https://img.yourdomain.com）
-            </span>
-            <Input
-              value={customImg}
-              onChange={(e) => setCustomImg(e.target.value)}
-              placeholder="https://img.yourdomain.com"
-            />
-          </label>
+      <Card title="默认数据源" desc="番剧数据与图片默认都走内置反代，无需配置">
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between rounded-lg border border-accent/30 bg-accent-soft px-3 py-2.5">
+            <span className="text-xs text-accent">API 反代地址</span>
+            <span className="text-[11px] text-accent">默认使用 ✓</span>
+          </div>
+          <div className="flex items-center justify-between rounded-lg border border-accent/30 bg-accent-soft px-3 py-2.5">
+            <span className="text-xs text-accent">图片反代地址</span>
+            <span className="text-[11px] text-accent">默认使用 ✓</span>
+          </div>
           <div className="text-[11px] leading-relaxed text-faint">
-            填写 API 反代后，它会被**强制**当作 API 源使用（走 <code className="font-mono">/v0/…</code> JSON 路径，
-            不要求域名以 <code className="font-mono">api.</code> 开头），并自动跳过已知被墙的 bangumi.pro。
-            图片反代会把 <code className="font-mono">lain.bgm.tv</code> 的封面按原路径改写过去。两项留空即维持原公共镜像链。
+            番剧表、搜索、番剧详情与<span className="text-dim">所有封面图片</span>都优先使用反代数据源；
+            反代取不到数据时会提示你切换到下面的镜像站，不会在后台偷偷换源。
+            镜像站在反代不可用（或未配置）时才会被使用，并且相互之间会自动切换。
           </div>
         </div>
       </Card>
 
+      {/* 高级：自定义反代地址（默认收起，默认不显示具体地址） */}
+      <Card title="高级" desc="仅在反代域名变更时需要修改">
+        <details className="group">
+          <summary className="cursor-pointer select-none text-[11px] text-faint hover:text-dim">
+            展开自定义反代地址（一般无需修改）
+          </summary>
+          <div className="mt-3 flex flex-col gap-3">
+            <label className="flex flex-col gap-1.5">
+              <span className="text-[11px] text-faint">API 反代地址（Worker 的 API_HOST）</span>
+              <Input
+                value={customApi}
+                onChange={(e) => setCustomApi(e.target.value)}
+                placeholder="留空则使用内置默认地址"
+              />
+            </label>
+            <label className="flex flex-col gap-1.5">
+              <span className="text-[11px] text-faint">图片反代地址（Worker 的 IMG_HOST）</span>
+              <Input
+                value={customImg}
+                onChange={(e) => setCustomImg(e.target.value)}
+                placeholder="留空则使用内置默认地址"
+              />
+            </label>
+            <div className="text-[11px] leading-relaxed text-faint">
+              部署方法见仓库 <code className="font-mono">deploy/bangumi-proxy-README.md</code>。
+              图片反代会把 <code className="font-mono">lain.bgm.tv</code> 等图床地址按原路径改写到反代，并走按需缩放。
+              <br />
+              注意：两个地址都留空并保存，就会回到「镜像站」模式（那时番剧表底栏会显示镜像站地址）。
+            </div>
+            {/* 地址默认不显示，所以必须留一个「恢复默认」的出口，否则清空后无法找回内置反代 */}
+            <div>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setCustomApi(DEFAULT_SETTINGS.bangumiCustomApi ?? '')
+                  setCustomImg(DEFAULT_SETTINGS.bangumiCustomImg ?? '')
+                  toast.info('已填入内置默认反代地址，点「保存」生效')
+                }}
+              >
+                恢复内置默认反代
+              </Button>
+            </div>
+          </div>
+        </details>
+      </Card>
+
       {/* 当前主数据源 */}
-      <Card title="当前主数据源" desc="日历、条目详情与搜索优先使用该地址">
+      <Card title="当前主数据源" desc="日历、条目详情、搜索与全部图片">
         <div className="flex flex-col gap-2">
-          <div className="break-all rounded-lg border border-accent/30 bg-accent-soft px-3 py-2.5 font-mono text-xs text-accent">
-            {(customApi.trim() || main).trim() || '（未设置）'}
+          <div className="break-all rounded-lg border border-accent/30 bg-accent-soft px-3 py-2.5 text-xs text-accent">
+            {customApi.trim() ? 'Bangumi（自建反代 · 默认数据源）' : (main.trim() || '（未设置）')}
           </div>
           <div className="text-[11px] leading-relaxed text-faint">
             {customApi.trim() ? (
               <>
-                已配置 API 反代，它被强制作为唯一数据源（走 <code className="font-mono">/v0/…</code> 与{' '}
-                <code className="font-mono">/calendar</code>），下面的 {mirrors.filter(Boolean).length} 个镜像站
+                反代拥有最高优先级：番剧表、条目详情、搜索、封面图片全部走它。
+                下面的 {mirrors.filter(Boolean).length} 个镜像站
                 <span className="text-dim">不会</span>被使用 ——
-                反代失败时应用会提示你手动切换，而不会在后台偷偷换源。清空「API 反代地址」即可回到镜像站。
+                反代失败时应用会提示你手动切换，而不会在后台偷偷换源。
               </>
             ) : (
               <>共 {mirrors.filter(Boolean).length} 个数据源；主数据源失败时会按下面的镜像顺序自动回退。</>

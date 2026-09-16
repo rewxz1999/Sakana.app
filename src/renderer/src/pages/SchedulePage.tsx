@@ -173,8 +173,8 @@ export function SchedulePage() {
       {/* 底部：数据来源 */}
       <div className="flex items-center justify-between border-t border-border bg-elev1/70 px-5 py-1.5 text-[11px] text-faint">
         <span>
-          {/* 配了自建反代就只能用它，这里必须显示反代地址，否则会让人误以为在走公共镜像 */}
-          数据来源：{settings.bangumiCustomApi || settings.bangumiBase}
+          {/* v0.2.7 附加：走反代时统一显示「Bangumi」，不再把反代/镜像地址摊在界面上 */}
+          数据来源：{settings.bangumiCustomApi ? 'Bangumi' : settings.bangumiBase || 'Bangumi'}
           {fetchedAt ? ` · 缓存于 ${fmtDateTime(fetchedAt)}${fromCache ? '（本地缓存）' : ''}` : ''}
         </span>
         <span>图片与数据本地缓存，减少重复请求</span>

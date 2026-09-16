@@ -51,6 +51,40 @@ function fmt(sec: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`
 }
 
+/**
+ * 详情面板要显示的「详细信息」几行（v0.2.7 附加）。
+ *
+ * 播放器里的详情面板是唯一一份，但过去只有评分/日期/标签/简介 —— 用户明确要求
+ * 「番剧详情等信息还是要有」。这里按关键度挑出常用几项（导演/脚本/原作/制作/音乐/平台…），
+ * 数据全部来自详情页同一份缓存，不额外请求反代，也不删减详情页本身的展示。
+ */
+function detailRows(d: SubjectDetail): { key: string; value: string }[] {
+  const score = (key: string): number => {
+    const rules: [RegExp, number][] = [
+      [/^(平台|话数|总集数)$/, 0],
+      [/^(放送开始|上映|发售|播放结束)/, 1],
+      [/^(导演|监督)/, 2],
+      [/^(系列构成|脚本|分镜|演出)/, 3],
+      [/^(原作|原案|人物设定)/, 4],
+      [/^(动画制作|製作|制作|音乐制作)/, 5],
+      [/^(音乐|主题歌)/, 6],
+      [/^(播放电视台|官方网站)/, 7]
+    ]
+    for (const [re, n] of rules) if (re.test(key)) return n
+    return 99
+  }
+  const rows = [...d.infobox]
+  if (d.platform && !rows.some((r) => r.key === '平台')) rows.unshift({ key: '平台', value: d.platform })
+  if (d.totalEpisodes && !rows.some((r) => r.key === '总集数')) {
+    rows.push({ key: '总集数', value: String(d.totalEpisodes) })
+  }
+  return rows
+    .filter((r) => score(r.key) < 99)
+    .sort((a, b) => score(a.key) - score(b.key))
+    .slice(0, 8)
+    .map((r) => ({ key: r.key, value: typeof r.value === 'string' ? r.value : String(r.value) }))
+}
+
 function IconBtn({
   title,
   onClick,
@@ -333,6 +367,22 @@ export default function PlayerOverlay(): React.ReactElement {
                       <span key={t.name} className="rounded-full bg-white/10 px-2 py-0.5 text-[10px] text-white/70">
                         {t.name}
                       </span>
+                    ))}
+                  </div>
+                ) : null}
+                {/*
+                  v0.2.7 附加：补上「详细信息」几行（导演 / 制作 / 平台 / 放送日期…）。
+                  播放器里的详情面板现在是唯一一份（页面内那份已经不再绘制），
+                  过去这里只有评分/日期/标签/简介，看不到制作信息；
+                  数据来自同一份详情缓存（subject3-<id>），不会再给反代增加请求。
+                */}
+                {detailRows(detail).length > 0 ? (
+                  <div className="mt-3 flex flex-col gap-1 border-t border-white/10 pt-3">
+                    {detailRows(detail).map((r) => (
+                      <div key={r.key} className="flex gap-2 text-[11px] leading-relaxed">
+                        <span className="w-14 shrink-0 text-white/45">{r.key}</span>
+                        <span className="min-w-0 flex-1 break-words text-white/75">{r.value}</span>
+                      </div>
                     ))}
                   </div>
                 ) : null}

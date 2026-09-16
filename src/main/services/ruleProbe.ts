@@ -71,23 +71,37 @@ function decodeMacPlayerUrl(raw: string, encrypt: unknown): string {
 }
 
 /** 从播放页 HTML 中提取真实媒体地址（MacCMS player_aaaa / 常见播放器字段 / 直链） */
-export function findMediaUrl(html: string): string | null {
+/**
+ * 收集播放页 HTML 里的**全部**候选媒体地址（按优先级去重）。
+ *
+ * v0.2.7 附加：过去 `findMediaUrl` 是「命中第一个就返回」——
+ * 实测 aafun（moonci）播放页里第一个候选是个已失效的 mp4（HEAD 400），
+ * 真正能播的地址排在后面，于是白等两轮校验。
+ * 现在把所有候选都收出来（MacCMS 的 `url`/`url_next` → 播放器配置字段 → 页面里的裸直链），
+ * 交给 `resolveFirstPlayable` **并行探测**，谁先确认可播就用谁。
+ */
+export function findMediaUrls(html: string): string[] {
   const text = String(html ?? '')
-  // 1) MacCMS 标准：player_aaaa = {... "url":"%68%74%74%70..." ...}
+  const out: string[] = []
+  const push = (u: string): void => {
+    if (!u || !/^https?:\/\//i.test(u)) return
+    if (!out.includes(u)) out.push(u)
+  }
+  // 1) MacCMS 标准：player_aaaa = {... "url":"%68%74%74%70…" …}
   const pa = text.match(/player_aaaa\s*=\s*(\{[\s\S]*?\})\s*(?:<\/script>|;)/)
   if (pa) {
     try {
       const obj = JSON.parse(pa[1]) as { url?: string; url_next?: string; encrypt?: unknown }
       const u = decodeMacPlayerUrl(obj?.url ?? '', obj?.encrypt)
-      if (/^https?:\/\//i.test(u) && MEDIA_EXT_RE.test(u)) return u
+      if (MEDIA_EXT_RE.test(u)) push(u)
       const next = decodeMacPlayerUrl(obj?.url_next ?? '', obj?.encrypt)
-      if (/^https?:\/\//i.test(next) && MEDIA_EXT_RE.test(next)) return next
+      if (MEDIA_EXT_RE.test(next)) push(next)
     } catch {
       const m = pa[1].match(/"url"\s*:\s*"([^"]+)"/)
       const enc = pa[1].match(/"encrypt"\s*:\s*(\d+)/)
       if (m) {
         const u = decodeMacPlayerUrl(m[1], enc ? Number(enc[1]) : 0)
-        if (/^https?:\/\//i.test(u) && MEDIA_EXT_RE.test(u)) return u
+        if (MEDIA_EXT_RE.test(u)) push(u)
       }
     }
   }
@@ -102,24 +116,24 @@ export function findMediaUrl(html: string): string | null {
     let m: RegExpExecArray | null
     while ((m = re.exec(text))) {
       const u = decodeOuter(m[1])
-      if (/^https?:\/\//i.test(u) && MEDIA_EXT_RE.test(u)) return u
+      if (MEDIA_EXT_RE.test(u)) push(u)
     }
   }
   // 3) HTML/JS 中直接出现的媒体直链
   const direct = text.match(
     /https?:\\?\/\\?\/[^"'\s\\<>]+\.(?:m3u8|mp4|flv|mkv|webm)(?:\?[^"'\s\\<>]*)?/gi
   )
-  if (direct) {
-    for (const d of direct) {
-      const u = decodeOuter(d)
-      if (/^https?:\/\//i.test(u)) return u
-    }
-  }
-  return null
+  if (direct) for (const d of direct) push(decodeOuter(d))
+  return out
 }
 
-/** 抓取播放页 HTML 并提取真实媒体地址（无则返回 null，交由窗口嗅探兜底） */
-export async function extractStreamFromHtml(url: string, referer?: string): Promise<string | null> {  try {
+export function findMediaUrl(html: string): string | null {
+  return findMediaUrls(html)[0] ?? null
+}
+
+/** 抓取播放页 HTML 并提取**全部**候选媒体地址（空数组则交给窗口嗅探兜底） */
+export async function extractStreamCandidates(url: string, referer?: string): Promise<string[]> {
+  try {
     let origin = ''
     try {
       origin = new URL(url).origin + '/'
@@ -127,7 +141,8 @@ export async function extractStreamFromHtml(url: string, referer?: string): Prom
       origin = url
     }
     const res = await axios.get<string>(url, {
-      timeout: 12000,
+      // 直出解析是「快路」，超时给短一点：卡住就交给窗口嗅探，别把整条链拖住
+      timeout: 8000,
       maxRedirects: 5,
       responseType: 'text',
       headers: {
@@ -136,13 +151,20 @@ export async function extractStreamFromHtml(url: string, referer?: string): Prom
         Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       }
     })
-    const found = findMediaUrl(String(res.data ?? ''))
-    if (found) log.append('info', 'rule-probe', `播放页直出地址: ${found.slice(0, 120)}`)
-    return found
+    const list = findMediaUrls(String(res.data ?? ''))
+    if (list.length > 0) {
+      log.append('info', 'rule-probe', `播放页直出候选 ${list.length} 个，首选: ${list[0].slice(0, 110)}`)
+    }
+    return list
   } catch (err) {
     log.append('warn', 'rule-probe', `播放页直出解析失败: ${String((err as { message?: string })?.message ?? err)}`)
-    return null
+    return []
   }
+}
+
+/** 兼容旧调用：只取第一个候选 */
+export async function extractStreamFromHtml(url: string, referer?: string): Promise<string | null> {
+  return (await extractStreamCandidates(url, referer))[0] ?? null
 }
 
 const PLAYABLE_MIME_RE = /^(video\/|audio\/|application\/(octet-stream|vnd\.apple\.mpegurl|mp2t|x-mpegurl|dash\+xml))/i
@@ -253,6 +275,180 @@ export async function resolvePlayable(
   return null
 }
 
+/** 只发 HEAD 的轻量探测：不消耗一次性下载令牌，用来给多个候选**并行**排序 */
+async function headProbeOnce(url: string, referer?: string): Promise<{ url: string; referer?: string } | null> {
+  try {
+    const head = await axios.head(url, {
+      timeout: 6000,
+      maxRedirects: 6,
+      validateStatus: () => true,
+      headers: { 'User-Agent': BROWSER_UA, ...(referer ? { Referer: referer } : {}) }
+    })
+    const mime = String(head.headers['content-type'] ?? '')
+    if (head.status >= 200 && head.status < 400 && PLAYABLE_MIME_RE.test(mime)) {
+      const finalUrl = String((head.request as { res?: { responseUrl?: string } })?.res?.responseUrl ?? url)
+      return { url: encodeForVlc(finalUrl), referer }
+    }
+  } catch {
+    /* 交给完整校验兜底 */
+  }
+  return null
+}
+
+/**
+ * 从多个候选里挑出第一个真正可播的地址（v0.2.7 附加）。
+ *
+ * 做法：先对所有候选**并行发 HEAD**（便宜且不消耗令牌），
+ * 按优先级取第一个通过的；若一个都没通过，再按优先级逐个做完整校验（HEAD+Range GET）。
+ * 这样既不会因为「第一个候选已失效」而白等，也保留了「某些 CDN 不支持 HEAD」的兜底。
+ */
+export async function resolveFirstPlayable(
+  candidates: string[],
+  referer?: string
+): Promise<{ url: string; referer?: string } | null> {
+  const list = candidates.slice(0, 6)
+  if (list.length === 0) return null
+  if (list.length > 1) {
+    const probes = await Promise.all(list.map((u) => headProbeOnce(u, referer)))
+    const idx = probes.findIndex((p) => p !== null)
+    if (idx >= 0) {
+      log.append('info', 'rule-probe', `并行探测命中第 ${idx + 1} 个候选`)
+      return probes[idx]
+    }
+  }
+  for (const u of list) {
+    const ok = await resolvePlayable(u, referer)
+    if (ok) return ok
+  }
+  return null
+}
+
+/**
+ * 是否是**一次性 / 超短时效**的下载直链（v0.2.7 附加）。
+ *
+ * 实测 aafun（moonci）的可用地址是 `tjdownload.pan.wo.cn/openapi/download?fid=…`：
+ * 每次抓播放页都会生成一个**新的 fid**，而且这个令牌用过（甚至只是被校验过）就失效。
+ * 对这类地址：预取与缓存不仅没意义，还会把令牌提前烧掉 ——
+ * 实测「预取 7 秒后再用」必然是 0 秒不播，反而比不预取更慢。
+ * 所以只缓存**可复用**的直链（普通 CDN 的 m3u8 / mp4），这些一律不缓存、不预取。
+ */
+export function isOneTimeStream(url: string): boolean {
+  try {
+    const u = new URL(url)
+    if (/openapi\/download|downapi|\/download(\/|$)/i.test(u.pathname)) return true
+    if (/[?&](fid|sign|expire|expires|token|e|st)=/i.test(u.search)) return true
+    if (/(^|\.)pan\./i.test(u.hostname)) return true
+    return false
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 会话内的「播放页地址 → 已验证媒体地址」缓存。
+ *
+ * 为什么有用：进入播放器、以及播放器里切集，最慢的一环都是「重新嗅探」。
+ * 同一个播放页在短时间内（同一集来回切、A/B 比较、退出再进）拿到的地址通常仍然可用，
+ * 缓存命中就能直接交给内核，省掉整轮嗅探。
+ * 反代/CDN 的直链有时效（有的是**一次性令牌**），所以：
+ * - TTL 只给 6 分钟；
+ * - 播放器侧仍保留「N 秒没开播就重新嗅探」的看门狗 —— 缓存过期不会变成卡死，只是白等几秒。
+ */
+const streamCache = new Map<string, { url: string; referer?: string; at: number }>()
+const STREAM_CACHE_TTL = 6 * 60 * 1000
+
+export function rememberStream(pageUrl: string, url: string, referer?: string): void {
+  if (!pageUrl || !url) return
+  // 一次性令牌类直链不缓存（缓存下来也已经失效，只会让下次切集白等一轮看门狗）
+  if (isOneTimeStream(url)) return
+  streamCache.set(pageUrl, { url, referer, at: Date.now() })
+}
+
+export function getCachedStream(pageUrl: string): { url: string; referer?: string } | null {
+  const hit = streamCache.get(pageUrl)
+  if (!hit) return null
+  if (Date.now() - hit.at > STREAM_CACHE_TTL) {
+    streamCache.delete(pageUrl)
+    return null
+  }
+  return { url: hit.url, referer: hit.referer }
+}
+
+export function clearStreamCache(): void {
+  streamCache.clear()
+}
+
+/**
+ * 正在进行的预取（按播放页地址索引）。
+ *
+ * 用途：从番剧详情页点「选集」时我们会先发起预取再跳转播放页，
+ * 播放页挂载后立刻来查缓存 —— 此时预取往往还在飞。
+ * `getCachedStreamOrWait` 会**短暂等它一下**（默认 2.5 秒），
+ * 命中就完全跳过「建嗅探窗口 → 加载播放页 → 等播放器发请求」这几步。
+ */
+const inflightPrefetch = new Map<string, Promise<{ url: string; referer?: string } | null>>()
+
+/** 查缓存；若该地址正在预取则等它落地（超时返回 null，交给正常嗅探） */
+export async function getCachedStreamOrWait(
+  pageUrl: string,
+  timeoutMs = 2500
+): Promise<{ url: string; referer?: string } | null> {
+  const hit = getCachedStream(pageUrl)
+  if (hit) return hit
+  const pending = inflightPrefetch.get(pageUrl)
+  if (!pending) return null
+  const raced = await Promise.race([
+    pending,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs))
+  ])
+  return raced ?? getCachedStream(pageUrl)
+}
+
+/**
+ * 预取某个播放页的直链（v0.2.7 附加：让切集更快）。
+ *
+ * 只走**直出解析**这一条路（纯 HTTP，不创建浏览器窗口），
+ * 命中就写进上面的缓存 —— 切到该集时播放器直接命中缓存、跳过整轮嗅探。
+ * 拿不到也没关系（很多站点必须靠网页渲染），只是那一集仍需正常嗅探。
+ */
+export async function prefetchStream(
+  pageUrl: string,
+  referer?: string
+): Promise<{ url: string; referer?: string } | null> {
+  const cached = getCachedStream(pageUrl)
+  if (cached) return cached
+  const running = inflightPrefetch.get(pageUrl)
+  if (running) return await running
+  const task = (async (): Promise<{ url: string; referer?: string } | null> => {
+    const candidates = await extractStreamCandidates(pageUrl, referer)
+    if (candidates.length === 0) return null
+    /*
+     * 一次性令牌类站点（如 aafun 的 pan.wo.cn 下载接口）**最终不入缓存**：
+     * 这类地址（多数是**经重定向**才拿到的最终地址）校验或延迟使用后即失效，
+     * 缓存下来只会让下次切集白等一轮看门狗 —— 实测反而比不预取更慢。
+     * 注意仍然要**并行探测全部候选**：像 aafun 这样「第一个候选 400、重定向后才拿到可用地址」的站点，
+     * 并行 HEAD 能几百毫秒定出可用地址。
+     */
+    if (candidates.every((u) => isOneTimeStream(u))) {
+      log.append('info', 'rule-probe', '该站点为一次性直链，跳过预取（切集时现解析更快）')
+      return null
+    }
+    const ok = await resolveFirstPlayable(candidates, referer)
+    if (!ok) return null
+    if (isOneTimeStream(ok.url)) {
+      log.append('info', 'rule-probe', '解析结果是时效性直链，跳过预取（不做无效缓存）')
+      return null
+    }
+    rememberStream(pageUrl, ok.url, ok.referer ?? referer)
+    log.append('info', 'rule-probe', `已预取直链（切集可秒开）: ${ok.url.slice(0, 110)}`)
+    return ok
+  })().finally(() => {
+    inflightPrefetch.delete(pageUrl)
+  })
+  inflightPrefetch.set(pageUrl, task)
+  return await task
+}
+
 let probeWin: BrowserWindow | null = null
 let foundUrls: string[] = []
 let doneSent = false
@@ -353,13 +549,15 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
   if (disposeListeners) disposeListeners()
   disposeListeners = addProbeListeners({ onBeforeRequest, onCompleted })
 
-  // 先尝试直接从播放页 HTML 提取真实地址（MacCMS 等），校验可播后再用，窗口仅作兜底
-  void extractStreamFromHtml(url, referer).then(async (direct) => {
-    if (!probeActive || !direct) return
-    const ok = await resolvePlayable(direct, referer)
+  // 先尝试直接从播放页 HTML 提取真实地址（MacCMS 等）：多候选并行探测，窗口仅作兜底
+  void extractStreamCandidates(url, referer).then(async (candidates) => {
+    if (!probeActive || candidates.length === 0) return
+    const ok = await resolveFirstPlayable(candidates, referer)
     if (!probeActive || !ok) return
     if (foundUrls.includes(ok.url)) return
     foundUrls.push(ok.url)
+    // 记进会话直链缓存（同一集来回切 / 退出再进可直接命中）
+    rememberStream(url, ok.url, ok.referer ?? referer)
     log.append('info', 'rule-probe', `直出地址命中: ${ok.url.slice(0, 120)}`)
     noteCapturedStream({
       url: ok.url,

@@ -79,7 +79,12 @@ const api: SakanaApi = {
     search: (ruleId, keyword) => call(CH.rulesSearch, ruleId, keyword),
     episodes: (ruleId, entry) => call(CH.rulesEpisodes, ruleId, entry),
     play: (ruleId, entry, lineIndex, episodeIndex, episodeLink, vars) =>
-      call(CH.rulesPlay, ruleId, entry, lineIndex, episodeIndex, episodeLink, vars)
+      call(CH.rulesPlay, ruleId, entry, lineIndex, episodeIndex, episodeLink, vars),
+    // v0.2.7 附加：直链会话缓存 / 预取（进入播放与切集提速）
+    cachedStream: (pageUrl) => call(CH.rulesCachedStream, pageUrl),
+    rememberStream: (pageUrl, url, referer) => call(CH.rulesRememberStream, pageUrl, url, referer),
+    prefetchStream: (ruleId, entry, lineIndex, episodeIndex, episodeLink, vars) =>
+      call(CH.rulesPrefetchStream, ruleId, entry, lineIndex, episodeIndex, episodeLink, vars)
   },
   media: {
     listVideos: (folder) => call(CH.mediaListVideos, folder),

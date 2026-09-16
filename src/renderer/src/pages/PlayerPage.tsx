@@ -216,8 +216,16 @@ export function PlayerPage() {
   const relayTriedRef = useRef(false)
   /** 切集互斥：连点/快捷键重复触发时只允许一次切换在飞，避免卡在中间态 */
   const switchRef = useRef(false)
-  /** 下一集预解析结果（播放页地址与变量），播到末尾前提前拿到，切集几乎无等待 */
-  const prefetchRef = useRef<{ key: string; pageUrl: string; vars?: Record<string, string> } | null>(null)
+  /**
+   * 下一集预取结果：播放页地址（切集直接用，省一次解析）与已验证的直链
+   * （写进主进程会话缓存，切集时可跳过整轮嗅探）。
+   */
+  const prefetchRef = useRef<{
+    key: string
+    pageUrl: string
+    vars?: Record<string, string>
+    stream?: { url: string; referer?: string }
+  } | null>(null)
   /** 本集是否已经做过续播跳转（只在每集第一次播放时做一次） */
   const resumeDoneRef = useRef('')
   /** 自动连播是否已经触发（防止 time 事件高频重复触发） */
@@ -398,9 +406,15 @@ export function PlayerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.mode])
 
-  // 规则模式：Kazumi 式在线播放 —— 用可见网页视图打开播放页，
-  // 让站点播放器在真实会话中运行并嗅探媒体地址，命中后交给 libVLC 播放。
-  const startRuleProbe = (pageUrl: string) => {
+  /**
+   * 规则模式：Kazumi 式在线播放 —— 用可见网页视图打开播放页，
+   * 让站点播放器在真实会话中运行并嗅探媒体地址，命中后交给 libVLC 播放。
+   *
+   * v0.2.7 附加（提速）：进这一集之前若已有**缓存直链**（上一轮嗅探、或切集前的预取），
+   * 直接交给内核播放，跳过「建窗口 → 加载播放页 → 等播放器发请求」整轮嗅探；
+   * 4 秒内没开播就自动回到完整嗅探（缓存直链有时效，失败不能让用户干等）。
+   */
+  const startRuleProbe = (pageUrl: string, opts?: { skipCache?: boolean }) => {
     if (probeCancelRef.current) probeCancelRef.current()
     // 新一轮嗅探：重置播放/中转状态并停掉上一条中转流
     playingRef.current = false
@@ -419,6 +433,8 @@ export function PlayerPage() {
     setVisible(true)
     let cancelled = false
     let usedWebview = false
+    /** 缓存直链是否命中（命中时先不建嗅探窗口，等看门狗判定失败再建） */
+    let cacheHit = false
     /** 网页视图位置：视频区域（上下控制条之外），保证退出按钮始终可点 */
     const currentBounds = (): { x: number; y: number; width: number; height: number } => {
       const host = document.getElementById('vlc-host')
@@ -454,7 +470,29 @@ export function PlayerPage() {
         playingRef.current = false
         // referer 语义：undefined=未判定（回退规则站点）；''=经校验确定不带 Referer
         const refForPlay = ev.referer !== undefined ? ev.referer || undefined : state.referer
-        void api.vlc.play(ev.url, refForPlay, ev.cookies)
+        /*
+         * v0.2.7 附加：这里过去是 `void api.vlc.play(...)` —— 引擎还没就绪（attach 未完成）
+         * 或内核报错时，失败被直接丢掉：界面停在「捕捉视频流中/已暂停 0:00」，
+         * 既没有日志也没有提示，看起来就是「抓到了流但播不出来」。
+         * 现在带重试并记录；仍然失败才提示用户。
+         */
+        const playWithRetry = async (attempt = 0): Promise<void> => {
+          const r = await api.vlc.play(ev.url, refForPlay, ev.cookies)
+          if (r.ok) return
+          console.warn(`[player] 交给内核播放失败（第 ${attempt + 1} 次）：${r.error}`)
+          if (attempt < 2) {
+            await new Promise((res) => window.setTimeout(res, 900))
+            if (cancelled) return
+            return playWithRetry(attempt + 1)
+          }
+          toast.error(`播放内核未接受该视频流：${r.error}`)
+        }
+        void playWithRetry()
+        /*
+         * 记进会话直链缓存（v0.2.7 附加）：同一集来回切、退出再进、以及切集预取命中时
+         * 都能跳过整轮嗅探。缓存有 6 分钟 TTL，过期或一次性令牌失效时看门狗会重新嗅探。
+         */
+        void api.rules.rememberStream(pageUrl, ev.url, refForPlay)
         // 直连 15 秒仍未开播 → 先用新地址重试（对付短时效直链），再不行才切 FFmpeg 中转
         window.setTimeout(() => {
           if (cancelled || playingRef.current || relayTriedRef.current) return
@@ -492,21 +530,57 @@ export function PlayerPage() {
         toast.info(ev.message ?? '未捕获到视频流')
       }
     })
-    // 优先走可见网页视图；创建失败则回退到隐藏窗口嗅探
-    void api.ruleWebview.open(pageUrl, currentBounds(), state.referer).then((r) => {
+    /** 完整嗅探（建窗口 / 隐藏窗口）；缓存直链失败时也会走这里 */
+    const runFullProbe = (): void => {
       if (cancelled) return
-      if (r.ok && r.data) {
-        usedWebview = true
-      } else {
-        void api.ruleProbe.start(pageUrl, state.referer)
-      }
-    })
+      setRuleProbing(true)
+      probingRef.current = true
+      // 优先走可见网页视图；创建失败则回退到隐藏窗口嗅探
+      void api.ruleWebview.open(pageUrl, currentBounds(), state.referer).then((r) => {
+        if (cancelled) return
+        if (r.ok && r.data) {
+          usedWebview = true
+        } else {
+          void api.ruleProbe.start(pageUrl, state.referer)
+        }
+      })
+    }
+    /*
+     * 先看会话直链缓存（v0.2.7 附加）：命中就直接播，省掉整轮嗅探。
+     * 4 秒内没开播（缓存已过期 / 一次性令牌被用掉）就自动回到完整嗅探，
+     * 因此不会出现「点了没反应」——最坏情况只是多等 4 秒。
+     */
+    if (!opts?.skipCache) {
+      void api.rules.cachedStream(pageUrl).then((r) => {
+        if (cancelled) return
+        const hit = r.ok ? r.data : null
+        if (!hit) {
+          runFullProbe()
+          return
+        }
+        cacheHit = true
+        console.log(`[player] 直链缓存命中，跳过嗅探直接播放: ${hit.url.slice(0, 90)}`)
+        ruleStreamRef.current = hit.url
+        setRuleStreamUrl(hit.url)
+        setRuleProbing(false)
+        probingRef.current = false
+        void api.vlc.play(hit.url, hit.referer ?? state.referer, undefined)
+        window.setTimeout(() => {
+          if (cancelled || playingRef.current || relayTriedRef.current) return
+          console.log('[player] 缓存直链未开播，改为完整嗅探')
+          runFullProbe()
+        }, 2500)
+      })
+    } else {
+      runFullProbe()
+    }
     return () => {
       offFound()
       offDone()
       if (probeCancelRef.current) probeCancelRef.current()
       probeCancelRef.current = null
       if (probeFallbackTimerRef.current) window.clearTimeout(probeFallbackTimerRef.current)
+      void cacheHit
     }
   }
 
@@ -583,6 +657,43 @@ export function PlayerPage() {
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [progressKeyOf, current, duration]
+  )
+
+  /**
+   * 预取某一集（v0.2.7 附加：切集提速）。
+   *
+   * 一次调用同时拿到「播放页地址 + 已验证的直链」，直链会写进主进程的会话缓存；
+   * 切到该集时播放器命中缓存直接播，跳过「建嗅探窗口 → 加载播放页 → 等播放器发请求」。
+   * 只走 HTML 直出（不开窗口），拿不到也没关系 —— 那一集仍走正常嗅探。
+   */
+  const prefetchNext = useCallback(
+    (line: number, ep: number): void => {
+      if (state.mode !== 'rule' || !state.ruleId || !state.entry) return
+      const key = `${line}:${ep}`
+      if (prefetchRef.current?.key === key) return
+      prefetchRef.current = { key, pageUrl: '' }
+      const link = state.groups?.[line]?.episodes?.[ep]?.link ?? ''
+      void api.rules
+        .prefetchStream(state.ruleId, state.entry, line, ep, link, state.vars ?? {})
+        .then((r) => {
+          if (prefetchRef.current?.key !== key) return
+          if (!r.ok || !r.data) {
+            prefetchRef.current = null
+            return
+          }
+          prefetchRef.current = {
+            key,
+            pageUrl: r.data.pageUrl,
+            stream: r.data.url ? { url: r.data.url, referer: r.data.referer } : undefined
+          }
+          if (r.data.url) console.log(`[player] 已预取下一集直链（切集可秒开）: ${r.data.url.slice(0, 90)}`)
+        })
+        .catch(() => {
+          if (prefetchRef.current?.key === key) prefetchRef.current = null
+        })
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [state.mode, state.ruleId, state.entry, state.groups, state.vars]
   )
 
   // 规则模式：选集切换
@@ -705,22 +816,13 @@ export function PlayerPage() {
     if (ep + 1 >= total) return
     const key = `${line}:${ep + 1}`
     if (prefetchRef.current?.key === key) return
-    // 只在「快播到结尾」或「已经播过半」时预解析，避免开播瞬间就发多余请求
-    if (duration - current > PRELOAD_LEAD || current < 30) return
-    prefetchRef.current = { key, pageUrl: '' }
-    const link = state.groups?.[line]?.episodes?.[ep + 1]?.link ?? ''
-    void api.rules
-      .play(state.ruleId, state.entry, line, ep + 1, link, state.vars ?? {})
-      .then((r) => {
-        if (!r.ok) {
-          prefetchRef.current = null
-          return
-        }
-        prefetchRef.current = { key, pageUrl: r.data.url }
-      })
-      .catch(() => {
-        prefetchRef.current = null
-      })
+    /*
+     * v0.2.7 附加（切集提速）：只要已经播起来（current ≥ 30s）就预取下一集，
+     * 不再等到快播完 —— 预取会同时解析「下一集播放页地址」和「直链」，
+     * 于是切集时播放器直接命中直链缓存、跳过整轮嗅探。
+     */
+    if (current < 30) return
+    void prefetchNext(line, ep + 1)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current, duration, ruleCurrent, state.mode, state.groups, state.ruleId, state.entry, autoNext])
 
@@ -1252,9 +1354,13 @@ export function PlayerPage() {
           if (!detail) void loadDetail()
           poke()
           break
-        /** 选集浮层里点了某一集（v0.2.6：与规则页选集走同一套「重新挂载」逻辑） */
+        /**
+         * 选集浮层里点了某一集（v0.2.6：与规则页选集走同一套「重新挂载」逻辑）
+         * v0.2.7 附加：本地播放时选集也走悬浮窗（见下面 setEpisodes 的分支），这里分流到本地切集。
+         */
         case 'selectEpisode':
-          void handleRuleEpisode(a.line, a.ep)
+          if (state.mode === 'rule') void handleRuleEpisode(a.line, a.ep)
+          else switchEpisode(a.ep)
           break
         /** 断点续播提示：撤销跳转 → 回到开头 */
         case 'undoResume':
@@ -1303,7 +1409,12 @@ export function PlayerPage() {
     goNextEpisode,
     changeAspect,
     state.title,
-    poke
+    poke,
+    /*
+     * v0.2.7 附加：本地播放的选集走悬浮窗后，这里必须跟着文件列表长度重新注册，
+     * 否则「暂停时列表才加载完」的情况下会捕获到 files 为空的旧闭包，点了没反应。
+     */
+    files.length
   ])
 
   /** 状态下行到悬浮窗（控制栏只依赖这些字段） */
@@ -1378,18 +1489,32 @@ export function PlayerPage() {
    * v0.2.7 修「选集按钮点了没反应」：悬浮窗是**异步创建**的，而这里原先只在挂载时推一次，
    * 推送很可能早于悬浮窗就绪 → 悬浮窗拿不到选集数据 → 点按钮后浮层渲染为空，看起来像没响应。
    * 现在首推之后加两次延时补推，并跟着浮层开合再推一次。
+   *
+   * v0.2.7 附加：本地播放（本地文件 / 本地文件夹）也要推 ——
+   * 画面由原生窗口绘制后，选集浮层只有悬浮窗这一份（页面里那份已经不再显示），
+   * 不推的话本地播放点「选集」只会一直停在「正在读取选集…」。
    */
   useEffect(() => {
-    if (!overlayActive || state.mode !== 'rule') return
+    if (!overlayActive) return
     const push = (): void => {
-      const groups = state.groups ?? []
+      if (state.mode === 'rule') {
+        const groups = state.groups ?? []
+        api.overlay.setEpisodes({
+          lines: groups.map((g, i) => ({
+            name: g.lineName ?? `线路 ${i + 1}`,
+            episodes: g.episodes.map((e, j) => e.name || `第 ${j + 1} 集`)
+          })),
+          currentLine: ruleCurrent?.line ?? 0,
+          currentEp: ruleCurrent?.ep ?? 0
+        })
+        return
+      }
+      // 本地播放：文件列表当成单条线路，高亮当前文件
+      if (files.length === 0) return
       api.overlay.setEpisodes({
-        lines: groups.map((g, i) => ({
-          name: g.lineName ?? `线路 ${i + 1}`,
-          episodes: g.episodes.map((e, j) => e.name || `第 ${j + 1} 集`)
-        })),
-        currentLine: ruleCurrent?.line ?? 0,
-        currentEp: ruleCurrent?.ep ?? 0
+        lines: [{ name: '本地文件', episodes: files.map((f, i) => f.episode != null ? `第 ${f.episode} 集` : (f.name || `第 ${i + 1} 个`)) }],
+        currentLine: 0,
+        currentEp: currentIndex
       })
     }
     push()
@@ -1399,7 +1524,7 @@ export function PlayerPage() {
       window.clearTimeout(t1)
       window.clearTimeout(t2)
     }
-  }, [overlayActive, state.mode, state.groups, ruleCurrent, showEpisodes])
+  }, [overlayActive, state.mode, state.groups, ruleCurrent, showEpisodes, files, currentIndex])
 
   // 播放历史记录（方案 3.2 历史 + 继续观看）
   const recordWatch = useCallback(() => {
@@ -2335,7 +2460,13 @@ function VlcModeUI({
 
       {/* 内容行：抽屉与视频容器为 flex 兄弟，视频区域随抽屉缩放 */}
       <div className="flex min-h-0 flex-1">
-        {showEpisodes ? (
+        {/*
+          v0.2.7 附加 修「左侧和右侧都出现选集列表」：
+          悬浮窗（overlayActive）已经用浮层画了选集，页面里再画一份就会左右各一个 ——
+          左侧正是这个 `border-r` 抽屉（它过去没有被 overlayActive 屏蔽，只受 showEpisodes 控制）。
+          画面由原生窗口绘制时，页面内的这套抽屉/控制栏一律不画，统一由悬浮窗呈现。
+        */}
+        {showEpisodes && !overlayActive ? (
           <div className="z-10 flex h-full w-60 shrink-0 flex-col border-r border-white/10 bg-[#111]">
             <div className="border-b border-white/10 px-3 py-2 text-xs font-semibold text-white/85">
               选集（{ruleMode ? (ruleGroups?.reduce((n, g) => n + g.episodes.length, 0) ?? 0) : files.length}）
@@ -2480,7 +2611,8 @@ function VlcModeUI({
             </div>
           ) : null}
         </div>
-        {showInfo ? (
+        {/* 详情面板同理：悬浮窗已经画了「番剧详情」，页面内不再重复画一份 */}
+        {showInfo && !overlayActive ? (
           <div className="z-10 flex h-full w-72 shrink-0 flex-col overflow-y-auto border-l border-white/10 bg-[#111] p-3">
             <div className="mb-2 flex items-center justify-between">
               <span className="text-sm font-semibold text-white">番剧详情</span>

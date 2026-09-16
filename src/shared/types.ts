@@ -73,6 +73,8 @@ export interface SubjectDetail {
 export interface SubjectResult {
   fromCache: boolean
   data: SubjectDetail | null
+  /** v0.2.7 附加：命中的是**已过期**的缓存（界面可照常渲染，后台正在静默刷新） */
+  stale?: boolean
   error?: SourceError
 }
 
@@ -716,6 +718,8 @@ export interface RuleEpisodesResult {
 
 export interface RulePlayResult {
   url: string
+  /** 该规则站点根地址：可作为播放页/媒体请求的 Referer（v0.2.7 附加，预取与播放共用） */
+  referer?: string
 }
 
 // ---------------- 日志 / 设置 ----------------

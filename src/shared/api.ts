@@ -174,6 +174,19 @@ export interface SakanaApi {
       episodeLink: string,
       vars: Record<string, string>
     ): Promise<ApiResult<RulePlayResult>>
+    /** 查该播放页已缓存的直链（命中可跳过整轮嗅探） */
+    cachedStream(pageUrl: string): Promise<ApiResult<{ url: string; referer?: string } | null>>
+    /** 把刚嗅探到的直链记进会话缓存 */
+    rememberStream(pageUrl: string, url: string, referer?: string): Promise<ApiResult<boolean>>
+    /** 后台预取某集的直链（只走 HTML 直出，不创建窗口）；一并返回播放页地址供切集复用 */
+    prefetchStream(
+      ruleId: string,
+      entry: RuleSearchEntry,
+      lineIndex: number,
+      episodeIndex: number,
+      episodeLink: string,
+      vars: Record<string, string>
+    ): Promise<ApiResult<{ pageUrl: string; url: string | null; referer?: string } | null>>
   }
   media: {
     listVideos(folder: string): Promise<ApiResult<LocalVideoFile[]>>

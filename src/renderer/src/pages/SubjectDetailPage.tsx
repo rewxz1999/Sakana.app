@@ -675,6 +675,13 @@ function RulePlayModal({
       toast.error(res.error)
       return
     }
+    /*
+     * v0.2.7 附加（进入播放提速）：先去后台预取这一集的直链，再跳转播放器。
+     * 跳转 + 播放页挂载大约要几百毫秒，而预取（抓播放页 HTML + 校验候选）刚好跑在这段时间里；
+     * 播放器挂载后来查缓存时若预取还在飞会短暂等一下 —— 命中就完全跳过
+     * 「建嗅探窗口 → 加载播放页 → 等站点播放器发请求」这 1.5~3 秒。
+     */
+    void api.rules.prefetchStream(rule.id, entry, groupIdx, epIdx, episodeLink, vars)
     onClose()
     navigate('/player', {
       state: {
