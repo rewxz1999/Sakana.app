@@ -527,19 +527,24 @@ function StatCard({
   accent?: boolean
   onClick?: () => void
 }) {
+  /*
+   * v0.2.8 附加三：整体瘦身（用户反馈「已订阅 / 已收藏 / 已安装工具板块有点大」）。
+   * 原来图标 44px、数字 2xl、内边距 p-4；现在图标 32px、数字 lg、p-2.5，
+   * 三个入口仍然可点、含义不变，只是不再占掉仪表盘第一屏的一大块。
+   */
   return (
     <button
       onClick={onClick}
-      className="flex items-center gap-3.5 rounded-xl border border-border bg-elev1 p-4 text-left transition-all hover:-translate-y-0.5 hover:shadow-md"
+      className="flex items-center gap-2.5 rounded-lg border border-border bg-elev1 px-2.5 py-2 text-left transition-all hover:-translate-y-0.5 hover:shadow-md"
     >
       <div
-        className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl ${accent ? 'bg-accent-soft text-accent' : 'bg-elev2 text-dim'}`}
+        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${accent ? 'bg-accent-soft text-accent' : 'bg-elev2 text-dim'}`}
       >
-        <Icon size={20} />
+        <Icon size={15} />
       </div>
-      <div>
-        <div className="text-2xl font-bold leading-tight tabular-nums">{value}</div>
-        <div className="text-xs text-dim">{label}</div>
+      <div className="min-w-0">
+        <div className="text-lg font-semibold leading-tight tabular-nums">{value}</div>
+        <div className="truncate text-[11px] leading-tight text-dim">{label}</div>
       </div>
     </button>
   )

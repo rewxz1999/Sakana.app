@@ -1,6 +1,8 @@
 import { app, BrowserWindow, dialog, Menu, screen, Tray, nativeImage } from 'electron'
 import { join } from 'node:path'
 import { log } from './log'
+import { getSettings } from './net'
+import { store } from './store'
 import { getMainWindow, iconPath } from './window'
 
 let tray: Tray | null = null
@@ -27,24 +29,57 @@ function showMain(): void {
   win.focus()
 }
 
-/** 关闭主窗口时的询问（方案：最小化至托盘 / 直接退出 / 取消） */
+/**
+ * 关闭主窗口时的询问（方案：最小化至托盘 / 直接退出 / 取消）。
+ *
+ * v0.2.8 附加：弹窗里带「记住本次选择」勾选框 —— 勾上以后同样的选择不再询问，
+ * 记录在设置里（`closeBehaviorRemembered`: 'tray' | 'quit'），
+ * 需要恢复询问时只要把该项清空即可（设置里没有单独开关，走数据目录里的 settings.json）。
+ */
 export async function askCloseBehavior(win: BrowserWindow): Promise<void> {
+  const saved = (getSettings() as unknown as { closeBehaviorRemembered?: string }).closeBehaviorRemembered
+  if (saved === 'tray') {
+    win.hide()
+    log.append('info', 'app', '最小化至托盘（已记住选择）')
+    return
+  }
+  if (saved === 'quit') {
+    markQuitting()
+    app.quit()
+    return
+  }
   const res = await dialog.showMessageBox(win, {
     type: 'question',
     title: 'Sakana',
     message: '关闭 Sakana？',
-    detail: '最小化到托盘后应用在后台继续运行，下载任务不会中断。',
+    detail: '最小化到托盘后应用在后台继续运行，下载任务不会中断。\n勾选「记住本次选择」后不再询问。',
     buttons: ['最小化到托盘', '直接退出', '取消'],
     defaultId: 0,
     cancelId: 2,
-    noLink: true
+    noLink: true,
+    checkboxLabel: '记住本次选择',
+    checkboxChecked: false
   })
+  const remember = res.checkboxChecked === true
   if (res.response === 0) {
+    if (remember) saveCloseBehavior('tray')
     win.hide()
-    log.append('info', 'app', '最小化至托盘')
+    log.append('info', 'app', `最小化至托盘${remember ? '（已记住选择）' : ''}`)
   } else if (res.response === 1) {
+    if (remember) saveCloseBehavior('quit')
     markQuitting()
     app.quit()
+  }
+}
+
+/** 记住关闭行为（写进设置；下次关闭不再询问） */
+function saveCloseBehavior(mode: 'tray' | 'quit'): void {
+  try {
+    const s = getSettings() as unknown as Record<string, unknown>
+    store.set('settings', { ...s, closeBehaviorRemembered: mode })
+    log.append('info', 'app', `已记住关闭行为：${mode === 'tray' ? '最小化到托盘' : '直接退出'}`)
+  } catch (err) {
+    log.append('warn', 'app', `保存关闭行为失败: ${String((err as Error)?.message ?? err)}`)
   }
 }
 

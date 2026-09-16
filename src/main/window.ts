@@ -232,9 +232,85 @@ export function createMainWindow(): BrowserWindow {
     win.webContents.once('did-finish-load', () => {
       console.log('[smoke] did-finish-load OK')
       const ms = parseInt(process.env.SAKANA_SMOKE_MS ?? '9000', 10)
+      /*
+       * 关闭行为自检（SAKANA_CLOSE_TEST=1，v0.2.8 附加）：
+       * 触发一次「关闭窗口」，看它是弹询问框、直接退回托盘还是直接退出 ——
+       * 配合 settings.closeBehaviorRemembered 验证「记住本次选择」是否生效。
+       * 有弹框时本自检会卡住（不会自动点按钮），这也是一个明确的失败信号。
+       */
+      if (process.env.SAKANA_CLOSE_TEST) {
+        setTimeout(() => {
+          console.log('[smoke] 触发关闭窗口（SAKANA_CLOSE_TEST）')
+          win.close()
+          setTimeout(() => {
+            console.log(`[smoke] 关闭后：窗口可见=${win.isVisible()} 已销毁=${win.isDestroyed()}`)
+            app.quit()
+          }, 2500)
+        }, Math.max(4000, ms))
+        return
+      }
+      if (process.env.SAKANA_ANNOUNCE_TEST) {
+        setTimeout(() => {
+          void (async () => {
+            const sleep = (n: number): Promise<void> => new Promise((r) => setTimeout(r, n))
+            try {
+              const before = (await win.webContents.executeJavaScript(
+                `JSON.stringify({open:/更新公告/.test(document.body.innerText), muted:(document.querySelector('input[type=checkbox]')||{}).checked===true})`,
+                true
+              )) as string
+              console.log(`[smoke] 公告初始：${before}`)
+              // 关键：**不勾选**「不再提示」，直接点「知道了」
+              const clicked = (await win.webContents.executeJavaScript(
+                `(function(){
+                   var btns=Array.prototype.slice.call(document.querySelectorAll('button'));
+                   var b=btns.filter(function(x){return (x.innerText||'').trim()==='知道了'})[0];
+                   if(!b) return false;
+                   b.click();
+                   return true
+                 })()`,
+                true
+              )) as boolean
+              console.log(`[smoke] 已点击「知道了」（未勾选）：${clicked}`)
+              await sleep(2500)
+              const after = (await win.webContents.executeJavaScript(
+                `JSON.stringify({open:/更新公告/.test(document.body.innerText)})`,
+                true
+              )) as string
+              console.log(`[smoke] 关闭后：${after}（期望 open=false）`)
+            } catch (err) {
+              console.log(`[smoke] 公告自检失败: ${String(err).slice(0, 120)}`)
+            }
+            console.log('[smoke] done, quitting')
+            app.quit()
+          })()
+        }, Math.max(5000, ms))
+        return
+      }
       setTimeout(() => {
-        console.log('[smoke] done, quitting')
-        app.quit()
+        /*
+         * v0.2.8 附加：退出前把主界面正文前 400 字带出来 ——
+         * 启动公告（AnnouncementModal）这类只挂在主窗口上的弹窗，
+         * 副窗口自检看不到，靠这里核对。
+         */
+        void win.webContents
+          .executeJavaScript(
+            `(function(){
+               var b=document.body;
+               var t=b?b.innerText:'';
+               var imgs=Array.prototype.filter.call(document.images||[],function(i){return i.complete&&i.naturalWidth>0}).length;
+               return JSON.stringify({
+                 announce:/更新公告/.test(t), muted:/不再提示/.test(t), checkbox:!!document.querySelector('input[type=checkbox]'),
+                 text:t.replace(/\\s+/g,' ').slice(0,160), len:t.length, imgs:imgs
+               })
+             })()`,
+            true
+          )
+          .then((s) => console.log(`[smoke] 主界面：${String(s)}`))
+          .catch(() => undefined)
+          .finally(() => {
+            console.log('[smoke] done, quitting')
+            app.quit()
+          })
       }, ms)
     })
   }

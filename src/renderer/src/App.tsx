@@ -25,6 +25,8 @@ import { DownloadDetailPage } from '@/pages/DownloadDetailPage'
 import { DownloaderConfigPage } from '@/pages/DownloaderConfigPage'
 import { PlayerSettingsPage } from '@/pages/PlayerSettingsPage'
 import { CacheSettingsPage } from '@/pages/CacheSettingsPage'
+import { DanmakuSettingsPage } from '@/pages/DanmakuSettingsPage'
+import { AnnouncementModal } from '@/components/AnnouncementModal'
 import { LogsPage } from '@/pages/LogsPage'
 import { AboutPage } from '@/pages/AboutPage'
 import { SaveDirsPage } from '@/pages/SaveDirsPage'
@@ -44,6 +46,7 @@ const SMALL_WINDOW_TITLES: Record<string, string> = {
   '/downloader-config': '下载器配置',
   '/player-settings': '播放器设置',
   '/cache-settings': '缓存设置',
+  '/danmaku-settings': '弹幕设置',
   '/downloads-win': '下载详情',
   '/galgame/tools': 'Galgame 工具'
 }
@@ -86,6 +89,7 @@ function AnimatedRoutes() {
         <Route path="/downloader-config" element={<PageTransition><DownloaderConfigPage /></PageTransition>} />
         <Route path="/player-settings" element={<PageTransition><PlayerSettingsPage /></PageTransition>} />
         <Route path="/cache-settings" element={<PageTransition><CacheSettingsPage /></PageTransition>} />
+        <Route path="/danmaku-settings" element={<PageTransition><DanmakuSettingsPage /></PageTransition>} />
         <Route path="/logs" element={<PageTransition><LogsPage /></PageTransition>} />
         <Route path="/about" element={<PageTransition><AboutPage /></PageTransition>} />
         <Route path="/save-dirs" element={<PageTransition><SaveDirsPage /></PageTransition>} />
@@ -212,6 +216,8 @@ function AppFrame() {
         </main>
       </div>
       <ToastHost />
+      {/* v0.2.8 附加：启动公告（只在主界面弹，小窗口/播放器/悬浮窗不弹） */}
+      <AnnouncementModal />
     </div>
   )
 }

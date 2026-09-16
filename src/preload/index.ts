@@ -114,12 +114,15 @@ const api: SakanaApi = {
   overlay: {
     isOverlay: process.argv.includes('--sakana-overlay'),
     show: () => call(CH.overlayShow),
-    hide: () => call(CH.overlayHide),
+    hide: (gen) => call(CH.overlayHide, gen),
     setInteractive: (interactive) => call(CH.overlaySetSpace, interactive),
     // 高频消息用 send：状态下行、动作上行、鼠标唤出
     pushState: (state) => ipcRenderer.send(CH.overlayState, state),
     setEpisodes: (payload) => ipcRenderer.send(CH.overlayEpisodes, payload),
     onEpisodes: (cb) => subscribe(CH.overlayEpisodes, cb),
+    // v0.2.8：弹幕数据与设置
+    setDanmaku: (payload) => ipcRenderer.send(CH.overlayDanmaku, payload),
+    onDanmaku: (cb) => subscribe(CH.overlayDanmaku, cb),
     poke: () => ipcRenderer.send(CH.overlayPoke),
     action: (action) => ipcRenderer.send(CH.overlayAction, action),
     onState: (cb) => subscribe(CH.overlayState, cb),
@@ -208,7 +211,11 @@ const api: SakanaApi = {
   },
   danmaku: {
     match: (title, episode) => call(CH.danmakuMatch, title, episode),
-    comments: (episodeId) => call(CH.danmakuComments, episodeId)
+    comments: (episodeId) => call(CH.danmakuComments, episodeId),
+    // v0.2.8：一步到位（播放器 / 本地播放共用）；opts 支持别名检测
+    load: (title, episode, opts) => call(CH.danmakuLoad, title, episode, opts),
+    // v0.2.8 附加：预取（只预热缓存）
+    prefetch: (title, episode, opts) => call(CH.danmakuPrefetch, title, episode, opts)
   },
   cache: {
     info: () => call(CH.cacheInfo),

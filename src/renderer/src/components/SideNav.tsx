@@ -40,11 +40,19 @@ const SIDEBAR_ART = sidebarArt
 export function SideNav() {
   const location = useLocation()
   const [bgPath, setBgPath] = useState('')
+  /** 应用版本号（v0.2.8 附加：底部标签改为读真实版本，不再写死） */
+  const [appVersion, setAppVersion] = useState('0.2.8')
 
   useEffect(() => {
     void api.navBg.get().then((r) => {
       if (r.ok) setBgPath(r.data.path)
     })
+    void api.app
+      .version()
+      .then((r) => {
+        if (r.ok && r.data) setAppVersion(String(r.data))
+      })
+      .catch(() => undefined)
   }, [])
 
   const active =
@@ -109,7 +117,8 @@ export function SideNav() {
         />
       </div>
       <div className="relative shrink-0 border-t border-border px-4 py-3 text-[10px] leading-relaxed text-faint">
-        Sakana v0.1.4
+        {/* v0.2.8 附加：版本号改为读取应用版本（此前这里写死 v0.1.4，早就过期了） */}
+        Sakana v{appVersion}
         <br />
         本地优先 · 数据不离开设备
       </div>

@@ -682,6 +682,12 @@ function RulePlayModal({
      * 「建嗅探窗口 → 加载播放页 → 等站点播放器发请求」这 1.5~3 秒。
      */
     void api.rules.prefetchStream(rule.id, entry, groupIdx, epIdx, episodeLink, vars)
+    /*
+     * v0.2.8 附加：**同时预取这一集的弹幕**（用户建议：从规则页进入某一集播放时就把弹幕准备好）。
+     * 弹幕要「搜索弹幕库 → 拉取弹幕」两步网络请求，正好利用跳转与播放页挂载这段时间；
+     * 播放器随后取弹幕时直接命中缓存，几乎零等待。
+     */
+    void api.danmaku.prefetch(title, epIdx + 1)
     onClose()
     navigate('/player', {
       state: {

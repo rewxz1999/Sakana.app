@@ -357,6 +357,83 @@ export interface DanmakuMatch {
   episodeTitle: string
 }
 
+/** v0.2.8：一次拿到的完整弹幕结果（播放器与本地播放共用） */
+export interface DanmakuLoadResult extends DanmakuMatch {
+  count: number
+  comments: DanmakuComment[]
+  /** 命中本地缓存（未再请求接口） */
+  fromCache: boolean
+  /** 这次是用哪个关键词匹配上的（别名检测命中时不是原始番剧名） */
+  matchedBy?: string
+  /** 是否用到了别名 */
+  aliasUsed?: boolean
+}
+
+/** v0.2.8：弹幕显示设置（播放器悬浮窗 + 设置页共用；未设置项用默认值） */
+export interface DanmakuSettings {
+  /** 总开关 */
+  enabled: boolean
+  /** 覆盖区域：占画面高度的比例（0.25 / 0.5 / 0.75 / 1） */
+  area: number
+  /** 同屏最大条数 */
+  maxCount: number
+  /** 时间轴微调（毫秒，正数 = 弹幕提前出现） */
+  offsetMs: number
+  /** 字号（px） */
+  fontSize: number
+  /** 不透明度 0~1 */
+  opacity: number
+  /** 滚动弹幕穿过屏幕的秒数（越小越快） */
+  speedSec: number
+  /** 显示滚动弹幕 */
+  showScroll: boolean
+  /** 显示顶部弹幕 */
+  showTop: boolean
+  /** 显示底部弹幕 */
+  showBottom: boolean
+  /** 加粗描边（提升复杂画面下的可读性） */
+  bold: boolean
+  /** 屏蔽词（逗号 / 换行分隔，命中即不显示） */
+  blockWords: string
+}
+
+export const DEFAULT_DANMAKU_SETTINGS: DanmakuSettings = {
+  enabled: true,
+  area: 1,
+  maxCount: 30,
+  offsetMs: 0,
+  fontSize: 22,
+  opacity: 0.9,
+  speedSec: 8,
+  showScroll: true,
+  showTop: true,
+  showBottom: true,
+  bold: true,
+  blockWords: ''
+}
+
+/** 把设置里的零散字段补成完整弹幕设置（兼容未设置/半设置的历史数据） */
+export function resolveDanmakuSettings(raw: Partial<DanmakuSettings> | undefined): DanmakuSettings {
+  const d = DEFAULT_DANMAKU_SETTINGS
+  if (!raw) return { ...d }
+  const num = (v: unknown, fallback: number): number =>
+    typeof v === 'number' && Number.isFinite(v) ? v : fallback
+  return {
+    enabled: raw.enabled !== false,
+    area: num(raw.area, d.area),
+    maxCount: num(raw.maxCount, d.maxCount),
+    offsetMs: num(raw.offsetMs, d.offsetMs),
+    fontSize: num(raw.fontSize, d.fontSize),
+    opacity: num(raw.opacity, d.opacity),
+    speedSec: num(raw.speedSec, d.speedSec),
+    showScroll: raw.showScroll !== false,
+    showTop: raw.showTop !== false,
+    showBottom: raw.showBottom !== false,
+    bold: raw.bold !== false,
+    blockWords: typeof raw.blockWords === 'string' ? raw.blockWords : d.blockWords
+  }
+}
+
 
 // ---------------- 工具 ----------------
 
@@ -806,6 +883,26 @@ export interface AppSettings {
    */
   bangumiCustomApi?: string
   bangumiCustomImg?: string
+  /**
+   * 弹幕显示设置（v0.2.8）。
+   *
+   * 播放器悬浮窗里的「弹幕设置」与设置页里的「弹幕设置」改的是同一份数据；
+   * 缺省字段由 `resolveDanmakuSettings()` 补默认值，所以历史用户升级后直接可用。
+   */
+  danmaku?: Partial<DanmakuSettings>
+  /**
+   * 启动公告（v0.2.8 附加）。
+   * - `announcementSeenVersion`：用户上次看完公告时的版本号；
+   * - `announcementMuted`：用户勾了「不再提示」。
+   * 两者同时成立才不再弹；版本变化后无视勾选再弹一次。
+   */
+  announcementSeenVersion?: string
+  announcementMuted?: boolean
+  /**
+   * 关闭窗口时记住的选择（v0.2.8 附加）：`'tray'` = 最小化到托盘，`'quit'` = 直接退出。
+   * 为空时每次关闭都会询问；设置了这个值就不再询问。
+   */
+  closeBehaviorRemembered?: 'tray' | 'quit'
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {

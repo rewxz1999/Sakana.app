@@ -87,6 +87,8 @@ export const CH = {
   overlayState: 'overlay:state',
   // v0.2.6：选集数据单独走一条低频通道（状态推送是每秒多次的，不适合塞大数组）
   overlayEpisodes: 'overlay:episodes',
+  // v0.2.8：弹幕数据同理（一集可能上千条，换集/改设置时才推）
+  overlayDanmaku: 'overlay:danmaku',
   overlayAction: 'overlay:action',
   overlayPoke: 'overlay:poke',
   // 内置组件探测（libVLC / FFmpeg / aria2 是否随包内置）
@@ -130,6 +132,10 @@ export const CH = {
   // 弹幕（预留：弹弹play）
   danmakuMatch: 'danmaku:match',
   danmakuComments: 'danmaku:comments',
+  /** v0.2.8：一步到位（番剧名 + 集数 → 弹幕列表），播放器与本地播放共用 */
+  danmakuLoad: 'danmaku:load',
+  /** v0.2.8 附加：只预热缓存、不回传弹幕本体（进播放/切集时预加载用） */
+  danmakuPrefetch: 'danmaku:prefetch',
 
   // 保存目录（立即生效）
   saveDirsSet: 'save-dirs:set',

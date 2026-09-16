@@ -23,6 +23,8 @@ import { toast } from '@/stores/app'
 import { api } from '@/lib/api'
 import { imgUrl, localImgUrl, timeAgo } from '@/lib/format'
 import { Badge, Button, ConfirmModal, Input, Modal, Spinner } from '@/components/ui'
+/** v0.2.8：没有导入任何 galgame 时的默认背景插画 */
+import galgameDefaultBg from '@/assets/galgame-default.png'
 
 /** 游玩时长展示：Xh Ym / Ym Zs / Zs */
 function fmtPlay(sec: number): string {
@@ -117,6 +119,11 @@ export function GalgamePage() {
 
   // 空态背景图同样走 sakana-img 协议（主进程白名单 + 磁盘缓存），失败则回落纯色渐变
   const navBgUrl = navBgPath ? localImgUrl(navBgPath) : ''
+  /**
+   * 空态默认背景（v0.2.8 附加）：用户没有设置「导航栏背景」时用内置的默认插画，
+   * 不再只显示纯色渐变。用户自己设置过背景就优先用用户的。
+   */
+  const emptyBg = navBgUrl || galgameDefaultBg
 
   // 底部封面条：竖向滚轮 → 横向滚动（原生非 passive 监听才能 preventDefault）
   useEffect(() => {
@@ -383,9 +390,9 @@ export function GalgamePage() {
             /* 空态：用用户自定义的导航栏背景图铺满整块区域代替纯色背景
                （父容器 items-end，用 self-stretch 让这块区域撑满中部空间，背景图才真的铺满） */
             <div className="relative flex w-full flex-1 self-stretch items-center justify-center overflow-hidden rounded-2xl">
-              {navBgUrl && !navBgFailed ? (
+              {emptyBg && !navBgFailed ? (
                 <img
-                  src={navBgUrl}
+                  src={emptyBg}
                   alt=""
                   aria-hidden
                   className="absolute inset-0 h-full w-full object-cover"

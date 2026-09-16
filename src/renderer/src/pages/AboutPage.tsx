@@ -9,6 +9,8 @@ import { Card, SubPage } from '@/components/SettingsShell'
 // 应用图标：resources/icon.png 只是打包资源，渲染层无法直接引用，
 // 因此把同一份图标复制为渲染层静态资源由 Vite 打包（与 sidebar-art.png 同一做法）。
 import appIcon from '@/assets/app-icon.png'
+/** v0.2.8：致谢 DeepSeek 的配图 */
+import deepseekThanks from '@/assets/deepseek-1.png'
 
 /** 版本号兜底（正常情况下由主进程 app.getVersion() 提供，避免多处硬编码漂移） */
 const APP_VERSION_FALLBACK = '0.2.7'
@@ -170,10 +172,26 @@ export function AboutPage() {
         </div>
       </Card>
 
-      {/* 致谢 */}
+      {/* 致谢 + DeepSeek（v0.2.8 附加：用户要求的专门致谢与配图） */}
+      <Card title="特别感谢 DeepSeek" desc="没有 DeepSeek，就没有这个项目">
+        <div className="flex flex-col gap-3">
+          <img
+            src={deepseekThanks}
+            alt="DeepSeek"
+            draggable={false}
+            className="w-full select-none rounded-xl border border-border object-cover"
+          />
+          <div className="text-xs leading-relaxed text-dim">
+            这个项目的代码与界面都由 <span className="text-text">DeepSeek</span> 协助完成 ——
+            从架构拆分、播放内核嵌入，到规则引擎与弹幕的每一个坑，都是在与它反复排查中解决的。
+            衷心感谢 DeepSeek。
+          </div>
+        </div>
+      </Card>
+
       <Card title="致谢">
         <ul className="flex flex-col gap-1 text-xs text-dim">
-          <li>应用使用 DeepSeek 构建</li>
+          <li>参考项目 Kazumi（在线播放规则引擎与规则仓库格式）</li>
           <li>galgame 数据来自月幕 galgame 与 VNDB</li>
           <li>番剧数据来自 Bangumi，资源来自蜜柑计划</li>
           <li>内置播放内核 libmpv 与 libVLC、内置下载器 aria2、转码组件 FFmpeg</li>

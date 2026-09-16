@@ -32,7 +32,7 @@ import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebvie
 import { mpvRuntimeAvailable } from './services/mpv'
 import { buildStreamInfo } from './services/playerInfo'
 import { checkUpdate, REPO_URL } from './services/updater'
-import { fetchDanmaku, matchDanmaku } from './services/danmaku'
+import { fetchDanmaku, loadDanmaku, matchDanmaku, prefetchDanmaku } from './services/danmaku'
 import { saveDirsInfo, setSaveDirs } from './services/saveDirs'
 import { ffmpegExe, inspectMedia, startLive, startLiveUrl, stopLive } from './services/transcode'
 import { resolveVlcDir } from './services/vlc'
@@ -57,6 +57,7 @@ import {
   destroyOverlay,
   pokeOverlay,
   pushOverlayEpisodes,
+  pushOverlayDanmaku,
   pushOverlayState,
   sendOverlayAction,
   setOverlayInteractive,
@@ -429,17 +430,28 @@ export function registerIpc(): void {
     }
   )
   // ---------- 全屏控制栏悬浮窗 ----------
-  ipcMain.handle(CH.overlayShow, () => {
-    const w = focused()
-    if (!w) return false
-    showOverlay(w)
-    return true
+  /*
+   * v0.2.8 附加 修「控制栏按钮点了没反应」：
+   * 这里过去用 `focused()`（当前聚焦窗口）当悬浮窗的 owner ——
+   * 一旦此刻聚焦的是别的小窗口（例如刚打开的「弹幕设置」），
+   * 悬浮窗的控制栏动作就会**发到那个窗口**上，而它没有播放器，于是所有按钮都像失灵。
+   * 现在改为认「发起请求的窗口」（也就是播放页所在窗口）：
+   * `BrowserWindow.fromWebContents(e.sender)`。
+   */
+  ipcMain.handle(CH.overlayShow, (e) => {
+    const w =
+      BrowserWindow.fromWebContents(e.sender) ?? focused() ?? getMainWindow() ?? undefined
+    if (!w) return { ok: false, gen: 0 }
+    const gen = showOverlay(w)
+    return { ok: true, gen }
   })
-  ipcMain.handle(CH.overlayHide, () => {
-    destroyOverlay()
+  ipcMain.handle(CH.overlayHide, (_e, gen?: number) => {
+    destroyOverlay(gen)
     return true
   })
   ipcMain.on(CH.overlayEpisodes, (_e, payload: unknown) => pushOverlayEpisodes(payload))
+  // v0.2.8：弹幕数据 / 设置（换集或改设置时推一次）
+  ipcMain.on(CH.overlayDanmaku, (_e, payload: unknown) => pushOverlayDanmaku(payload))
   ipcMain.handle(CH.overlaySetSpace, (_e, interactive: boolean) => {
     setOverlayInteractive(interactive)
     return true
@@ -655,6 +667,18 @@ export function registerIpc(): void {
   })
   ipcMain.handle(CH.danmakuMatch, (_e, title: string, episode: number) => matchDanmaku(title, episode))
   ipcMain.handle(CH.danmakuComments, (_e, episodeId: number) => fetchDanmaku(episodeId))
+  // v0.2.8：播放器与本地播放共用的一步到位接口（opts.aliases / aliasMode 用于「别名检测弹幕」）
+  ipcMain.handle(
+    CH.danmakuLoad,
+    (_e, title: string, episode: number, opts?: { aliases?: string[]; aliasMode?: boolean }) =>
+      loadDanmaku(title, episode, opts)
+  )
+  // v0.2.8 附加：预取（只预热缓存，不回传弹幕本体），用于「进播放/切集时提前加载」
+  ipcMain.handle(
+    CH.danmakuPrefetch,
+    (_e, title: string, episode: number, opts?: { aliases?: string[]; aliasMode?: boolean }) =>
+      prefetchDanmaku(title, episode, opts)
+  )
 
   // 自动创建未配置的保存目录（baseDir = userData/saves）
   ensureSaveDirs()

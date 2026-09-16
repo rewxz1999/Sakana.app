@@ -24,6 +24,8 @@ import {
 import { useLocation, useNavigate } from 'react-router-dom'
 import type {
   AspectMode,
+  DanmakuComment,
+  DanmakuSettings,
   LiveStartResult,
   LocalSubFile,
   LocalVideoFile,
@@ -33,6 +35,7 @@ import type {
   RuleSearchEntry,
   SubjectDetail
 } from '@shared/types'
+import { resolveDanmakuSettings } from '@shared/types'
 import { api } from '@/lib/api'
 import { fmtDuration, localSubUrl, localVideoUrl } from '@/lib/format'
 import { useLibrary } from '@/stores/library'
@@ -194,6 +197,19 @@ export function PlayerPage() {
   const [resumeHint, setResumeHint] = useState<{ at: number; target: number } | null>(null)
   const [switching, setSwitching] = useState(false)
   const { settings: appSettings, save: saveSettings } = useSettings()
+  /** v0.2.8：弹幕（整集数据 + 显示设置），推送悬浮窗绘制 */
+  const [danmaku, setDanmaku] = useState<{ comments: DanmakuComment[]; source: string; loading: boolean }>({
+    comments: [],
+    source: '',
+    loading: false
+  })
+  const danmakuSettings = resolveDanmakuSettings(appSettings?.danmaku)
+  const danmakuSettingsRef = useRef(danmakuSettings)
+  danmakuSettingsRef.current = danmakuSettings
+  /** 已经为哪一集拉过弹幕（避免重复请求） */
+  const danmakuKeyRef = useRef('')
+  /** 当前弹幕对应的「集」标识（同一集内重载时保留已有弹幕） */
+  const danmakuBaseKeyRef = useRef('')
   // 设置加载完成后同步一次（首帧可能拿不到设置）
   useEffect(() => {
     if (appSettings?.aspectMode && appSettings.aspectMode !== aspect) setAspect(appSettings.aspectMode)
@@ -249,24 +265,28 @@ export function PlayerPage() {
   const progressApi = useWatchProgress()
 
   /**
-   * 播放状态（顶部状态栏文案）：
-   * 失败 > 捕捉视频流 > 加载 > 播放中 > 已暂停，优先级从高到低，保证异常状态不会被覆盖。
+   * 播放状态（顶部状态栏文案）：失败 > **播放中** > 捕捉视频流 > 切换中 > 加载 > 已暂停。
+   *
+   * v0.2.8 修「已经在播放了（有声音）却一直显示捕捉视频流中」：
+   * 「播放中」必须排在「捕捉视频流」**前面**。原因见下面 `playing` 事件里的说明 ——
+   * 缓存直链 / 上一集下一集切换时可能还有一轮嗅探在跑，此时画面与声音早就起来了，
+   * 若让嗅探状态优先，状态栏就会一直卡在「捕捉视频流中」。
    */
   const playStatus: { kind: PlayStatus; text: string } = videoError
     ? { kind: 'failed', text: '播放失败' }
     : ruleProbeFailed
       ? { kind: 'failed', text: '播放失败' }
-      : ruleProbing
-        ? { kind: 'capturing', text: '捕捉视频流中' }
-        : switching
-          ? { kind: 'loading', text: '切换中' }
-          : vlcState === 'trying' || preparing
-            ? // 规则模式挂载到开始嗅探之间还有一个「解析播放页」的阶段，单独给出文案（v0.2.7）
-              state.mode === 'rule'
-              ? { kind: 'loading' as PlayStatus, text: '准备播放源' }
-              : { kind: 'loading' as PlayStatus, text: '加载中' }
-            : playing
-              ? { kind: 'playing', text: '播放中' }
+      : playing
+        ? { kind: 'playing', text: '播放中' }
+        : ruleProbing
+          ? { kind: 'capturing', text: '捕捉视频流中' }
+          : switching
+            ? { kind: 'loading', text: '切换中' }
+            : vlcState === 'trying' || preparing
+              ? // 规则模式挂载到开始嗅探之间还有一个「解析播放页」的阶段，单独给出文案（v0.2.7）
+                state.mode === 'rule'
+                ? { kind: 'loading' as PlayStatus, text: '准备播放源' }
+                : { kind: 'loading' as PlayStatus, text: '加载中' }
               : { kind: 'idle', text: '已暂停' }
 
   /**
@@ -672,6 +692,11 @@ export function PlayerPage() {
       const key = `${line}:${ep}`
       if (prefetchRef.current?.key === key) return
       prefetchRef.current = { key, pageUrl: '' }
+      /*
+       * 同时预取**弹幕**（v0.2.8 附加）：切集时弹幕直接命中缓存，
+       * 不用等「搜索弹幕库 → 拉弹幕」这一两秒。
+       */
+      void api.danmaku.prefetch(state.title, ep + 1)
       const link = state.groups?.[line]?.episodes?.[ep]?.link ?? ''
       void api.rules
         .prefetchStream(state.ruleId, state.entry, line, ep, link, state.vars ?? {})
@@ -693,7 +718,7 @@ export function PlayerPage() {
         })
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [state.mode, state.ruleId, state.entry, state.groups, state.vars]
+    [state.mode, state.ruleId, state.entry, state.groups, state.vars, state.title]
   )
 
   // 规则模式：选集切换
@@ -722,6 +747,11 @@ export function PlayerPage() {
       // 目标播放页地址：优先用预解析结果，否则现解析一次
       const key = `${line}:${ep}`
       let pageUrl = ''
+      /*
+       * 切集的弹幕预取（v0.2.8 附加）：与播放页地址并行发起，
+       * 跳转 + 挂载这段时间刚好用来加载弹幕，切过去基本立刻就有弹幕。
+       */
+      void api.danmaku.prefetch(state.title, ep + 1)
       const cached = prefetchRef.current
       if (cached && cached.key === key && cached.pageUrl) {
         pageUrl = cached.pageUrl
@@ -939,6 +969,21 @@ export function PlayerPage() {
         case 'playing':
           playingRef.current = true
           setPlaying(true)
+          /*
+           * v0.2.8 修「已经在播放了却仍显示捕捉视频流中」：
+           * 一旦内核真的开播，就把还在跑的那一轮嗅探**收掉**。
+           * 什么时候会出现「边播边嗅探」：
+           * - 命中会话直链缓存后播放，2.5 秒看门狗以为没开播、又起了一轮完整嗅探（慢 CDN 上常见）；
+           * - 直连 15 秒未开播的补救重嗅探刚刚启动，媒体紧接着开播；
+           * - 上一集/下一集按钮连点。
+           * 收掉之后状态栏才会正确显示「播放中」，也顺带关掉多出来的嗅探窗口（省资源）。
+           */
+          if (probingRef.current) {
+            probingRef.current = false
+            setRuleProbing(false)
+            probeCancelRef.current?.()
+            probeCancelRef.current = null
+          }
           // 本集真正开播了：这之后的时间/结束事件才算数
           awaitingStartRef.current = false
           // 记录本集开播时刻：自动连播的进度兜底要求「已经播够久」，避免刚开播就被判定为播完
@@ -1117,15 +1162,17 @@ export function PlayerPage() {
    * 只有确实没有任何播放实例存活时才释放内核。
    */
   useEffect(() => {
-    const leave = enterPlayer()
+    const handle = enterPlayer()
     return () => {
-      leave()
+      handle.leave()
       whenPlayerGone(() => {
         void api.ruleWebview.close()
         void api.ruleProbe.stop()
         void api.vlc.detach()
-        void api.overlay.hide()
-      }, 600)
+        // 带上 show 时拿到的代号：迟到的 hide 不会关掉新实例刚建好的控制栏（v0.2.8 附加）
+        void api.overlay.hide(overlayGenRef.current ?? undefined)
+        // 世代号判定：只要新实例已经进入过播放页，上面这些清理就不会执行
+      }, handle.epoch)
     }
   }, [])
 
@@ -1260,11 +1307,46 @@ export function PlayerPage() {
    * 同时修掉「详情按钮点了没反应」——面板过去画在页面里，被原生视频窗口完全盖住了。
    */
   const overlayActive = vlcState !== 'fallback'
+  /** 最近一次 show 拿到的悬浮窗代号（hide 时带回去，防止迟到的 hide 关掉新窗口） */
+  const overlayGenRef = useRef<number | null>(null)
   useEffect(() => {
-    if (overlayActive) void api.overlay.show()
-    else void api.overlay.hide()
+    if (overlayActive) {
+      void api.overlay.show().then((r) => {
+        if (r.ok && r.data.ok) overlayGenRef.current = r.data.gen
+      })
+    } else {
+      void api.overlay.hide(overlayGenRef.current ?? undefined)
+    }
   }, [overlayActive])
-  useEffect(() => () => void api.overlay.hide(), [])
+  /**
+   * 悬浮窗心跳（v0.2.8 附加三）。
+   *
+   * 切集是重新挂载播放页，期间悬浮窗可能被各种时序问题（旧实例的清理、主窗口失焦隐藏、
+   * 迟到销毁）弄成隐藏或消失的状态 —— 用户看到的就是「切集后控制栏按钮失灵」。
+   * 这里每 3 秒幂等地 show 一次（主进程侧会顺带把被隐藏的窗口重新显示），
+   * 并把代号更新到 ref，任何一次自愈都不会被随后的迟到 hide 影响。
+   */
+  useEffect(() => {
+    if (!overlayActive) return
+    const t = window.setInterval(() => {
+      void api.overlay.show().then((r) => {
+        if (r.ok && r.data.ok) {
+          const prev = overlayGenRef.current
+          overlayGenRef.current = r.data.gen
+          if (prev !== null && prev !== r.data.gen) {
+            console.log(`[player] 悬浮窗自愈：代号 ${prev} → ${r.data.gen}`)
+          }
+        }
+      })
+    }, 3000)
+    return () => window.clearInterval(t)
+  }, [overlayActive])
+  /*
+   * 这里过去还有一句无条件的 `useEffect(() => () => api.overlay.hide(), [])`：
+   * 切集时旧的播放页实例卸载会**无条件销毁**悬浮窗，而新实例的 show 可能已经先执行了 ——
+   * 结果控制栏整个消失，点哪都没反应，只有 Esc（键盘）还能退出（用户反馈的「所有按键都失灵」）。
+   * 现在统一由上面带代号的 show/hide 与 `whenPlayerGone` 保护的清理负责，不再单独挂一个。
+   */
 
   /** 剧集前后切换（悬浮窗与快捷键共用） */
   const goPrevEpisode = useCallback((): void => {
@@ -1391,6 +1473,24 @@ export function PlayerPage() {
         case 'exitFullscreen':
           void api.window.setFullscreen(false)
           break
+        /** v0.2.8 弹幕：开关 / 逐项设置 / 打开详细设置 / 重新匹配 */
+        case 'toggleDanmaku':
+          void updateDanmaku({ enabled: !danmakuSettingsRef.current.enabled })
+          if (danmakuSettingsRef.current.enabled) toast.info('已关闭弹幕')
+          else toast.info('已打开弹幕')
+          break
+        case 'danmakuSetting':
+          void updateDanmaku({ [a.key]: a.value } as Partial<DanmakuSettings>)
+          break
+        case 'openDanmakuSettings':
+          void api.window.openSmall('/danmaku-settings', { width: 620, height: 560, title: '弹幕设置' })
+          break
+        case 'reloadDanmaku':
+          void loadDanmaku(true)
+          break
+        case 'detectDanmakuAlias':
+          void loadDanmaku(true, { aliasMode: true })
+          break
         case 'exitPlayer':
           exitPlayer()
           break
@@ -1416,6 +1516,40 @@ export function PlayerPage() {
      */
     files.length
   ])
+
+  /**
+   * 内核实际状态轮询（v0.2.8 附加三）。
+   *
+   * 修「已经在播放了（有声音）却仍显示捕捉视频流中 / 已暂停」：
+   * 内核的 `playing` 事件可能在渲染层订阅之前就发出了（快速开播的源、断点里继续播放这条路尤其常见），
+   * 于是 React 里的 `playing` 一直是 false，状态栏就一直停在嗅探态。
+   * 这里在「尚未开播」时每 800ms 问一次内核，**以内核的真实状态为准**纠正界面。
+   */
+  useEffect(() => {
+    if (!overlayActive) return
+    const timer = window.setInterval(() => {
+      if (playingRef.current) return
+      void api.vlc.getState().then((r) => {
+        if (!r.ok) return
+        const st = r.data
+        if (!st.playing || (st.time <= 0 && st.length <= 0)) return
+        console.log(`[player] 轮询确认内核已在播放（time=${Math.round(st.time)}s length=${Math.round(st.length)}s）`)
+        playingRef.current = true
+        awaitingStartRef.current = false
+        if (!playStartedAtRef.current) playStartedAtRef.current = Date.now()
+        setPlaying(true)
+        setRuleProbeFailed(false)
+        if (probingRef.current) {
+          probingRef.current = false
+          setRuleProbing(false)
+          probeCancelRef.current?.()
+          probeCancelRef.current = null
+        }
+      })
+    }, 800)
+    return () => window.clearInterval(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overlayActive])
 
   /** 状态下行到悬浮窗（控制栏只依赖这些字段） */
   useEffect(() => {
@@ -1454,7 +1588,16 @@ export function PlayerPage() {
       currentLine: line,
       currentEp: ruleCurrent?.ep ?? 0,
       subjectId: state.subjectId,
-      resume: resumeHint ? { target: resumeHint.target } : null
+      resume: resumeHint ? { target: resumeHint.target } : null,
+      // v0.2.8：弹幕要精确盖在画面之上（避开上下控制栏），所以把视频区域矩形一并推过去
+      videoRect: (() => {
+        const el = document.getElementById('vlc-host')
+        const r = el?.getBoundingClientRect()
+        if (r && r.width > 0 && r.height > 0) {
+          return { x: Math.round(r.left), y: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) }
+        }
+        return { x: 0, y: 56, width: window.innerWidth, height: Math.max(120, window.innerHeight - 112) }
+      })()
     })
   }, [
     overlayActive,
@@ -1556,6 +1699,137 @@ export function PlayerPage() {
   const toggleFullscreen = () => {
     void api.window.setFullscreen(!fullscreen)
   }
+
+  // ---------------- 弹幕（v0.2.8） ----------------
+
+  /** 保存弹幕设置（写进 settings.danmaku，播放器悬浮窗与设置页共用同一份） */
+  const updateDanmaku = async (patch: Partial<DanmakuSettings>): Promise<void> => {
+    const next = { ...danmakuSettingsRef.current, ...patch }
+    danmakuSettingsRef.current = next
+    await saveSettings({ danmaku: next })
+  }
+
+  /**
+   * 番剧库里的别名（用于「别名检测弹幕」）。
+   *
+   * 数据来自番剧详情的 infobox「别名」与中/日文名，按 、/ 分隔拆开；
+   * 只在第一次用时拉一次（详情本身有 30 天缓存，代价很低）。
+   */
+  const danmakuAliasRef = useRef<string[] | null>(null)
+  const danmakuAliases = async (): Promise<string[]> => {
+    if (danmakuAliasRef.current) return danmakuAliasRef.current
+    const out: string[] = []
+    const push = (s: unknown): void => {
+      for (const part of String(s ?? '').split(/[、,，/|]/)) {
+        const t = part.trim()
+        if (t && t !== state.title && !out.includes(t)) out.push(t)
+      }
+    }
+    if (state.subjectId != null) {
+      const r = await api.bangumi.subject(state.subjectId)
+      const d = r.ok ? r.data.data : null
+      if (d) {
+        push(d.name)
+        push(d.name_cn)
+        for (const row of d.infobox ?? []) {
+          if (/别名|別名|中文名|日文名/.test(row.key)) push(row.value)
+        }
+      }
+    }
+    danmakuAliasRef.current = out.slice(0, 6)
+    if (out.length > 0) console.log(`[player] 别名候选（${out.length}）：${out.slice(0, 4).join(' / ')}`)
+    return danmakuAliasRef.current
+  }
+
+  /**
+   * 拉取当前这一集的弹幕。
+   *
+   * - 规则播放：番剧名用 `state.title`，集数用当前线路里的集序号（从 1 开始）；
+   * - 本地播放：番剧名用标题（通常是文件夹名），集数优先用文件名里解析出的集数；
+   * 匹配不到就显示「未找到弹幕」，不影响播放。
+   *
+   * `opts.aliasMode`（悬浮窗里的「别名检测弹幕」）：把番剧库的别名（原名 / 其它译名）
+   * 与弹幕库自己的别名一起当搜索关键词 —— 番剧名与弹幕库标题对不上时靠它救回来。
+   */
+  const loadDanmaku = async (force = false, opts: { aliasMode?: boolean } = {}): Promise<void> => {
+    const episode =
+      state.mode === 'rule'
+        ? (ruleCurrent?.ep ?? 0) + 1
+        : (currentFile?.episode ?? currentIndex + 1)
+    const baseKey = `${state.mode}:${state.title}:${episode}`
+    const key = `${baseKey}:${opts.aliasMode ? 'alias' : 'plain'}`
+    if (!force && danmakuKeyRef.current === key) return
+    /** 同一集内的「重新检测 / 别名检测」：保留现有弹幕，别让画面上的弹幕先消失 */
+    const sameEpisode = danmakuBaseKeyRef.current === baseKey
+    danmakuKeyRef.current = key
+    danmakuBaseKeyRef.current = baseKey
+    setDanmaku((prev) => ({
+      comments: sameEpisode ? prev.comments : [],
+      source: sameEpisode ? prev.source : '',
+      loading: true
+    }))
+    if (opts.aliasMode) {
+      toast.info('正在用别名检测弹幕…')
+      console.log('[player] 弹幕：收到别名检测请求')
+    }
+    const aliases = await danmakuAliases()
+    try {
+      const r = await api.danmaku.load(state.title, episode, {
+        aliases,
+        aliasMode: opts.aliasMode
+      })
+      if (danmakuKeyRef.current !== key) return // 期间又换集了
+      if (r.ok && r.data) {
+        const by = r.data.aliasUsed ? `（别名「${r.data.matchedBy}」命中）` : ''
+        setDanmaku({
+          comments: r.data.comments,
+          source: `${r.data.animeTitle} · ${r.data.episodeTitle}${by}`,
+          loading: false
+        })
+        console.log(`[player] 弹幕已加载：${r.data.episodeTitle} 共 ${r.data.count} 条（缓存=${r.data.fromCache}）${by}`)
+        if (opts.aliasMode) toast.success(`别名检测成功：${r.data.episodeTitle} 共 ${r.data.count} 条`)
+      } else {
+        // 失败也保留原弹幕（同一集重载时先前那一份仍然可用）
+        setDanmaku((prev) => ({ comments: sameEpisode ? prev.comments : [], source: prev.source, loading: false }))
+        console.log(`[player] 未找到弹幕（${state.title} 第 ${episode} 集，别名模式=${!!opts.aliasMode}）`)
+        if (opts.aliasMode) toast.warn('别名检测后仍未找到弹幕')
+      }
+    } catch (err) {
+      if (danmakuKeyRef.current === key) {
+        setDanmaku((prev) => ({ comments: sameEpisode ? prev.comments : [], source: prev.source, loading: false }))
+      }
+      console.warn('[player] 弹幕加载失败:', String(err))
+    }
+  }
+
+  /** 弹幕数据 / 设置推送到悬浮窗（低频：换集、改设置、开关时各一次） */
+  useEffect(() => {
+    if (!overlayActive) return
+    const push = (): void => {
+      api.overlay.setDanmaku({
+        comments: danmaku.comments,
+        settings: danmakuSettings,
+        source: danmaku.source,
+        loading: danmaku.loading
+      })
+    }
+    push()
+    // 悬浮窗是异步创建的：和选集一样补推两次，避免首推早于窗口就绪
+    const t1 = window.setTimeout(push, 1200)
+    const t2 = window.setTimeout(push, 3500)
+    return () => {
+      window.clearTimeout(t1)
+      window.clearTimeout(t2)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overlayActive, danmaku, danmakuSettings.enabled, danmakuSettings.area, danmakuSettings.maxCount, danmakuSettings.offsetMs])
+
+  /** 换集（或首次进入）时自动拉弹幕：规则模式按当前集数，本地模式按文件集数 */
+  useEffect(() => {
+    if (vlcState !== 'active') return
+    void loadDanmaku()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vlcState, ruleCurrent?.line, ruleCurrent?.ep, currentIndex, state.mode])
 
   const exitPlayer = () => {
     probingRef.current = false
@@ -2395,7 +2669,8 @@ function VlcModeUI({
           </div>
           <div className="text-[10px] text-white/60">
             {ruleMode
-              ? ruleProbing
+              ? // 已开播就不再显示「正在解析视频流」（v0.2.8：边播边嗅探时状态栏会误报，见 playStatus 注释）
+                ruleProbing && !playing
                 ? '正在解析视频流…'
                 : '规则播放 · 直连视频流'
               : files.length > 0
@@ -2574,7 +2849,7 @@ function VlcModeUI({
               <Camera size={20} />
             </button>
           </div>
-          {ruleProbing ? (
+          {ruleProbing && !playing ? (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/60">
               <Spinner size={26} />
               <div className="text-xs text-white/70">正在解析视频流…</div>

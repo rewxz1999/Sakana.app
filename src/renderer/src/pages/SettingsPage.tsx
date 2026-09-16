@@ -13,6 +13,7 @@ import {
   HardDrive,
   Image,
   Info,
+  MessagesSquare,
   MonitorPlay,
   RefreshCw,
   ScrollText,
@@ -285,6 +286,13 @@ export function SettingsPage() {
               title="播放器设置"
               desc="播放内核、FFmpeg / libVLC 路径与播放器快捷键"
               onOpen={() => openSmall('/player-settings', 700, 620, '播放器设置')}
+            />
+            <RowDivider />
+            <OpenRow
+              icon={MessagesSquare}
+              title="弹幕设置"
+              desc="弹幕开关、覆盖区域、同屏数量、时间轴、字号 / 透明度 / 速度与屏蔽词"
+              onOpen={() => openSmall('/danmaku-settings', 640, 620, '弹幕设置')}
             />
             <RowDivider />
             <OpenRow

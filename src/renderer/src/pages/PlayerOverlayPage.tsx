@@ -7,6 +7,8 @@ import {
   ListVideo,
   LogOut,
   Maximize,
+  MessageSquareOff,
+  MessagesSquare,
   Minimize,
   Pause,
   Play,
@@ -15,17 +17,19 @@ import {
   FastForward,
   SkipBack,
   SkipForward,
+  SlidersHorizontal,
   Subtitles,
   Volume1,
   Volume2,
   VolumeX,
   X
 } from 'lucide-react'
-import type { OverlayAction, OverlayEpisodes, OverlayState } from '@shared/api'
+import type { OverlayAction, OverlayDanmaku, OverlayEpisodes, OverlayState } from '@shared/api'
 import type { AspectMode, SubjectDetail } from '@shared/types'
 import { api } from '@/lib/api'
 import { StreamInfoModal } from '@/components/StreamInfoModal'
 import { CoverImage } from '@/components/CoverImage'
+import { DanmakuLayer } from '@/components/DanmakuLayer'
 
 /**
  * 全屏控制栏悬浮窗（透明窗口内的控制栏）
@@ -85,6 +89,62 @@ function detailRows(d: SubjectDetail): { key: string; value: string }[] {
     .map((r) => ({ key: r.key, value: typeof r.value === 'string' ? r.value : String(r.value) }))
 }
 
+/** 弹幕设置面板里的小胶囊按钮（v0.2.8） */
+function Chip({
+  active,
+  onClick,
+  children
+}: {
+  active?: boolean
+  onClick: () => void
+  children: React.ReactNode
+}): React.ReactElement {
+  return (
+    <button
+      onPointerDown={(e) => {
+        if (e.button !== 0) return
+        e.stopPropagation()
+        onClick()
+      }}
+      className={`rounded-md border px-2 py-0.5 text-[11px] transition-colors ${
+        active ? 'border-accent bg-accent/30 text-white' : 'border-white/20 text-white/70 hover:bg-white/10'
+      }`}
+    >
+      {children}
+    </button>
+  )
+}
+
+/** 弹幕区域：视频矩形往里收，避开顶部标题栏与底部控制栏（v0.2.8） */
+const DANMAKU_TOP_GAP = 58
+const DANMAKU_BOTTOM_GAP_VISIBLE = 104
+const DANMAKU_BOTTOM_GAP_HIDDEN = 26
+
+function danmakuRect(
+  state: OverlayState,
+  controlsVisible: boolean
+): { x: number; y: number; width: number; height: number } {
+  const r =
+    state.videoRect ??
+    ({ x: 0, y: 56, width: window.innerWidth, height: Math.max(120, window.innerHeight - 112) } as const)
+  const bottomGap = controlsVisible ? DANMAKU_BOTTOM_GAP_VISIBLE : DANMAKU_BOTTOM_GAP_HIDDEN
+  return {
+    x: r.x,
+    y: r.y + DANMAKU_TOP_GAP,
+    width: r.width,
+    height: Math.max(80, r.height - DANMAKU_TOP_GAP - bottomGap)
+  }
+}
+
+/** 弹幕设置面板的一行：左侧标签 + 右侧一组胶囊 */function SettingRow({ label, children }: { label: string; children: React.ReactNode }): React.ReactElement {
+  return (
+    <div className="mt-1.5 flex items-center gap-2">
+      <span className="w-14 shrink-0 text-[11px] text-white/55">{label}</span>
+      <div className="flex flex-wrap items-center gap-1">{children}</div>
+    </div>
+  )
+}
+
 function IconBtn({
   title,
   onClick,
@@ -116,6 +176,9 @@ function IconBtn({
 export default function PlayerOverlay(): React.ReactElement {
   const [state, setState] = useState<OverlayState | null>(null)
   const [episodes, setEpisodes] = useState<OverlayEpisodes | null>(null)
+  /** v0.2.8：弹幕数据与设置（由播放页推送，换集/改设置时更新） */
+  const [danmaku, setDanmaku] = useState<OverlayDanmaku | null>(null)
+  const [danmakuMenu, setDanmakuMenu] = useState(false)
   const [visible, setVisible] = useState(false)
   const [subMenu, setSubMenu] = useState(false)
   const [aspectMenu, setAspectMenu] = useState(false)
@@ -144,6 +207,7 @@ export default function PlayerOverlay(): React.ReactElement {
       if (holdRef.current) return
       setSubMenu(false)
       setAspectMenu(false)
+      setDanmakuMenu(false)
       setVisible(false)
       void api.overlay.setInteractive(false)
     }, 5000)
@@ -151,6 +215,8 @@ export default function PlayerOverlay(): React.ReactElement {
 
   // 选集数据（低频）：由播放页单独推送
   useEffect(() => api.overlay.onEpisodes(setEpisodes), [])
+  // 弹幕数据（v0.2.8，低频）：同样由播放页推送
+  useEffect(() => api.overlay.onDanmaku(setDanmaku), [])
 
   // 打开详情浮层时拉一次番剧详情（悬浮窗有完整的 api 能力）
   const showInfoPanel = state?.showInfo === true
@@ -172,7 +238,8 @@ export default function PlayerOverlay(): React.ReactElement {
 
   // 浮层/菜单打开时保持可交互，关闭后恢复正常 5 秒自动隐藏
   useEffect(() => {
-    holdRef.current = showInfo || subMenu || aspectMenu || showInfoPanel || state?.showEpisodes === true
+    holdRef.current =
+      showInfo || subMenu || aspectMenu || danmakuMenu || showInfoPanel || state?.showEpisodes === true
     if (holdRef.current) {
       setVisible(true)
       void api.overlay.setInteractive(true)
@@ -223,6 +290,23 @@ export default function PlayerOverlay(): React.ReactElement {
       style={{ background: 'transparent' }}
       onDoubleClick={() => send({ type: 'playPause' })}
     >
+      {/*
+        v0.2.8：弹幕层 —— 画在悬浮窗里才能盖在原生视频之上（页面里的元素会被视频整个挡住）。
+        位置取播放页推送过来的视频区域矩形，再**往里收一圈**：
+        - 顶部让出标题/状态栏的高度（否则最上面几行弹幕会被顶栏盖住 —— 用户反馈过）；
+        - 底部让出控制栏（控制栏隐藏时只留一点点安全边）。
+      */}
+      {state && danmaku && danmaku.settings.enabled && danmaku.comments.length > 0 ? (
+        <DanmakuLayer
+          comments={danmaku.comments}
+          settings={danmaku.settings}
+          time={state.current}
+          playing={state.playing}
+          rect={danmakuRect(state, visible)}
+          scale={window.devicePixelRatio || 1}
+        />
+      ) : null}
+
       {/*
         v0.2.6：选集浮层 —— 半透明浮在画面上，打开时不再改动播放内容区域。
         点空白处关闭（回到纯播放画面）。
@@ -514,12 +598,141 @@ export default function PlayerOverlay(): React.ReactElement {
         </div>
       </div>
 
-      {/* 底部：进度条 + 控制按钮 */}
+      {/*
+        底部：进度条 + 控制按钮
+        v0.2.8：弹幕开关与弹幕设置放在**控制栏上方**（同一容器里、进度条之前），
+        跟着控制栏一起显隐，不额外占用画面。
+      */}
       <div
         className={`absolute inset-x-0 bottom-0 z-30 flex flex-col gap-1 bg-gradient-to-t from-black/75 via-black/30 to-transparent px-3 pb-2 pt-6 transition-opacity duration-300 ${
           visible ? 'opacity-100' : 'pointer-events-none opacity-0'
         }`}
       >
+        {/* 弹幕设置面板（覆盖区域 / 弹幕数量 / 时间轴 / 别名检测 + 更多设置） */}
+        {danmakuMenu ? (
+          <div className="absolute bottom-[86px] right-3 z-40 w-80 rounded-xl border border-white/15 bg-black/85 p-3 text-white shadow-2xl backdrop-blur">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-xs font-medium">弹幕设置</span>
+              <button
+                className="rounded-md p-1 text-white/60 hover:bg-white/10 hover:text-white"
+                onPointerDown={(e) => {
+                  e.stopPropagation()
+                  setDanmakuMenu(false)
+                }}
+              >
+                <X size={14} />
+              </button>
+            </div>
+            {danmaku ? (
+              <>
+                <div className="mb-1 text-[10px] text-white/45">
+                  {danmaku.source ? `来源：${danmaku.source}` : '未匹配到弹幕库条目'}
+                </div>
+                <SettingRow label="覆盖区域">
+                  {[
+                    { v: 0.25, t: '1/4' },
+                    { v: 0.5, t: '1/2' },
+                    { v: 0.75, t: '3/4' },
+                    { v: 1, t: '全屏' }
+                  ].map((o) => (
+                    <Chip
+                      key={o.t}
+                      active={Math.abs(danmaku.settings.area - o.v) < 0.01}
+                      onClick={() => send({ type: 'danmakuSetting', key: 'area', value: o.v })}
+                    >
+                      {o.t}
+                    </Chip>
+                  ))}
+                </SettingRow>
+                <SettingRow label="弹幕数量">
+                  {[10, 20, 30, 50, 80].map((n) => (
+                    <Chip
+                      key={n}
+                      active={danmaku.settings.maxCount === n}
+                      onClick={() => send({ type: 'danmakuSetting', key: 'maxCount', value: n })}
+                    >
+                      {n}
+                    </Chip>
+                  ))}
+                </SettingRow>
+                <SettingRow label="时间轴">
+                  <Chip onClick={() => send({ type: 'danmakuSetting', key: 'offsetMs', value: danmaku.settings.offsetMs - 500 })}>
+                    −0.5s
+                  </Chip>
+                  <span className="min-w-[52px] text-center text-[11px] tabular-nums text-white/80">
+                    {(danmaku.settings.offsetMs / 1000).toFixed(1)}s
+                  </span>
+                  <Chip onClick={() => send({ type: 'danmakuSetting', key: 'offsetMs', value: danmaku.settings.offsetMs + 500 })}>
+                    +0.5s
+                  </Chip>
+                  <Chip active={danmaku.settings.offsetMs === 0} onClick={() => send({ type: 'danmakuSetting', key: 'offsetMs', value: 0 })}>
+                    重置
+                  </Chip>
+                </SettingRow>
+                <SettingRow label="显示类型">
+                  <Chip
+                    active={danmaku.settings.showScroll}
+                    onClick={() => send({ type: 'danmakuSetting', key: 'showScroll', value: !danmaku.settings.showScroll })}
+                  >
+                    滚动
+                  </Chip>
+                  <Chip
+                    active={danmaku.settings.showTop}
+                    onClick={() => send({ type: 'danmakuSetting', key: 'showTop', value: !danmaku.settings.showTop })}
+                  >
+                    顶部
+                  </Chip>
+                  <Chip
+                    active={danmaku.settings.showBottom}
+                    onClick={() => send({ type: 'danmakuSetting', key: 'showBottom', value: !danmaku.settings.showBottom })}
+                  >
+                    底部
+                  </Chip>
+                </SettingRow>
+                <div className="mt-2 flex items-center justify-between gap-2 border-t border-white/10 pt-2">
+                  <div className="flex items-center gap-2">
+                    {/*
+                      v0.2.8：两个检测入口 ——
+                      「别名检测弹幕」会用番剧别名（番剧库别名 + 弹幕库自身别名）再搜一轮，
+                      中文译名/日文原名/其它译名不一致时特别有用；
+                      「重新检测弹幕」按当前番剧名重查一次（也会绕过本地缓存重新拉取）。
+                    */}
+                    <button
+                      className="rounded-md border border-white/20 px-2 py-0.5 text-[11px] text-white/80 hover:bg-white/10"
+                      onPointerDown={(e) => {
+                        e.stopPropagation()
+                        send({ type: 'detectDanmakuAlias' })
+                      }}
+                    >
+                      别名检测弹幕
+                    </button>
+                    <button
+                      className="rounded-md border border-white/20 px-2 py-0.5 text-[11px] text-white/80 hover:bg-white/10"
+                      onPointerDown={(e) => {
+                        e.stopPropagation()
+                        send({ type: 'reloadDanmaku' })
+                      }}
+                    >
+                      重新检测弹幕
+                    </button>
+                  </div>
+                  <button
+                    className="shrink-0 text-[11px] text-accent hover:underline"
+                    onPointerDown={(e) => {
+                      e.stopPropagation()
+                      send({ type: 'openDanmakuSettings' })
+                    }}
+                  >
+                    更多设置 ›
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="py-3 text-center text-[11px] text-white/60">弹幕数据还没到，稍候…</div>
+            )}
+          </div>
+        ) : null}
+
         <div
           ref={seekRef}
           className="group relative flex h-6 cursor-pointer items-center"
@@ -626,6 +839,37 @@ export default function PlayerOverlay(): React.ReactElement {
                   )}
                 </div>
               )}
+            </div>
+
+            {/*
+              v0.2.8：弹幕开关与弹幕设置放进**控制栏内部**（与选集/字幕/比例同一排），
+              不再单独占控制栏外的一行。
+            */}
+            <IconBtn
+              title={
+                danmaku?.loading
+                  ? '弹幕加载中…'
+                  : danmaku?.settings.enabled === false
+                    ? '打开弹幕'
+                    : `关闭弹幕${danmaku ? `（${danmaku.comments.length} 条）` : ''}`
+              }
+              active={danmaku?.settings.enabled !== false}
+              onClick={() => send({ type: 'toggleDanmaku' })}
+            >
+              {danmaku?.settings.enabled === false ? <MessageSquareOff size={18} /> : <MessagesSquare size={18} />}
+            </IconBtn>
+            <div className="relative">
+              <IconBtn
+                title="弹幕设置"
+                active={danmakuMenu}
+                onClick={() => {
+                  setDanmakuMenu(!danmakuMenu)
+                  setSubMenu(false)
+                  setAspectMenu(false)
+                }}
+              >
+                <SlidersHorizontal size={18} />
+              </IconBtn>
             </div>
 
             {/* 画面比例 */}

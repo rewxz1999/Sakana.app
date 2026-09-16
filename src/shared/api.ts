@@ -4,7 +4,9 @@ import type {
   AspectMode,
   CalendarResult,
   DanmakuComment,
+  DanmakuLoadResult,
   DanmakuMatch,
+  DanmakuSettings,
   DownloadTask,
   GalEvent,
   GalGame,
@@ -72,6 +74,11 @@ export interface OverlayState {
   subjectId?: number
   /** 断点续播提示（非空时悬浮窗右下角显示「撤销跳转」）：同样因为画在页面里会被视频盖住 */
   resume?: { target: number } | null
+  /**
+   * v0.2.8：视频区域矩形（相对窗口的 CSS 像素）。
+   * 弹幕要精确地盖在画面之上、且不压到上下控制栏，所以由播放页把 `#vlc-host` 的矩形推过来。
+   */
+  videoRect?: { x: number; y: number; width: number; height: number }
 }
 
 /** 选集数据（低频变化，单独走一个通道；避免把大数组塞进每秒多次的状态推送） */
@@ -79,6 +86,23 @@ export interface OverlayEpisodes {
   lines: { name: string; episodes: string[] }[]
   currentLine: number
   currentEp: number
+}
+
+/**
+ * 弹幕数据（v0.2.8）。
+ *
+ * 与选集同理单独走一个通道：一集可能有上千条弹幕，不能塞进每秒多次的状态推送。
+ * 只有「换集 / 改设置 / 开关弹幕」时才推一次。
+ */
+export interface OverlayDanmaku {
+  /** 整集弹幕（已按时间排序）；空数组表示这一集没找到弹幕 */
+  comments: DanmakuComment[]
+  /** 显示设置（覆盖区域、同屏条数、时间轴微调、字号…） */
+  settings: DanmakuSettings
+  /** 当前这一集的来源描述，例如「败犬女主太多了！ 第01集」；空表示没匹配到 */
+  source: string
+  /** 正在加载弹幕 */
+  loading: boolean
 }
 
 /** 悬浮窗 → 播放页 的控制栏动作 */
@@ -103,6 +127,12 @@ export type OverlayAction =
   | { type: 'exitPlayer' }
   /** 选集浮层里点了某一集 */
   | { type: 'selectEpisode'; line: number; ep: number }
+  /** v0.2.8 弹幕：开关 / 改单项设置 / 打开详细设置 / 重新检测 / 别名检测 */
+  | { type: 'toggleDanmaku' }
+  | { type: 'danmakuSetting'; key: keyof DanmakuSettings; value: number | boolean | string }
+  | { type: 'openDanmakuSettings' }
+  | { type: 'reloadDanmaku' }
+  | { type: 'detectDanmakuAlias' }
   /** 断点续播提示上的两个按钮 */
   | { type: 'undoResume' }
   | { type: 'dismissResume' }
@@ -248,13 +278,21 @@ export interface SakanaApi {
   /** 全屏控制栏悬浮窗：主窗口播放页 ↔ 悬浮窗渲染层 */
   overlay: {
     isOverlay: boolean
-    show(): Promise<ApiResult<boolean>>
-    hide(): Promise<ApiResult<boolean>>
+    /**
+     * 显示/销毁控制栏悬浮窗。
+     * v0.2.8 附加：show 会返回「代号」，hide 时把它带回来 ——
+     * 切集时旧的播放页实例卸载得比新实例的 show 晚，迟到的 hide 不能把新控制栏一起关掉。
+     */
+    show(): Promise<ApiResult<{ ok: boolean; gen: number }>>
+    hide(gen?: number): Promise<ApiResult<boolean>>
     setInteractive(interactive: boolean): Promise<ApiResult<boolean>>
     pushState(state: OverlayState): void
     /** v0.2.6：推送选集数据（低频），供悬浮窗绘制半透明选集浮层 */
     setEpisodes(payload: OverlayEpisodes): void
     onEpisodes(cb: (payload: OverlayEpisodes) => void): () => void
+    /** v0.2.8：推送弹幕数据与设置（换集 / 改设置时一次） */
+    setDanmaku(payload: OverlayDanmaku): void
+    onDanmaku(cb: (payload: OverlayDanmaku) => void): () => void
     poke(): void
     action(action: OverlayAction): void
     onState(cb: (state: OverlayState) => void): () => void
@@ -344,12 +382,24 @@ export interface SakanaApi {
     /** 用系统浏览器打开链接（更新下载页等） */
     openUrl(url: string): Promise<ApiResult<boolean>>
   }
-  /** 弹幕（预留：弹弹play API，接入方式参考 Kazumi） */
+  /** 弹幕（弹弹play 接口；签名由反代完成，客户端无需 AppId） */
   danmaku: {
     /** 按番剧标题 + 集数匹配弹幕库条目 */
     match(title: string, episode: number): Promise<ApiResult<DanmakuMatch | null>>
     /** 拉取该集弹幕 */
     comments(episodeId: number): Promise<ApiResult<DanmakuComment[]>>
+    /** 一步到位：番剧标题 + 集数 → 弹幕列表（播放器与本地播放共用） */
+    load(
+      title: string,
+      episode: number,
+      opts?: { aliases?: string[]; aliasMode?: boolean }
+    ): Promise<ApiResult<DanmakuLoadResult | null>>
+    /** 预取：只预热主进程缓存、不回传弹幕本体（进播放 / 切集时提前加载） */
+    prefetch(
+      title: string,
+      episode: number,
+      opts?: { aliases?: string[]; aliasMode?: boolean }
+    ): Promise<ApiResult<{ ok: boolean; count: number; cached: boolean }>>
   }
   cache: {
     info(): Promise<ApiResult<CacheInfo>>

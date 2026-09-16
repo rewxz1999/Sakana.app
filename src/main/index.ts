@@ -1013,6 +1013,240 @@ if (!gotLock) {
       }, 2500)
     }
 
+    /*
+     * 弹幕自检（SAKANA_DANMAKU_TEST='番剧名[|集数]'，v0.2.8）：
+     * 打印「匹配到哪个条目 / 第几集 / 弹幕条数 / 前几条内容 / 是否命中缓存」，
+     * 并跑两遍（第二遍应命中磁盘缓存）——弹幕链路排查全靠它。
+     */
+    if (process.env.SAKANA_DANMAKU_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const raw = String(process.env.SAKANA_DANMAKU_TEST)
+          const [title, epRaw] = raw.split('|')
+          const episode = Number.parseInt(epRaw ?? '1', 10) || 1
+          const { matchDanmaku, loadDanmaku, episodeNumberFromTitle } = await import('./services/danmaku')
+          console.log(`[danmaku-test] 关键词「${title}」第 ${episode} 集`)
+          console.log(
+            `[danmaku-test] 集数解析自检：` +
+              ['【renren】 第01集', 'EP03', '[05]', ' - 12 ', '第7话'].map((s) => `${s}→${episodeNumberFromTitle(s)}`).join(' | ')
+          )
+          try {
+            const m = await matchDanmaku(title, episode)
+            console.log(`[danmaku-test] 匹配结果: ${m ? JSON.stringify(m) : '(未匹配到)'}`)
+          } catch (err) {
+            console.log(`[danmaku-test] 匹配失败: ${String(err)}`)
+          }
+          for (const round of [1, 2]) {
+            try {
+              const t0 = Date.now()
+              const r = await loadDanmaku(title, episode)
+              if (!r) {
+                console.log(`[danmaku-test] 第 ${round} 遍：未拿到弹幕`)
+                continue
+              }
+              console.log(
+                `[danmaku-test] 第 ${round} 遍：${r.animeTitle} / ${r.episodeTitle} | 共 ${r.count} 条 | ` +
+                  `缓存命中=${r.fromCache} | 用时 ${Date.now() - t0}ms`
+              )
+              console.log(
+                `[danmaku-test]   前 5 条: ${r.comments
+                  .slice(0, 5)
+                  .map((c) => `${c.time}s[${c.mode}]${c.color} ${c.text}`)
+                  .join(' ／ ')}`
+              )
+            } catch (err) {
+              console.log(`[danmaku-test] 第 ${round} 遍失败: ${String(err)}`)
+            }
+          }
+          console.log('[danmaku-test] done')
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
+    }
+
+    /*
+     * 播放器输入自检（SAKANA_PLAYER_INPUT_TEST='番剧名'，v0.2.8 附加）。
+     *
+     * 用来复现「播放器按键全部失灵、但 Esc 还能退出」这类问题：
+     * 1) 控制栏隐藏后，鼠标移入是否重新变为可交互（poke → setInteractive(true)）；
+     * 2) 控制栏按钮位置上的**命中测试**（elementFromPoint 拿到的到底是谁）；
+     * 3) 发**真实鼠标事件**点击播放/暂停与选集，看状态是否真的变化；
+     * 4) 给主窗口发真实键盘事件（空格），看快捷键是否生效。
+     */
+    if (process.env.SAKANA_PLAYER_INPUT_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const kw = String(process.env.SAKANA_PLAYER_INPUT_TEST)
+          const ruleName = process.env.SAKANA_PLAYER_INPUT_RULE ?? 'aafun'
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
+          if (!win) return
+          const { ruleEpisodes, rulePlay, ruleSearch } = await import('./services/rules')
+          const rules = store.get<import('@shared/types').PlayRule[]>('rules', [])
+          const rule =
+            rules.find((r) => r.enabled && r.name.toLowerCase().includes(ruleName.toLowerCase())) ??
+            rules.find((r) => r.enabled)
+          if (!rule) {
+            console.log('[input-test] 没有可用规则')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+          const s = await ruleSearch(rule.id, kw)
+          if (!s.items.length) {
+            console.log('[input-test] 搜索无结果')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const ep = await ruleEpisodes(rule.id, s.items[0])
+          const g = ep.groups[0]
+          if (!g) {
+            console.log('[input-test] 没有剧集')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const play = await rulePlay(rule.id, s.items[0], 0, 0, g.episodes[0].link, ep.vars)
+          const state = {
+            mode: 'rule',
+            title: s.items[0].name || kw,
+            url: play.url,
+            ruleId: rule.id,
+            entry: s.items[0],
+            vars: ep.vars,
+            groups: ep.groups,
+            referer: rule.baseUrl,
+            startLine: 0,
+            startEp: 0
+          }
+          const b64 = Buffer.from(JSON.stringify(state), 'utf8').toString('base64')
+          const hash = `/player?ts=${encodeURIComponent(b64)}`
+          const devUrl = process.env['ELECTRON_RENDERER_URL']
+          if (!app.isPackaged && devUrl) await win.loadURL(`${devUrl}#${hash}`)
+          else await win.loadFile(join(__dirname, '../renderer/index.html'), { hash })
+
+          const { overlayWindow, isOverlayInteractive } = await import('./services/playerOverlay')
+          const readOverlay = async (): Promise<{ text: string; visible: boolean }> => {
+            const ow = overlayWindow()
+            if (!ow || ow.isDestroyed()) return { text: '(无悬浮窗)', visible: false }
+            const raw = (await ow.webContents.executeJavaScript(
+              `JSON.stringify({text:(document.body.innerText||'').replace(/\\s+/g,' ').slice(0,160),visible:!!document.querySelector('[class*="bottom-0"]')&&getComputedStyle(document.querySelector('[class*="bottom-0"]')).opacity!=='0'})`,
+              true
+            )) as string
+            return JSON.parse(raw) as { text: string; visible: boolean }
+          }
+          /** 在悬浮窗里做命中测试：返回该坐标最上层元素 */
+          const hitTest = async (x: number, y: number): Promise<string> => {
+            const ow = overlayWindow()
+            if (!ow || ow.isDestroyed()) return '(无悬浮窗)'
+            return (await ow.webContents.executeJavaScript(
+              `(function(){var el=document.elementFromPoint(${x},${y});if(!el)return '(空)';var c=el.tagName+(el.className&&typeof el.className==='string'?'.'+el.className.split(' ').slice(0,3).join('.'):'');return c.slice(0,90)})()`,
+              true
+            )) as string
+          }
+          const clickAt = async (x: number, y: number): Promise<void> => {
+            const ow = overlayWindow()
+            if (!ow || ow.isDestroyed()) return
+            ow.webContents.sendInputEvent({ type: 'mouseMove', x, y })
+            await sleep(120)
+            ow.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
+            await sleep(60)
+            ow.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
+          }
+
+          // 轮询等待：控制栏出现且真的开播了再开始测（固定等待在慢站点上会测了个空）
+          let ready = false
+          for (let i = 0; i < 40; i++) {
+            const ow = overlayWindow()
+            if (ow && !ow.isDestroyed()) {
+              const t = (await readOverlay()).text
+              if (t.includes('播放中')) {
+                ready = true
+                break
+              }
+            }
+            await sleep(2000)
+          }
+          console.log(`[input-test] 开播就绪=${ready}`)
+          if (!ready) {
+            console.log('[input-test] 播放未就绪，跳过后续输入测试')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const ow0 = overlayWindow()
+          const size = ow0 && !ow0.isDestroyed() ? ow0.getContentBounds() : { width: 1280, height: 800 }
+          const cx = Math.round(size.width / 2)
+          const cyBottom = size.height - 40
+          const a = await readOverlay()
+          console.log(`[input-test] 初始：可交互=${isOverlayInteractive()} 控制栏可见=${a.visible} | ${a.text}`)
+
+          // ① 空闲 6 秒让控制栏自动隐藏，再模拟鼠标移入
+          await sleep(6500)
+          const b = await readOverlay()
+          console.log(`[input-test] 空闲后：可交互=${isOverlayInteractive()} 控制栏可见=${b.visible}`)
+          ow0?.webContents.sendInputEvent({ type: 'mouseMove', x: cx, y: cyBottom - 120 })
+          await sleep(1200)
+          const c = await readOverlay()
+          console.log(`[input-test] 鼠标移入后：可交互=${isOverlayInteractive()} 控制栏可见=${c.visible}`)
+
+          // ② 命中测试：底部控制栏一行
+          const hits: string[] = []
+          for (const dx of [-260, -200, 0, 120, 220]) {
+            hits.push(`${dx}:${await hitTest(cx + dx, cyBottom)}`)
+          }
+          console.log(`[input-test] 命中测试(y=${cyBottom})：${hits.join(' | ')}`)
+
+          // ③ 真实点击「播放/暂停」（左下角第一个按钮）与「选集」
+          const before = await readOverlay()
+          await clickAt(30, cyBottom)
+          await sleep(2500)
+          const afterPause = await readOverlay()
+          console.log(`[input-test] 点击播放/暂停：${before.text.includes('播放中') ? '播放中' : '?'} → ${afterPause.text}`)
+          await clickAt(30, cyBottom)
+          await sleep(2000)
+
+          // ④ 键盘：给主窗口发真实空格
+          const beforeKey = await readOverlay()
+          win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Space' })
+          win.webContents.sendInputEvent({ type: 'char', keyCode: ' ' })
+          win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Space' })
+          await sleep(2500)
+          const afterKey = await readOverlay()
+          console.log(`[input-test] 键盘空格：${beforeKey.text.includes('播放中') ? '播放中' : '?'} → ${afterKey.text}`)
+
+          /*
+           * ⑤ owner 归属自检（v0.2.8 附加）：
+           * 「所有按钮都没反应」的经典原因之一是控制栏 owner 认成了别的小窗口 ——
+           * 这里故意打开并聚焦一个「弹幕设置」小窗口，再从**播放页所在窗口**请求显示控制栏，
+           * 打印出 owner 是谁。owner 应该是播放页那个窗口（且不聚焦），而不是刚打开的小窗口。
+           */
+          const { openSmallWindow } = await import('./window')
+          const { logOverlayOwner } = await import('./services/playerOverlay')
+          const small = openSmallWindow('/danmaku-settings', { width: 620, height: 560, title: '弹幕设置' })
+          small.focus()
+          await sleep(1500)
+          console.log(`[input-test] 小窗口已聚焦：${small.isFocused()}`)
+          await win.webContents
+            .executeJavaScript(`window.sakana && window.sakana.overlay.show()`, true)
+            .catch(() => undefined)
+          await sleep(1500)
+          logOverlayOwner('播放页请求显示控制栏后')
+          await clickAt(30, cyBottom)
+          await sleep(2500)
+          const afterSmall = await readOverlay()
+          console.log(`[input-test] 小窗口打开时点击播放/暂停：${afterSmall.text}`)
+          if (!small.isDestroyed()) small.destroy()
+
+          console.log('[input-test] done')
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
+    }
+
     // 小窗口自检（SAKANA_SMALLWIN_TEST=1）：逐个打开副窗口并输出渲染层错误/内容长度
     if (process.env.SAKANA_SMALLWIN_TEST) {
       setTimeout(() => {
@@ -1034,6 +1268,8 @@ if (!gotLock) {
             '/shortcuts',
             '/player-settings',
             '/cache-settings',
+            // v0.2.8：弹幕设置页
+            '/danmaku-settings',
             '/datasource',
             '/logs',
             '/about',
@@ -1041,6 +1277,10 @@ if (!gotLock) {
             '/nav-bg',
             '/downloader-config',
             '/galgame/tools',
+            // v0.2.8 附加：galgame 页（空态默认背景图）纳入
+            '/galgame',
+            // v0.2.8 附加三：仪表盘（统计板块瘦身）纳入
+            '/dashboard',
             '/downloads-win?title=%E6%B5%8B%E8%AF%95'
           ]
           for (const hash of hashes) {
@@ -1744,6 +1984,187 @@ if (!gotLock) {
           app.quit()
         })()
       }, 3000)
+    }
+
+    /*
+     * 弹幕 UI 自检（SAKANA_DANMAKU_UI_TEST='番剧名'，v0.2.8）。
+     *
+     * 为什么要读**画布像素**：弹幕是画在悬浮窗 canvas 上的（画在播放页里会被原生视频盖住），
+     * 「有没有真的画出来」无法从日志判断 —— 这里直接数非透明像素，
+     * 并顺带验证「关闭弹幕 → 像素归零 → 重新打开 → 像素恢复」和「改覆盖区域不炸」。
+     * 覆盖区域变小后同屏条数下降，像素数通常会明显减少，也可作为生效判据。
+     */
+    if (process.env.SAKANA_DANMAKU_UI_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const kw = String(process.env.SAKANA_DANMAKU_UI_TEST)
+          const ruleName = process.env.SAKANA_DANMAKU_UI_RULE ?? 'aafun'
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
+          if (!win) return
+          const { ruleEpisodes, rulePlay, ruleSearch } = await import('./services/rules')
+          const rules = store.get<import('@shared/types').PlayRule[]>('rules', [])
+          const rule =
+            rules.find((r) => r.enabled && r.name.toLowerCase().includes(ruleName.toLowerCase())) ??
+            rules.find((r) => r.enabled)
+          if (!rule) {
+            console.log('[danmaku-ui] 没有可用规则')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+          /*
+           * 本地播放模式（SAKANA_DANMAKU_UI_LOCAL='<文件夹>|<标题>'）：
+           * 本地播放同样要能用弹幕，所以这里也走一遍 —— 状态直接注入 local 模式，
+           * 跳过规则搜索（本地播放不需要规则）。
+           */
+          const localSpec = process.env.SAKANA_DANMAKU_UI_LOCAL
+          let state: Record<string, unknown>
+          if (localSpec) {
+            const [folder, title] = localSpec.split('|')
+            state = { mode: 'local', title: title || '本地视频', folder }
+            console.log(`[danmaku-ui] 本地播放模式：文件夹 ${folder}，标题「${title}」`)
+          } else {
+            const s = await ruleSearch(rule.id, kw)
+            if (!s.items.length) {
+              console.log(`[danmaku-ui] 搜索无结果（${rule.name} / ${kw}）`)
+              markQuitting()
+              app.quit()
+              return
+            }
+            const ep = await ruleEpisodes(rule.id, s.items[0])
+            const g = ep.groups[0]
+            if (!g) {
+              console.log('[danmaku-ui] 没有剧集')
+              markQuitting()
+              app.quit()
+              return
+            }
+            const play = await rulePlay(rule.id, s.items[0], 0, 0, g.episodes[0].link, ep.vars)
+            state = {
+              mode: 'rule',
+              title: s.items[0].name || kw,
+              url: play.url,
+              ruleId: rule.id,
+              entry: s.items[0],
+              vars: ep.vars,
+              groups: ep.groups,
+              referer: rule.baseUrl,
+              startLine: 0,
+              startEp: 0
+            }
+            console.log(`[danmaku-ui] ${rule.name} 《${state.title}》 第 1 集，播放页 ${play.url.slice(0, 90)}`)
+          }
+          win.webContents.on('console-message', (...args: unknown[]) => {
+            const d =
+              typeof args[1] === 'object' && args[1] !== null
+                ? (args[1] as { message?: string })
+                : { message: String(args[2]) }
+            const msg = String(d.message ?? '')
+            // 弹幕自检需要看到播放页的全部异常（否则崩溃时只能看到「无悬浮窗」）
+            if (/弹幕|player|Error|error|Uncaught|失败|警告/.test(msg)) console.log(`[renderer] ${msg.slice(0, 300)}`)
+          })
+          const b64 = Buffer.from(JSON.stringify(state), 'utf8').toString('base64')
+          const hash = `/player?ts=${encodeURIComponent(b64)}`
+          const devUrl = process.env['ELECTRON_RENDERER_URL']
+          if (!app.isPackaged && devUrl) await win.loadURL(`${devUrl}#${hash}`)
+          else await win.loadFile(join(__dirname, '../renderer/index.html'), { hash })
+
+          const { overlayWindow } = await import('./services/playerOverlay')
+          /** 读取悬浮窗：正文 + canvas 非透明像素数 */
+          const probe = async (label: string): Promise<{ px: number; canvas: boolean; text: string }> => {
+            const ow = overlayWindow()
+            if (!ow || ow.isDestroyed()) {
+              console.log(`[danmaku-ui] ${label}: (无悬浮窗)`)
+              return { px: 0, canvas: false, text: '' }
+            }
+            try {
+              const raw = (await ow.webContents.executeJavaScript(
+                `(function(){
+                   var c=document.querySelector('canvas');
+                   var px=0;
+                   if(c){try{var ctx=c.getContext('2d');var d=ctx.getImageData(0,0,c.width,c.height).data;
+                     for(var i=3;i<d.length;i+=4){if(d[i]>8)px++}}catch(e){px=-1}}
+                   return JSON.stringify({px:px,canvas:!!c,size:c?c.width+'x'+c.height:'',css:c?(c.style.width+'x'+c.style.height+' @'+c.style.top):'',dbg:window.__sakanaDanmaku||null,mount:window.__sakanaDanmakuMount===true,hasCanvas:window.__sakanaDanmakuHasCanvas===true,hasCtx:window.__sakanaDanmakuHasCtx===true,frames:window.__sakanaDanmakuFrames||0,text:(document.body.innerText||'').replace(/\\s+/g,' ').slice(0,150)})
+                 })()`,
+                true
+              )) as string
+              const o = JSON.parse(raw) as {
+                px: number
+                canvas: boolean
+                size: string
+                css: string
+                text: string
+                dbg: unknown
+                mount: boolean
+                hasCanvas: boolean
+                hasCtx: boolean
+                frames: number
+              }
+              console.log(
+                `[danmaku-ui] ${label}: canvas=${o.canvas} 背板=${o.size} CSS=${o.css} 像素=${o.px} 帧=${o.frames} ` +
+                  `挂载=${o.mount} ref=${o.hasCanvas} ctx=${o.hasCtx} 探针=${JSON.stringify(o.dbg)} | ${o.text}`
+              )
+              return { px: o.px, canvas: o.canvas, text: o.text }
+            } catch (err) {
+              console.log(`[danmaku-ui] ${label}: 读取失败 ${String(err).slice(0, 120)}`)
+              return { px: 0, canvas: false, text: '' }
+            }
+          }
+
+          // 等播放起来 + 弹幕加载完
+          await sleep(22000)
+          let maxPlaying = 0
+          for (let i = 0; i < 4; i++) {
+            const a = await probe(`播放中 #${i + 1}`)
+            maxPlaying = Math.max(maxPlaying, a.px)
+            await sleep(4000)
+          }
+          // 关闭弹幕 → 像素应归零
+          win.webContents.send(CH.overlayAction, { type: 'toggleDanmaku' })
+          await sleep(2500)
+          const off = await probe('关闭弹幕后')
+          // 重新打开 → 像素应恢复
+          win.webContents.send(CH.overlayAction, { type: 'toggleDanmaku' })
+          await sleep(6000)
+          const on = await probe('重新打开后')
+          // 改覆盖区域（缩小到 1/4）与时间轴，验证不崩且仍在绘制
+          win.webContents.send(CH.overlayAction, { type: 'danmakuSetting', key: 'area', value: 0.25 })
+          win.webContents.send(CH.overlayAction, { type: 'danmakuSetting', key: 'offsetMs', value: -1000 })
+          await sleep(6000)
+          const area = await probe('覆盖区域 1/4 + 时间轴 -1s')
+          // 关掉滚动弹幕（只留顶部/底部）再打开
+          win.webContents.send(CH.overlayAction, { type: 'danmakuSetting', key: 'showScroll', value: false })
+          await sleep(4000)
+          const noScroll = await probe('关闭滚动弹幕')
+          win.webContents.send(CH.overlayAction, { type: 'danmakuSetting', key: 'showScroll', value: true })
+          win.webContents.send(CH.overlayAction, { type: 'danmakuSetting', key: 'area', value: 1 })
+          win.webContents.send(CH.overlayAction, { type: 'danmakuSetting', key: 'offsetMs', value: 0 })
+          await sleep(5000)
+          const restored = await probe('恢复默认设置')
+          // 别名检测：会用番剧别名 + 弹幕库别名再搜一轮
+          win.webContents.send(CH.overlayAction, { type: 'detectDanmakuAlias' })
+          await sleep(15000)
+          const alias = await probe('别名检测后')
+
+          console.log(
+            `[danmaku-ui] 结论：播放中最大像素=${maxPlaying} | 关闭后=${off.px} | 重开=${on.px} | ` +
+              `区域1/4=${area.px} | 关滚动=${noScroll.px} | 恢复=${restored.px} | 别名检测=${alias.px}`
+          )
+          /*
+           * 判据说明：这一集弹幕可能很稀疏（例如只有 15 条、间隔几十秒），
+           * 所以只要求「播放期间至少有一帧真的画出了弹幕」，以及开关的挂载/卸载行为正确。
+           */
+          const pass = maxPlaying > 200 && off.canvas === false && on.canvas === true
+          console.log(
+            `[danmaku-ui] ${pass ? '✅ 通过' : '❌ 未通过'}` +
+              `（判据：播放中画出过弹幕、关闭后画布移除、重开后画布回来）`
+          )
+          console.log('[danmaku-ui] done')
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
     }
   })
 
