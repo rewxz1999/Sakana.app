@@ -1024,11 +1024,28 @@ if (!gotLock) {
           const raw = String(process.env.SAKANA_DANMAKU_TEST)
           const [title, epRaw] = raw.split('|')
           const episode = Number.parseInt(epRaw ?? '1', 10) || 1
-          const { matchDanmaku, loadDanmaku, episodeNumberFromTitle } = await import('./services/danmaku')
+          const { matchDanmaku, loadDanmaku, episodeNumberFromTitle, seasonOfTitle } = await import('./services/danmaku')
           console.log(`[danmaku-test] 关键词「${title}」第 ${episode} 集`)
           console.log(
             `[danmaku-test] 集数解析自检：` +
-              ['【renren】 第01集', 'EP03', '[05]', ' - 12 ', '第7话'].map((s) => `${s}→${episodeNumberFromTitle(s)}`).join(' | ')
+              ['【renren】 第01集', 'EP03', '[05]', ' - 12 ', '第7话', '葬送的芙莉莲_28', '【qq】 葬送的芙莉莲[普通话版]_28']
+                .map((s) => `${s}→${episodeNumberFromTitle(s)}`)
+                .join(' | ')
+          )
+          console.log(
+            `[danmaku-test] 季数解析自检：` +
+              [
+                '葬送的芙莉莲 第二季',
+                '葬送的芙莉莲 第1季(2023)',
+                '葬送的芙莉莲(2023)',
+                'Sousou no Frieren S02E05',
+                '间谍过家家 第二季(2023)',
+                '无职转生Ⅱ 到了异世界就拿出真本事 Part 2',
+                '败犬女主太多了！',
+                'Frieren 2nd Season'
+              ]
+                .map((s) => `${s.slice(0, 20)}→第${seasonOfTitle(s)}季`)
+                .join(' | ')
           )
           try {
             const m = await matchDanmaku(title, episode)
@@ -1227,17 +1244,36 @@ if (!gotLock) {
           const { logOverlayOwner } = await import('./services/playerOverlay')
           const small = openSmallWindow('/danmaku-settings', { width: 620, height: 560, title: '弹幕设置' })
           small.focus()
-          await sleep(1500)
+          await sleep(1800)
           console.log(`[input-test] 小窗口已聚焦：${small.isFocused()}`)
+          /*
+           * v0.2.8 附加五（用户定位的显示 bug）：主窗口被别的窗口盖住时，
+           * 控制栏悬浮窗不能继续浮在别人窗口之上，否则「卡在别人窗口的位置上、点什么都没反应」。
+           * 这里验证：① 小窗口抢焦点后控制栏自动收起；② 主窗口回前台后控制栏恢复且仍可点击。
+           */
+          const owFocus = overlayWindow()
+          console.log(
+            `[input-test] 主窗口失焦后：控制栏可见=${owFocus && !owFocus.isDestroyed() ? owFocus.isVisible() : '(无)'}（期望 false）`
+          )
           await win.webContents
             .executeJavaScript(`window.sakana && window.sakana.overlay.show()`, true)
             .catch(() => undefined)
-          await sleep(1500)
+          await sleep(1200)
+          const owStill = overlayWindow()
+          console.log(
+            `[input-test] 失焦状态下播放页请求 show 后：控制栏可见=${owStill && !owStill.isDestroyed() ? owStill.isVisible() : '(无)'}（期望仍为 false）`
+          )
+          win.focus()
+          await sleep(1800)
+          const owBack = overlayWindow()
+          console.log(
+            `[input-test] 主窗口回前台后：控制栏可见=${owBack && !owBack.isDestroyed() ? owBack.isVisible() : '(无)'}（期望 true）`
+          )
           logOverlayOwner('播放页请求显示控制栏后')
           await clickAt(30, cyBottom)
           await sleep(2500)
           const afterSmall = await readOverlay()
-          console.log(`[input-test] 小窗口打开时点击播放/暂停：${afterSmall.text}`)
+          console.log(`[input-test] 回到前台后点击播放/暂停：${afterSmall.text}`)
           if (!small.isDestroyed()) small.destroy()
 
           console.log('[input-test] done')

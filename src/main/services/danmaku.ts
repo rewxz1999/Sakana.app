@@ -156,14 +156,16 @@ function normalizeTitle(raw: string): string {
   return s.replace(/\s+/g, '').toLowerCase()
 }
 
-/** 从剧集标题里解析集数：「【renren】 第01集」「EP01」「[01]」「- 01」 */
+/** 从剧集标题里解析集数：「【renren】 第01集」「EP01」「[01]」「_01」「- 12」 */
 export function episodeNumberFromTitle(raw: string): number | null {
   const s = String(raw ?? '')
   const patterns = [
     /第\s*(\d{1,4})\s*[集话話回期彈弹]/,
     /(?:^|[^a-z])(?:ep|episode)\s*\.?\s*(\d{1,4})/i,
     /\[(\d{1,4})\]/,
-    /[-\s](\d{1,4})(?:v\d)?\s*(?:$|\.|\[|\()/i
+    // 「葬送的芙莉莲_01」「番剧 - 12」「(5)」这类
+    /[_\-–—\s(](\d{1,4})(?:v\d)?\s*(?:$|\.|\[|\(|】|\))/,
+    /(\d{1,4})\s*$/
   ]
   for (const re of patterns) {
     const m = re.exec(s)
@@ -173,6 +175,86 @@ export function episodeNumberFromTitle(raw: string): number | null {
     }
   }
   return null
+}
+
+const CN_NUM: Record<string, number> = {
+  一: 1,
+  二: 2,
+  两: 2,
+  三: 3,
+  四: 4,
+  五: 5,
+  六: 6,
+  七: 7,
+  八: 8,
+  九: 9,
+  十: 10
+}
+const ROMAN_NUM: Record<string, number> = {
+  i: 1,
+  ii: 2,
+  iii: 3,
+  iv: 4,
+  v: 5,
+  vi: 6,
+  vii: 7,
+  viii: 8,
+  ix: 9,
+  x: 10
+}
+
+/** 中文/罗马数字转阿拉伯数字（只处理常见写法：二 / 十二 / 二十 / Ⅱ） */
+function toNumber(raw: string): number | null {
+  const s = String(raw ?? '').trim()
+  if (!s) return null
+  if (/^\d{1,2}$/.test(s)) return Number.parseInt(s, 10)
+  if (ROMAN_NUM[s.toLowerCase()]) return ROMAN_NUM[s.toLowerCase()]
+  if (/^[一二两三四五六七八九十]+$/.test(s)) {
+    if (s.length === 1) return CN_NUM[s] ?? null
+    if (s.startsWith('十')) return 10 + (CN_NUM[s[1]] ?? 0)
+    if (s.endsWith('十')) return (CN_NUM[s[0]] ?? 0) * 10
+    if (s.includes('十')) {
+      const [a, , b] = s.split('')
+      return (CN_NUM[a] ?? 0) * 10 + (CN_NUM[b] ?? 0)
+    }
+  }
+  return null
+}
+
+/**
+ * 从标题里解析「第几季」（v0.2.8 附加四）。
+ *
+ * 为什么要这个：弹幕库同一部番常按季分开收录，而「番剧名 → 别名 → 简化标题」的降级链
+ * 很容易命中**别的季** —— 用户反馈「每一集弹幕都不对、感觉把不同集数搞混了」，
+ * 主要就是「第 1 季的条目被用在了第 2/3 季的播放上」。
+ * 没有季标记时一律按第 1 季处理（绝大多数单季番就是如此）。
+ *
+ * 支持：第N季 / 第N期 / 第N部 / 第Nクール / Season N / S02 / 2nd Season / Part N / Ⅱ Ⅲ Ⅳ
+ * 注意：`普通话版`、`国配`、`中配` 是同一季的配音版本，不算不同季。
+ */
+export function seasonOfTitle(raw: string): number {
+  const s = String(raw ?? '')
+  const patterns = [
+    /第\s*([0-9一二两三四五六七八九十]{1,3})\s*[季期部クール]/,
+    /(?:season|s)\s*\.?\s*([0-9]{1,2})(?![0-9])/i,
+    /([0-9]{1,2})\s*(?:st|nd|rd|th)\s*season/i,
+    /part\s*\.?\s*([0-9]{1,2})/i,
+    /(?:^|[^a-z0-9])((?:i{1,3}|iv|vi{0,3}|ix|x))(?:[^a-z0-9]|$)/i
+  ]
+  for (const re of patterns) {
+    const m = re.exec(s)
+    if (!m) continue
+    const n = toNumber(m[1])
+    if (n && n >= 1 && n <= 20) return n
+  }
+  return 1
+}
+
+/** 标题里是否**明确**写了季数（用于区分「明确第 1 季」与「完全没写季」） */
+export function hasSeasonMark(title: string): boolean {
+  return /第\s*[0-9一二两三四五六七八九十]{1,3}\s*[季期クール]|season\s*\.?\s*[0-9]{1,2}|[0-9]{1,2}\s*(?:st|nd|rd|th)\s*season|part\s*\.?\s*[0-9]{1,2}/i.test(
+    String(title ?? '')
+  )
 }
 
 interface SearchAnime {
@@ -296,16 +378,19 @@ export async function matchDanmaku(title: string, episode: number): Promise<Danm
     const ranked = animes
       .map((a) => ({ a, score: scoreAnime(kw, a, episode > 0 ? episode : 1) }))
       .sort((x, y) => y.score - x.score)
-    const best = ranked[0]
+    // 季数闸门（v0.2.8 附加四）：match 只作辅助接口，同样不允许跨季命中
+    const wantSeasonMatch = seasonOfTitle(kw)
+    const best = ranked.find((x) => seasonOfTitle(x.a.animeTitle) === wantSeasonMatch) ?? ranked[0]
     const wantEp = Number(episode) > 0 ? Number(episode) : 1
     const pickEpisode = (a: SearchAnime): { episodeId: number; episodeTitle: string } | null => {
       const eps = a.episodes ?? []
       if (eps.length === 0) return null
-      const byNumber = eps.find((e) => episodeNumberFromTitle(e.episodeTitle) === wantEp)
-      if (byNumber) return byNumber
-      // 剧集标题里解析不出集数时按顺序取第 N 集
-      if (wantEp <= eps.length) return eps[wantEp - 1]
-      return eps[0]
+      // 严格按集数解析（避免编号不从 1 开始时取错集）
+      const parsed = eps
+        .map((e) => ({ e, n: episodeNumberFromTitle(e.episodeTitle) }))
+        .filter((x): x is { e: { episodeId: number; episodeTitle: string }; n: number } => x.n !== null)
+      if (parsed.length > 0) return parsed.find((x) => x.n === wantEp)?.e ?? null
+      return wantEp <= eps.length ? eps[wantEp - 1] : null
     }
     const ep = pickEpisode(best.a)
     if (!ep) {
@@ -438,6 +523,8 @@ async function loadDanmakuInner(
    * 表现是每次调用都返回失败、界面永久显示「未找到弹幕」。
    */
   const wantEp = Number(episode) > 0 ? Number(episode) : 1
+  /** 当前播放的是第几季（从番剧名解析；没写季标记就是第 1 季）—— 严格筛选用 */
+  const wantSeason = seasonOfTitle(kw)
 
   /** 搜索若干关键词（并行 + 各自缓存），合并候选：同一 animeId 取最高分并记住来源关键词 */
   const collect = async (queries: string[]): Promise<{ a: SearchAnime; score: number; by: string }[]> => {
@@ -482,18 +569,56 @@ async function loadDanmakuInner(
   ): Promise<DanmakuLoadResult | null> => {
     const targets: { a: SearchAnime; ep: { episodeId: number; episodeTitle: string }; by: string }[] = []
     const seenEp = new Set<number>()
+    /*
+     * 严格的「季 + 集」闸门（v0.2.8 附加四，用户要求）。
+     *
+     * 用户反馈「每一集弹幕都不对，感觉把不同集数搞混了」—— 根因是降级链（番剧名 → 别名 → 简化标题）
+     * 会命中**别的季**的条目（例如第 2/3 季的播放用了第 1 季的弹幕），
+     * 以及「按序号取第 N 集」这种在编号不从 1 开始、或把两季合并编号的条目上会取错集。
+     *
+     * 现在：
+     * 1. 条目季数必须等于当前播放的季数（从标题解析，两边都没写就是第 1 季）；
+     * 2. 必须能在该条目里**按集数解析出同一集**（`第N集/第N话/EP N/[N]/_NN`）才采用；
+     *    只有整条条目的剧集名都解析不出集数时，才退回按序号取（并记日志）。
+     * 宁可显示「未找到弹幕」，也不放别的季/别的集的弹幕进来。
+     */
+    const skipped: string[] = []
     for (const { a, by, score } of ranked.slice(0, limit)) {
       // 别名轮里，分数太低的候选取信度不足（容易命中同名无关条目），直接跳过
       if (aliasRound && score < 40) continue
+      if (seasonOfTitle(a.animeTitle) !== wantSeason) {
+        skipped.push(`季数不符「${a.animeTitle.slice(0, 24)}」(第${seasonOfTitle(a.animeTitle)}季)`)
+        continue
+      }
       const eps = a.episodes ?? []
       if (eps.length === 0) continue
-      const ep =
-        eps.find((e) => episodeNumberFromTitle(e.episodeTitle) === wantEp) ??
-        (wantEp <= eps.length ? eps[wantEp - 1] : eps[0])
-      if (!ep || seenEp.has(ep.episodeId)) continue
+      const parsed = eps
+        .map((e) => ({ e, n: episodeNumberFromTitle(e.episodeTitle) }))
+        .filter((x): x is { e: { episodeId: number; episodeTitle: string }; n: number } => x.n !== null)
+      let ep: { episodeId: number; episodeTitle: string } | undefined
+      if (parsed.length > 0) {
+        ep = parsed.find((x) => x.n === wantEp)?.e
+        if (!ep) {
+          skipped.push(`「${a.animeTitle.slice(0, 20)}」没有第 ${wantEp} 集（共 ${eps.length} 集）`)
+          continue
+        }
+      } else {
+        // 整条条目都解析不出集数（罕见）：按序号取，并在日志里标明
+        ep = wantEp <= eps.length ? eps[wantEp - 1] : undefined
+        if (!ep) continue
+        log.append(
+          'warn',
+          'danmaku',
+          `该来源剧集名解析不出集数，按序号取第 ${wantEp} 集：${a.animeTitle.slice(0, 30)}`
+        )
+      }
+      if (seenEp.has(ep.episodeId)) continue
       seenEp.add(ep.episodeId)
       targets.push({ a, ep, by })
       if (targets.length >= MERGE_SOURCES) break
+    }
+    if (skipped.length > 0) {
+      log.append('info', 'danmaku', `严格筛选：第${wantSeason}季第${wantEp}集，排除 ${skipped.length} 个候选（${skipped.slice(0, 3).join('；')}）`)
     }
     if (targets.length === 0) return null
 
@@ -607,12 +732,25 @@ async function loadDanmakuInner(
   return null
 }
 
-/** 去掉装饰性部分（`～…～`、括号补充、`from xx`），保留季数标记 —— 用于第 3 轮搜索 */
+/**
+ * 去掉「装饰性部分」**与季标记**，只用于第 3 轮的**搜索**（季数正确性由严格闸门把关）。
+ *
+ * 例：`葬送的芙莉莲 第二季 ～到了异世界…～` → `葬送的芙莉莲`
+ * （弹幕库里第 2 季的条目可能写成别的标题，去掉季标记更容易把它搜出来；
+ *   万一搜出来的是第 1 季的条目，`takeBest` 的季数闸门会把它排除，不会串季。）
+ */
 function simplifyTitle(title: string): string | null {
   let s = String(title ?? '')
   s = s.replace(/[～~][^～~]{1,60}[～~]/g, ' ')
   s = s.replace(/[（(【\[][^）)】\]]*[）)】\]]/g, ' ')
   s = s.replace(/\bfrom\b.*$/i, '')
+  if (hasSeasonMark(s)) {
+    s = s
+      .replace(/第\s*[0-9一二两三四五六七八九十]{1,3}\s*[季期部クール]/g, ' ')
+      .replace(/(?:season|s)\s*\.?\s*[0-9]{1,2}(?![0-9])/gi, ' ')
+      .replace(/[0-9]{1,2}\s*(?:st|nd|rd|th)\s*season/gi, ' ')
+      .replace(/part\s*\.?\s*[0-9]{1,2}/gi, ' ')
+  }
   s = s.replace(/\s+/g, ' ').trim()
   return s && s !== title.trim() ? s : null
 }

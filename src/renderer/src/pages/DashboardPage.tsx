@@ -297,54 +297,60 @@ export function DashboardPage() {
 
   return (
     <div className="h-full overflow-y-auto px-6 py-5">
-      {/* 数量统计 + 继续观看 */}
-      <div className="grid grid-cols-4 gap-3.5">
-        <StatCard icon={Rss} label="已订阅番剧" value={subscriptions.length} accent onClick={() => navigate('/subs')} />
-        <StatCard icon={Heart} label="已收藏番剧" value={favorites.length} accent onClick={() => navigate('/favorites')} />
-        <StatCard icon={Puzzle} label="已安装工具" value={tools.length} accent onClick={() => navigate('/tools')} />
-        <div className="col-span-1 rounded-xl border border-accent/25 bg-gradient-to-br from-accent-soft to-elev1 p-4">
-          <div className="flex items-center justify-between">
-            <span className="flex items-center gap-1.5 text-xs text-dim">
-              <CirclePlay size={13} className="text-accent" /> 继续观看
-            </span>
-            {continueList.length > 0 ? <span className="text-[10px] text-faint">{continueList.length} 条</span> : null}
-          </div>
-          {continueList.length > 0 ? (
-            <div className="mt-2 flex flex-col gap-1.5">
-              {continueList.map((item) => (
-                <button
-                  key={item.key}
-                  onClick={() => openContinue(item)}
-                  disabled={resumingKey === item.key}
-                  title={item.episodeName ?? item.title}
-                  className="flex items-center gap-2 rounded-lg border border-border bg-elev1/80 p-1.5 text-left transition-colors hover:border-accent disabled:opacity-60"
-                >
-                  {/* CoverImage 在 src 为空时会渲染渐变占位，所以没有封面也能直接用 */}
-                  <CoverImage src={item.cover} className="h-11 w-8 shrink-0" rounded="rounded" />
-                  <div className="min-w-0 flex-1">
-                    <div className="line-clamp-1 text-[11px] font-semibold">{item.title}</div>
-                    <div className="line-clamp-1 text-[10px] text-faint">
-                      {item.episodeNo != null ? `第 ${item.episodeNo} 集` : '集数未知'}
-                      {item.percent != null
-                        ? ` · 进度 ${item.percent}%`
-                        : ` · 上次观看 ${timeAgo(item.updatedAt)}`}
-                    </div>
-                    {item.percent != null ? <ProgressBar value={item.percent} className="mt-1" /> : null}
-                  </div>
-                  {resumingKey === item.key ? (
-                    <Spinner size={12} />
-                  ) : (
-                    <Badge tone={item.source === 'online' ? 'accent' : 'neutral'}>
-                      {item.source === 'online' ? '在线' : '本地'}
-                    </Badge>
-                  )}
-                </button>
-              ))}
-            </div>
-          ) : (
-            <div className="mt-2 text-xs text-faint">暂无观看记录</div>
-          )}
+      {/*
+        v0.2.8 附加四：统计入口再瘦身（用户第二次反馈「还是有点大」）。
+        改成一行小胶囊（图标 + 数值 + 名称全部在一行内），高度从整块卡片降到 28px，
+        继续观看因此可以独占一整行、列表更宽更好点。
+      */}
+      <div className="flex flex-wrap items-center gap-2">
+        <StatPill icon={Rss} label="已订阅" value={subscriptions.length} onClick={() => navigate('/subs')} />
+        <StatPill icon={Heart} label="已收藏" value={favorites.length} onClick={() => navigate('/favorites')} />
+        <StatPill icon={Puzzle} label="已安装工具" value={tools.length} onClick={() => navigate('/tools')} />
+      </div>
+
+      {/* 继续观看（独占一行） */}
+      <div className="mt-3 rounded-xl border border-accent/25 bg-gradient-to-br from-accent-soft to-elev1 p-4">
+        <div className="flex items-center justify-between">
+          <span className="flex items-center gap-1.5 text-xs text-dim">
+            <CirclePlay size={13} className="text-accent" /> 继续观看
+          </span>
+          {continueList.length > 0 ? <span className="text-[10px] text-faint">{continueList.length} 条</span> : null}
         </div>
+        {continueList.length > 0 ? (
+          <div className="mt-2 grid grid-cols-2 gap-1.5 lg:grid-cols-3">
+            {continueList.map((item) => (
+              <button
+                key={item.key}
+                onClick={() => openContinue(item)}
+                disabled={resumingKey === item.key}
+                title={item.episodeName ?? item.title}
+                className="flex items-center gap-2 rounded-lg border border-border bg-elev1/80 p-1.5 text-left transition-colors hover:border-accent disabled:opacity-60"
+              >
+                {/* CoverImage 在 src 为空时会渲染渐变占位，所以没有封面也能直接用 */}
+                <CoverImage src={item.cover} className="h-11 w-8 shrink-0" rounded="rounded" />
+                <div className="min-w-0 flex-1">
+                  <div className="line-clamp-1 text-[11px] font-semibold">{item.title}</div>
+                  <div className="line-clamp-1 text-[10px] text-faint">
+                    {item.episodeNo != null ? `第 ${item.episodeNo} 集` : '集数未知'}
+                    {item.percent != null
+                      ? ` · 进度 ${item.percent}%`
+                      : ` · 上次观看 ${timeAgo(item.updatedAt)}`}
+                  </div>
+                  {item.percent != null ? <ProgressBar value={item.percent} className="mt-1" /> : null}
+                </div>
+                {resumingKey === item.key ? (
+                  <Spinner size={12} />
+                ) : (
+                  <Badge tone={item.source === 'online' ? 'accent' : 'neutral'}>
+                    {item.source === 'online' ? '在线' : '本地'}
+                  </Badge>
+                )}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="mt-2 text-xs text-faint">暂无观看记录</div>
+        )}
       </div>
 
       {/* 更新动态 + 历史记录 */}
@@ -511,6 +517,34 @@ export function DashboardPage() {
         {fmtDateTime(Math.max(...watchHistory.map((h) => h.watchedAt), ...progressItems.map((p) => p.updatedAt), 0))}
       </div>
     </div>
+  )
+}
+
+/**
+ * 统计入口小胶囊（v0.2.8 附加四）。
+ * 用户两次反馈「板块有点大」，这里做成一行内的小胶囊：图标 + 数值 + 名称，高 28px。
+ * （原来的 `StatCard` 保留给别处复用，不再用于仪表盘第一屏。）
+ */
+function StatPill({
+  icon: Icon,
+  label,
+  value,
+  onClick
+}: {
+  icon: typeof Bookmark
+  label: string
+  value: number
+  onClick?: () => void
+}): React.ReactElement {
+  return (
+    <button
+      onClick={onClick}
+      className="flex h-7 items-center gap-1.5 rounded-full border border-border bg-elev1 px-2.5 text-[11px] transition-colors hover:border-accent hover:text-accent"
+    >
+      <Icon size={12} className="text-dim" />
+      <span className="tabular-nums font-semibold text-text">{value}</span>
+      <span className="text-dim">{label}</span>
+    </button>
   )
 }
 

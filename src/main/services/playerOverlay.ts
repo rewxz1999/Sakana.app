@@ -20,6 +20,51 @@ let overlayWin: BrowserWindow | null = null
 let ownerWin: BrowserWindow | null = null
 /** 跟随主窗口尺寸/位置的监听器解绑函数（悬浮窗销毁时必须解绑，否则会泄漏监听） */
 let followDisposers: (() => void)[] = []
+/** 前台状态轮询定时器（见 startFocusWatch） */
+let focusWatchTimer: NodeJS.Timeout | null = null
+
+function stopFocusWatch(): void {
+  if (focusWatchTimer) {
+    clearInterval(focusWatchTimer)
+    focusWatchTimer = null
+  }
+}
+
+/**
+ * 前台状态看护（v0.2.8 附加五，用户定位的显示 bug）。
+ *
+ * 现象：播放器窗口被别的窗口盖住时，**控制栏悬浮窗仍然浮在那个窗口上面**
+ * （视频是主窗口的原生子窗口，会跟着一起被盖住，而悬浮窗是 `alwaysOnTop`），
+ * 于是控制栏「卡」在别人窗口的位置上、点什么都没反应；等这个状态结束后，播放器按钮全部失灵。
+ *
+ * 为什么不能只靠 `blur` 事件：窗口被别的应用盖住但未真正失焦、
+ * 或者事件在我们的时序里被别的操作盖掉时，blur 不一定送达 —— 状态就会卡住。
+ * 这里用 500ms 轮询**主动核对**「主窗口是否前台」，不前台就收起控制栏，
+ * 回到前台再恢复；顺带把点击穿透状态复位，避免留下「看得见但点不动」的窗口。
+ */
+function startFocusWatch(owner: BrowserWindow): void {
+  stopFocusWatch()
+  focusWatchTimer = setInterval(() => {
+    if (!overlayWin || overlayWin.isDestroyed()) {
+      stopFocusWatch()
+      return
+    }
+    if (owner.isDestroyed()) {
+      stopFocusWatch()
+      return
+    }
+    const foreground = owner.isFocused() && !owner.isMinimized() && owner.isVisible()
+    const shown = overlayWin.isVisible()
+    if (!foreground && shown) {
+      overlayWin.hide()
+      setOverlayInteractive(false)
+      log.append('info', 'overlay', '主窗口不在前台，控制栏已收起（避免浮在其它窗口之上）')
+    } else if (foreground && !shown && !owner.isDestroyed()) {
+      overlayWin.showInactive()
+      log.append('info', 'overlay', '主窗口回到前台，控制栏已恢复')
+    }
+  }, 500)
+}
 
 function stopFollowing(): void {
   for (const off of followDisposers) {
@@ -112,11 +157,10 @@ export function showOverlay(owner: BrowserWindow): number {
   if (overlayWin && !overlayWin.isDestroyed()) {
     syncBounds()
     /*
-     * v0.2.8 附加三：窗口还在但**被隐藏**时也要重新显示。
-     * 主窗口失焦会让悬浮窗隐身（hideForOwner），如果之后没有 focus 事件（例如用户一直用键盘、
-     * 或刚关掉一个小窗口），控制栏就会「看不见、点不着」——切集时偶发按钮失灵正是这一类。
+     * v0.2.8 附加三/五：窗口还在但**被隐藏**时也要重新显示 ——
+     * 但**只有主窗口在前台时才恢复**：否则控制栏又会浮到别的窗口上面（用户定位的那个 bug）。
      */
-    if (!overlayWin.isVisible()) {
+    if (!overlayWin.isVisible() && owner.isFocused() && !owner.isMinimized()) {
       overlayWin.showInactive()
       log.append('info', 'overlay', '悬浮窗此前处于隐藏状态，已重新显示')
     }
@@ -176,6 +220,7 @@ export function showOverlay(owner: BrowserWindow): number {
   if (!app.isPackaged && devUrl) void overlayWin.loadURL(`${devUrl}#/overlay`)
   else void overlayWin.loadFile(rendererUrl(), { hash: '/overlay' })
   overlayWin.once('ready-to-show', () => overlayWin?.showInactive())
+  startFocusWatch(owner)
   log.append('info', 'overlay', `控制栏悬浮窗已创建（第 ${myGen} 代）`)
   logOverlayOwner('control bar owner')
   return myGen
@@ -198,6 +243,7 @@ export function destroyOverlay(gen?: number): void {
   if (gen !== undefined && gen !== overlayGen) return
   overlayGen += 1 // 之后到达的旧 hide 请求一律作废
   stopFollowing()
+  stopFocusWatch()
   if (overlayWin && !overlayWin.isDestroyed()) {
     overlayWin.destroy()
   }
