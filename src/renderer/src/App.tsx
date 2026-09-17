@@ -137,7 +137,7 @@ function PlayerRoute() {
           window.location.hash = '/'
           window.location.reload()
         }}
-        className="rounded-lg border border-border bg-elev1 px-3 py-1.5 text-xs text-dim transition-colors hover:border-accent hover:text-accent"
+        className="rounded-lg border border-border bg-elev1 px-3 py-1.5 text-xs text-dim transition-colors hover:border-accent hover:text-accent whitespace-nowrap"
       >
         返回首页
       </button>

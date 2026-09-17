@@ -89,6 +89,17 @@ const PRELOAD_LEAD = 40
 /** 续播阈值：上次进度超过这个秒数才自动跳转，太小会显得莫名其妙 */
 const RESUME_MIN_SEC = 30
 
+/**
+ * 播放倍速档位（v0.2.9 最后更新）。
+ * 与 Kazumi 的档位一致（0.25–3.0 里取常用段），顺序即「按钮循环」的顺序；
+ * 1 放在中间位置，循环一圈不会出现跳档突兀感。
+ */
+export const SPEED_STEPS: number[] = [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3]
+/** 倍速显示文案：1 → `1.0x`，1.25 → `1.25x` */
+export function formatSpeed(s: number): string {
+  return `${Number(s).toFixed(Number.isInteger(s) ? 1 : 2).replace(/0$/, '')}x`.replace('.x', '.0x')
+}
+
 export function PlayerPage() {
   const location = useLocation()
   const navigate = useNavigate()
@@ -155,8 +166,8 @@ export function PlayerPage() {
   const [live, setLive] = useState<(LiveStartResult & { height: number | null }) | null>(null)
   const [inspectInfo, setInspectInfo] = useState<MediaInspectResult | null>(null)
   const [preparing, setPreparing] = useState(state.mode === 'local')
-  const [vlcState, setVlcState] = useState<'trying' | 'active' | 'fallback'>('trying')
-  const [vlcError, setVlcError] = useState<string | null>(null)
+  const [engineState, setEngineState] = useState<'trying' | 'active' | 'fallback'>('trying')
+  const [engineError, setEngineError] = useState<string | null>(null)
   const [ruleStreamUrl, setRuleStreamUrl] = useState<string | null>(null)
   const [rulePageUrl, setRulePageUrl] = useState(state.url ?? '')
   const [ruleProbeFailed, setRuleProbeFailed] = useState(false)
@@ -184,10 +195,36 @@ export function PlayerPage() {
     }
     return null
   })
-  const [vlcVolume, setVlcVolume] = useState(100)
-  const [vlcMuted, setVlcMuted] = useState(false)
-  const [vlcSubs, setVlcSubs] = useState<{ id: number; label: string }[]>([])
-  const [vlcSubIdx, setVlcSubIdx] = useState(-1)
+  const [playerVolume, setPlayerVolume] = useState(100)
+  const [playerMuted, setPlayerMuted] = useState(false)
+  /**
+   * 播放倍速（v0.2.9 最后更新）。
+   *
+   * 为什么用 1 作为默认、并把档位常量放在组件外：倍速是「一次设置、长期保持」的状态，
+   * 切集不该被重置（用户调了 1.5x 通常希望下一集也是 1.5x）；
+   * 档位表放在模块级，Overlay 与快捷键共用同一份，避免两处各写一遍档位。
+   */
+  const [playerSpeed, setPlayerSpeed] = useState(1)
+  const playerSpeedRef = useRef(playerSpeed)
+  playerSpeedRef.current = playerSpeed
+
+  /**
+   * 应用倍速（v0.2.9 最后更新：README 一直宣称支持倍速，实际缺失，对照 Kazumi 时补上）。
+   *
+   * 用 `function` 声明而不是 `const` 箭头函数：控制栏动作与快捷键处理都在下面几百行处调用它，
+   * `const` 会因为暂时性死区（TDZ）在运行时抛 ReferenceError（类型检查也会直接报「找不到名字」）。
+   * 内核走 mpv 的 `speed` + `scaletempo2` 音频滤镜（**变速不变调**），HTML5 回退路径走 `playbackRate`。
+   */
+  function applySpeed(speed: number): void {
+    const s = Math.max(0.25, Math.min(4, speed || 1))
+    setPlayerSpeed(s)
+    if (engineState !== 'fallback') void api.player.setSpeed(s)
+    const el = videoRef.current
+    if (el) el.playbackRate = s
+    toast.info(s === 1 ? '已恢复原速' : `倍速 ${formatSpeed(s)}`)
+  }
+  const [engineSubs, setEngineSubs] = useState<{ id: number; label: string }[]>([])
+  const [engineSubIdx, setEngineSubIdx] = useState(-1)
   /** 画面比例：fit=适应 / cover=裁剪铺满 / stretch=拉伸铺满 */
   const [aspect, setAspect] = useState<AspectMode>('fit')
   /** 顶部状态栏文案（捕捉视频流中 / 加载中 / 播放中 / 播放失败…） */
@@ -206,6 +243,14 @@ export function PlayerPage() {
   const danmakuSettings = resolveDanmakuSettings(appSettings?.danmaku)
   const danmakuSettingsRef = useRef(danmakuSettings)
   danmakuSettingsRef.current = danmakuSettings
+  /**
+   * v0.2.9：弹幕是否由 mpv 的 uosc_danmaku 插件渲染。
+   * 插件是在「进入播放器时」跟着 mpv 一起挂载的，所以这里在引擎就绪后查一次状态；
+   * 为 true 时内置画布让位（同一份弹幕数据交给插件画），避免两套弹幕叠在一起。
+   */
+  const [uoscActive, setUoscActive] = useState(false)
+  const uoscActiveRef = useRef(false)
+  uoscActiveRef.current = uoscActive
   /** 已经为哪一集拉过弹幕（避免重复请求） */
   const danmakuKeyRef = useRef('')
   /** 当前弹幕对应的「集」标识（同一集内重载时保留已有弹幕） */
@@ -282,7 +327,7 @@ export function PlayerPage() {
           ? { kind: 'capturing', text: '捕捉视频流中' }
           : switching
             ? { kind: 'loading', text: '切换中' }
-            : vlcState === 'trying' || preparing
+            : engineState === 'trying' || preparing
               ? // 规则模式挂载到开始嗅探之间还有一个「解析播放页」的阶段，单独给出文案（v0.2.7）
                 state.mode === 'rule'
                 ? { kind: 'loading' as PlayStatus, text: '准备播放源' }
@@ -312,7 +357,7 @@ export function PlayerPage() {
       return
     }
     relayRef.current = { sessionId: r.data.sessionId }
-    void api.vlc.play(r.data.url)
+    void api.player.play(r.data.url)
     /*
      * 中转成功的判定要给足时间：FFmpeg 需要先连上源站、缓冲一段才会开始出数据，
      * 24 分钟的长片在冷启动 + 慢 CDN 下超过 12 秒很常见。
@@ -328,64 +373,64 @@ export function PlayerPage() {
 
   const currentFile = files[currentIndex]
   const currentSubs: LocalSubFile[] = currentFile?.subs ?? []
-  const subtitleLabel = vlcSubIdx >= 0 && vlcSubs[vlcSubIdx] ? vlcSubs[vlcSubIdx].label : null
+  const subtitleLabel = engineSubIdx >= 0 && engineSubs[engineSubIdx] ? engineSubs[engineSubIdx].label : null
 
-  // 刷新字幕轨列表（libmpv / libVLC 共用同一接口）
-  const refreshVlcSubs = async (retries = 0): Promise<void> => {
-    const r = await api.vlc.subtitleTracks()
+  // 刷新字幕轨列表（libmpv 接口）
+  const refreshEngineSubs = async (retries = 0): Promise<void> => {
+    const r = await api.player.subtitleTracks()
     if (r.ok) {
-      setVlcSubs(r.data)
-      setVlcSubIdx((prev) => (prev === -1 ? -1 : Math.min(prev, r.data.length - 1)))
+      setEngineSubs(r.data)
+      setEngineSubIdx((prev) => (prev === -1 ? -1 : Math.min(prev, r.data.length - 1)))
       // 内核解析字幕轨需要时间（libmpv 读 track-list 更晚）：为空时短暂重试，避免误报「无字幕轨」
       if (r.data.length === 0 && retries < 5) {
-        window.setTimeout(() => void refreshVlcSubs(retries + 1), 700)
+        window.setTimeout(() => void refreshEngineSubs(retries + 1), 700)
       }
     }
   }
 
-  const cycleVlcSubtitle = async () => {
-    if (vlcSubs.length === 0) {
+  const cycleEngineSubtitle = async () => {
+    if (engineSubs.length === 0) {
       toast.info('未检测到字幕轨（内封或外挂字幕文件）')
       return
     }
-    const next = vlcSubIdx + 1 >= vlcSubs.length ? -1 : vlcSubIdx + 1
-    setVlcSubIdx(next)
-    await api.vlc.setSubtitle(next === -1 ? -1 : vlcSubs[next].id)
-    toast.info(next === -1 ? '字幕已关闭' : `字幕：${vlcSubs[next].label}`)
+    const next = engineSubIdx + 1 >= engineSubs.length ? -1 : engineSubIdx + 1
+    setEngineSubIdx(next)
+    await api.player.setSubtitle(next === -1 ? -1 : engineSubs[next].id)
+    toast.info(next === -1 ? '字幕已关闭' : `字幕：${engineSubs[next].label}`)
   }
 
-  // VLC 就绪后拉取初始状态；播放时刷新字幕轨、加载外挂字幕
+  // 内核就绪后拉取初始状态；播放时刷新字幕轨、加载外挂字幕
   useEffect(() => {
-    if (vlcState !== 'active') return
-    void api.vlc.getState().then((r) => {
+    if (engineState !== 'active') return
+    void api.player.getState().then((r) => {
       if (r.ok) {
-        setVlcVolume(r.data.volume)
-        setVlcMuted(r.data.muted)
+        setPlayerVolume(r.data.volume)
+        setPlayerMuted(r.data.muted)
       }
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vlcState])
+  }, [engineState])
 
   useEffect(() => {
-    if (vlcState !== 'active') return
+    if (engineState !== 'active') return
     const sourceKey = state.mode === 'local' ? (currentFile?.path ?? '') : (ruleStreamUrl ?? '')
     if (!sourceKey || subtitlesLoadedRef.current === sourceKey) return
     subtitlesLoadedRef.current = sourceKey
     // 本地模式：加载同名字幕文件
     if (state.mode === 'local' && currentSubs.length > 0) {
-      for (const s of currentSubs) void api.vlc.addSubtitleFile(s.path)
+      for (const s of currentSubs) void api.player.addSubtitleFile(s.path)
     }
-    setTimeout(() => void refreshVlcSubs(), 800)
+    setTimeout(() => void refreshEngineSubs(), 800)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vlcState, currentFile?.path, ruleStreamUrl])
+  }, [engineState, currentFile?.path, ruleStreamUrl])
 
-  // 尝试嵌入播放内核（libVLC 或 libmpv，由主进程按设置分发）；失败回退 HTML5 + FFmpeg 管线
+  // 尝试嵌入 libmpv 播放内核；失败回退 HTML5 + FFmpeg 管线
   useEffect(() => {
     let alive = true
     void (async () => {
-      // 视频区域矩形：libmpv 用它定位画面子窗口（libVLC 忽略该参数）
+      // 视频区域矩形：libmpv 用它定位画面子窗口
       const hostRect = (): { x: number; y: number; width: number; height: number } => {
-        const el = document.getElementById('vlc-host')
+        const el = document.getElementById('player-host')
         const r = el?.getBoundingClientRect()
         if (r && r.width > 0 && r.height > 0) {
           return { x: r.left, y: r.top, width: r.width, height: r.height }
@@ -394,29 +439,29 @@ export function PlayerPage() {
       }
       // 防卡死：attach 若 20 秒内无响应（内核初始化异常），直接降级，避免播放器界面卡住
       const attachResult = await Promise.race([
-        api.vlc.attach(hostRect()),
+        api.player.attach(hostRect()),
         new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 20000))
       ])
       if (!alive) return
       if (attachResult === null) {
         const msg = '播放内核初始化超时（20 秒无响应）'
-        setVlcError(msg)
+        setEngineError(msg)
         if (state.mode === 'rule') setVideoError(`在线播放初始化失败：${msg}`)
-        else setVlcState('fallback')
+        else setEngineState('fallback')
         return
       }
       const r = attachResult
       if (r.ok && r.data.ok) {
-        setVlcState('active')
+        setEngineState('active')
         setPreparing(false)
       } else {
         const msg = r.ok ? r.data.message : r.error
-        setVlcError(msg)
+        setEngineError(msg)
         if (state.mode === 'rule') {
           // 在线播放初始化失败：不再回退网页播放，直接显示错误并允许退出
           setVideoError(`在线播放初始化失败：${msg}`)
         } else {
-          setVlcState('fallback')
+          setEngineState('fallback')
         }
       }
     })()
@@ -428,7 +473,7 @@ export function PlayerPage() {
 
   /**
    * 规则模式：Kazumi 式在线播放 —— 用可见网页视图打开播放页，
-   * 让站点播放器在真实会话中运行并嗅探媒体地址，命中后交给 libVLC 播放。
+   * 让站点播放器在真实会话中运行并嗅探媒体地址，命中后交给 libmpv 播放。
    *
    * v0.2.7 附加（提速）：进这一集之前若已有**缓存直链**（上一轮嗅探、或切集前的预取），
    * 直接交给内核播放，跳过「建窗口 → 加载播放页 → 等播放器发请求」整轮嗅探；
@@ -457,7 +502,7 @@ export function PlayerPage() {
     let cacheHit = false
     /** 网页视图位置：视频区域（上下控制条之外），保证退出按钮始终可点 */
     const currentBounds = (): { x: number; y: number; width: number; height: number } => {
-      const host = document.getElementById('vlc-host')
+      const host = document.getElementById('player-host')
       const r = host?.getBoundingClientRect()
       if (r && r.width > 0 && r.height > 0) {
         return { x: r.left, y: r.top, width: r.width, height: r.height }
@@ -484,21 +529,29 @@ export function PlayerPage() {
         setRuleProbing(false)
         probingRef.current = false
         relayTriedRef.current = false
-        // 命中即移除网页视图（用完即毁），再交给 libVLC（带站点 Cookie）
+        // 命中即移除网页视图（用完即毁），再交给 libmpv（带站点 Cookie）
         if (usedWebview) void api.ruleWebview.close()
         void api.ruleProbe.stop()
         playingRef.current = false
         // referer 语义：undefined=未判定（回退规则站点）；''=经校验确定不带 Referer
         const refForPlay = ev.referer !== undefined ? ev.referer || undefined : state.referer
         /*
-         * v0.2.7 附加：这里过去是 `void api.vlc.play(...)` —— 引擎还没就绪（attach 未完成）
+         * v0.2.7 附加：这里过去是 `void api.player.play(...)` —— 引擎还没就绪（attach 未完成）
          * 或内核报错时，失败被直接丢掉：界面停在「捕捉视频流中/已暂停 0:00」，
          * 既没有日志也没有提示，看起来就是「抓到了流但播不出来」。
          * 现在带重试并记录；仍然失败才提示用户。
          */
         const playWithRetry = async (attempt = 0): Promise<void> => {
-          const r = await api.vlc.play(ev.url, refForPlay, ev.cookies)
-          if (r.ok) return
+          const r = await api.player.play(ev.url, refForPlay, ev.cookies)
+          if (r.ok) {
+            /*
+             * v0.2.8 附加七：把**播放页地址**告知 mpv 的 B 站弹幕脚本。
+             * 交给内核的是直链，脚本无法据此反推 B 站页面（也就取不到弹幕），
+             * 所以必须由宿主把 `state.url`（规则模式下就是播放页地址）告诉它。
+             */
+            if (state.mode === 'rule' && state.url) void api.player.setDanmakuSource(state.url)
+            return
+          }
           console.warn(`[player] 交给内核播放失败（第 ${attempt + 1} 次）：${r.error}`)
           if (attempt < 2) {
             await new Promise((res) => window.setTimeout(res, 900))
@@ -584,7 +637,7 @@ export function PlayerPage() {
         setRuleStreamUrl(hit.url)
         setRuleProbing(false)
         probingRef.current = false
-        void api.vlc.play(hit.url, hit.referer ?? state.referer, undefined)
+        void api.player.play(hit.url, hit.referer ?? state.referer, undefined)
         window.setTimeout(() => {
           if (cancelled || playingRef.current || relayTriedRef.current) return
           console.log('[player] 缓存直链未开播，改为完整嗅探')
@@ -741,7 +794,7 @@ export function PlayerPage() {
       setShowEpisodes(false)
       setVideoError(null)
       // 先暂停当前播放：旧流继续拉流会和新一轮嗅探抢带宽
-      if (playing) void api.vlc.togglePause()
+      if (playing) void api.player.togglePause()
       reportPosition(true)
 
       // 目标播放页地址：优先用预解析结果，否则现解析一次
@@ -902,7 +955,7 @@ export function PlayerPage() {
             : 0
     if (target <= 0 || target >= duration - 15) return
     setCurrent(target)
-    void api.vlc.seek(target)
+    void api.player.seek(target)
     setResumeHint({ at: Date.now(), target })
     toast.info(`已从上次位置 ${fmtDuration(target)} 继续播放`)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -925,7 +978,7 @@ export function PlayerPage() {
 
   // 规则模式：attach 就绪后开始探流
   useEffect(() => {
-    if (vlcState !== 'active' || state.mode !== 'rule') return
+    if (engineState !== 'active' || state.mode !== 'rule') return
     const pageUrl = rulePageUrl || state.url
     if (!pageUrl) return
     const cleanup = startRuleProbe(pageUrl)
@@ -933,20 +986,20 @@ export function PlayerPage() {
       cleanup?.()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vlcState, state.mode, rulePageUrl])
+  }, [engineState, state.mode, rulePageUrl])
 
   // ---------- 观看进度（v0.2.4）：集数记录 + 断点续播 ----------
-  // VLC 模式：设置播放列表并播放当前集
+  // 原生内核模式：设置播放列表并播放当前集
   useEffect(() => {
-    if (vlcState !== 'active') return
+    if (engineState !== 'active') return
     if (state.mode === 'local') {
       if (files.length === 0) return
-      void api.vlc.setPlaylist(files.map((f) => f.path))
+      void api.player.setPlaylist(files.map((f) => f.path))
       const f = files[currentIndex]
-      if (f) void api.vlc.play(f.path)
+      if (f) void api.player.play(f.path)
     } else if (state.mode === 'online') {
       // 直连流模式：url 本身就是媒体地址
-      if (state.url) void api.vlc.play(state.url)
+      if (state.url) void api.player.play(state.url)
     }
     /*
      * rule 模式**不能**把 url 交给内核：那是**播放页 HTML 地址**，不是媒体地址
@@ -955,15 +1008,15 @@ export function PlayerPage() {
      * 实测（v0.2.6 自动连播自检）过去这里会把 …/play/1-2.html 当媒体播，导致切集后黑屏卡住。
      */
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vlcState, currentIndex, files.length, state.mode, state.url])
+  }, [engineState, currentIndex, files.length, state.mode, state.url])
 
-  // VLC 事件 → 播放状态/进度/集数同步
+  // 内核事件 → 播放状态/进度/集数同步
   useEffect(() => {
-    if (vlcState !== 'active') return
-    return api.vlc.onEvent((ev) => {
+    if (engineState !== 'active') return
+    return api.player.onEvent((ev) => {
       switch (ev.type) {
         case 'cursor':
-          // 主进程光标监听：libVLC 画面子窗口会吞掉 mousemove，全屏时靠它唤出控制栏
+          // 主进程光标监听：画面是原生子窗口、会吞掉 mousemove，全屏时靠它唤出控制栏
           pokeRef.current?.()
           break
         case 'playing':
@@ -994,7 +1047,7 @@ export function PlayerPage() {
           else if (state.mode === 'local') rememberLocal(currentIndex)
           // 新媒体的比例设置会被内核重置，重新下发一次
           applyAspect(aspectRef.current)
-          setTimeout(() => void refreshVlcSubs(), 300)
+          setTimeout(() => void refreshEngineSubs(), 300)
           break
         case 'paused':
           if (awaitingStartRef.current) break
@@ -1036,7 +1089,7 @@ export function PlayerPage() {
           break
         case 'error':
           if (state.mode === 'rule' && !ruleStreamRef.current) {
-            // 规则模式 VLC 播放出错且无流 → 回退 iframe（可正常退出）
+            // 规则模式播放出错且无流 → 回退 iframe（可正常退出）
             setRuleProbeFailed(true)
           } else {
             if (ev.message) setVideoError(`播放失败: ${ev.message}`)
@@ -1045,7 +1098,7 @@ export function PlayerPage() {
       }
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vlcState, state.mode, currentIndex, files.length])
+  }, [engineState, state.mode, currentIndex, files.length])
 
   const stopCurrentLive = () => {
     if (live) {
@@ -1129,10 +1182,10 @@ export function PlayerPage() {
 
   // 本地模式：切换集数时（重新）准备播放源（仅在 HTML5 回退路径启用）
   useEffect(() => {
-    if (state.mode !== 'local' || !currentFile || vlcState !== 'fallback') return
+    if (state.mode !== 'local' || !currentFile || engineState !== 'fallback') return
     void prepareFile(currentFile)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentFile?.path, state.mode, vlcState])
+  }, [currentFile?.path, state.mode, engineState])
 
   // 非本地模式：直接使用传入地址
   useEffect(() => {
@@ -1168,7 +1221,7 @@ export function PlayerPage() {
       whenPlayerGone(() => {
         void api.ruleWebview.close()
         void api.ruleProbe.stop()
-        void api.vlc.detach()
+        void api.player.detach()
         // 带上 show 时拿到的代号：迟到的 hide 不会关掉新实例刚建好的控制栏（v0.2.8 附加）
         void api.overlay.hide(overlayGenRef.current ?? undefined)
         // 世代号判定：只要新实例已经进入过播放页，上面这些清理就不会执行
@@ -1277,16 +1330,16 @@ export function PlayerPage() {
   useEffect(() => {
     aspectRef.current = aspect
   }, [aspect])
-  /** 把比例模式下发给内核（区域尺寸用于 VLC 的拉伸/裁剪几何） */
+  /** 把比例模式下发给内核（区域尺寸用于内核的拉伸/裁剪几何） */
   const applyAspect = useCallback((mode: AspectMode): void => {
-    const el = document.getElementById('vlc-host')
+    const el = document.getElementById('player-host')
     const r = el?.getBoundingClientRect()
-    void api.vlc.setAspect(mode, r?.width ?? window.innerWidth, r?.height ?? window.innerHeight)
+    void api.player.setAspect(mode, r?.width ?? window.innerWidth, r?.height ?? window.innerHeight)
   }, [])
   useEffect(() => {
-    if (vlcState !== 'active') return
+    if (engineState !== 'active') return
     applyAspect(aspect)
-  }, [aspect, vlcState, fullscreen, showEpisodes, showInfo, applyAspect])
+  }, [aspect, engineState, fullscreen, showEpisodes, showInfo, applyAspect])
   const changeAspect = useCallback(
     (mode: AspectMode) => {
       setAspect(mode)
@@ -1306,7 +1359,7 @@ export function PlayerPage() {
    * 打开它们时画面不再需要让位（用户反馈「打开播放列表不该改动播放内容页面」），
    * 同时修掉「详情按钮点了没反应」——面板过去画在页面里，被原生视频窗口完全盖住了。
    */
-  const overlayActive = vlcState !== 'fallback'
+  const overlayActive = engineState !== 'fallback'
   /** 最近一次 show 拿到的悬浮窗代号（hide 时带回去，防止迟到的 hide 关掉新窗口） */
   const overlayGenRef = useRef<number | null>(null)
   useEffect(() => {
@@ -1373,41 +1426,53 @@ export function PlayerPage() {
     const off = api.overlay.onAction((a) => {
       switch (a.type) {
         case 'playPause':
-          void api.vlc.togglePause()
+          void api.player.togglePause()
           break
         case 'forward10': {
           const t = duration > 0 ? Math.min(duration, current + 10) : current + 10
           setCurrent(t)
-          void api.vlc.seek(t)
+          void api.player.seek(t)
           break
         }
         case 'back10': {
           const t = Math.max(0, current - 10)
           setCurrent(t)
-          void api.vlc.seek(t)
+          void api.player.seek(t)
           break
         }
         case 'volumeUp': {
-          const nv = Math.min(100, vlcVolume + 10)
-          setVlcVolume(nv)
-          void api.vlc.setVolume(nv)
+          const nv = Math.min(100, playerVolume + 10)
+          setPlayerVolume(nv)
+          void api.player.setVolume(nv)
           break
         }
         case 'volumeDown': {
-          const nv = Math.max(0, vlcVolume - 10)
-          setVlcVolume(nv)
-          void api.vlc.setVolume(nv)
+          const nv = Math.max(0, playerVolume - 10)
+          setPlayerVolume(nv)
+          void api.player.setVolume(nv)
+          break
+        }
+        case 'setVolume': {
+          // v0.2.9：控制栏音量滑杆（0-100）。拖动时高频触发，这里只改状态与音量，不做其它副作用。
+          const nv = Math.max(0, Math.min(100, Math.round(a.value)))
+          setPlayerVolume(nv)
+          void api.player.setVolume(nv)
+          break
+        }
+        case 'setSpeed': {
+          // v0.2.9 最后更新：控制栏倍速菜单/按钮 → 内核 speed（变速不变调）
+          applySpeed(a.value)
           break
         }
         case 'toggleMute': {
-          const next = !vlcMuted
-          setVlcMuted(next)
-          void api.vlc.setMute(next)
+          const next = !playerMuted
+          setPlayerMuted(next)
+          void api.player.setMute(next)
           break
         }
         case 'seek':
           setCurrent(a.time)
-          void api.vlc.seek(a.time)
+          void api.player.seek(a.time)
           break
         case 'prevEpisode':
           goPrevEpisode()
@@ -1416,14 +1481,14 @@ export function PlayerPage() {
           goNextEpisode()
           break
         case 'cycleSubtitle':
-          void cycleVlcSubtitle()
+          void cycleEngineSubtitle()
           break
         case 'setSubtitle': {
-          const idx = vlcSubs.findIndex((s) => s.id === a.id)
+          const idx = engineSubs.findIndex((s) => s.id === a.id)
           if (idx >= 0) {
-            setVlcSubIdx(idx)
-            void api.vlc.setSubtitle(a.id)
-            toast.info(`字幕：${vlcSubs[idx].label}`)
+            setEngineSubIdx(idx)
+            void api.player.setSubtitle(a.id)
+            toast.info(`字幕：${engineSubs[idx].label}`)
           }
           break
         }
@@ -1447,7 +1512,7 @@ export function PlayerPage() {
         /** 断点续播提示：撤销跳转 → 回到开头 */
         case 'undoResume':
           setCurrent(0)
-          void api.vlc.seek(0)
+          void api.player.seek(0)
           setResumeHint(null)
           toast.info('已回到本集开头')
           break
@@ -1455,7 +1520,7 @@ export function PlayerPage() {
           setResumeHint(null)
           break
         case 'snapshot':
-          void api.vlc.snapshot(state.title).then((r) => {
+          void api.player.snapshot(state.title, currentEpisodeNo()).then((r) => {
             if (r.ok) toast.success(`截图已保存: ${r.data}`)
             else toast.error(r.error)
           })
@@ -1474,16 +1539,26 @@ export function PlayerPage() {
           void api.window.setFullscreen(false)
           break
         /** v0.2.8 弹幕：开关 / 逐项设置 / 打开详细设置 / 重新匹配 */
-        case 'toggleDanmaku':
-          void updateDanmaku({ enabled: !danmakuSettingsRef.current.enabled })
-          if (danmakuSettingsRef.current.enabled) toast.info('已关闭弹幕')
-          else toast.info('已打开弹幕')
+        case 'toggleDanmaku': {
+          const next = !danmakuSettingsRef.current.enabled
+          void updateDanmaku({ enabled: next })
+          // v0.2.9：插件渲染时，把开关同步给插件自己（它有自己的弹幕开关状态）
+          if (uoscActiveRef.current) void api.uosc.setVisible(next)
+          if (next) toast.info('已打开弹幕')
+          else toast.info('已关闭弹幕')
           break
+        }
         case 'danmakuSetting':
           void updateDanmaku({ [a.key]: a.value } as Partial<DanmakuSettings>)
+          // 时间轴微调对两种渲染方式都生效：同步告诉插件（它按「秒」处理延迟）
+          if (uoscActiveRef.current && a.key === 'offsetMs') void api.uosc.delay(Number(a.value) || 0)
           break
         case 'openDanmakuSettings':
           void api.window.openSmall('/danmaku-settings', { width: 620, height: 560, title: '弹幕设置' })
+          break
+        case 'uoscMenu':
+          // v0.2.9：打开插件自己的菜单（uosc 渲染）：搜索弹幕 / 总菜单 / 弹幕样式 / 源延迟
+          void api.uosc.menu(String(a.key) as 'search' | 'total' | 'style' | 'delay' | 'add')
           break
         case 'reloadDanmaku':
           void loadDanmaku(true)
@@ -1502,9 +1577,9 @@ export function PlayerPage() {
     overlayActive,
     duration,
     current,
-    vlcVolume,
-    vlcMuted,
-    vlcSubs,
+    playerVolume,
+    playerMuted,
+    engineSubs,
     goPrevEpisode,
     goNextEpisode,
     changeAspect,
@@ -1529,7 +1604,7 @@ export function PlayerPage() {
     if (!overlayActive) return
     const timer = window.setInterval(() => {
       if (playingRef.current) return
-      void api.vlc.getState().then((r) => {
+      void api.player.getState().then((r) => {
         if (!r.ok) return
         const st = r.data
         if (!st.playing || (st.time <= 0 && st.length <= 0)) return
@@ -1568,8 +1643,10 @@ export function PlayerPage() {
       playing,
       current,
       duration,
-      volume: vlcVolume,
-      muted: vlcMuted,
+      volume: playerVolume,
+      muted: playerMuted,
+      /** v0.2.9 最后更新：倍速（控制栏显示当前档位） */
+      speed: playerSpeed,
       aspect,
       hasEpisodes: state.mode === 'rule' ? groups.length > 0 : files.length > 1,
       canPrev: state.mode === 'rule' ? !!ruleCurrent && ruleCurrent.ep > 0 : currentIndex > 0,
@@ -1577,8 +1654,8 @@ export function PlayerPage() {
         state.mode === 'rule'
           ? !!ruleCurrent && ruleCurrent.ep + 1 < (groups[line]?.episodes.length ?? 0)
           : currentIndex < files.length - 1,
-      subs: vlcSubs,
-      subIdx: vlcSubIdx,
+      subs: engineSubs,
+      subIdx: engineSubIdx,
       fullscreen,
       status: playStatus,
       error: videoError ?? (ruleProbeFailed ? '未能捕获到视频流，请切换线路或退出' : null),
@@ -1591,7 +1668,7 @@ export function PlayerPage() {
       resume: resumeHint ? { target: resumeHint.target } : null,
       // v0.2.8：弹幕要精确盖在画面之上（避开上下控制栏），所以把视频区域矩形一并推过去
       videoRect: (() => {
-        const el = document.getElementById('vlc-host')
+        const el = document.getElementById('player-host')
         const r = el?.getBoundingClientRect()
         if (r && r.width > 0 && r.height > 0) {
           return { x: Math.round(r.left), y: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) }
@@ -1612,11 +1689,11 @@ export function PlayerPage() {
     playing,
     current,
     duration,
-    vlcVolume,
-    vlcMuted,
+    playerVolume,
+    playerMuted,
     aspect,
-    vlcSubs,
-    vlcSubIdx,
+    engineSubs,
+    engineSubIdx,
     fullscreen,
     playStatus,
     videoError,
@@ -1751,6 +1828,14 @@ export function PlayerPage() {
    * `opts.aliasMode`（悬浮窗里的「别名检测弹幕」）：把番剧库的别名（原名 / 其它译名）
    * 与弹幕库自己的别名一起当搜索关键词 —— 番剧名与弹幕库标题对不上时靠它救回来。
    */
+  /**
+   * 当前播放的是第几集（v0.2.9：截图命名要用它）。
+   * 规则模式下 `ruleCurrent.ep` 从 0 开始，本地模式优先用文件名解析出的集数，
+   * 解析不出才退回播放列表序号 —— 与弹幕匹配用的是同一套口径，避免两处算出来不一样。
+   */
+  const currentEpisodeNo = (): number =>
+    state.mode === 'rule' ? (ruleCurrent?.ep ?? 0) + 1 : (currentFile?.episode ?? currentIndex + 1)
+
   const loadDanmaku = async (force = false, opts: { aliasMode?: boolean } = {}): Promise<void> => {
     const episode =
       state.mode === 'rule'
@@ -1787,6 +1872,38 @@ export function PlayerPage() {
           loading: false
         })
         console.log(`[player] 弹幕已加载：${r.data.episodeTitle} 共 ${r.data.count} 条（缓存=${r.data.fromCache}）${by}`)
+        /*
+         * v0.2.9：插件渲染时，确认插件**真的**把这批弹幕挂上了。
+         * 判据是插件自己暴露的 `user-data/uosc_danmaku/has-danmaku`（v2.1.0 没有条数属性）。
+         *
+         * 分两轮看：注入必须等 mpv 载入文件（否则插件会崩、脚本被终止），
+         * 所以第一轮看到 pending=true 时不能急着回落，再等一轮；两轮都没挂上才回落到内置画布 ——
+         * 用户要的是「看到弹幕」，不是「必须由插件画」。
+         */
+        if (uoscActiveRef.current) {
+          const checkKey = key
+          const check = (round: number): void => {
+            window.setTimeout(() => {
+              void (async () => {
+                if (danmakuKeyRef.current !== checkKey) return
+                const s = await api.uosc.status()
+                if (!s.ok || !s.data.active) return
+                if (s.data.loaded) {
+                  console.log('[player] uosc_danmaku 已挂上弹幕（has-danmaku=true）')
+                  return
+                }
+                if (s.data.pending && round < 2) {
+                  console.log('[player] uosc_danmaku 弹幕还在等文件就绪，稍后再确认')
+                  check(round + 1)
+                  return
+                }
+                console.warn('[player] uosc_danmaku 未挂上弹幕，回落到内置画布渲染')
+                setUoscActive(false)
+              })()
+            }, 4500)
+          }
+          check(0)
+        }
         if (opts.aliasMode) toast.success(`别名检测成功：${r.data.episodeTitle} 共 ${r.data.count} 条`)
       } else {
         // 失败也保留原弹幕（同一集重载时先前那一份仍然可用）
@@ -1810,7 +1927,9 @@ export function PlayerPage() {
         comments: danmaku.comments,
         settings: danmakuSettings,
         source: danmaku.source,
-        loading: danmaku.loading
+        loading: danmaku.loading,
+        // v0.2.9：插件渲染时内置画布让位，避免两套弹幕叠加
+        pluginActive: uoscActive
       })
     }
     push()
@@ -1822,19 +1941,52 @@ export function PlayerPage() {
       window.clearTimeout(t2)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [overlayActive, danmaku, danmakuSettings.enabled, danmakuSettings.area, danmakuSettings.maxCount, danmakuSettings.offsetMs])
+  }, [overlayActive, danmaku, danmakuSettings.enabled, danmakuSettings.area, danmakuSettings.maxCount, danmakuSettings.offsetMs, uoscActive])
 
   /** 换集（或首次进入）时自动拉弹幕：规则模式按当前集数，本地模式按文件集数 */
   useEffect(() => {
-    if (vlcState !== 'active') return
+    if (engineState !== 'active') return
     void loadDanmaku()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vlcState, ruleCurrent?.line, ruleCurrent?.ep, currentIndex, state.mode])
+  }, [engineState, ruleCurrent?.line, ruleCurrent?.ep, currentIndex, state.mode])
+
+  /**
+   * v0.2.9：mpv 弹幕插件（uosc_danmaku）状态。
+   * 引擎就绪后再查（插件是随 mpv 实例一起挂载的），拿到 active 后：
+   * - 内置画布让位；
+   * - 设置里的时间轴微调同步给插件；
+   * - 顺便清一次来源，避免上一集残留。
+   */
+  useEffect(() => {
+    if (engineState !== 'active') return
+    let alive = true
+    const sync = async (): Promise<void> => {
+      const r = await api.uosc.status()
+      if (!alive || !r.ok) return
+      setUoscActive(r.data.active)
+      if (r.data.active) {
+        console.log(`[player] 弹幕由 uosc_danmaku 插件渲染（已显示=${r.data.loaded}）`)
+        void api.uosc.delay(danmakuSettingsRef.current.offsetMs)
+        // 开关状态与内置开关保持一致（插件自己记状态，显式设一次避免两边不一致）
+        void api.uosc.setVisible(danmakuSettingsRef.current.enabled)
+      } else if (r.data.requested) {
+        console.warn('[player] 已选择插件渲染，但插件未挂上（回落到内置画布）')
+      }
+    }
+    void sync()
+    // 插件是异步挂载的，补查两次
+    const t1 = window.setTimeout(() => void sync(), 2500)
+    return () => {
+      alive = false
+      window.clearTimeout(t1)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engineState])
 
   const exitPlayer = () => {
     probingRef.current = false
     playingRef.current = false
-    const needDetach = vlcState !== 'fallback'
+    const needDetach = engineState !== 'fallback'
     const relayId = relayRef.current?.sessionId
     relayRef.current = null
     // 退出前落一次进度，「继续观看」才能接着上次的位置
@@ -1846,13 +1998,13 @@ export function PlayerPage() {
     } else {
       navigate(-1)
     }
-    // ② 主进程清理全部延后执行：销毁网页视图 / detach libVLC 都可能阻塞
+    // ② 主进程清理全部延后执行：销毁网页视图 / detach 内核都可能阻塞
     window.setTimeout(() => {
       if (relayId) void api.media.stopLive(relayId)
       void api.ruleWebview.close()
       void api.ruleProbe.stop()
       if (fullscreen) void api.window.setFullscreen(false)
-      if (needDetach) void api.vlc.detach()
+      if (needDetach) void api.player.detach()
     }, 150)
   }
 
@@ -1874,7 +2026,7 @@ export function PlayerPage() {
       const action = matchShortcut(e, shortcutMap)
       if (!action) return
       const v = videoRef.current
-      const useVlc = vlcState !== 'fallback'
+      const useEngine = engineState !== 'fallback'
       switch (action) {
         case 'exit':
           // 依次关闭：选集 → 详情 → 退出全屏 → 退出播放（全屏时第一次 ESC 仅退出全屏）
@@ -1888,38 +2040,38 @@ export function PlayerPage() {
           break
         case 'playPause':
           e.preventDefault()
-          if (useVlc) void api.vlc.togglePause()
+          if (useEngine) void api.player.togglePause()
           else if (v) {
             if (v.paused) void v.play()
             else v.pause()
           }
           break
         case 'forward10':
-          if (useVlc) {
+          if (useEngine) {
             const t = duration > 0 ? Math.min(duration, current + 10) : current + 10
             setCurrent(t)
-            void api.vlc.seek(t)
+            void api.player.seek(t)
           } else if (v) {
             v.currentTime = Math.min(duration || 0, v.currentTime + 10)
           }
           break
         case 'back10':
-          if (useVlc) {
+          if (useEngine) {
             const t = Math.max(0, current - 10)
             setCurrent(t)
-            void api.vlc.seek(t)
+            void api.player.seek(t)
           } else if (v) {
             v.currentTime = Math.max(0, v.currentTime - 10)
           }
           break
         case 'volumeUp':
-          if (useVlc) {
-            const nv = Math.min(100, vlcVolume + 10)
-            setVlcVolume(nv)
-            void api.vlc.setVolume(nv)
-            if (vlcMuted) {
-              setVlcMuted(false)
-              void api.vlc.setMute(false)
+          if (useEngine) {
+            const nv = Math.min(100, playerVolume + 10)
+            setPlayerVolume(nv)
+            void api.player.setVolume(nv)
+            if (playerMuted) {
+              setPlayerMuted(false)
+              void api.player.setMute(false)
             }
           } else {
             setVolume((vol) => Math.min(1, vol + 0.1))
@@ -1927,19 +2079,19 @@ export function PlayerPage() {
           }
           break
         case 'volumeDown':
-          if (useVlc) {
-            const nv = Math.max(0, vlcVolume - 10)
-            setVlcVolume(nv)
-            void api.vlc.setVolume(nv)
+          if (useEngine) {
+            const nv = Math.max(0, playerVolume - 10)
+            setPlayerVolume(nv)
+            void api.player.setVolume(nv)
           } else {
             setVolume((vol) => Math.max(0, vol - 0.1))
           }
           break
         case 'mute':
-          if (useVlc) {
-            const next = !vlcMuted
-            setVlcMuted(next)
-            void api.vlc.setMute(next)
+          if (useEngine) {
+            const next = !playerMuted
+            setPlayerMuted(next)
+            void api.player.setMute(next)
           } else {
             setMuted((m) => !m)
           }
@@ -1957,17 +2109,27 @@ export function PlayerPage() {
           void loadDetail()
           break
         case 'subtitle':
-          if (useVlc) void cycleVlcSubtitle()
+          if (useEngine) void cycleEngineSubtitle()
           else if (v) cycleSubtitle()
           break
+        /**
+         * 倍速切换（v0.2.9 最后更新）：按预设档位循环，1.0x 之后回到 1.25x。
+         * HTML5 回退路径同样支持（`video.playbackRate`）。
+         */
+        case 'speed': {
+          const idx = SPEED_STEPS.indexOf(playerSpeedRef.current)
+          const next = SPEED_STEPS[(idx + 1) % SPEED_STEPS.length] ?? 1
+          applySpeed(next)
+          break
+        }
         case 'screenshot':
-          if (vlcState !== 'fallback') {
-            void api.vlc.snapshot(state.title).then((r) => {
+          if (engineState !== 'fallback') {
+            void api.player.snapshot(state.title, currentEpisodeNo()).then((r) => {
               if (r.ok) toast.success(`截图已保存: ${r.data}`)
               else toast.error(r.error)
             })
           } else {
-            void api.player.screenshot(state.title).then((r) => {
+            void api.player.screenshot(state.title, currentEpisodeNo()).then((r) => {
               if (r.ok) toast.success(`截图已保存: ${r.data}`)
               else toast.error(r.error)
             })
@@ -1987,9 +2149,9 @@ export function PlayerPage() {
     current,
     files.length,
     currentIndex,
-    vlcState,
-    vlcVolume,
-    vlcMuted,
+    engineState,
+    playerVolume,
+    playerMuted,
     subIndex,
     currentSubs.length
   ])
@@ -2022,8 +2184,8 @@ export function PlayerPage() {
       onMouseMove={poke}
       onMouseDown={poke}
     >
-      {vlcState !== 'fallback' ? (
-        <VlcModeUI
+      {engineState !== 'fallback' ? (
+        <EngineModeUI
           title={state.title}
           files={files}
           currentIndex={currentIndex}
@@ -2035,13 +2197,13 @@ export function PlayerPage() {
           detailLoading={detailLoading}
           fullscreen={fullscreen}
           visible={visible}
-          initError={vlcError}
+          initError={engineError}
           videoError={videoError ?? (ruleProbeFailed ? '在线播放失败：未能捕获到视频流，请切换线路重试或退出' : null)}
           playing={playing}
           current={current}
           duration={duration}
-          volume={vlcVolume}
-          muted={vlcMuted}
+          volume={playerVolume}
+          muted={playerMuted}
           subtitleLabel={subtitleLabel}
           ruleMode={state.mode === 'rule'}
           ruleGroups={state.groups}
@@ -2056,36 +2218,36 @@ export function PlayerPage() {
           onToggleFullscreen={toggleFullscreen}
           aspect={aspect}
           onChangeAspect={changeAspect}
-          onTogglePause={() => void api.vlc.togglePause()}
+          onTogglePause={() => void api.player.togglePause()}
           onSeek={(t) => {
-            // 本地同步进度（暂停时 libVLC 不推送进度事件，避免进度条不响应）
+            // 本地同步进度（暂停时内核不推送进度事件，避免进度条不响应）
             setCurrent(t)
-            void api.vlc.seek(t)
+            void api.player.seek(t)
           }}
           onVolume={(v) => {
-            setVlcVolume(v)
-            void api.vlc.setVolume(v)
+            setPlayerVolume(v)
+            void api.player.setVolume(v)
             if (v === 0) {
-              setVlcMuted(true)
-              void api.vlc.setMute(true)
-            } else if (vlcMuted) {
-              setVlcMuted(false)
-              void api.vlc.setMute(false)
+              setPlayerMuted(true)
+              void api.player.setMute(true)
+            } else if (playerMuted) {
+              setPlayerMuted(false)
+              void api.player.setMute(false)
             }
           }}
           onToggleMute={() => {
-            const next = !vlcMuted
-            setVlcMuted(next)
-            void api.vlc.setMute(next)
+            const next = !playerMuted
+            setPlayerMuted(next)
+            void api.player.setMute(next)
           }}
-          onCycleSubtitle={cycleVlcSubtitle}
-          subs={vlcSubs}
-          subIdx={vlcSubIdx}
+          onCycleSubtitle={cycleEngineSubtitle}
+          subs={engineSubs}
+          subIdx={engineSubIdx}
           onSelectSub={(i) => {
-            setVlcSubIdx(i)
-            void api.vlc.setSubtitle(i < 0 ? -1 : (vlcSubs[i]?.id ?? -1))
+            setEngineSubIdx(i)
+            void api.player.setSubtitle(i < 0 ? -1 : (engineSubs[i]?.id ?? -1))
             if (i < 0) toast.info('字幕已关闭')
-            else if (vlcSubs[i]) toast.info(`字幕：${vlcSubs[i].label}`)
+            else if (engineSubs[i]) toast.info(`字幕：${engineSubs[i].label}`)
           }}
           onPickSubtitle={() => {
             void api.dialog.pickSubtitle().then(async (r) => {
@@ -2094,13 +2256,13 @@ export function PlayerPage() {
                 return
               }
               if (!r.data) return
-              const add = await api.vlc.addSubtitleFile(r.data)
+              const add = await api.player.addSubtitleFile(r.data)
               if (!add.ok) {
                 toast.error(add.error)
                 return
               }
               toast.success('字幕已加载')
-              setTimeout(() => void refreshVlcSubs(), 800)
+              setTimeout(() => void refreshEngineSubs(), 800)
             })
           }}
           onToggleEpisodes={() => {
@@ -2118,7 +2280,7 @@ export function PlayerPage() {
               {videoError ?? (ruleProbeFailed ? '在线播放失败：未能捕获到视频流' : '没有可播放的地址')}
             </div>
             <button
-              className="rounded-lg bg-white/15 px-3 py-1.5 text-xs text-white hover:bg-white/25"
+              className="rounded-lg bg-white/15 px-3 py-1.5 text-xs text-white hover:bg-white/25 whitespace-nowrap"
               onClick={exitPlayer}
             >
               ✕ 退出播放
@@ -2175,7 +2337,7 @@ export function PlayerPage() {
           {state.mode === 'local' && files.length > 1 ? (
             <div className="flex gap-2">
               <button
-                className="rounded-lg bg-white/15 px-3 py-1.5 text-xs text-white hover:bg-white/25"
+                className="rounded-lg bg-white/15 px-3 py-1.5 text-xs text-white hover:bg-white/25 whitespace-nowrap"
                 onClick={() => switchEpisode(currentIndex + 1)}
               >
                 播放下一集
@@ -2276,7 +2438,7 @@ export function PlayerPage() {
                 }}
               />
             ) : null}
-            <div className="mt-2 flex items-center gap-3">
+            <div className="mt-2 flex flex-wrap items-center gap-3">
               {state.mode !== 'rule' ? (
                 <>
                   <button
@@ -2286,7 +2448,7 @@ export function PlayerPage() {
                       if (v.paused) void v.play()
                       else v.pause()
                     }}
-                    className="text-white transition-transform hover:scale-110"
+                    className="text-white transition-transform hover:scale-110 whitespace-nowrap"
                     title={playing ? '暂停' : '播放'}
                   >
                     {playing ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
@@ -2314,7 +2476,7 @@ export function PlayerPage() {
                   <div className="flex items-center gap-1.5">
                     <button
                       onClick={() => setMuted((m) => !m)}
-                      className="text-white/85 hover:text-white"
+                      className="text-white/85 hover:text-white whitespace-nowrap"
                       title={muted ? '取消静音' : '静音'}
                     >
                       {effectiveVolume === 0 ? <VolumeX size={16} /> : <Volume2 size={16} />}
@@ -2337,7 +2499,7 @@ export function PlayerPage() {
                     onClick={cycleSubtitle}
                     className={`flex items-center gap-1 text-[11px] transition-colors ${
                       subIndex >= 0 ? 'text-accent' : 'text-white/70 hover:text-white'
-                    }`}
+                    } whitespace-nowrap `}
                     title="切换字幕（srt / ass / ssa / vtt 自动转换）"
                   >
                     <Captions size={16} />
@@ -2363,7 +2525,7 @@ export function PlayerPage() {
                 <TopBtn
                   title="截屏（保存到截图文件夹）"
                   onClick={() => {
-                    void api.player.screenshot(state.title).then((r) => {
+                    void api.player.screenshot(state.title, currentEpisodeNo()).then((r) => {
                       if (r.ok) toast.success(`截图已保存: ${r.data}`)
                       else toast.error(r.error)
                     })
@@ -2459,7 +2621,7 @@ export function PlayerPage() {
           onClose={() => setResumeHint(null)}
           onUndo={() => {
             setCurrent(0)
-            void api.vlc.seek(0)
+            void api.player.seek(0)
             setResumeHint(null)
             toast.info('已回到本集开头')
           }}
@@ -2475,15 +2637,15 @@ function ResumeUndoHint({ target, onUndo, onClose }: { target: number; onUndo: (
     <div className="fixed bottom-24 right-5 z-[55] flex w-72 flex-col gap-2 rounded-xl border border-white/15 bg-black/85 p-3 text-white shadow-2xl backdrop-blur">
       <div className="text-xs">已自动跳转到上次观看位置 {fmtDuration(target)}</div>
       <div className="text-[11px] text-white/60">如果不想从这里继续，可以回到本集开头。</div>
-      <div className="flex justify-end gap-2">
+      <div className="flex flex-wrap justify-end gap-2">
         <button
-          className="rounded-lg bg-white/10 px-2.5 py-1 text-[11px] text-white/80 hover:bg-white/20"
+          className="rounded-lg bg-white/10 px-2.5 py-1 text-[11px] text-white/80 hover:bg-white/20 whitespace-nowrap"
           onClick={onClose}
         >
           保持
         </button>
         <button
-          className="rounded-lg bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:brightness-110"
+          className="rounded-lg bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:brightness-110 whitespace-nowrap"
           onClick={onUndo}
         >
           撤销跳转
@@ -2493,9 +2655,9 @@ function ResumeUndoHint({ target, onUndo, onClose }: { target: number; onUndo: (
   )
 }
 
-/** libVLC 模式界面（一体化控制布局）：顶条 + 视频区 + 底条均为 DOM，
+/** 原生内核模式界面（一体化控制布局）：顶条 + 视频区 + 底条均为 DOM，
  *  无内置 overlay 遮挡，上下控件同步 5 秒自动隐藏 */
-function VlcModeUI({
+function EngineModeUI({
   title,
   files,
   currentIndex,
@@ -2585,17 +2747,17 @@ function VlcModeUI({
   const [subMenuOpen, setSubMenuOpen] = useState(false)
   const [aspectMenuOpen, setAspectMenuOpen] = useState(false)
   const [selectedLine, setSelectedLine] = useState(0)
-  // 抽屉开合/全屏切换/控制栏显隐后同步画面位置（libmpv 子窗口需要新矩形，libVLC 用其内部布局通知）
+  // 抽屉开合/全屏切换/控制栏显隐后同步画面位置（libmpv 子窗口需要新矩形）
   useEffect(() => {
     const sync = (delay: number): void => {
       const t = setTimeout(() => {
-        const el = document.getElementById('vlc-host')
+        const el = document.getElementById('player-host')
         const r = el?.getBoundingClientRect()
         const bounds =
           r && r.width > 0 && r.height > 0
             ? { x: r.left, y: r.top, width: r.width, height: r.height }
             : undefined
-        void api.vlc.notifyLayout(bounds)
+        void api.player.notifyLayout(bounds)
       }, delay)
       timers.push(t)
     }
@@ -2675,7 +2837,7 @@ function VlcModeUI({
                 : '规则播放 · 直连视频流'
               : files.length > 0
                 ? `${currentIndex + 1} / ${files.length}`
-                : 'libVLC 播放'}
+                : '内核播放'}
           </div>
         </div>
         {/*
@@ -2696,7 +2858,7 @@ function VlcModeUI({
               : playStatus.kind === 'playing'
                 ? 'bg-white/12 text-white/90 hover:bg-white/25'
                 : 'bg-white/18 text-white hover:bg-white/30'
-          }`}
+          } whitespace-nowrap `}
         >
           <span
             className={`h-1.5 w-1.5 rounded-full ${
@@ -2722,7 +2884,7 @@ function VlcModeUI({
           <TopBtn
             title="截图（保存到截图文件夹）"
             onClick={() => {
-              void api.vlc.snapshot(title).then((r) => {
+              void api.player.snapshot(title, currentEpisode ?? undefined).then((r) => {
                 if (r.ok) toast.success(`截图已保存: ${r.data}`)
                 else toast.error(r.error)
               })
@@ -2825,7 +2987,7 @@ function VlcModeUI({
             非全屏保持原布局（控制栏常驻可见）。
           */}
           <div
-            id="vlc-host"
+            id="player-host"
             className={overlayActive ? 'fixed inset-0' : 'absolute inset-x-0 bottom-0 top-1.5'}
           />
           {/* 播放画面右侧悬浮截屏按钮（随控件一同显示/隐藏） */}
@@ -2839,7 +3001,7 @@ function VlcModeUI({
               onPointerDown={(e) => {
                 if (e.button !== 0) return
                 e.stopPropagation()
-                void api.vlc.snapshot(title).then((r) => {
+                void api.player.snapshot(title, currentEpisode ?? undefined).then((r) => {
                   if (r.ok) toast.success(`截图已保存: ${r.data}`)
                   else toast.error(r.error)
                 })
@@ -2859,7 +3021,7 @@ function VlcModeUI({
                   e.stopPropagation()
                   onExit()
                 }}
-                className="rounded-lg bg-white/15 px-3 py-1.5 text-xs text-white hover:bg-white/25"
+                className="rounded-lg bg-white/15 px-3 py-1.5 text-xs text-white hover:bg-white/25 whitespace-nowrap"
               >
                 ✕ 退出播放
               </button>
@@ -2874,7 +3036,7 @@ function VlcModeUI({
                   e.stopPropagation()
                   onExit()
                 }}
-                className="rounded-lg bg-white/15 px-3 py-1.5 text-xs text-white hover:bg-white/25"
+                className="rounded-lg bg-white/15 px-3 py-1.5 text-xs text-white hover:bg-white/25 whitespace-nowrap"
               >
                 ✕ 退出播放
               </button>
@@ -2936,7 +3098,7 @@ function VlcModeUI({
                 e.stopPropagation()
                 onTogglePause()
               }}
-              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-white transition-colors hover:bg-white/20 active:bg-white/30"
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-white transition-colors hover:bg-white/20 active:bg-white/30 whitespace-nowrap"
               title="播放/暂停（空格）"
             >
               {playing ? <Pause size={22} fill="currentColor" /> : <Play size={22} fill="currentColor" />}
@@ -2975,7 +3137,7 @@ function VlcModeUI({
                   e.stopPropagation()
                   onToggleMute()
                 }}
-                className="flex h-9 w-9 items-center justify-center rounded-lg text-white/90 hover:bg-white/20 hover:text-white"
+                className="flex h-9 w-9 items-center justify-center rounded-lg text-white/90 hover:bg-white/20 hover:text-white whitespace-nowrap"
                 title="静音（m）"
               >
                 {muted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
@@ -3002,7 +3164,7 @@ function VlcModeUI({
                 }}
                 className={`flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[12px] transition-colors ${
                   showEpisodes ? 'bg-white/25 text-white' : 'text-white/85 hover:bg-white/20 hover:text-white'
-                }`}
+                } whitespace-nowrap `}
                 title="选集（l）"
               >
                 <ListVideo size={18} />
@@ -3023,7 +3185,7 @@ function VlcModeUI({
                 }}
                 className={`flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[12px] transition-colors ${
                   subtitleLabel ? 'bg-white/20 text-accent' : 'text-white/85 hover:bg-white/20 hover:text-white'
-                } ${ruleMode ? 'opacity-50' : ''}`}
+                } ${ruleMode ? 'opacity-50' : ''} whitespace-nowrap `}
                 title={ruleMode ? '在线播放不适用字幕选择' : '字幕（c 快速切换）'}
               >
                 <Captions size={17} />
@@ -3043,7 +3205,7 @@ function VlcModeUI({
                       }}
                       className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] hover:bg-white/10 ${
                         subIdx < 0 ? 'text-accent' : 'text-white/80'
-                      }`}
+                      } whitespace-nowrap `}
                     >
                       关闭字幕
                     </button>
@@ -3074,7 +3236,7 @@ function VlcModeUI({
                         setSubMenuOpen(false)
                         onPickSubtitle()
                       }}
-                      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] text-white/85 hover:bg-white/10"
+                      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] text-white/85 hover:bg-white/10 whitespace-nowrap"
                     >
                       选择字幕文件…
                     </button>
@@ -3093,7 +3255,7 @@ function VlcModeUI({
                 }}
                 className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-white/90 transition-colors hover:bg-white/20 hover:text-white ${
                   aspectMenuOpen ? 'bg-white/20 text-white' : ''
-                }`}
+                } whitespace-nowrap `}
                 title={`画面比例：${ASPECT_TEXT[aspect]}`}
               >
                 {aspect === 'cover' ? (
@@ -3132,7 +3294,7 @@ function VlcModeUI({
                 e.stopPropagation()
                 onToggleFullscreen()
               }}
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-white/90 transition-colors hover:bg-white/20 hover:text-white"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-white/90 transition-colors hover:bg-white/20 hover:text-white whitespace-nowrap"
               title="全屏（f）"
             >
               {fullscreen ? <Minimize size={18} /> : <Maximize size={18} />}
@@ -3178,7 +3340,7 @@ function TopBtn({
         active
           ? 'bg-white/25 text-white'
           : 'text-white/90 hover:bg-white/20 hover:text-white active:bg-white/30'
-      }`}
+      } whitespace-nowrap `}
     >
       {children}
     </button>

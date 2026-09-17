@@ -7,25 +7,31 @@ import type {
   DanmakuLoadResult,
   DanmakuMatch,
   DanmakuSettings,
+  DeleteLocalResult,
   DownloadTask,
   GalEvent,
   GalGame,
   GalLaunchResult,
   GalRecentShot,
+  GalSiteSearchResult,
   GalToolsConfig,
   LiveStartResult,
+  LocalDirInfo,
+  LocalTargetInput,
   LocalVideoFile,
   LogEntry,
   MediaInspectResult,
   MikanSearchResult,
   MirrorTestResult,
   PlayStatus,
+  RemoveRecordsResult,
   RuleEpisodeGroup,
   RuleEpisodesResult,
   RulePlayResult,
   RuleSearchEntry,
   RuleSearchResult,
   SearchResult,
+  SeasonResult,
   StreamInfo,
   SubUpdateCheck,
   SubjectResult,
@@ -34,6 +40,7 @@ import type {
   Subscription,
   ToolMeta,
   ToolRunResult,
+  UpdateInstallState,
   UpdateInfo,
   YmgalCandidate
 } from './types'
@@ -49,6 +56,8 @@ export interface OverlayState {
   duration: number
   volume: number
   muted: boolean
+  /** v0.2.9 最后更新：当前播放倍速（控制栏显示档位，1 = 原速） */
+  speed: number
   aspect: AspectMode
   hasEpisodes: boolean
   canPrev: boolean
@@ -76,7 +85,7 @@ export interface OverlayState {
   resume?: { target: number } | null
   /**
    * v0.2.8：视频区域矩形（相对窗口的 CSS 像素）。
-   * 弹幕要精确地盖在画面之上、且不压到上下控制栏，所以由播放页把 `#vlc-host` 的矩形推过来。
+   * 弹幕要精确地盖在画面之上、且不压到上下控制栏，所以由播放页把 `#player-host` 的矩形推过来。
    */
   videoRect?: { x: number; y: number; width: number; height: number }
 }
@@ -103,6 +112,12 @@ export interface OverlayDanmaku {
   source: string
   /** 正在加载弹幕 */
   loading: boolean
+  /**
+   * v0.2.9：弹幕是否由 mpv 的 uosc_danmaku 插件渲染。
+   * 为 true 时内置画布层必须**停止绘制**（否则两套弹幕会叠在一起），
+   * 但条数/来源信息照常显示 —— 数据本来就是同一份。
+   */
+  pluginActive?: boolean
 }
 
 /** 悬浮窗 → 播放页 的控制栏动作 */
@@ -112,6 +127,10 @@ export type OverlayAction =
   | { type: 'back10' }
   | { type: 'volumeUp' }
   | { type: 'volumeDown' }
+  /** v0.2.9：控制栏音量滑杆（0-100），取代原来的静音按钮 */
+  | { type: 'setVolume'; value: number }
+  /** v0.2.9 最后更新：设置播放倍速（0.25–4） */
+  | { type: 'setSpeed'; value: number }
   | { type: 'toggleMute' }
   | { type: 'seek'; time: number }
   | { type: 'prevEpisode' }
@@ -131,6 +150,8 @@ export type OverlayAction =
   | { type: 'toggleDanmaku' }
   | { type: 'danmakuSetting'; key: keyof DanmakuSettings; value: number | boolean | string }
   | { type: 'openDanmakuSettings' }
+  /** v0.2.9：打开 mpv 弹幕插件（uosc_danmaku）自己的菜单 */
+  | { type: 'uoscMenu'; key: 'search' | 'total' | 'style' | 'delay' | 'add' }
   | { type: 'reloadDanmaku' }
   | { type: 'detectDanmakuAlias' }
   /** 断点续播提示上的两个按钮 */
@@ -163,6 +184,11 @@ export interface SakanaApi {
     subject(id: number): Promise<ApiResult<SubjectResult>>
     search(keyword: string): Promise<ApiResult<SearchResult>>
     ratings(ids: number[]): Promise<ApiResult<Record<number, { score: number | null; total: number }>>>
+    /**
+     * 某个季度的番剧列表（番剧表「预览 20xx年春」弹窗）。
+     * month 可传该季度内的任意一个月，主进程会规范化到季度并按季度缓存。
+     */
+    season(year: number, month: number, force?: boolean): Promise<ApiResult<SeasonResult>>
     testMirrors(): Promise<ApiResult<MirrorTestResult[]>>
   }
   mikan: {
@@ -191,6 +217,15 @@ export interface SakanaApi {
     remove(id: string): Promise<ApiResult<boolean>>
     list(): Promise<ApiResult<DownloadTask[]>>
     test(): Promise<ApiResult<{ ok: boolean; message: string }>>
+    /**
+     * 推导某番剧/订阅的本地目录。卡片上的「本地播放」用它取代旧的文件夹选择框：
+     * 目录自动按「下载任务记录 → 订阅记录 → 下载根目录/番剧名」推导。
+     */
+    localDir(input: LocalTargetInput): Promise<ApiResult<LocalDirInfo>>
+    /** 删除本地资源：磁盘文件 + 对应下载记录（不可撤销，界面必须二次确认） */
+    deleteLocal(input: LocalTargetInput): Promise<ApiResult<DeleteLocalResult>>
+    /** 只删下载记录，**绝不**删除磁盘上已下载的文件（下载列表综合卡片用） */
+    removeRecords(input: { animeTitle?: string; ids?: string[] }): Promise<ApiResult<RemoveRecordsResult>>
     onChanged(cb: (tasks: DownloadTask[]) => void): () => void
   }
   rules: {
@@ -238,7 +273,7 @@ export interface SakanaApi {
       opts?: { referer?: string; cookies?: string; userAgent?: string }
     ): Promise<ApiResult<LiveStartResult>>
   }
-  vlc: {
+  player: {
     attach(bounds?: { x: number; y: number; width: number; height: number }): Promise<
       ApiResult<{ ok: boolean; message: string }>
     >
@@ -249,14 +284,18 @@ export interface SakanaApi {
     setVolume(volume: number): Promise<ApiResult<boolean>>
     getState(): Promise<ApiResult<{ time: number; length: number; playing: boolean; volume: number; muted: boolean }>>
     setMute(muted: boolean): Promise<ApiResult<boolean>>
+    /** v0.2.9 最后更新：播放倍速（0.25–4，scaletempo2 变速不变调） */
+    setSpeed(speed: number): Promise<ApiResult<boolean>>
     subtitleTracks(): Promise<ApiResult<{ id: number; label: string }[]>>
     setSubtitle(id: number): Promise<ApiResult<boolean>>
     addSubtitleFile(path: string): Promise<ApiResult<boolean>>
-    snapshot(title?: string): Promise<ApiResult<string | boolean>>
+    snapshot(title?: string, episode?: number): Promise<ApiResult<string | boolean>>
     detach(): Promise<ApiResult<boolean>>
     notifyLayout(bounds?: { x: number; y: number; width: number; height: number }): Promise<ApiResult<boolean>>
     /** 画面比例：fit=适应 / cover=裁剪铺满 / stretch=拉伸铺满 */
     setAspect(mode: AspectMode, areaW: number, areaH: number): Promise<ApiResult<boolean>>
+    /** v0.2.8 附加七：把当前播放页地址告知 mpv 的 B 站弹幕脚本（直链无法反推页面） */
+    setDanmakuSource(pageUrl: string): Promise<ApiResult<boolean>>
     onEvent(
       cb: (ev: {
         type: string
@@ -267,12 +306,11 @@ export interface SakanaApi {
         index?: number
       }) => void
     ): () => void
-  }
-  player: {
-    screenshot(title?: string): Promise<ApiResult<string>>
-    /** 探测随包内置的播放/下载组件（libVLC / FFmpeg / aria2） */
+    /** 截图（v0.2.9：目录/文件名规则统一由主进程处理，见 snapshotPath） */
+    screenshot(title?: string, episode?: number): Promise<ApiResult<string>>
+    /** 探测随包内置的播放/下载组件（libmpv / FFmpeg / aria2） */
     assets(): Promise<ApiResult<PlayerAssets>>
-    /** 当前流的详细信息（地址/播放列表/分辨率/编码/码率），供播放状态栏展示 */
+    /** 当前流的详细信息（分辨率/编码/码率等），供播放状态栏展示 */
     streamInfo(): Promise<ApiResult<StreamInfo>>
   }
   /** 全屏控制栏悬浮窗：主窗口播放页 ↔ 悬浮窗渲染层 */
@@ -366,6 +404,10 @@ export interface SakanaApi {
     dirsGet(): Promise<ApiResult<{ dir: string }>>
     dirsSet(dir: string): Promise<ApiResult<{ dir: string }>>
     recentShots(): Promise<ApiResult<GalRecentShot[]>>
+    /** 某款游戏自己的截图（只读该游戏的截图子目录） */
+    listShots(gameName: string): Promise<ApiResult<GalRecentShot[]>>
+    /** 按游戏名统计各资源站的搜索结果数量（只回数量 + 跳转链接，不回传站点内容） */
+    searchSites(keyword: string): Promise<ApiResult<GalSiteSearchResult[]>>
     onEvent(cb: (ev: GalEvent) => void): () => void
   }
   stat: {
@@ -377,8 +419,21 @@ export interface SakanaApi {
     version(): Promise<ApiResult<string>>
     openDataDir(): Promise<ApiResult<string>>
     openPath(path: string): Promise<ApiResult<string>>
-    /** 从 git 仓库检查更新（比对远端 package.json / version.json） */
+    /**
+     * 从 git 仓库检查更新（v0.2.9 最后更新后以 **GitHub Releases** 为准：
+     * 能拿到更新说明与安装包资产，因此可以一键更新；拿不到 API 时回落到 version.json 镜像）。
+     */
     checkUpdate(): Promise<ApiResult<UpdateInfo>>
+    /** 下载安装包（进度通过 onUpdateState 推送） */
+    updateDownload(): Promise<ApiResult<{ ok: boolean; file?: string; message: string }>>
+    /** 静默安装已下载的安装包并自动重启（本进程会退出） */
+    updateInstall(): Promise<ApiResult<{ ok: boolean; message: string }>>
+    /** 打开 Releases 页面（该版本没有可用安装包时的兜底） */
+    updateOpenReleases(): Promise<ApiResult<boolean>>
+    /** 查询当前下载/安装状态（刚打开面板时用） */
+    updateState(): Promise<ApiResult<UpdateInstallState>>
+    /** 订阅下载/安装状态推送 */
+    onUpdateState(cb: (state: UpdateInstallState) => void): () => void
     /** 用系统浏览器打开链接（更新下载页等） */
     openUrl(url: string): Promise<ApiResult<boolean>>
   }
@@ -400,6 +455,24 @@ export interface SakanaApi {
       episode: number,
       opts?: { aliases?: string[]; aliasMode?: boolean }
     ): Promise<ApiResult<{ ok: boolean; count: number; cached: boolean }>>
+  }
+  /**
+   * uosc_danmaku（mpv 弹幕插件）集成（v0.2.9）。
+   *
+   * 应用只暴露「语义动作」：把弹幕交给插件、开关、打开插件的菜单、清空来源。
+   * 插件自身的渲染、布局、样式菜单完全由上游实现，替换资源目录即可升级。
+   */
+  uosc: {
+    /** 插件当前状态：用户是否选了插件渲染 / 插件是否真的挂上了 / 是否已显示弹幕 / 是否有弹幕在等文件就绪 */
+    status(): Promise<ApiResult<{ requested: boolean; active: boolean; loaded: boolean; pending: boolean }>>
+    /** 打开插件的菜单（uosc 渲染）：搜索弹幕 / 总菜单 / 弹幕样式 / 源延迟 / 从源添加 */
+    menu(which: 'search' | 'total' | 'style' | 'delay' | 'add'): Promise<ApiResult<boolean>>
+    /** 显式设置插件的弹幕开关（与内置开关联动；插件把开关状态存在自己的记录文件里） */
+    setVisible(on: boolean): Promise<ApiResult<boolean>>
+    /** 清空当前关联的弹幕源（切集时用，避免上一集残留） */
+    clear(): Promise<ApiResult<boolean>>
+    /** 弹幕时间轴微调（毫秒） */
+    delay(offsetMs: number): Promise<ApiResult<boolean>>
   }
   cache: {
     info(): Promise<ApiResult<CacheInfo>>
@@ -429,7 +502,7 @@ export interface SaveDirsInfo {
 
 /** 随包内置的播放/下载组件探测结果（player:assets） */
 export interface PlayerAssets {
-  vlc: boolean
+  player: boolean
   ffmpeg: boolean
   aria2: boolean
   /** libmpv 运行时（libmpv-2.dll）是否就绪 */

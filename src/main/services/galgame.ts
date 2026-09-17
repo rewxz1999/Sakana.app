@@ -11,6 +11,7 @@ import { log } from '../log'
 import { store } from '../store'
 import { buildProxyAgents, getSettings, httpGetBuffer, UA } from '../net'
 import { galToolsActivate, galToolsDeactivate } from './galgameTools'
+import { galgameCoversDir } from './settingsExt'
 
 // ---------------- 运行状态（进程内） ----------------
 
@@ -366,7 +367,7 @@ async function vndbBuildMeta(vn: VndbVn): Promise<VndbMeta> {
   if (coverUrl) {
     try {
       const idStr = String(vn.id ?? '')
-      const coversDir = join(app.getPath('userData'), 'galgame-covers')
+      const coversDir = galgameCoversDir()
       mkdirSync(coversDir, { recursive: true })
       const file = join(coversDir, `${idStr || 'vndb'}.jpg`)
       const buf = await httpGetBuffer(coverUrl, 30000)
@@ -391,7 +392,7 @@ async function vndbBuildMeta(vn: VndbVn): Promise<VndbMeta> {
     bannerRemote = shotSafe.url
     try {
       const idStr = String(vn.id ?? '')
-      const coversDir = join(app.getPath('userData'), 'galgame-covers')
+      const coversDir = galgameCoversDir()
       mkdirSync(coversDir, { recursive: true })
       const file = join(coversDir, `vndb-shot-${idStr || 'vndb'}.jpg`)
       const buf = await httpGetBuffer(shotSafe.url, 30000)
@@ -648,7 +649,7 @@ async function buildYmgalMeta(listItem: YmgalListItem | null, game: YmgalGame): 
   let coverLocal: string | null = null
   if (coverRemote) {
     try {
-      const coversDir = join(app.getPath('userData'), 'galgame-covers')
+      const coversDir = galgameCoversDir()
       mkdirSync(coversDir, { recursive: true })
       const file = join(coversDir, `ymgal-${gid || 'game'}.jpg`)
       const buf = await httpGetBuffer(coverRemote, 30000)
@@ -664,7 +665,7 @@ async function buildYmgalMeta(listItem: YmgalListItem | null, game: YmgalGame): 
   let bannerLocal: string | null = null
   if (bannerRemote) {
     try {
-      const coversDir = join(app.getPath('userData'), 'galgame-covers')
+      const coversDir = galgameCoversDir()
       mkdirSync(coversDir, { recursive: true })
       const file = join(coversDir, `ymgal-banner-${gid || 'game'}.jpg`)
       const buf = await httpGetBuffer(bannerRemote, 30000)
@@ -692,7 +693,7 @@ async function buildYmgalMeta(listItem: YmgalListItem | null, game: YmgalGame): 
       let imgLocal: string | undefined
       if (imgRemote) {
         try {
-          const coversDir = join(app.getPath('userData'), 'galgame-covers')
+          const coversDir = galgameCoversDir()
           mkdirSync(coversDir, { recursive: true })
           const file = join(coversDir, `ymgal-char-${gid}-${i}.jpg`)
           const buf = await httpGetBuffer(imgRemote, 30000)
@@ -1105,7 +1106,7 @@ export function galSetCustomImage(id: string, kind: 'cover' | 'banner', srcPath:
   if (!game) throw new Error('游戏不存在')
   if (!srcPath || !existsSync(srcPath)) throw new Error('图片文件不存在')
   const ext = extname(srcPath).toLowerCase() || '.jpg'
-  const coversDir = join(app.getPath('userData'), 'galgame-covers')
+  const coversDir = galgameCoversDir()
   mkdirSync(coversDir, { recursive: true })
   const dst = join(coversDir, `custom-${id}-${kind}${ext}`)
   try {

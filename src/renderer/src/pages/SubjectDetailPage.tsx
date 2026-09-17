@@ -322,13 +322,13 @@ export function SubjectDetailPage() {
         <button
           onClick={goBack}
           title={fromSearch ? '返回搜索结果' : '返回上一页'}
-          className={
+          className={`whitespace-nowrap ${
             fullscreen
               ? // 全屏时窗口边框消失、左侧留白变窄，按钮显得贴边：向右让出 4rem（ml-16），
                 // 既不与标题栏/侧边栏等控件重叠，也加浅色底以适配全屏下的毛玻璃背景
                 'mb-4 ml-16 flex items-center gap-1.5 rounded-lg border border-border bg-elev1/80 px-3 py-1.5 text-xs text-dim backdrop-blur transition-colors hover:border-accent hover:text-text'
               : 'mb-4 flex items-center gap-1.5 text-xs text-dim transition-colors hover:text-text'
-          }
+          }`}
         >
           <ArrowLeft size={14} /> {fromSearch ? '返回搜索' : '返回'}
         </button>
@@ -408,7 +408,7 @@ export function SubjectDetailPage() {
                   {infoRest > 0 ? (
                     <button
                       onClick={() => setShowAllInfo((v) => !v)}
-                      className="text-[11px] text-accent hover:underline"
+                      className="text-[11px] text-accent hover:underline whitespace-nowrap"
                     >
                       {showAllInfo ? '收起' : `展开全部（还有 ${infoRest} 项）`}
                     </button>
@@ -548,7 +548,7 @@ function RuleSelectModal({
                 className="flex items-center justify-between rounded-xl border border-border bg-elev2/60 px-4 py-3 text-left transition-colors hover:border-accent hover:bg-accent-soft"
               >
                 <div className="min-w-0">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <span className="text-sm font-medium">{rule.name}</span>
                     <Badge tone="neutral">v{rule.version}</Badge>
                     <Badge tone="accent">{rule.search.type === 'xpath' ? 'XPath' : 'API'}</Badge>
@@ -788,7 +788,7 @@ function RulePlayModal({
                   onClick={() => setLineIndex(i)}
                   className={`rounded-lg px-2.5 py-1 text-[11px] transition-colors ${
                     i === lineIndex ? 'bg-accent-soft text-accent' : 'bg-elev2 text-dim hover:text-text'
-                  }`}
+                  } whitespace-nowrap `}
                 >
                   {g.lineName ?? `线路 ${i + 1}`}
                 </button>
@@ -829,7 +829,7 @@ function RulePlayModal({
                     >
                       {ep.name || `第 ${i + 1} 集`}
                       {isLast ? (
-                        <span className="absolute -right-1 -top-1 rounded-full bg-white px-1.5 py-px text-[9px] font-semibold text-accent shadow">
+                        <span className="absolute -right-1 -top-1 rounded-full bg-white px-1.5 py-px text-[9px] font-semibold text-accent shadow whitespace-nowrap">
                           继续
                         </span>
                       ) : null}
@@ -980,7 +980,7 @@ function MikanSelectModal({
           {items.map((item) => (
             <div
               key={item.guid}
-              className="flex items-center gap-3 rounded-lg border border-border bg-elev2/50 px-3 py-2.5 transition-colors hover:border-accent"
+              className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-elev2/50 px-3 py-2.5 transition-colors hover:border-accent"
             >
               <div className="min-w-0 flex-1">
                 <div className="line-clamp-2 text-[13px] leading-snug" title={item.title}>

@@ -298,14 +298,14 @@ export function DashboardPage() {
   return (
     <div className="h-full overflow-y-auto px-6 py-5">
       {/*
-        v0.2.8 附加四：统计入口再瘦身（用户第二次反馈「还是有点大」）。
-        改成一行小胶囊（图标 + 数值 + 名称全部在一行内），高度从整块卡片降到 28px，
-        继续观看因此可以独占一整行、列表更宽更好点。
+        v0.2.9：统计入口从「一行小胶囊」还原成卡片（用户要求「还原成卡片形式，但是卡片不要太大」）。
+        所以既不用胶囊，也不回到 v0.2.3 那种 44px 图标的大卡：三个 64px 高的小卡并排，
+        图标徽章缩到 28px、数字降到 lg，第一屏占用与胶囊时期基本持平，继续观看仍独占一行。
       */}
-      <div className="flex flex-wrap items-center gap-2">
-        <StatPill icon={Rss} label="已订阅" value={subscriptions.length} onClick={() => navigate('/subs')} />
-        <StatPill icon={Heart} label="已收藏" value={favorites.length} onClick={() => navigate('/favorites')} />
-        <StatPill icon={Puzzle} label="已安装工具" value={tools.length} onClick={() => navigate('/tools')} />
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+        <MiniStatCard icon={Rss} label="已订阅" value={subscriptions.length} onClick={() => navigate('/subs')} />
+        <MiniStatCard icon={Heart} label="已收藏" value={favorites.length} onClick={() => navigate('/favorites')} />
+        <MiniStatCard icon={Puzzle} label="已安装工具" value={tools.length} onClick={() => navigate('/tools')} />
       </div>
 
       {/* 继续观看（独占一行） */}
@@ -521,11 +521,11 @@ export function DashboardPage() {
 }
 
 /**
- * 统计入口小胶囊（v0.2.8 附加四）。
- * 用户两次反馈「板块有点大」，这里做成一行内的小胶囊：图标 + 数值 + 名称，高 28px。
- * （原来的 `StatCard` 保留给别处复用，不再用于仪表盘第一屏。）
+ * 仪表盘统计小卡（v0.2.9）。
+ * 用户要卡片但明确「不要太大」：固定 64px 高（介于 28px 胶囊与旧版大卡之间），
+ * 结构沿用旧 `StatCard` 的图标徽章 + 数值 + 名称，只是全部缩小一档，点击仍跳对应页面。
  */
-function StatPill({
+function MiniStatCard({
   icon: Icon,
   label,
   value,
@@ -539,42 +539,10 @@ function StatPill({
   return (
     <button
       onClick={onClick}
-      className="flex h-7 items-center gap-1.5 rounded-full border border-border bg-elev1 px-2.5 text-[11px] transition-colors hover:border-accent hover:text-accent"
+      className="flex h-16 items-center gap-2.5 rounded-xl border border-border bg-elev2/40 px-3 text-left transition-colors hover:border-accent"
     >
-      <Icon size={12} className="text-dim" />
-      <span className="tabular-nums font-semibold text-text">{value}</span>
-      <span className="text-dim">{label}</span>
-    </button>
-  )
-}
-
-function StatCard({
-  icon: Icon,
-  label,
-  value,
-  accent,
-  onClick
-}: {
-  icon: typeof Bookmark
-  label: string
-  value: number
-  accent?: boolean
-  onClick?: () => void
-}) {
-  /*
-   * v0.2.8 附加三：整体瘦身（用户反馈「已订阅 / 已收藏 / 已安装工具板块有点大」）。
-   * 原来图标 44px、数字 2xl、内边距 p-4；现在图标 32px、数字 lg、p-2.5，
-   * 三个入口仍然可点、含义不变，只是不再占掉仪表盘第一屏的一大块。
-   */
-  return (
-    <button
-      onClick={onClick}
-      className="flex items-center gap-2.5 rounded-lg border border-border bg-elev1 px-2.5 py-2 text-left transition-all hover:-translate-y-0.5 hover:shadow-md"
-    >
-      <div
-        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${accent ? 'bg-accent-soft text-accent' : 'bg-elev2 text-dim'}`}
-      >
-        <Icon size={15} />
+      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
+        <Icon size={14} />
       </div>
       <div className="min-w-0">
         <div className="text-lg font-semibold leading-tight tabular-nums">{value}</div>

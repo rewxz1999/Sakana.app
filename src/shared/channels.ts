@@ -22,6 +22,8 @@ export const CH = {
   bgmSubject: 'bgm:subject',
   bgmSearch: 'bgm:search',
   bgmRatings: 'bgm:ratings',
+  // 季度（新番季）预览：年份 + 该季度内任意月份
+  bgmSeason: 'bgm:season',
   bgmTestMirrors: 'bgm:test-mirrors',
 
   // 蜜柑计划
@@ -41,6 +43,12 @@ export const CH = {
   dlList: 'dl:list',
   dlStatus: 'dl:status',
   dlTest: 'dl:test',
+  /** 推导某番剧的本地目录（自动用下载目录，不再让用户选文件夹） */
+  dlLocalDir: 'dl:local-dir',
+  /** 删除本地资源：磁盘文件 + 对应下载记录（不可撤销） */
+  dlDeleteLocal: 'dl:delete-local',
+  /** 只删下载记录，不删文件（下载列表综合卡片用） */
+  dlRemoveRecords: 'dl:remove-records',
   evDownloads: 'ev:downloads',
 
   // 播放规则引擎
@@ -63,22 +71,24 @@ export const CH = {
   mediaStartLive: 'media:start-live',
   mediaStopLive: 'media:stop-live',
   mediaStartLiveUrl: 'media:start-live-url',
-  vlcAttach: 'vlc:attach',
-  vlcPlay: 'vlc:play',
-  vlcSetPlaylist: 'vlc:set-playlist',
-  vlcTogglePause: 'vlc:toggle-pause',
-  vlcSeek: 'vlc:seek',
-  vlcSetVolume: 'vlc:set-volume',
-  vlcGetState: 'vlc:get-state',
-  vlcSetMute: 'vlc:set-mute',
-  vlcSubtitleTracks: 'vlc:subtitle-tracks',
-  vlcSetSubtitle: 'vlc:set-subtitle',
-  vlcAddSubtitleFile: 'vlc:add-subtitle-file',
-  vlcSnapshot: 'vlc:snapshot',
-  vlcDetach: 'vlc:detach',
-  vlcNotifyLayout: 'vlc:notify-layout',
-  vlcSetAspect: 'vlc:set-aspect',
-  evVlc: 'ev:vlc',
+  playerAttach: 'player:attach',
+  playerPlay: 'player:play',
+  playerSetPlaylist: 'player:set-playlist',
+  playerTogglePause: 'player:toggle-pause',
+  playerSeek: 'player:seek',
+  playerSetVolume: 'player:set-volume',
+  playerGetState: 'player:get-state',
+  playerSetMute: 'player:set-mute',
+  /** v0.2.9 最后更新：播放倍速（0.25–4，变速不变调） */
+  playerSetSpeed: 'player:set-speed',
+  playerSubtitleTracks: 'player:subtitle-tracks',
+  playerSetSubtitle: 'player:set-subtitle',
+  playerAddSubtitleFile: 'player:add-subtitle-file',
+  playerSnapshot: 'player:snapshot',
+  playerDetach: 'player:detach',
+  playerNotifyLayout: 'player:notify-layout',
+  playerSetAspect: 'player:set-aspect',
+  evPlayer: 'ev:player',
   playerScreenshot: 'player:screenshot',
   // 全屏控制栏悬浮窗（原生视频窗口永远盖在网页之上，全屏时控制栏需独立透明窗口叠加）
   overlayShow: 'overlay:show',
@@ -91,8 +101,22 @@ export const CH = {
   overlayDanmaku: 'overlay:danmaku',
   overlayAction: 'overlay:action',
   overlayPoke: 'overlay:poke',
-  // 内置组件探测（libVLC / FFmpeg / aria2 是否随包内置）
+  // 内置组件探测（libmpv / FFmpeg / aria2 是否随包内置）
   playerAssets: 'player:assets',
+  /** v0.2.8 附加七：把「当前播放页地址」告知 mpv 的 B 站弹幕脚本 */
+  playerDanmakuSource: 'player:danmaku-source',
+  /**
+   * v0.2.9：uosc_danmaku（mpv 弹幕插件）的集成接口。
+   * 应用侧只负责「把已解析好的弹幕交给插件」与「调用插件的菜单/开关」，
+   * 渲染、布局、样式菜单全部由插件自己实现。
+   */
+  playerUoscStatus: 'player:uosc-status',
+  playerUoscMenu: 'player:uosc-menu',
+  playerUoscVisible: 'player:uosc-visible',
+  /** 直接给插件 episodeId（插件自己去 api_server 取弹幕）—— 应用侧本地弹幕文件不可用时的第二级 */
+  playerUoscEpisode: 'player:uosc-episode',
+  playerUoscClear: 'player:uosc-clear',
+  playerUoscDelay: 'player:uosc-delay',
 
   // 订阅（主进程为唯一写入方：变更后广播，渲染层只读 + 触发操作）
   subsList: 'subs:list',
@@ -125,8 +149,18 @@ export const CH = {
   // 播放状态与流详情（播放器顶部状态栏）
   playerStreamInfo: 'player:stream-info',
 
-  // 更新检查（git 仓库）
+  // 更新检查与一键更新（GitHub Releases）
   appUpdateCheck: 'app:update-check',
+  /** v0.2.9 最后更新：下载安装包（带进度推送） */
+  appUpdateDownload: 'app:update-download',
+  /** v0.2.9 最后更新：静默安装并重启 */
+  appUpdateInstall: 'app:update-install',
+  /** v0.2.9 最后更新：打不开安装包时引导到 Releases 页面 */
+  appUpdateOpenReleases: 'app:update-open-releases',
+  /** 查询当前下载/安装状态（渲染层刚打开面板时用） */
+  appUpdateState: 'app:update-state',
+  /** 下载/安装状态下行（进度条） */
+  evUpdateState: 'ev:update-state',
   appOpenUrl: 'app:open-url',
 
   // 弹幕（预留：弹弹play）
@@ -168,6 +202,10 @@ export const CH = {
   galScreenshotNow: 'gal:screenshot-now',
   galOverlayShot: 'gal:overlay-shot',
   galRecentShots: 'gal:recent-shots',
+  /** 某款游戏自己的截图（「最近截图」挂在每张游戏卡片上，只看该游戏目录） */
+  galListShots: 'gal:list-shots',
+  /** 按游戏名统计各资源站的搜索结果数量（只回数量 + 跳转链接，不回传站点内容） */
+  galSearchSites: 'gal:search-sites',
   evGal: 'ev:gal',
 
   // 统计工具

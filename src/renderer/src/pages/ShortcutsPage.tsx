@@ -67,7 +67,7 @@ export function ShortcutsPanel() {
               capturing === s.action
                 ? 'border-accent bg-accent-soft text-accent'
                 : 'border-border bg-elev2 text-dim hover:border-accent hover:text-text'
-            }`}
+            } whitespace-nowrap `}
           >
             {capturing === s.action ? '请按键…' : keyLabel(map[s.action] ?? s.defaultKey)}
           </button>

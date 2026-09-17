@@ -10,12 +10,44 @@ import { store } from '../store'
 export const MIKAN_BASE = 'https://mikanani.kas.pub'
 
 interface RssRawItem {
-  guid?: string
+  /**
+   * RSS 的 <guid isPermaLink="false">xxx</guid>。
+   *
+   * 坑：本文件的 XMLParser 配了 `ignoreAttributes: false`，fast-xml-parser 会把**带属性的节点**
+   * 解析成对象 `{ '#text': 'xxx', '@_isPermaLink': 'false' }`，
+   * 于是 `String(raw.guid)` 得到的是 `"[object Object]"` —— 整份 RSS 里每一条都一模一样。
+   * 这个字符串同时是「确认下载」列表的 React key 与勾选集合的键，
+   * 撞车后表现为「勾一条全被勾上」以及「下载所选 1 项」却下载了全部，所以必须取 #text。
+   */
+  guid?: unknown
   title?: string
-  link?: string
+  link?: unknown
   pubDate?: string
+  /** 蜜柑的发布日期挂在 <torrent><pubDate> 上（顶层没有 pubDate） */
+  torrent?: { pubDate?: unknown }
   enclosure?: { '@_url'?: string; '@_length'?: string | number }
 }
+
+/** 取 XML 节点文本：兼容 fast-xml-parser 把带属性节点解析成对象的情况 */
+function nodeText(v: unknown): string {
+  if (v == null) return ''
+  if (typeof v === 'string') return v.trim()
+  if (typeof v === 'number') return String(v)
+  if (typeof v === 'object') {
+    const t = (v as Record<string, unknown>)['#text']
+    if (typeof t === 'string') return t.trim()
+    if (typeof t === 'number') return String(t)
+  }
+  return ''
+}
+
+/**
+ * 字幕组归一化与匹配规则放在 shared 里：主进程的过滤与「确认下载」弹窗的兜底过滤
+ * 必须用同一份规则（见 shared/subgroup.ts 的说明）。
+ */
+import { matchesSubGroup } from '@shared/subgroup'
+
+export { matchesSubGroup, normGroup } from '@shared/subgroup'
 
 class MikanService {
   async search(keyword: string): Promise<MikanSearchResult> {
@@ -33,24 +65,31 @@ class MikanService {
       }
       const rawItems = doc?.rss?.channel?.item ?? []
       const list: RssRawItem[] = Array.isArray(rawItems) ? rawItems : [rawItems]
-      const items: MikanItem[] = list
-        .map((raw): MikanItem => {
-          const title = String(raw.title ?? '')
-          const torrentUrl = raw.enclosure?.['@_url'] ? String(raw.enclosure['@_url']) : null
-          return {
-            guid: String(raw.guid ?? raw.link ?? title),
-            title,
-            link: String(raw.link ?? ''),
-            torrentUrl,
-            magnet: null,
-            size: humanSize(Number(raw.enclosure?.['@_length'] ?? 0)),
-            pubDate: String(raw.pubDate ?? ''),
-            group: parseGroup(title),
-            episode: parseEpisode(title),
-            resolution: parseResolution(title)
-          }
+      const seen = new Set<string>()
+      const items: MikanItem[] = []
+      for (const raw of list) {
+        const title = String(raw.title ?? '')
+        if (!title) continue
+        const base = nodeText(raw.guid) || nodeText(raw.link) || title
+        // guid 必须全局唯一：它既是列表行标识也是勾选键，重复就会出现「勾一条全勾上」
+        let guid = base
+        for (let n = 2; seen.has(guid); n++) guid = `${base}#${n}`
+        seen.add(guid)
+        items.push({
+          guid,
+          title,
+          link: nodeText(raw.link),
+          torrentUrl: raw.enclosure?.['@_url'] ? String(raw.enclosure['@_url']) : null,
+          magnet: null,
+          size: humanSize(Number(raw.enclosure?.['@_length'] ?? 0)),
+          // 发布日期在 <torrent><pubDate> 里；过去只读顶层 raw.pubDate 拿到的一直是空串，
+          // 于是「本集发布日期」永远空白、按日期判断新资源的过滤也形同虚设
+          pubDate: nodeText(raw.pubDate) || nodeText(raw.torrent?.pubDate),
+          group: parseGroup(title),
+          episode: parseEpisode(title),
+          resolution: parseResolution(title)
         })
-        .filter((i) => i.title)
+      }
       return { items }
     } catch (err) {
       const e = err as { message?: string }
@@ -78,7 +117,8 @@ class MikanService {
       )
     const newItems = result.items
       .filter((item) => {
-        if (sub.group && item.group && item.group !== sub.group) return false
+        // 只留订阅选定字幕组的资源（归一化比较；解析不出字幕组的一律不要，见 matchesSubGroup）
+        if (!matchesSubGroup(sub.group, item.group)) return false
         if (handled(item)) return false
         if (!sub.lastPubDate) return true
         const itemTime = new Date(item.pubDate).getTime()

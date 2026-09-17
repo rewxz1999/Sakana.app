@@ -58,6 +58,15 @@ function baseUrl(): string {
   return signed() ? OFFICIAL_BASE : DEFAULT_BASE
 }
 
+/**
+ * 当前弹幕接口地址（v0.2.9：给 uosc_danmaku 插件用同一套数据源）。
+ * 单独导出是为了让 mpv 那边**不要**再抄一份逻辑 —— 自定义地址、官方地址、反代地址
+ * 三者的优先级只在这里定义。
+ */
+export function danmakuApiBase(): string {
+  return baseUrl()
+}
+
 function authHeaders(path: string): Record<string, string> {
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (!signed()) return headers
@@ -757,6 +766,51 @@ function simplifyTitle(title: string): string | null {
 
 /** 正在进行的弹幕加载（同一「番剧名+集数」并发只发一轮请求） */
 const inflightLoad = new Map<string, Promise<DanmakuLoadResult | null>>()
+
+/* ─────────────────── 弹幕出口：交给 mpv 的 uosc_danmaku 插件（v0.2.9） ─────────────────── */
+
+/** XML 文本转义（弹幕内容里出现 `&`、`<`、`>` 的概率不低，不转义会让插件解析出错） */
+function xmlEscape(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+/**
+ * 把弹幕写成 B 站格式的 XML，供 mpv 的 uosc_danmaku 插件作为**本地弹幕源**加载。
+ *
+ * 为什么走这条路而不是让插件自己去请求：
+ * 应用侧已经做完了「严格第几季+第几集」判定与同集多来源合并（弹幕更全、不会串集），
+ * 直接复用这份数据，两个渲染器（内置画布 / mpv 插件）看到的才是**同一份弹幕**。
+ *
+ * 格式（插件 `parse_xml_danmaku` 的解析规则，实测要求前 4 个字段都能被 tonumber 解析）：
+ * `<d p="时间秒,模式(1滚动/4底部/5顶部),字号,颜色十进制">文本</d>`
+ */
+export function writeDanmakuXml(comments: DanmakuComment[], key: string): string {
+  const dir = join(app.getPath('userData'), 'tmp', 'danmaku')
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch {
+    /* 目录已存在或不可写，下面写文件时会失败并返回空串 */
+  }
+  const file = join(dir, `uosc-${createHash('md5').update(key).digest('hex').slice(0, 12)}.xml`)
+  const lines: string[] = ['<?xml version="1.0" encoding="UTF-8"?>', '<i>']
+  for (const c of comments) {
+    const mode = c.mode === 4 || c.mode === 5 ? c.mode : 1
+    // 应用内的颜色是 `#rrggbb` 字符串，XML 里要十进制 RGB
+    const parsed = Number.parseInt(String(c.color ?? '').replace('#', ''), 16)
+    const color = Number.isFinite(parsed) ? Math.max(0, Math.min(0xffffff, parsed)) : 0xffffff
+    lines.push(
+      `<d p="${c.time.toFixed(2)},${mode},25,${color},0,0,0,0">${xmlEscape(String(c.text ?? '').replace(/[\u0000-\u001f]/g, ''))}</d>`
+    )
+  }
+  lines.push('</i>')
+  try {
+    writeFileSync(file, lines.join('\n'), 'utf8')
+    return file
+  } catch (err) {
+    log.append('warn', 'danmaku', `写弹幕 XML 失败: ${String((err as Error)?.message ?? err)}`)
+    return ''
+  }
+}
 
 /**
  * 预取弹幕（v0.2.8 附加：从规则页进入播放、以及切集时提前把弹幕准备好）。

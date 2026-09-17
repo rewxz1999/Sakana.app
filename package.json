@@ -1,6 +1,6 @@
 {
   "name": "sakana",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Sakana - 番剧管理及播放桌面客户端",
   "main": "./out/main/index.js",
   "author": "Sakana Team",
@@ -16,7 +16,6 @@
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "aria2:fetch": "node scripts/fetch-aria2.js",
     "ffmpeg:fetch": "node scripts/fetch-ffmpeg.js",
-    "libvlc:fetch": "node scripts/fetch-libvlc.js",
     "libmpv:fetch": "node scripts/fetch-libmpv.js",
     "mpv:build": "node-gyp rebuild --directory native/mpv"
   },
@@ -42,10 +41,6 @@
     ],
     "extraResources": [
       {
-        "from": "resources/libvlc",
-        "to": "libvlc"
-      },
-      {
         "from": "resources/libmpv",
         "to": "libmpv"
       },
@@ -64,6 +59,14 @@
       {
         "from": "resources/icon.png",
         "to": "icon.png"
+      },
+      {
+        "from": "resources/mpv-scripts",
+        "to": "mpv-scripts"
+      },
+      {
+        "from": "resources/mpv-config",
+        "to": "mpv-config"
       }
     ],
     "win": {
@@ -84,13 +87,15 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Sakana"
+      "shortcutName": "Sakana",
+      "include": "resources/installer.nsh",
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true
     }
   },
   "dependencies": {
     "axios": "^1.20.0",
     "dayjs": "^1.11.23",
-    "electron-vlc-player": "^1.0.2",
     "fast-xml-parser": "^5.11.1",
     "framer-motion": "^13.1.1",
     "htmlparser2": "^12.0.0",

@@ -1,13 +1,15 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { ListChecks, Pause, Play, RotateCcw, Trash2 } from 'lucide-react'
+import { ListChecks, ListX, Pause, Play, RotateCcw, Trash2 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import type { DownloadStatus, DownloadTask } from '@shared/types'
 import { useSubs } from '@/stores/subs'
 import { api } from '@/lib/api'
+import { resolveLocalPlay } from '@/lib/localPlay'
 import { toast } from '@/stores/app'
 import { Badge, EmptyState, IconButton, ProgressBar } from './ui'
 import { CoverImage } from './CoverImage'
+import { DeleteLocalModal, RemoveRecordsModal, type DeleteLocalTarget, type RemoveRecordsTarget } from './LocalResourceActions'
 
 const STATUS_LABEL: Record<DownloadStatus, { text: string; tone: 'neutral' | 'accent' | 'ok' | 'warn' | 'danger' }> = {
   queued: { text: '排队中', tone: 'neutral' },
@@ -38,16 +40,26 @@ export function TaskRow({ task }: { task: DownloadTask }) {
   const done = task.status === 'done'
   const controllable = CONTROLLABLE.includes(task.status) || task.status === 'paused'
 
-  const playLocal = (t: DownloadTask) => {
-    if (!t.dir) {
-      toast.warn('未记录下载目录，请在订阅页点击「本地播放」选择文件夹')
+  /**
+   * 本地播放：目录自动推导（任务记录的 dir 优先，没有就按「下载根目录 + 番剧名」推导），
+   * 不再提示「未记录下载目录，请在订阅页点击本地播放在选择文件夹」。
+   */
+  const playLocal = async (t: DownloadTask) => {
+    const r = await resolveLocalPlay({
+      subscriptionId: t.subscriptionId,
+      subjectId: t.subjectId,
+      animeTitle: t.animeTitle,
+      dir: t.dir
+    })
+    if (!r.ok) {
+      toast.error(r.error)
       return
     }
     navigate('/player', {
       state: {
         mode: 'local',
         title: t.animeTitle,
-        folder: t.dir,
+        folder: r.dir,
         subjectId: t.subjectId,
         episode: t.episode ?? undefined
       }
@@ -96,7 +108,7 @@ export function TaskRow({ task }: { task: DownloadTask }) {
       <div className="flex shrink-0 flex-col items-end gap-1.5">
         <Badge tone={st.tone}>{st.text}</Badge>
         {!done && task.speed ? <span className="text-[10px] text-faint">{task.speed}</span> : null}
-        <div className="flex gap-1">
+        <div className="flex flex-wrap justify-end gap-1">
           {done ? (
             <IconButton title="本地播放" className="h-7 w-7 !text-ok" onClick={() => playLocal(task)}>
               <Play size={13} fill="currentColor" />
@@ -145,6 +157,13 @@ export function TaskRow({ task }: { task: DownloadTask }) {
 export function DownloadTaskList({ limit }: { limit?: number }) {
   const downloads = useSubs((s) => s.downloads)
   const navigate = useNavigate()
+  /**
+   * 分组卡片的两个删除动作共用一对弹窗（分组是 map 出来的，hook 不能写在循环里）：
+   * - 删除本地资源：删文件 + 清记录；
+   * - 删除：只清这一部番剧的全部下载记录，绝不删文件。
+   */
+  const [delTarget, setDelTarget] = useState<DeleteLocalTarget | null>(null)
+  const [recTarget, setRecTarget] = useState<RemoveRecordsTarget | null>(null)
 
   const groups = useMemo(() => {
     const map = new Map<string, DownloadTask[]>()
@@ -157,6 +176,48 @@ export function DownloadTaskList({ limit }: { limit?: number }) {
   }, [downloads])
 
   const list = limit ? groups.slice(0, limit) : groups
+
+  /** 分组卡片上的「本地播放」：目录自动推导（任务记录的 dir 优先） */
+  const playGroupLocal = async (t: DownloadTask) => {
+    const r = await resolveLocalPlay({
+      subscriptionId: t.subscriptionId,
+      subjectId: t.subjectId,
+      animeTitle: t.animeTitle,
+      dir: t.dir
+    })
+    if (!r.ok) {
+      toast.error(r.error)
+      return
+    }
+    navigate('/player', {
+      state: {
+        mode: 'local',
+        title: t.animeTitle,
+        folder: r.dir,
+        subjectId: t.subjectId,
+        episode: t.episode ?? undefined
+      }
+    })
+  }
+
+  /** 「删除本地资源」：先把真实目录问出来，弹窗里要写清路径 */
+  const askDeleteLocal = async (title: string, tasks: DownloadTask[]) => {
+    const subjectId = tasks.find((t) => t.subjectId)?.subjectId
+    const r = await api.downloads.localDir({
+      subjectId,
+      animeTitle: title,
+      dir: tasks.find((t) => t.dir)?.dir
+    })
+    if (!r.ok) {
+      toast.error(r.error)
+      return
+    }
+    setDelTarget({
+      input: { subjectId, animeTitle: title },
+      dir: r.data.dir,
+      activeCount: tasks.filter((t) => !['done', 'error'].includes(t.status)).length
+    })
+  }
 
   return (
     <div className="flex flex-col gap-2">
@@ -214,26 +275,14 @@ export function DownloadTaskList({ limit }: { limit?: number }) {
               </div>
               <div className="flex shrink-0 flex-col items-end gap-1.5">
                 <Badge tone={badge.tone}>{badge.text}</Badge>
-                <div className="flex gap-1">
+                <div className="flex flex-wrap justify-end gap-1">
                   {playDone ? (
                     <IconButton
                       title="本地播放已完成资源"
                       className="h-7 w-7 !text-ok"
                       onClick={(e) => {
                         e.stopPropagation()
-                        if (!playDone.dir) {
-                          toast.warn('未记录下载目录')
-                          return
-                        }
-                        navigate('/player', {
-                          state: {
-                            mode: 'local',
-                            title: playDone.animeTitle,
-                            folder: playDone.dir,
-                            subjectId: playDone.subjectId,
-                            episode: playDone.episode ?? undefined
-                          }
-                        })
+                        void playGroupLocal(playDone)
                       }}
                     >
                       <Play size={13} fill="currentColor" />
@@ -249,6 +298,28 @@ export function DownloadTaskList({ limit }: { limit?: number }) {
                   >
                     <ListChecks size={13} />
                   </IconButton>
+                  {/* 删除本地资源：删文件 + 清记录（危险，二次确认） */}
+                  <IconButton
+                    title="删除本地资源（删除已下载的文件）"
+                    className="h-7 w-7 hover:!text-danger"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      void askDeleteLocal(title, tasks)
+                    }}
+                  >
+                    <Trash2 size={13} />
+                  </IconButton>
+                  {/* 删除：只清这一部番剧的全部下载记录，不删文件 */}
+                  <IconButton
+                    title="删除下载记录（不删除文件）"
+                    className="h-7 w-7 hover:!text-danger"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setRecTarget({ animeTitle: title, taskCount: tasks.length, activeCount })
+                    }}
+                  >
+                    <ListX size={13} />
+                  </IconButton>
                 </div>
               </div>
             </motion.div>
@@ -258,6 +329,8 @@ export function DownloadTaskList({ limit }: { limit?: number }) {
       {list.length === 0 ? (
         <EmptyState icon={Play} title="暂无下载任务" desc="在番剧详情页订阅资源，或在订阅页确认更新后开始下载" />
       ) : null}
+      <DeleteLocalModal target={delTarget} onClose={() => setDelTarget(null)} />
+      <RemoveRecordsModal target={recTarget} onClose={() => setRecTarget(null)} />
     </div>
   )
 }

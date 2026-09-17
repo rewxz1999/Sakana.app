@@ -1,7 +1,7 @@
 import { app, BrowserWindow, desktopCapturer, dialog, globalShortcut, screen } from 'electron'
-import { mkdirSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
-import type { GalToolsConfig } from '@shared/types'
+import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { extname, join } from 'node:path'
+import type { GalRecentShot, GalToolsConfig } from '@shared/types'
 import { DEFAULT_GAL_TOOLS } from '@shared/types'
 import { galReadWindowTitle, galRunningInfo } from './galgame'
 import { maybeShowSaveHint } from './onboarding'
@@ -264,10 +264,48 @@ function tsName(d = new Date()): string {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
 }
 
-/** 截图：先隐藏悬浮窗 200ms → 抓取当前游戏窗口 → 恢复悬浮窗 → 写入 <dir>/<游戏名>_<时间>.png */
+/**
+ * 游戏名 → 合法 Windows 文件名/目录名。
+ *
+ * 截图现在按「游戏名」建子目录、文件名也用游戏名打头（CLANNAD_20260917_143512.png），
+ * 而游戏标题里常见 `:` `/` `?` `*` 等非法字符（例如「CLANNAD - 被光守望着的坡道」
+ * 或带 `Fate/stay night` 这类斜杠），不清理会导致 mkdir/writeFile 直接抛 EINVAL。
+ * 同时去掉结尾的点和空格（Windows 不允许），并限制长度避免超出路径上限。
+ */
+export function sanitizeGalName(raw: string): string {
+  const s = String(raw ?? '')
+    // Windows 非法字符 + 控制字符
+    .replace(/[\\/:*?"<>|]/g, '_')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    // 结尾的点和空格在 Windows 上会被系统悄悄丢掉，干脆自己清掉，保证「记录的名字」= 实际目录名
+    .replace(/[. ]+$/g, '')
+  // 按码点截断，避免把代理对（emoji / 生僻字）劈成半个字符
+  const cut = [...s].slice(0, 60).join('').trim()
+  return cut || 'sakana'
+}
+
+/** galgame 截图根目录（配置为空时回落 userData/screenshots/galgame） */
+export function galShotRootDir(cfg: GalToolsConfig = getCfg()): string {
+  return cfg.dir || join(app.getPath('userData'), 'screenshots', 'galgame')
+}
+
+/** 某款游戏的截图目录：<根目录>/<游戏名>（自动创建） */
+export function galGameShotDir(gameName: string): string {
+  const dir = join(galShotRootDir(), sanitizeGalName(gameName))
+  mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+/**
+ * 截图：先隐藏悬浮窗 200ms → 抓取当前游戏窗口 → 恢复悬浮窗 →
+ * 写入 <截图根目录>/<游戏名>/<游戏名>_<时间>.png
+ */
 export async function galScreenshotNow(): Promise<string> {
   const cfg = getCfg()
-  const dir = cfg.dir || join(app.getPath('userData'), 'screenshots', 'galgame')
+  const dir = galShotRootDir(cfg)
   mkdirSync(dir, { recursive: true })
 
   const win = overlayWin && !overlayWin.isDestroyed() ? overlayWin : null
@@ -276,12 +314,12 @@ export async function galScreenshotNow(): Promise<string> {
   try {
     await sleep(200)
     const png = await captureGameWindow()
-    // 命名规则：游戏名_时间.png（无游戏信息时退回 sakana_时间.png）
+    // 命名规则：<游戏名>/<游戏名>_<时间>.png（无游戏信息时退回 sakana/sakana_时间.png）
     const run = galRunningInfo()
-    const prefix = run?.gameTitle
-      ? run.gameTitle.replace(/[\\/:*?"<>|]/g, '_').slice(0, 60)
-      : 'sakana'
-    const file = join(dir, `${prefix}_${tsName()}.png`)
+    const name = sanitizeGalName(run?.gameTitle || 'sakana')
+    const gameDir = join(dir, name)
+    mkdirSync(gameDir, { recursive: true })
+    const file = join(gameDir, `${name}_${tsName()}.png`)
     writeFileSync(file, png)
     log.append('info', 'gal', `游戏窗口截图已保存: ${file}`)
     maybeShowSaveHint()
@@ -294,6 +332,77 @@ export async function galScreenshotNow(): Promise<string> {
 /** 悬浮窗拍摄按钮：与 galScreenshotNow 相同（截图时自动隐藏悬浮窗避免入镜） */
 export function galOverlayShot(): Promise<string> {
   return galScreenshotNow()
+}
+
+// ---------------- 截图列表 ----------------
+
+const SHOT_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp'])
+
+/** 读一个目录下的图片文件（不递归），按修改时间倒序 */
+function listImagesIn(dir: string, limit: number): GalRecentShot[] {
+  if (!existsSync(dir)) return []
+  const out: GalRecentShot[] = []
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return []
+  }
+  for (const name of names) {
+    if (!SHOT_EXTS.has(extname(name).toLowerCase())) continue
+    const full = join(dir, name)
+    try {
+      const st = statSync(full)
+      if (!st.isFile()) continue
+      out.push({ path: full, mtime: st.mtimeMs, name })
+    } catch {
+      /* 单个文件读失败就跳过，不影响其余截图 */
+    }
+  }
+  out.sort((a, b) => b.mtime - a.mtime)
+  return out.slice(0, limit)
+}
+
+/**
+ * 某款游戏自己的截图（gal:list-shots）。
+ *
+ * 「最近截图」现在挂在每张游戏卡片上，只允许看**这款游戏自己的目录**：
+ * 截图保存在 <根目录>/<游戏名>/，所以这里只读该子目录，不混进别的游戏。
+ */
+export function galListShots(gameName: string, limit = 60): GalRecentShot[] {
+  const name = sanitizeGalName(gameName || 'sakana')
+  return listImagesIn(join(galShotRootDir(), name), limit)
+}
+
+/**
+ * 最近截图（gal:recent-shots）：截图根目录 + 一级子目录。
+ *
+ * 兼容两代存储布局：旧版截图直接躺在根目录（<游戏名>_<时间>.png），
+ * 新版按游戏名建子目录（<根目录>/<游戏名>/<游戏名>_<时间>.png）。
+ * 沉浸模式里的「最近截图」面板仍然用这个聚合结果。
+ */
+export function galRecentShots(limit = 30): GalRecentShot[] {
+  const root = galShotRootDir()
+  const all: GalRecentShot[] = [...listImagesIn(root, limit)]
+  if (existsSync(root)) {
+    let names: string[] = []
+    try {
+      names = readdirSync(root)
+    } catch {
+      names = []
+    }
+    for (const name of names) {
+      const sub = join(root, name)
+      try {
+        if (!statSync(sub).isDirectory()) continue
+      } catch {
+        continue
+      }
+      all.push(...listImagesIn(sub, limit))
+    }
+  }
+  all.sort((a, b) => b.mtime - a.mtime)
+  return all.slice(0, limit)
 }
 
 // ---------------- 目录选择 ----------------

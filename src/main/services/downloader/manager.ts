@@ -13,6 +13,17 @@ import { qbit, type QbitProgress } from './qbit'
 import { maybeShowSaveHint } from '../onboarding'
 
 const ACTIVE_STATUSES: DownloadStatus[] = ['queued', 'parsing', 'torrent', 'downloading', 'paused', 'seeding']
+
+/**
+ * 下载根目录（设置里的 downloadDir，留空则 userData/downloads）。
+ *
+ * 与 process() 里建番剧文件夹用的是同一份推导，抽出来是为了让
+ * 「本地播放 / 删除本地资源」在订阅卡片上能算出**同一个**目录，不靠用户手选。
+ */
+export function downloadRoot(): string {
+  const s = getSettings()
+  return s.downloadDir || join(app.getPath('userData'), 'downloads')
+}
 /** 允许暂停/继续的状态 */
 const PAUSABLE: DownloadStatus[] = ['queued', 'parsing', 'torrent', 'downloading', 'seeding']
 /** 列表排序权重：正在下载的任务置顶 */
@@ -166,8 +177,7 @@ class DownloadManager {
   private async process(id: string): Promise<void> {
     const task = this.tasks().find((t) => t.id === id)
     if (!task) return
-    const settings = getSettings()
-    const root = settings.downloadDir || join(app.getPath('userData'), 'downloads')
+    const root = downloadRoot()
     const dir = join(root, safeName(task.animeTitle))
     mkdirSync(dir, { recursive: true })
     this.patch(id, { dir })
@@ -228,9 +238,25 @@ class DownloadManager {
     }
   }
 
-  async remove(id: string): Promise<boolean> {
-    const task = this.tasks().find((t) => t.id === id)
-    if (task?.downloaderId) {
+  /**
+   * 批量删除下载任务记录（下载列表综合卡片的「删除」与「删除本地资源」共用）。
+   *
+   * - `detach`（默认 true）：有 downloaderId 的任务一并通知下载器移除，避免留下界面看不见、
+   *   也没人管的孤儿任务（aria2 只是停止任务，qbit 用 deleteFiles=false，都不会删文件）；
+   * - `deleteUnfinishedFiles`（默认 false）：是否顺手清空**未完成**任务的下载内容。
+   *   两个新入口都明确要求「不动磁盘」，所以默认 false；只有单条「删除任务」保持老行为。
+   */
+  async removeRecords(
+    ids: string[],
+    opts: { detach?: boolean; deleteUnfinishedFiles?: boolean } = {}
+  ): Promise<{ removed: number; cancelled: number }> {
+    const tasks = this.tasks()
+    const removeSet = new Set(ids)
+    const targets = tasks.filter((t) => removeSet.has(t.id))
+    let cancelled = 0
+    for (const task of targets) {
+      if (opts.detach === false || !task.downloaderId) continue
+      if (!['done', 'error'].includes(task.status)) cancelled += 1
       try {
         if (this.engineOf(task) === 'aria2') await aria2.remove(task.downloaderId)
         else await qbit.remove(task.downloaderId)
@@ -238,10 +264,12 @@ class DownloadManager {
         log.append('warn', 'download', `移除下载器任务失败: ${String(err)}`)
       }
     }
-    // 未完成任务删除时清空已下载内容（已完成/做种的任务保留文件；目录被其它任务共用时不清空）
-    if (task && task.dir && !['done', 'seeding'].includes(task.status)) {
-      const shared = this.tasks().some((t) => t.id !== id && t.dir === task.dir)
-      if (!shared) {
+    if (opts.deleteUnfinishedFiles) {
+      for (const task of targets) {
+        if (!task.dir || ['done', 'seeding'].includes(task.status)) continue
+        // 目录被同一批之外的任务共用时不清空
+        const shared = tasks.some((t) => !removeSet.has(t.id) && t.dir === task.dir)
+        if (shared) continue
         try {
           rmSync(task.dir, { recursive: true, force: true })
           log.append('info', 'download', `已清空未完成任务下载内容: ${task.dir}`)
@@ -250,8 +278,14 @@ class DownloadManager {
         }
       }
     }
-    this.save(this.tasks().filter((t) => t.id !== id))
-    log.append('info', 'download', `删除下载任务: ${task?.name ?? id}`)
+    this.save(tasks.filter((t) => !removeSet.has(t.id)))
+    for (const task of targets) log.append('info', 'download', `删除下载任务: ${task.name}`)
+    return { removed: targets.length, cancelled }
+  }
+
+  async remove(id: string): Promise<boolean> {
+    // 单条「删除任务」保持老行为：未完成的任务顺手清空已下载内容
+    await this.removeRecords([id], { deleteUnfinishedFiles: true })
     return true
   }
 

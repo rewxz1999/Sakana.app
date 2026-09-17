@@ -89,6 +89,81 @@ function detailRows(d: SubjectDetail): { key: string; value: string }[] {
     .map((r) => ({ key: r.key, value: typeof r.value === 'string' ? r.value : String(r.value) }))
 }
 
+/**
+ * 音量滑杆（v0.2.9）。
+ *
+ * 用户要求：控制栏要能调音量，**不需要静音键**。
+ * 所以这里没有「点一下静音」的行为 —— 图标只是当前音量档位的指示（拖到 0 自然就没声音），
+ * 拖动过程中持续发送 setVolume；用 pointer capture 保证拖出滑杆外也不断。
+ */
+function VolumeSlider({ volume, onSet }: { volume: number; onSet: (v: number) => void }): React.ReactElement {
+  const trackRef = useRef<HTMLDivElement | null>(null)
+  const [dragging, setDragging] = useState(false)
+  const v = Math.max(0, Math.min(100, volume))
+
+  const applyFromEvent = (clientX: number): void => {
+    const el = trackRef.current
+    if (!el) return
+    const r = el.getBoundingClientRect()
+    const ratio = r.width > 0 ? (clientX - r.left) / r.width : 0
+    onSet(Math.round(Math.max(0, Math.min(1, ratio)) * 100))
+  }
+
+  const Icon = v === 0 ? VolumeX : v > 50 ? Volume2 : Volume1
+  return (
+    <div className="ml-1 flex items-center gap-1.5" title={`音量 ${v}%`}>
+      <Icon size={16} className="shrink-0 text-white/80" />
+      <div
+        ref={trackRef}
+        data-sakana-volume={v}
+        className="group relative flex h-6 w-[76px] cursor-pointer items-center"
+        onPointerDown={(e) => {
+          if (e.button !== 0) return
+          e.stopPropagation()
+          /*
+           * 指针捕获要用 try/catch 包住：合成事件（自检里 dispatch 的 PointerEvent）没有真实
+           * pointerId，setPointerCapture 会抛 NotFoundError；抛出去会把整个拖动逻辑打断。
+           */
+          try {
+            ;(e.target as HTMLElement).setPointerCapture?.(e.pointerId)
+          } catch {
+            /* 忽略：拿不到捕获也不影响按位置计算音量 */
+          }
+          setDragging(true)
+          applyFromEvent(e.clientX)
+        }}
+        onPointerMove={(e) => {
+          if (!dragging) return
+          e.stopPropagation()
+          applyFromEvent(e.clientX)
+        }}
+        onPointerUp={(e) => {
+          if (!dragging) return
+          e.stopPropagation()
+          setDragging(false)
+          applyFromEvent(e.clientX)
+        }}
+        onPointerCancel={() => setDragging(false)}
+      >
+        <div className="h-1 w-full overflow-hidden rounded-full bg-white/25">
+          <div className="h-full rounded-full bg-white/85" style={{ width: `${v}%` }} />
+        </div>
+        <div
+          className={`absolute top-1/2 h-3 w-3 -translate-y-1/2 rounded-full bg-white shadow transition-opacity ${
+            dragging ? 'opacity-100' : 'opacity-80 group-hover:opacity-100'
+          }`}
+          style={{ left: `calc(${v}% - 6px)` }}
+        />
+      </div>
+      <span className="w-7 shrink-0 text-[11px] tabular-nums text-white/60">{v}</span>
+    </div>
+  )
+}
+
+/** 倍速档位（与控制栏按钮里的显示顺序一致；播放页那份是给快捷键循环用的） */
+const SPEED_CHOICES = [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3]
+const fmtSpeed = (s: number): string => `${Number.isInteger(s) ? s.toFixed(1) : s}x`
+
 /** 弹幕设置面板里的小胶囊按钮（v0.2.8） */
 function Chip({
   active,
@@ -108,7 +183,7 @@ function Chip({
       }}
       className={`rounded-md border px-2 py-0.5 text-[11px] transition-colors ${
         active ? 'border-accent bg-accent/30 text-white' : 'border-white/20 text-white/70 hover:bg-white/10'
-      }`}
+      } whitespace-nowrap `}
     >
       {children}
     </button>
@@ -166,7 +241,7 @@ function IconBtn({
       }}
       className={`flex h-10 w-10 items-center justify-center rounded-full text-white/90 transition-colors hover:bg-white/20 hover:text-white active:bg-white/30 ${
         active ? 'bg-white/20 text-white' : ''
-      }`}
+      } whitespace-nowrap `}
     >
       {children}
     </button>
@@ -182,6 +257,8 @@ export default function PlayerOverlay(): React.ReactElement {
   const [visible, setVisible] = useState(false)
   const [subMenu, setSubMenu] = useState(false)
   const [aspectMenu, setAspectMenu] = useState(false)
+  // v0.2.9 最后更新：倍速菜单
+  const [speedMenu, setSpeedMenu] = useState(false)
   const [showInfo, setShowInfo] = useState(false)
   /** 选集浮层里正在查看的线路（悬浮窗本地状态，切换线路不打断播放） */
   const [browseLine, setBrowseLine] = useState(0)
@@ -259,13 +336,45 @@ export default function PlayerOverlay(): React.ReactElement {
     }
   }, [])
   useEffect(() => api.overlay.onPoke(poke), [poke])
+  /** 排障探针：把控制栏的真实显隐状态暴露给自检脚本（DOM 上的 opacity 判断不可靠） */
+  useEffect(() => {
+    ;(window as unknown as Record<string, unknown>).__sakanaOverlayVisible = visible
+  }, [visible])
+  /**
+   * 交互状态心跳（v0.2.8 附加六）。
+   *
+   * 「切到后台再回来，控制栏按钮全部失灵」的最后一环：主进程会在失焦时复位点击穿透，
+   * 回到前台后如果用户**不移动鼠标直接点**，就收不到 mousemove、交互状态也不会恢复 ——
+   * 表现为控制栏看得见、点不动。这里在控制栏可见期间每 1.5 秒幂等地重申一次
+   * 「我在接收点击」，保证窗口的系统级状态始终与界面状态一致。
+   */
+  useEffect(() => {
+    if (!visible) return
+    const t = window.setInterval(() => {
+      void api.overlay.setInteractive(true)
+    }, 1500)
+    return () => {
+      window.clearInterval(t)
+      // 控制栏收起时归还点击穿透，避免透明窗口挡住画面上的其它操作
+      void api.overlay.setInteractive(false)
+    }
+  }, [visible])
   useEffect(() => {
     // 点击穿透时 mousemove 依然会转发到本窗口，因此可以自行感知鼠标移动
     const onMove = (): void => poke()
     window.addEventListener('mousemove', onMove)
+    /*
+     * 窗口被隐藏（切到后台）后再显示时，主动把控制栏唤出一次：
+     * 否则「看不见 → 回来」之后可能停在既不可见也不可交互的状态（用户反馈过按钮全失灵）。
+     */
+    const onVisibility = (): void => {
+      if (document.visibilityState === 'visible') poke()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
     poke()
     return () => {
       window.removeEventListener('mousemove', onMove)
+      document.removeEventListener('visibilitychange', onVisibility)
       window.clearTimeout(hideTimer.current)
     }
   }, [poke])
@@ -296,7 +405,7 @@ export default function PlayerOverlay(): React.ReactElement {
         - 顶部让出标题/状态栏的高度（否则最上面几行弹幕会被顶栏盖住 —— 用户反馈过）；
         - 底部让出控制栏（控制栏隐藏时只留一点点安全边）。
       */}
-      {state && danmaku && danmaku.settings.enabled && danmaku.comments.length > 0 ? (
+      {state && danmaku && danmaku.settings.enabled && danmaku.comments.length > 0 && !danmaku.pluginActive ? (
         <DanmakuLayer
           comments={danmaku.comments}
           settings={danmaku.settings}
@@ -320,7 +429,7 @@ export default function PlayerOverlay(): React.ReactElement {
           <div className="ml-auto flex h-full w-[380px] max-w-[70vw] flex-col items-center justify-center gap-2 border-l border-white/10 bg-black/72 backdrop-blur-md">
             <span className="text-xs text-white/80">正在读取选集…</span>
             <button
-              className="rounded-lg bg-white/10 px-3 py-1 text-[11px] text-white/80 hover:bg-white/20"
+              className="rounded-lg bg-white/10 px-3 py-1 text-[11px] text-white/80 hover:bg-white/20 whitespace-nowrap"
               onPointerDown={(e) => {
                 e.stopPropagation()
                 send({ type: 'toggleEpisodes' })
@@ -448,7 +557,7 @@ export default function PlayerOverlay(): React.ReactElement {
                 {detail.tags.length > 0 ? (
                   <div className="mt-3 flex flex-wrap gap-1">
                     {detail.tags.slice(0, 10).map((t) => (
-                      <span key={t.name} className="rounded-full bg-white/10 px-2 py-0.5 text-[10px] text-white/70">
+                      <span key={t.name} className="rounded-full bg-white/10 px-2 py-0.5 text-[10px] text-white/70 whitespace-nowrap">
                         {t.name}
                       </span>
                     ))}
@@ -493,9 +602,9 @@ export default function PlayerOverlay(): React.ReactElement {
         <div className="absolute bottom-24 right-5 z-40 flex w-72 flex-col gap-2 rounded-xl border border-white/15 bg-black/80 p-3 text-white shadow-2xl backdrop-blur">
           <div className="text-xs">已自动跳转到上次观看位置 {fmt(state.resume.target)}</div>
           <div className="text-[11px] text-white/60">如果不想从这里继续，可以回到本集开头。</div>
-          <div className="flex justify-end gap-2">
+          <div className="flex flex-wrap justify-end gap-2">
             <button
-              className="rounded-lg bg-white/10 px-2.5 py-1 text-[11px] text-white/80 hover:bg-white/20"
+              className="rounded-lg bg-white/10 px-2.5 py-1 text-[11px] text-white/80 hover:bg-white/20 whitespace-nowrap"
               onPointerDown={(e) => {
                 e.stopPropagation()
                 send({ type: 'dismissResume' })
@@ -504,7 +613,7 @@ export default function PlayerOverlay(): React.ReactElement {
               保持
             </button>
             <button
-              className="rounded-lg bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:brightness-110"
+              className="rounded-lg bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:brightness-110 whitespace-nowrap"
               onPointerDown={(e) => {
                 e.stopPropagation()
                 send({ type: 'undoResume' })
@@ -522,7 +631,7 @@ export default function PlayerOverlay(): React.ReactElement {
       */}
       {state && (state.status.kind === 'capturing' || state.status.kind === 'loading') ? (
         <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center">
-          <div className="flex items-center gap-2 rounded-full bg-black/65 px-4 py-2 text-xs text-white backdrop-blur">
+          <div className="flex items-center gap-2 rounded-full bg-black/65 px-4 py-2 text-xs text-white backdrop-blur whitespace-nowrap">
             <span className="h-2 w-2 animate-pulse rounded-full bg-warn" />
             {state.status.text}…
           </div>
@@ -533,7 +642,7 @@ export default function PlayerOverlay(): React.ReactElement {
           <div className="flex items-center gap-3 rounded-xl bg-black/80 px-4 py-2.5 text-xs text-white backdrop-blur">
             <span className="max-w-md">{state.error}</span>
             <button
-              className="rounded-lg bg-white/20 px-3 py-1 hover:bg-white/30"
+              className="rounded-lg bg-white/20 px-3 py-1 hover:bg-white/30 whitespace-nowrap"
               onPointerDown={(e) => {
                 e.stopPropagation()
                 send({ type: 'exitPlayer' })
@@ -575,7 +684,7 @@ export default function PlayerOverlay(): React.ReactElement {
             state?.status.kind === 'failed'
               ? 'bg-danger/30 text-white hover:bg-danger/45'
               : 'bg-white/15 text-white hover:bg-white/30'
-          }`}
+          } whitespace-nowrap `}
         >
           <span
             className={`h-1.5 w-1.5 rounded-full ${
@@ -689,8 +798,21 @@ export default function PlayerOverlay(): React.ReactElement {
                     底部
                   </Chip>
                 </SettingRow>
+                {/*
+                  v0.2.9：插件渲染时，画面上的弹幕由 mpv 的 uosc_danmaku 负责，
+                  它自带一套菜单（搜索弹幕 / 弹幕样式 / 弹幕源延迟 / 总菜单）。
+                  这里只做「入口」——菜单本身由插件用 uosc 画在画面上。
+                */}
+                {danmaku.pluginActive ? (
+                  <SettingRow label="插件菜单">
+                    <Chip onClick={() => send({ type: 'uoscMenu', key: 'search' })}>搜索弹幕</Chip>
+                    <Chip onClick={() => send({ type: 'uoscMenu', key: 'style' })}>弹幕样式</Chip>
+                    <Chip onClick={() => send({ type: 'uoscMenu', key: 'delay' })}>源延迟</Chip>
+                    <Chip onClick={() => send({ type: 'uoscMenu', key: 'total' })}>总菜单</Chip>
+                  </SettingRow>
+                ) : null}
                 <div className="mt-2 flex items-center justify-between gap-2 border-t border-white/10 pt-2">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     {/*
                       v0.2.8：两个检测入口 ——
                       「别名检测弹幕」会用番剧别名（番剧库别名 + 弹幕库自身别名）再搜一轮，
@@ -698,7 +820,7 @@ export default function PlayerOverlay(): React.ReactElement {
                       「重新检测弹幕」按当前番剧名重查一次（也会绕过本地缓存重新拉取）。
                     */}
                     <button
-                      className="rounded-md border border-white/20 px-2 py-0.5 text-[11px] text-white/80 hover:bg-white/10"
+                      className="rounded-md border border-white/20 px-2 py-0.5 text-[11px] text-white/80 hover:bg-white/10 whitespace-nowrap"
                       onPointerDown={(e) => {
                         e.stopPropagation()
                         send({ type: 'detectDanmakuAlias' })
@@ -707,7 +829,7 @@ export default function PlayerOverlay(): React.ReactElement {
                       别名检测弹幕
                     </button>
                     <button
-                      className="rounded-md border border-white/20 px-2 py-0.5 text-[11px] text-white/80 hover:bg-white/10"
+                      className="rounded-md border border-white/20 px-2 py-0.5 text-[11px] text-white/80 hover:bg-white/10 whitespace-nowrap"
                       onPointerDown={(e) => {
                         e.stopPropagation()
                         send({ type: 'reloadDanmaku' })
@@ -717,7 +839,7 @@ export default function PlayerOverlay(): React.ReactElement {
                     </button>
                   </div>
                   <button
-                    className="shrink-0 text-[11px] text-accent hover:underline"
+                    className="shrink-0 text-[11px] text-accent hover:underline whitespace-nowrap"
                     onPointerDown={(e) => {
                       e.stopPropagation()
                       send({ type: 'openDanmakuSettings' })
@@ -779,15 +901,8 @@ export default function PlayerOverlay(): React.ReactElement {
             <span className="ml-1 text-[11px] tabular-nums text-white/80">
               {fmt(current)} / {fmt(duration)}
             </span>
-            <IconBtn title="静音" onClick={() => send({ type: 'toggleMute' })}>
-              {state?.muted ? (
-                <VolumeX size={18} />
-              ) : (state?.volume ?? 0) > 50 ? (
-                <Volume2 size={18} />
-              ) : (
-                <Volume1 size={18} />
-              )}
-            </IconBtn>
+            {/* v0.2.9：音量改为滑杆（用户要求，不加静音键） */}
+            <VolumeSlider volume={state?.volume ?? 0} onSet={(nv) => send({ type: 'setVolume', value: nv })} />
           </div>
 
           <div className="flex items-center gap-0.5">
@@ -811,7 +926,7 @@ export default function PlayerOverlay(): React.ReactElement {
               {subMenu && (
                 <div className="absolute bottom-12 right-0 z-40 max-h-64 w-48 overflow-y-auto rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur">
                   <button
-                    className="block w-full rounded px-2 py-1.5 text-left hover:bg-white/10"
+                    className="block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 whitespace-nowrap"
                     onClick={() => {
                       send({ type: 'cycleSubtitle' })
                       setSubMenu(false)
@@ -837,6 +952,44 @@ export default function PlayerOverlay(): React.ReactElement {
                       </button>
                     ))
                   )}
+                </div>
+              )}
+            </div>
+
+            {/*
+              v0.2.9 最后更新：倍速。与画面比例同一套写法（点按钮弹出档位菜单），
+              当前档位直接显示在按钮上，非 1x 时用强调色，避免「忘了自己开过倍速」。
+            */}
+            <div className="relative">
+              <IconBtn
+                title="播放倍速"
+                active={speedMenu || (state?.speed ?? 1) !== 1}
+                onClick={() => {
+                  setSpeedMenu(!speedMenu)
+                  setAspectMenu(false)
+                  setSubMenu(false)
+                }}
+              >
+                <span className="min-w-[30px] text-center text-[12px] font-semibold tabular-nums whitespace-nowrap">
+                  {fmtSpeed(state?.speed ?? 1)}
+                </span>
+              </IconBtn>
+              {speedMenu && (
+                <div className="absolute bottom-12 right-0 z-40 w-28 rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur">
+                  {SPEED_CHOICES.map((s) => (
+                    <button
+                      key={s}
+                      className={`block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 ${
+                        Math.abs((state?.speed ?? 1) - s) < 0.001 ? 'text-accent' : ''
+                      } whitespace-nowrap`}
+                      onClick={() => {
+                        send({ type: 'setSpeed', value: s })
+                        setSpeedMenu(false)
+                      }}
+                    >
+                      {fmtSpeed(s)}
+                    </button>
+                  ))}
                 </div>
               )}
             </div>
@@ -897,7 +1050,7 @@ export default function PlayerOverlay(): React.ReactElement {
                       key={m}
                       className={`block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 ${
                         state?.aspect === m ? 'text-accent' : ''
-                      }`}
+                      } whitespace-nowrap `}
                       onClick={() => {
                         send({ type: 'setAspect', aspect: m })
                         setAspectMenu(false)

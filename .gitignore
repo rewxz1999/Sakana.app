@@ -9,14 +9,12 @@ release/
 .electron-cache/
 .cache/
 
-# ---- 大体积运行时不入库（用 npm run {libvlc,libmpv,ffmpeg,aria2}:fetch 获取） ----
-resources/libvlc/
+# ---- 大体积运行时不入库（用 npm run {libmpv,ffmpeg,aria2}:fetch 获取） ----
 resources/libmpv/
 resources/ffmpeg/
 resources/aria2/*.exe
 resources/aria2/*.zip
 resources/ffmpeg/*.zip
-resources/libvlc/*.zip
 resources/libmpv/*.zip
 # N-API 原生插件的编译产物（源码在 native/mpv/src）
 native/mpv/build/
@@ -41,7 +39,13 @@ docs/更新记录.md
 docs/备用数据源调研.md
 
 # ---- 运行期数据、诊断输出与临时文件 ----
+# v0.2.9 最后更新：数据根目录改到**安装目录**下（开发态就是仓库目录），
+# 因此这几个运行期目录必须忽略，否则开发时跑一次就会把缓存/截图/下载内容带进提交。
 data/
+cache/
+downloads/
+screenshots/
+galgame-screenshots/
 logs/
 *.log
 .cap*.log

@@ -53,6 +53,37 @@ export interface CalendarResult {
   error?: SourceError
 }
 
+/**
+ * 季度（新番季）预览里的一个条目。
+ *
+ * 数据来自 `GET {反代}/v0/subjects?type=2&year=<y>&month=<m>&sort=rank&limit=100`
+ * （一个季度 = 三个月份合并去重，见 main/services/bangumi.ts 的 season()）。
+ * 与 CalendarItem 的差别：v0 的放送日期字段叫 `date`（不是 `air_date`），
+ * 且季度条目多带 `platform`（TV / WEB / 剧场版…）。
+ */
+export interface SeasonItem {
+  id: number
+  name: string
+  name_cn: string
+  images: CoverImages | null
+  rating: Rating | null
+  air_date: string | null
+  platform?: string
+}
+
+export interface SeasonResult {
+  /** 实际命中的年份 */
+  year: number
+  /** 实际命中的季度序号：1=冬 2=春 3=夏 4=秋（约定见 shared/season.ts） */
+  season: number
+  fromCache: boolean
+  /** 命中的是**已过期**的缓存（数据仍照常返回，界面照常渲染） */
+  stale?: boolean
+  fetchedAt: number | null
+  items: SeasonItem[]
+  error?: SourceError
+}
+
 export interface SubjectDetail {
   id: number
   name: string
@@ -213,6 +244,53 @@ export interface AddDownloadInput {
   pubDate?: string // 资源发布日期（用于订阅更新判定）
 }
 
+// ---------------- 本地资源（下载目录自动推导 / 删除本地资源 / 删除下载记录） ----------------
+
+/**
+ * 定位某部番剧本地目录的入参（订阅卡片与下载卡片共用）。
+ *
+ * 三种来源按优先级：下载任务记录的 dir > 订阅记录的 folder > 按「下载根目录 + 番剧名」推导。
+ * 有了它，「本地播放」不再需要弹文件夹选择框（用户明确要求：从卡片进入直接播）。
+ */
+export interface LocalTargetInput {
+  subscriptionId?: string
+  subjectId?: number
+  animeTitle?: string
+  /** 已知的下载目录（例如下载任务里记录的 dir），优先级最高 */
+  dir?: string
+}
+
+/** 本地目录推导结果 */
+export interface LocalDirInfo {
+  /** 推导出的绝对路径（番剧文件夹） */
+  dir: string
+  exists: boolean
+  /** 目录内可播放的视频文件数（0 = 还没下载完 / 已删干净） */
+  videos: number
+  /** 目录来源：task=下载任务记录 / folder=订阅记录 / derived=按下载根目录推导 */
+  source: 'task' | 'folder' | 'derived'
+}
+
+/** 删除本地资源（文件 + 对应下载记录）的结果 */
+export interface DeleteLocalResult {
+  dir: string
+  /** 真正删掉的视频文件数（目录不存在时为 0） */
+  filesDeleted: number
+  /** 一并清理掉的下载记录数 */
+  recordsRemoved: number
+  /** 被取消的进行中任务数（文件删了，任务不能再留着） */
+  tasksCancelled: number
+  /** 非致命错误（文件被占用 / 权限不足等），由界面 toast 呈现 */
+  errors: string[]
+}
+
+/** 只删下载记录（不碰磁盘文件）的结果 */
+export interface RemoveRecordsResult {
+  removed: number
+  /** 被取消的进行中任务数（只取消下载，不删已下载的部分文件） */
+  tasksCancelled: number
+}
+
 // ---------------- 历史记录 ----------------
 
 export interface WatchHistoryItem {
@@ -277,6 +355,11 @@ export interface MarkList {
   id: string
   name: string
   createdAt: number
+  /**
+   * 创建该书签时搜索框里的关键词（v0.2.9）。
+   * 搜索页书签弹窗的「重新搜索」据此重跑一次搜索；老数据没有这个字段（可选）。
+   */
+  keyword?: string
 }
 
 export interface MarkItem {
@@ -335,7 +418,27 @@ export interface UpdateInfo {
   url: string
   checkedAt: number
   error?: string
+  /**
+   * v0.2.9 最后更新：GitHub Releases 里找到了可用的 Windows 安装包 → 支持应用内一键更新。
+   * 只有版本号（旧 version.json 通道）时为 false，此时只能引导用户去 Releases 手动下载。
+   */
+  canInstall?: boolean
+  /** 安装包文件名（用于显示与本地缓存去重） */
+  assetName?: string
+  /** 安装包字节数（下载进度与完整性校验用） */
+  assetSize?: number
 }
+
+/**
+ * 应用内一键更新的下载/安装状态（主进程 → 渲染层推送）。
+ * `received/total` 用来画进度条；`file` 在下载完成后给出本地路径。
+ */
+export type UpdateInstallState =
+  | { phase: 'idle' }
+  | { phase: 'downloading'; received: number; total: number; version: string }
+  | { phase: 'done'; file: string; version: string }
+  | { phase: 'installing'; file: string }
+  | { phase: 'failed'; message: string }
 
 // ---------------- 弹幕（预留：弹弹play） ----------------
 
@@ -395,6 +498,13 @@ export interface DanmakuSettings {
   bold: boolean
   /** 屏蔽词（逗号 / 换行分隔，命中即不显示） */
   blockWords: string
+  /**
+   * v0.2.9：弹幕渲染方式。
+   * - `canvas`（默认）：应用自己的画布渲染（画在控制栏悬浮窗里，与视频窗口同层）；
+   * - `uosc`：交给 mpv 内置的 uosc_danmaku 插件渲染（ASS 字幕层，字幕样式/搜索菜单由插件提供）。
+   * 两种方式用的是**同一份**弹幕数据（应用侧统一做季集判定与多来源合并）。
+   */
+  renderer?: 'canvas' | 'uosc'
 }
 
 export const DEFAULT_DANMAKU_SETTINGS: DanmakuSettings = {
@@ -841,6 +951,16 @@ export interface DataSourcesConfig {
 /** 画面比例模式：fit=适应（保持比例，可能留黑边）/ cover=裁剪铺满 / stretch=拉伸铺满 */
 export type AspectMode = 'fit' | 'cover' | 'stretch'
 
+/**
+ * 番剧表「显示范围」筛选（v0.2.9 附加）：三个开关相互独立、同时生效，默认全关 = 全部显示。
+ * 只影响界面显示，不改动数据。
+ */
+export interface ScheduleDisplayFilters {
+  hideWatched: boolean // 隐藏已看完的番剧
+  hideDropped: boolean // 隐藏已抛弃的番剧
+  onlyWatching: boolean // 只看在看的番剧
+}
+
 export interface AppSettings {
   theme: string
   bangumiBase: string
@@ -850,8 +970,6 @@ export interface AppSettings {
   screenshotDir: string
   downloadDir: string
   ffmpegPath: string // 留空自动使用内置 resources/ffmpeg
-  vlcPath: string // 留空自动探测：内置 libvlc / 系统 VLC / 磁盘根目录 VLC（如 E:\VLC）
-  playerEngine: 'vlc' | 'mpv' // 播放器内核：mpv=libmpv（推荐，默认），vlc=libVLC（兼容性备选）
   aspectMode: AspectMode // 画面比例：fit=保持比例（可留黑边）/ cover=裁剪铺满 / stretch=拉伸铺满
   cacheDir: string // 自定义缓存目录，留空使用 userData/cache
   downloader: {
@@ -903,6 +1021,31 @@ export interface AppSettings {
    * 为空时每次关闭都会询问；设置了这个值就不再询问。
    */
   closeBehaviorRemembered?: 'tray' | 'quit'
+  /**
+   * B 站弹幕（mpv 脚本）配置（v0.2.8 附加七）。
+   *
+   * 管线：yt-dlp 抓 danmaku 字幕（xml）→ biliass 转 ASS → mpv `sub-add`。
+   * 这两个可执行文件需要用户自行下载（本机网络到 GitHub Release 不通，无法随包分发），
+   * 内置脚本 `resources/mpv-scripts/sakana-bdanmaku.lua` 负责串起这条管线；
+   * 也可以把自己的 bdanmaku.lua 路径填进来（那时优先用它）。
+   */
+  biliDanmaku?: {
+    enabled?: boolean
+    /** yt-dlp 可执行文件路径（留空按 PATH 里的 yt-dlp） */
+    ytdlpPath?: string
+    /** biliass 可执行文件路径（留空按 PATH 里的 biliass） */
+    biliassPath?: string
+    /** 自定义 mpv 脚本（留空用内置的 sakana-bdanmaku.lua） */
+    scriptPath?: string
+    /** 临时目录：biliass 在 Windows 上必须有一个可写 tmpdir，否则弹幕下载会失败 */
+    tmpdir?: string
+  }
+  /**
+   * 番剧表「显示范围」筛选（v0.2.9 附加）：属偏好设置，随设置一起持久化。
+   * 可选字段：旧设置文件缺省该键时按「全关（全部显示）」处理，
+   * 渲染层由 `resolveScheduleFilters()` 补默认值。
+   */
+  scheduleFilters?: Partial<ScheduleDisplayFilters>
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -932,8 +1075,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   screenshotDir: '',
   downloadDir: '',
   ffmpegPath: '',
-  vlcPath: '',
-  playerEngine: 'mpv',
   aspectMode: 'fit',
   cacheDir: '',
   downloader: {
@@ -948,7 +1089,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   hlsAdFilter: true,
   // 自建反代（默认启用，可在「设置 → 数据源配置」改回公共镜像）
   bangumiCustomApi: 'https://sankana-bangumi.de5.net/api',
-  bangumiCustomImg: 'https://sankana-bangumi.de5.net/img'
+  bangumiCustomImg: 'https://sankana-bangumi.de5.net/img',
+  // 番剧表「显示范围」筛选默认全关 = 全部显示
+  scheduleFilters: { hideWatched: false, hideDropped: false, onlyWatching: false }
 }
 
 // ---------------- 工具数据导出 ----------------
@@ -1097,6 +1240,34 @@ export interface GalRecentShot {
   path: string
   mtime: number
   name: string
+}
+
+/**
+ * 站点搜索结果统计（gal:search-sites）。
+ *
+ * 「galgame 库」顶部搜索只回传**数量 + 跳转链接**，永远不回传站点正文：
+ * 各站页面结构随时会变、且大多靠 JS 渲染，抓正文既不可靠也没必要。
+ */
+export interface GalSiteSearchResult {
+  /** 站点标识（稳定，前端按固定顺序展示） */
+  key: string
+  /** 站点展示名，如「稻荷acg」 */
+  name: string
+  /** 站点域名（展示与跳转用） */
+  host: string
+  /** 命中数量；null = 无法统计 */
+  count: number | null
+  /**
+   * 数量语义（决定前端文案，避免把「首屏条数」冒充「总数」）：
+   * - total：站点自己给出的（分页）总数 → 「约 N 个结果」
+   * - page：只数出站点返回的首页清单里的条目 → 「首屏 N 个」
+   * - none：无法统计（需要 JS / 被 Cloudflare 拦截 / TLS 证书过期等）
+   */
+  countKind: 'total' | 'page' | 'none'
+  /** 站点搜索页跳转链接（能否统计都始终可用） */
+  url: string
+  /** countKind='none' 时的简短原因（只进日志与提示，不含站点内容） */
+  note?: string
 }
 
 /** 月幕搜索候选 */

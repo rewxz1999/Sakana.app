@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { log } from './log'
 import { registerIpc } from './ipc'
 import { store } from './store'
+import { applyDataRoot, dataPaths, dataRootLabel } from './services/paths'
 import { bangumi } from './services/bangumi'
 import { mikan } from './services/mikan'
 import { downloadManager } from './services/downloader/manager'
@@ -41,7 +42,7 @@ import { DEFAULT_RULES } from '@shared/types'
  *  1) 视频窗口必须显式提升 z 序（SetWindowPos(HWND_TOP)）：不做提升时画面完全不可见，
  *     表现为「有声音、一片黑屏」——这正是 0.1.6 的问题，已 1:1 复现（屏幕抓取亮度 0.0，
  *     同时 mpv 自身截图有正常画面 124.6）；提升后同一位置亮度 109.3（画面可见）。
- *     与 electron-vlc-player 的 RaiseAboveWebContent 完全同理。
+ *     与 electron-vlc-player 里 RaiseAboveWebContent 的思路一致（该项目已不再使用）。
  *  2) webContents 的 'paint' 事件在非离屏渲染下不触发，不能依赖它做提升时机；
  *     因此用「首帧后立即提升 + 400ms 定时自愈」。
  *  3) 把视频窗口挂进页面渲染窗口（Chrome_RenderWidgetHostHWND）内部也能显示，
@@ -148,6 +149,14 @@ async function measureWindowRegion(
   }
 }
 
+/*
+ * v0.2.9 最后更新（用户要求）：数据根目录改到**安装目录**下 ——
+ * 所有缓存/设置/日志/Chromium profile 都跟着走，最大限度减少 C 盘占用；
+ * 必须放在单实例锁之前：锁文件就挂在 userData 上，晚一步就会出现「锁在旧位置、数据在新位置」。
+ */
+applyDataRoot()
+const DATA_PATHS = dataPaths()
+
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
@@ -156,6 +165,7 @@ if (!gotLock) {
     store.init()
     log.init()
     log.append('info', 'app', `Sakana v${app.getVersion()} 启动`)
+    log.append('info', 'app', `数据根目录：${dataRootLabel()}${DATA_PATHS.fallback ? '（安装目录不可写）' : ''}`)
     bangumi.init()
     ensureDefaultRules()
     registerMediaProtocols()
@@ -163,7 +173,7 @@ if (!gotLock) {
     createMainWindow()
     createTray()
     downloadManager.start()
-    // 中转流用本机 HTTP 提供（libVLC / libmpv / 渲染层 <video> 三方都能播）
+    // 中转流用本机 HTTP 提供（libmpv / 渲染层 <video> 两方都能播）
     void initLiveServer()
     // 网页视图 / 嗅探窗口 / 图片协议同样走应用代理（否则部分站点只有 HTTP 能访问）
     applySessionProxy(session.defaultSession)
@@ -264,20 +274,12 @@ if (!gotLock) {
                   const { openRuleWebview, closeRuleWebview } = await import('./services/ruleWebview')
                   // SAKANA_ONLINE_ATTACH_FIRST=1：先挂载内核再开探针视图（复现真实 UI 顺序：
                   // 播放页进入即 attach，探针网页视图随后盖在视频区之上）
-                  const useMpv = process.env.SAKANA_ONLINE_ENGINE === 'mpv'
-                  // 指定 mpv 时必须同时强制内核，否则 activeEngine() 会按用户设置回落到 libVLC
-                  if (useMpv && !process.env.SAKANA_FORCE_ENGINE) process.env.SAKANA_FORCE_ENGINE = 'mpv'
-                  // 指定 vlc 或 mpv 时都走播放内核调度器（这样才会经过广告过滤等调度层逻辑）
-                  const eng = process.env.SAKANA_ONLINE_ENGINE
-                    ? await import('./services/playerEngine')
-                    : null
+                  // v0.2.9：内核只剩 libmpv，统一走播放内核门面（广告过滤等横切逻辑都在里面）
+                  const eng = await import('./services/playerEngine')
                   const attachFirst = process.env.SAKANA_ONLINE_ATTACH_FIRST === '1'
                   let preAttach: { ok: boolean; message: string } | null = null
                   if (attachFirst) {
-                    const { attachVlc } = await import('./services/vlc')
-                    preAttach = eng
-                      ? await eng.engineAttach(win, { x: 0, y: 60, width: 960, height: 480 })
-                      : await attachVlc(win)
+                    preAttach = await eng.engineAttach(win, { x: 0, y: 60, width: 960, height: 480 })
                     console.log(
                       `[online-test] ${rule.name}: 先挂载内核(UI 顺序) ${JSON.stringify(preAttach)}`
                     )
@@ -313,24 +315,19 @@ if (!gotLock) {
                     )
                     // 端到端验证：先直连（带 Cookie），失败则改走 FFmpeg 中转
                     try {
-                      const { attachVlc, vlcPlay, getVlcState, destroyVlc } = await import('./services/vlc')
                       const { startLiveUrl, stopLive } = await import('./services/transcode')
                       console.log(
-                        `[online-test] ${rule.name}: 验证内核=${eng ? eng.activeEngine() : 'vlc(直连调用)'}`
+                        `[online-test] ${rule.name}: 验证内核=${eng.activeEngine()}`
                       )
                       const att =
-                        preAttach ??
-                        (eng
-                          ? await eng.engineAttach(win, { x: 0, y: 60, width: 960, height: 480 })
-                          : await attachVlc(win))
+                        preAttach ?? (await eng.engineAttach(win, { x: 0, y: 60, width: 960, height: 480 }))
                       console.log(`[online-test] ${rule.name}: 内核嵌入 ${JSON.stringify(att)}`)
                       const engPlay = (u: string, ref?: string, ck?: string): void =>
-                        eng ? eng.enginePlay(u, ref, ck) : vlcPlay(u, ref, ck)
+                        eng.enginePlay(u, ref, ck)
                       const engState = (): { playing: boolean; time: number; length: number } | null =>
-                        eng ? eng.engineGetState() : getVlcState()
+                        eng.engineGetState()
                       const engDetach = (): void => {
-                        if (eng) eng.engineDetach()
-                        else destroyVlc()
+                        eng.engineDetach()
                       }
                       if (!att.ok) {
                         console.log(`[online-test] ${rule.name}: ⚠ 内核嵌入失败：${att.message}`)
@@ -476,7 +473,7 @@ if (!gotLock) {
     }
 
     // 中转流自检（SAKANA_LIVE_TEST=视频文件）：
-    // FFmpeg 中转 → 本机 HTTP 地址 → 当前内核播放（验证回退方案对 libVLC/libmpv 都可用）
+    // FFmpeg 中转 → 本机 HTTP 地址 → 当前内核播放（验证中转回退方案可用）
     if (process.env.SAKANA_LIVE_TEST) {
       setTimeout(() => {
         void (async () => {
@@ -733,7 +730,7 @@ if (!gotLock) {
           if (process.env.SAKANA_PLAYERUI_FULLSCREEN) {
             const hostRect = async (): Promise<unknown> =>
               win.webContents.executeJavaScript(
-                `(function(){var el=document.getElementById('vlc-host');var r=el?el.getBoundingClientRect():null;return r?{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height),winW:window.innerWidth,winH:window.innerHeight,dpr:window.devicePixelRatio}:null})()`
+                `(function(){var el=document.getElementById('player-host');var r=el?el.getBoundingClientRect():null;return r?{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height),winW:window.innerWidth,winH:window.innerHeight,dpr:window.devicePixelRatio}:null})()`
               )
             const videoRect = async (): Promise<string> => {
               const { mpvWindowsOf } = await import('./services/mpv')
@@ -953,7 +950,7 @@ if (!gotLock) {
                 return s.zIndex === '30' && d.className && String(d.className).includes('gradient')
               })
               const top = bars[0], bottom = bars[bars.length-1]
-              const host = document.getElementById('vlc-host')
+              const host = document.getElementById('player-host')
               const seek = document.querySelector('.group.relative.flex.h-6')
               const btns = Array.from(document.querySelectorAll('button'))
               return JSON.stringify({
@@ -984,27 +981,37 @@ if (!gotLock) {
       }, 2500)
     }
 
-    // 打包环境自检（SAKANA_ENV_TEST=1）：检查内置 libVLC / FFmpeg / aria2 是否可见
+    // 打包环境自检（SAKANA_ENV_TEST=1）：检查内置 libmpv / FFmpeg / aria2 与弹幕插件目录是否可见
     if (process.env.SAKANA_ENV_TEST) {
       setTimeout(() => {
         void (async () => {
-          const { resolveVlcDir } = await import('./services/vlc')
           const { ffmpegExe } = await import('./services/transcode')
           const { aria2 } = await import('./services/downloader/aria2')
-          const { mpvRuntimeAvailable, mpvAvailable } = await import('./services/mpv')
+          const { mpvRuntimeAvailable, mpvAvailable, bundledMpvConfigDir, bundledBiliScript } = await import(
+            './services/mpv'
+          )
           const { existsSync } = await import('node:fs')
-          const vlcDir = resolveVlcDir()
           const ffmpeg = ffmpegExe()
           const aria = await aria2.findBinary()
           console.log(`[env-test] isPackaged=${app.isPackaged}`)
           console.log(`[env-test] appPath=${app.getAppPath()}`)
           console.log(`[env-test] resourcesPath=${process.resourcesPath ?? '(none)'}`)
           console.log(`[env-test] userData=${app.getPath('userData')}`)
-          console.log(`[env-test] libVLC=${vlcDir ?? '未找到'} ${vlcDir ? (existsSync(vlcDir) ? '✓' : '✗') : ''}`)
           console.log(`[env-test] FFmpeg=${ffmpeg ?? '未找到'} ${ffmpeg ? '✓' : ''}`)
           console.log(`[env-test] aria2c=${aria ?? '未找到'} ${aria ? '✓' : ''}`)
           console.log(
             `[env-test] libmpv.dll=${mpvRuntimeAvailable() ? '✓' : '✗'} 插件=${mpvAvailable() ? '✓' : '✗'}`
+          )
+          /*
+           * v0.2.9：VLC 内核删除后，打包自检改为核对打包进来的两组 mpv 资源 ——
+           * 弹幕脚本（resources/mpv-scripts）与 uosc/uosc_danmaku 插件目录（resources/mpv-config）。
+           * 这两样「缺了不报错、只是功能静默失效」，必须在自检里显式检查。
+           */
+          const cfg = bundledMpvConfigDir()
+          const bili = bundledBiliScript()
+          console.log(
+            `[env-test] 弹幕插件目录=${cfg || '(未找到)'} ${cfg ? (existsSync(cfg) ? '✓' : '✗') : ''}` +
+              ` B 站弹幕脚本=${bili ? '✓' : '✗'}`
           )
           console.log('[env-test] done')
           markQuitting()
@@ -1149,7 +1156,7 @@ if (!gotLock) {
             const ow = overlayWindow()
             if (!ow || ow.isDestroyed()) return { text: '(无悬浮窗)', visible: false }
             const raw = (await ow.webContents.executeJavaScript(
-              `JSON.stringify({text:(document.body.innerText||'').replace(/\\s+/g,' ').slice(0,160),visible:!!document.querySelector('[class*="bottom-0"]')&&getComputedStyle(document.querySelector('[class*="bottom-0"]')).opacity!=='0'})`,
+              `JSON.stringify({text:(document.body.innerText||'').replace(/\\s+/g,' ').slice(0,160),visible:window.__sakanaOverlayVisible===true})`,
               true
             )) as string
             return JSON.parse(raw) as { text: string; visible: boolean }
@@ -1241,40 +1248,373 @@ if (!gotLock) {
            * 打印出 owner 是谁。owner 应该是播放页那个窗口（且不聚焦），而不是刚打开的小窗口。
            */
           const { openSmallWindow } = await import('./window')
-          const { logOverlayOwner } = await import('./services/playerOverlay')
+          const { logOverlayOwner, isOverlayAlwaysOnTop } = await import('./services/playerOverlay')
+          const { mpvHitTest } = await import('./services/mpv')
+          /*
+           * 桌面截图（真实观感的唯一证据）：窗口层级问题只有「屏幕上实际长什么样」算数 ——
+           * capturePage 只能拍到某个窗口自己的内容，拍不到窗口之间的遮挡关系。
+           */
+          const { spawn: spawnPs } = await import('node:child_process')
+          const desktopShot = async (name: string): Promise<void> => {
+            try {
+              const { mkdirSync } = await import('node:fs')
+              const { join: pjoin } = await import('node:path')
+              const dir = pjoin(process.cwd(), '.shots')
+              mkdirSync(dir, { recursive: true })
+              const out = pjoin(dir, `${name}.png`).replace(/\\/g, '/')
+              const ps = [
+                'Add-Type -AssemblyName System.Windows.Forms,System.Drawing;',
+                '$b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds;',
+                '$bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height;',
+                '$g=[System.Drawing.Graphics]::FromImage($bmp);',
+                '$g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size);',
+                `$bmp.Save('${out}');`
+              ].join(' ')
+              await new Promise<void>((resolve) => {
+                const p = spawnPs('powershell', ['-NoProfile', '-STA', '-Command', ps], { windowsHide: true })
+                p.on('exit', () => resolve())
+                setTimeout(resolve, 8000)
+              })
+              console.log(`[input-test] 桌面截图 .shots/${name}.png`)
+            } catch (err) {
+              console.log(`[input-test] 桌面截图失败: ${String(err).slice(0, 120)}`)
+            }
+          }
+          /**
+           * 采样屏幕上若干点的颜色（桌面截图 + 取像素），用于人工排障时把「屏幕上到底显示什么」变成文字。
+           * 注意坐标必须是**物理像素**（Electron 的 DIP 要乘缩放系数）。
+           */
+          const samplePixels = async (points: { x: number; y: number }[]): Promise<string> => {
+            const list = points.map((p) => `@(${p.x},${p.y})`).join(',')
+            const ps = [
+              'Add-Type -AssemblyName System.Drawing;',
+              '$bmp=New-Object System.Drawing.Bitmap 1,1;',
+              '$g=[System.Drawing.Graphics]::FromImage($bmp);',
+              '$out=@();',
+              `foreach ($p in @(${list})) {`,
+              '  $g.CopyFromScreen($p[0],$p[1],0,0,(New-Object System.Drawing.Size 1,1));',
+              '  $c=$bmp.GetPixel(0,0);',
+              '  $out += ("{0},{1}=#{2:X2}{3:X2}{4:X2}" -f $p[0],$p[1],$c.R,$c.G,$c.B);',
+              '}',
+              '$out -join " | "'
+            ].join(' ')
+            return await new Promise<string>((resolve) => {
+              let buf = ''
+              const p = spawnPs('powershell', ['-NoProfile', '-STA', '-Command', ps], { windowsHide: true })
+              p.stdout?.on('data', (d: Buffer) => (buf += d.toString()))
+              p.on('exit', () => resolve(buf.trim()))
+              p.on('error', () => resolve('(采样失败)'))
+              setTimeout(() => resolve(buf.trim() || '(采样超时)'), 8000)
+            })
+          }
           const small = openSmallWindow('/danmaku-settings', { width: 620, height: 560, title: '弹幕设置' })
           small.focus()
           await sleep(1800)
           console.log(`[input-test] 小窗口已聚焦：${small.isFocused()}`)
-          /*
-           * v0.2.8 附加五（用户定位的显示 bug）：主窗口被别的窗口盖住时，
-           * 控制栏悬浮窗不能继续浮在别人窗口之上，否则「卡在别人窗口的位置上、点什么都没反应」。
-           * 这里验证：① 小窗口抢焦点后控制栏自动收起；② 主窗口回前台后控制栏恢复且仍可点击。
-           */
-          const owFocus = overlayWindow()
-          console.log(
-            `[input-test] 主窗口失焦后：控制栏可见=${owFocus && !owFocus.isDestroyed() ? owFocus.isVisible() : '(无)'}（期望 false）`
-          )
-          await win.webContents
-            .executeJavaScript(`window.sakana && window.sakana.overlay.show()`, true)
-            .catch(() => undefined)
-          await sleep(1200)
-          const owStill = overlayWindow()
-          console.log(
-            `[input-test] 失焦状态下播放页请求 show 后：控制栏可见=${owStill && !owStill.isDestroyed() ? owStill.isVisible() : '(无)'}（期望仍为 false）`
-          )
-          win.focus()
-          await sleep(1800)
-          const owBack = overlayWindow()
-          console.log(
-            `[input-test] 主窗口回前台后：控制栏可见=${owBack && !owBack.isDestroyed() ? owBack.isVisible() : '(无)'}（期望 true）`
-          )
           logOverlayOwner('播放页请求显示控制栏后')
           await clickAt(30, cyBottom)
           await sleep(2500)
           const afterSmall = await readOverlay()
-          console.log(`[input-test] 回到前台后点击播放/暂停：${afterSmall.text}`)
+          console.log(`[input-test] 小窗口抢焦点后点击播放/暂停：${afterSmall.text}`)
           if (!small.isDestroyed()) small.destroy()
+
+          /*
+           * ⑥ z 序与交互（v0.2.9：用户第三次反馈「把播放器放到别的窗口后面时，
+           *    播放器会强行抢占最前面窗口的位置，控制栏按钮还全部失灵」）。
+           *
+           * 这一版把根因按 Windows 的窗口分层规则重写（见 playerOverlay.ts 文件头），
+           * 所以这里用**外部进程的真实窗口**来量：在控制栏所在位置放一个别的应用的窗口，
+           * 然后问系统「这个屏幕点最上层的窗口是谁」——
+           * 命中链里出现悬浮窗的 HWND 就说明我们在抢位（老代码必然失败）。
+           */
+          // 控制栏对应的屏幕坐标（悬浮窗铺满主窗口，用客户区左上角 + 相对位置换算）
+          const overlayForHit = overlayWindow()
+          const ob = overlayForHit?.getContentBounds() ?? { x: 0, y: 0, width: 1280, height: 800 }
+          /*
+           * ⚠️ DPI：Electron 的窗口坐标是 **DIP**，而 Windows 的命中测试 / 取屏幕像素用的是**物理像素**。
+           * 缩放不是 100% 时，直接把 DIP 丢给 WindowFromPoint 会问到另一个点上去 ——
+           * 这正是之前那次「命中链里没有悬浮窗」的假警报来源。这里统一乘上缩放系数。
+           */
+          const sf = (await import('electron')).screen.getPrimaryDisplay().scaleFactor
+          const dipPoint = { x: ob.x + 30, y: ob.y + ob.height - 40 }
+          const screenPoint = {
+            x: Math.round(dipPoint.x * sf),
+            y: Math.round(dipPoint.y * sf)
+          }
+          console.log(
+            `[input-test] 缩放=${sf} 主窗口 DIP=${JSON.stringify(win.getBounds())} 悬浮窗 DIP=${JSON.stringify(ob)}` +
+              ` 采样点 DIP=(${dipPoint.x},${dipPoint.y}) → 物理=(${screenPoint.x},${screenPoint.y})`
+          )
+          const overlayHwndBuf = overlayForHit?.getNativeWindowHandle()
+          const overlayHwnd = overlayHwndBuf ? overlayHwndBuf.readBigUInt64LE(0).toString() : ''
+          const chainHasOverlay = (): boolean => {
+            const hit = mpvHitTest(screenPoint.x, screenPoint.y)
+            if (!hit) return false
+            if (hit.hitHwnd.toString() === overlayHwnd) return true
+            return hit.hitChain.some((c) => c.includes(`(${overlayHwnd})`))
+          }
+          /**
+           * 悬浮窗自己画了什么（alpha 分析）。
+           * 这是「控制栏到底有没有被绘制」的直接证据，且不受 DPI 与窗口层级干扰：
+           * capturePage 拍的是悬浮窗这个窗口的内容，透明处 alpha=0。
+           */
+          const overlayPaint = async (): Promise<string> => {
+            const ow = overlayWindow()
+            if (!ow || ow.isDestroyed()) return '(无悬浮窗)'
+            const img = await ow.webContents.capturePage()
+            const size = img.getSize()
+            const buf = img.toBitmap() // BGRA
+            let opaque = 0
+            let firstRow = -1
+            let lastRow = -1
+            const rowCounts = new Array<number>(size.height).fill(0)
+            for (let y = 0; y < size.height; y++) {
+              for (let x = 0; x < size.width; x++) {
+                const a = buf[(y * size.width + x) * 4 + 3]
+                if (a > 20) {
+                  opaque++
+                  rowCounts[y]++
+                }
+              }
+            }
+            for (let y = 0; y < size.height; y++) {
+              if (rowCounts[y] > size.width * 0.02) {
+                if (firstRow < 0) firstRow = y
+                lastRow = y
+              }
+            }
+            return `${size.width}x${size.height} 不透明像素=${opaque}（${((opaque / (size.width * size.height)) * 100).toFixed(2)}%）主绘制区=第 ${firstRow}~${lastRow} 行`
+          }
+          console.log(
+            `[input-test] 悬浮窗置顶=${isOverlayAlwaysOnTop()}（期望 false，任何时候都不该置顶）` +
+              ` 悬浮窗 HWND=${overlayHwnd}`
+          )
+
+          // (a) 播放器在前台、鼠标移入 → 控制栏可点击，且该点最上层窗口就是我们
+          win.focus()
+          await sleep(800)
+          overlayWindow()?.webContents.sendInputEvent({ type: 'mouseMove', x: cx, y: cyBottom - 140 })
+          await sleep(1500)
+          const frontInfo = await readOverlay()
+          /*
+           * ⑨ 音量滑杆（v0.2.9，用户要求：加音量调节、不要静音键）。
+           *    在悬浮窗 DOM 里定位滑杆（`data-sakana-volume` 记录当前值）→ 在 30% 处按下并拖动
+           *    → 数值应随之变化。数值本身来自播放页推送的状态，所以它变了就说明
+           *    「拖动 → 动作 → 内核音量 → 状态回推」整条链路都通了，而不是只改了个数字。
+           */
+          const volumeProbe = async (): Promise<string> => {
+            const ow = overlayWindow()
+            if (!ow || ow.isDestroyed()) return '(无悬浮窗)'
+            return (await ow.webContents.executeJavaScript(
+              `(function(){
+                 var el=document.querySelector('[data-sakana-volume]');
+                 if(!el) return 'NO_SLIDER';
+                 var before=el.getAttribute('data-sakana-volume');
+                 var r=el.getBoundingClientRect();
+                 var x=r.left+r.width*0.3, y=r.top+r.height/2;
+                 var opts={bubbles:true,cancelable:true,clientX:x,clientY:y,button:0,pointerId:1,isPrimary:true,pointerType:'mouse'};
+                 el.dispatchEvent(new PointerEvent('pointerdown',opts));
+                 el.dispatchEvent(new PointerEvent('pointermove',opts));
+                 el.dispatchEvent(new PointerEvent('pointerup',opts));
+                 return JSON.stringify({before:before,rect:Math.round(r.width)+'x'+Math.round(r.height)});
+               })()`,
+              true
+            )) as string
+          }
+          const volProbe = await volumeProbe()
+          await sleep(1500)
+          const volAfter = await (async (): Promise<string> => {
+            const ow = overlayWindow()
+            if (!ow || ow.isDestroyed()) return '(无悬浮窗)'
+            return (await ow.webContents.executeJavaScript(
+              `(function(){var el=document.querySelector('[data-sakana-volume]');return el?el.getAttribute('data-sakana-volume'):'NO_SLIDER'})()`,
+              true
+            )) as string
+          })()
+          console.log(`[input-test] 音量滑杆：探测=${volProbe} 拖动后数值=${volAfter}（期望回推后的值）`)
+
+          /*
+           * ⑩ 截图命名规则（v0.2.9）：番剧名+图片 文件夹、`番剧名_集数_分.秒.png`。
+           * 直接通过播放页暴露的桥调一次截图，核对返回路径（真实落盘 + 真实播放位置换算）。
+           */
+          const shotPath = (await win.webContents.executeJavaScript(
+            `window.sakana.player.snapshot('无职转生', 12)`,
+            true
+          )) as { ok?: boolean; data?: string; error?: string }
+          console.log(`[input-test] 截图命名检查：${JSON.stringify(shotPath)}`)
+
+          /*
+           * ⑪ 播放倍速（v0.2.9 最后更新：README 一直宣称有、实际缺失，对照 Kazumi 后补上）。
+           * 走的是与控制栏按钮完全相同的链路：IPC → 内核 speed + scaletempo2 → 状态回推，
+           * 因此这里核对「控制栏上的档位文字」是否跟着变，等于验证了整条链路。
+           */
+          const speedProbe = async (v: number): Promise<string> => {
+            await win.webContents.executeJavaScript(`window.sakana.player.setSpeed(${v})`, true)
+            await sleep(1200)
+            return (await readOverlay()).text
+          }
+          const speedText = await speedProbe(1.5)
+          const speedBack = await speedProbe(1)
+          console.log(
+            `[input-test] 倍速：设为 1.5 后控制栏文案含=${/1\.5x/.test(speedText) ? '1.5x ✓' : '(未看到 1.5x)'}` +
+              ` → 恢复原速后含=${/1\.0x/.test(speedBack) ? '1.0x ✓' : '(未看到 1.0x)'}`
+          )
+          /*
+           * 注意：命中测试要留一点时间差。
+           * 「控制栏可见 → 主进程把点击穿透关掉」是**异步消息**，同一 tick 里立刻做
+           * `WindowFromPoint` 会问到「还在穿透状态」的悬浮窗（系统会跳过它、返回下面的窗口），
+           * 从而得到「命中链里没有悬浮窗」的假警报（这一版踩过）。
+           */
+          overlayForHit?.webContents.sendInputEvent({ type: 'mouseMove', x: cx, y: cyBottom - 140 })
+          await sleep(700)
+          console.log(
+            `[input-test] 前台：控制栏可见=${frontInfo.visible} 可交互=${isOverlayInteractive()}` +
+              ` 屏幕点(${screenPoint.x},${screenPoint.y})最上层含悬浮窗=${chainHasOverlay()}` +
+              `（此项仅参考：悬浮窗处于点击穿透时系统会跳过它，且测试自己唤起的窗口也会影响结果；` +
+              `「控制栏在画面之上」以 z 序 + 绘制证据为准）`
+          )
+          {
+            // 层级细节：命中窗口是不是悬浮窗本身、以及它的祖先链
+            const h = mpvHitTest(screenPoint.x, screenPoint.y)
+            console.log(
+              `[input-test] 命中详情：hwnd=${h?.hitHwnd} 是悬浮窗=${h?.hitHwnd?.toString() === overlayHwnd}` +
+                ` 链=${(h?.hitChain ?? []).slice(0, 4).join(' → ')}`
+            )
+            console.log(
+              `[input-test] 悬浮窗 owner=${overlayForHit?.getParentWindow()?.id ?? '(无)'}` +
+                ` 主窗口=${win.id} 悬浮窗可见=${overlayForHit?.isVisible()}`
+            )
+          }
+          await desktopShot('zorder-foreground')
+          // SAKANA_SHOT=1：把控制栏截一张图，便于人工核对（音量滑杆等改动的样子）
+          if (process.env.SAKANA_SHOT) {
+            try {
+              const { mkdirSync, writeFileSync } = await import('node:fs')
+              const { join: pjoin } = await import('node:path')
+              const dir = pjoin(process.cwd(), '.shots')
+              mkdirSync(dir, { recursive: true })
+              const shot = await overlayForHit!.webContents.capturePage()
+              writeFileSync(pjoin(dir, 'overlay-controlbar.png'), shot.toPNG())
+              console.log('[input-test] 控制栏截图 .shots/overlay-controlbar.png')
+            } catch (err) {
+              console.log(`[input-test] 控制栏截图失败: ${String(err).slice(0, 120)}`)
+            }
+          }
+
+          /*
+           * (b) 用一个**外部进程**的真实窗口盖在控制栏位置上（PowerShell 的 WinForms 窗口，
+           *     class 与我们的窗口完全不同，判据干净），并让它到前台。
+           */
+          const { spawn } = await import('node:child_process')
+          const psScript = [
+            'Add-Type -AssemblyName System.Windows.Forms;',
+            '$f = New-Object System.Windows.Forms.Form;',
+            `$f.StartPosition = 'Manual'; $f.Location = New-Object System.Drawing.Point(${screenPoint.x - 120}, ${screenPoint.y - 160});`,
+            '$f.Size = New-Object System.Drawing.Size(420, 260);',
+            '$f.Text = "Sakana 抢位测试窗口";',
+            '$f.Show(); $f.Activate(); $f.TopMost = $false;',
+            'for ($i = 0; $i -lt 120; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 200 }'
+          ].join(' ')
+          const other = spawn('powershell', ['-NoProfile', '-STA', '-Command', psScript], {
+            windowsHide: true,
+            stdio: 'ignore'
+          })
+          await sleep(5000) // 等窗口出现并稳定
+          const busy = await readOverlay()
+          console.log(
+            `[input-test] 别的应用窗口盖住控制栏位置后：最上层含悬浮窗=${chainHasOverlay()}（**期望 false**：不抢位）` +
+              ` 可交互=${isOverlayInteractive()}（期望 false：不在前台就不接受点击）` +
+              ` 控制栏可见=${busy.visible}`
+          )
+          await desktopShot('zorder-other-app-window')
+          const hitNow = mpvHitTest(screenPoint.x, screenPoint.y)
+          console.log(`[input-test] 该点最上层窗口：${hitNow?.hitClass ?? '(空)'}`)
+          // (c) 关闭外部窗口，主窗口回前台 → 控制栏恢复「可见 + 可点击」，点击真的生效
+          try {
+            other.kill()
+          } catch {
+            /* ignore */
+          }
+          await sleep(1200)
+          win.focus()
+          await sleep(1000)
+          overlayWindow()?.webContents.sendInputEvent({ type: 'mouseMove', x: cx, y: cyBottom - 140 })
+          await sleep(1500)
+          const backInfo = await readOverlay()
+          const beforeBack = backInfo.text
+          await clickAt(30, cyBottom)
+          await sleep(2500)
+          const afterBack = await readOverlay()
+          console.log(
+            `[input-test] 回前台：控制栏可见=${backInfo.visible} 可交互=${isOverlayInteractive()}` +
+              `（关键断言是这两个；命中测试见上面的说明）`
+          )
+          console.log(
+            `[input-test] 回前台后点击播放/暂停：${beforeBack.includes('播放中') ? '播放中' : '已暂停'} → ${afterBack.text}`
+          )
+          console.log(`[input-test] 再次确认悬浮窗置顶=${isOverlayAlwaysOnTop()}（期望 false）`)
+
+          /*
+           * ⑧ 绘制证据（v0.2.9）：直接分析悬浮窗自己的像素（capturePage + alpha）。
+           *    控制栏显示时应有明显的绘制区域；空闲自动隐藏后应几乎为空 ——
+           *    这两句对比就是「控制栏真的画出来了」的直接证据，不受 DPI/层级干扰。
+           */
+          const paintShown = await overlayPaint()
+          await clickAt(30, cyBottom)
+          await sleep(1500)
+          if ((await readOverlay()).text.includes('播放中')) {
+            await clickAt(30, cyBottom)
+            await sleep(1200)
+          }
+          overlayWindow()?.webContents.sendInputEvent({ type: 'mouseMove', x: cx, y: cyBottom - 140 })
+          await sleep(1500)
+          const paintVisible = await overlayPaint()
+          const pxVisible = await samplePixels([
+            { x: screenPoint.x, y: screenPoint.y },
+            { x: screenPoint.x + 90, y: screenPoint.y }
+          ])
+          await sleep(7000)
+          const paintHidden = await overlayPaint()
+          const pxHidden = await samplePixels([
+            { x: screenPoint.x, y: screenPoint.y },
+            { x: screenPoint.x + 90, y: screenPoint.y }
+          ])
+          const hiddenNow = await readOverlay()
+          console.log(`[input-test] 悬浮窗绘制：点击前=${paintShown}`)
+          console.log(`[input-test] 悬浮窗绘制：控制栏可见时=${paintVisible}（期望有明显绘制区，位置贴近窗口底部）`)
+          console.log(
+            `[input-test] 悬浮窗绘制：空闲隐藏后=${paintHidden}` +
+              ` 页面自述可见=${hiddenNow.visible}（期望 false）`
+          )
+          console.log(
+            `[input-test] 屏幕像素（物理坐标 ${screenPoint.x},${screenPoint.y}）：可见时=${pxVisible} 隐藏后=${pxHidden}` +
+              `（仅作参考：受 DPI 缩放与窗口位置影响，判定以悬浮窗绘制区为准）`
+          )
+          /*
+           * ⑦ 全屏回归：控制栏过去靠「置顶」压在 mpv 的原生画面上，
+           *    现在完全不置顶了，必须确认全屏时它依旧在画面之上（owned window 天然在主窗口之上）。
+           */
+          win.setFullScreen(true)
+          await sleep(2500)
+          const fsBounds = overlayWindow()?.getContentBounds() ?? { x: 0, y: 0, width: 1280, height: 800 }
+          overlayWindow()?.webContents.sendInputEvent({
+            type: 'mouseMove',
+            x: Math.round(fsBounds.width / 2),
+            y: fsBounds.height - 160
+          })
+          await sleep(1500)
+          const fsHit = mpvHitTest(30, fsBounds.y + fsBounds.height - 40)
+          const fsHitHasOverlay =
+            !!fsHit &&
+            (fsHit.hitHwnd.toString() === overlayHwnd || fsHit.hitChain.some((c) => c.includes(`(${overlayHwnd})`)))
+          const fsInfo = await readOverlay()
+          console.log(
+            `[input-test] 全屏：控制栏可见=${fsInfo.visible} 可交互=${isOverlayInteractive()}` +
+              ` 底部最上层含悬浮窗=${fsHitHasOverlay}（全屏时它是可点击状态，所以这里应当为 true）` +
+              `最上层=${fsHit?.hitClass ?? '(空)'}`
+          )
+          win.setFullScreen(false)
+          await sleep(2000)
 
           console.log('[input-test] done')
           markQuitting()
@@ -1317,6 +1657,10 @@ if (!gotLock) {
             '/galgame',
             // v0.2.8 附加三：仪表盘（统计板块瘦身）纳入
             '/dashboard',
+            // v0.2.9：订阅页与工具页纳入（订阅卡片改过「本地播放」「删除本地资源」，
+            // 工具页是仪表盘卡片的跳转目标，路由级错误要能第一时间发现）
+            '/subs',
+            '/tools',
             '/downloads-win?title=%E6%B5%8B%E8%AF%95'
           ]
           for (const hash of hashes) {
@@ -1371,6 +1715,52 @@ if (!gotLock) {
                       imgs:Array.prototype.filter.call(document.images||[],function(i){return i.complete&&i.naturalWidth>0}).length,
                       badImgs:Array.prototype.filter.call(document.images||[],function(i){return i.complete&&i.naturalWidth===0}).length,
                       imgHosts:Array.from(new Set(Array.prototype.map.call(document.images||[],function(i){try{return new URL(i.src).host}catch(e){return i.src.slice(0,24)}}))).slice(0,4),
+                      /*
+                       * v0.2.9：铺满型背景图核对（galgame 页面用户反馈「背景还有黑边」）。
+                       * 判据：存在一张 object-fit:cover 的图，且它的渲染矩形与视口尺寸基本一致
+                       * （留边就意味着 contain/模糊垫底那套老做法又回来了）。
+                       */
+                      fullBleedBg:(function(){
+                        var hit=null;
+                        for(var i=0;i<(document.images||[]).length;i++){
+                          var im=document.images[i];var cs=getComputedStyle(im);
+                          if(cs.objectFit!=='cover')continue;
+                          var r=im.getBoundingClientRect();
+                          var pr=im.parentElement?im.parentElement.getBoundingClientRect():null;
+                          /* 铺满的判据：渲染矩形与其父容器一致（留边 = contain/模糊垫底那套老做法） */
+                          if(pr&&Math.abs(r.width-pr.width)<2&&Math.abs(r.height-pr.height)<2&&r.width>200){
+                            hit={img:Math.round(r.width)+'x'+Math.round(r.height),box:Math.round(pr.width)+'x'+Math.round(pr.height),nat:im.naturalWidth+'x'+im.naturalHeight,pos:cs.objectPosition};
+                            break
+                          }
+                        }
+                        return hit?JSON.stringify(hit):'(没有铺满容器的 cover 背景图)'
+                      })(),
+                      /*
+                       * v0.2.9：按钮文本排版核对（用户反馈「按钮上的文本显示不规范（全屏正常）」）。
+                       *
+                       * 判据一（wrap）：文本**被挤成多行** —— 必须同时满足
+                       *   ① 没有 white-space:nowrap（有 nowrap 就物理上不可能换行）；
+                       *   ② 文本自身不含换行符、内部也没有块级子元素（卡片式两行布局是有意为之）；
+                       *   ③ 内容高度 > 行高 × 1.6（固定高度的单个按钮不该按「一行 + 内边距」比，
+                       *      否则 h-8 的小按钮会被全部误报 —— 第一版就踩了这个误报）。
+                       * 判据二（clip）：横向溢出但没有省略号/横向滚动 = 文本被裁掉。
+                       * 返回空数组表示没有问题的按钮。
+                       */
+                      btnIssues:(function(){
+                        var out=[];
+                        Array.prototype.forEach.call(document.querySelectorAll('button,a[role="button"]'),function(b){
+                          var cs=getComputedStyle(b);
+                          if(cs.display==='none'||cs.visibility==='hidden')return;
+                          var txt=(b.innerText||'').trim();
+                          if(!txt)return;
+                          var lh=parseFloat(cs.lineHeight)||(parseFloat(cs.fontSize)*1.5);
+                          var intrinsicMulti = txt.indexOf('\n')>=0 || !!b.querySelector('div,p,ul,li,h1,h2,h3');
+                          var canWrap = cs.whiteSpace!=='nowrap';
+                          if(canWrap && !intrinsicMulti && b.clientHeight>lh*1.6){out.push('wrap:'+txt.slice(0,18))}
+                          else if(b.scrollWidth>b.clientWidth+2&&cs.textOverflow!=='ellipsis'&&cs.overflowX!=='auto'){out.push('clip:'+txt.slice(0,18))}
+                        });
+                        return JSON.stringify(out.slice(0,12))
+                      })(),
                       // 详情页核对用：把正文前 600 字带出来，能直接看到上映日期/导演/製作等是否渲染
                       text:(b?(b.innerText||'').replace(/\\s+/g,' ').slice(0,600):'')
                     })})()`
@@ -1679,82 +2069,7 @@ if (!gotLock) {
             console.log('[probe-test] done')
             markQuitting()
             app.quit()
-          }, 18000)
-        })()
-      }, 2000)
-    }
-
-    // libVLC 播放自检（SAKANA_VLC_TEST=视频文件）：嵌入 + 播放 + 状态日志后退出
-    if (process.env.SAKANA_VLC_TEST) {
-      setTimeout(() => {
-        void (async () => {
-          const { attachVlc, destroyVlc, getVlcState, vlcPlay } = await import('./services/vlc')
-          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
-          if (!win) {
-            console.log('[vlc-test] 无窗口')
-            markQuitting()
-            app.quit()
-            return
-          }
-          await new Promise<void>((resolve) => {
-            if (!win.webContents.isLoading()) return resolve()
-            win.webContents.once('did-finish-load', () => resolve())
-            setTimeout(resolve, 8000)
-          })
-          // 在页面中创建 #vlc-host 容器（自检用）
-          await win.webContents.executeJavaScript(
-            `(() => { const d = document.createElement('div'); d.id = 'vlc-host'; d.style.cssText = 'position:fixed;inset:44px 0 0 0;'; document.body.appendChild(d); return true })()`
-          )
-          const file = process.env.SAKANA_VLC_TEST!
-          console.log(`[vlc-test] 播放: ${file}`)
-          try {
-            // 直接实例化以获取完整错误堆栈
-            const { VlcPlayer, getLibVlcVersion } = await import('electron-vlc-player')
-            const { resolveVlcDir } = await import('./services/vlc')
-            const dir = resolveVlcDir()
-            console.log(`[vlc-test] vlcDir: ${dir}`)
-            try {
-              console.log('[vlc-test] libVLC 版本:', JSON.stringify(getLibVlcVersion()))
-            } catch (e) {
-              console.log('[vlc-test] 版本查询失败:', (e as Error).message)
-            }
-            const probe = new VlcPlayer({
-              window: win,
-              container: '#vlc-host',
-              vlcDir: dir!,
-              locale: 'zh-CN',
-              controls: true,
-              pageFullscreenButton: false
-            })
-            try {
-              await probe.embed()
-              console.log('[vlc-test] 直接 embed 成功')
-              probe.destroy()
-            } catch (e) {
-              console.log('[vlc-test] 直接 embed 失败:', (e as Error).stack ?? String(e))
-            }
-          } catch (e) {
-            console.log('[vlc-test] 实例化失败:', (e as Error).stack ?? String(e))
-          }
-          const r = await attachVlc(win)
-          console.log(`[vlc-test] 嵌入结果: ${JSON.stringify(r)}`)
-          if (r.ok) {
-            vlcPlay(file)
-            let lastLog = ''
-            for (let i = 0; i < 16; i++) {
-              await new Promise((res) => setTimeout(res, 1000))
-              const s = getVlcState()
-              const line = s ? `playing=${s.playing} time=${Math.round(s.time / 1000)}s length=${Math.round(s.length / 1000)}s` : 'not-ready'
-              if (line !== lastLog) {
-                console.log(`[vlc-test] ${line}`)
-                lastLog = line
-              }
-            }
-          }
-          destroyVlc()
-          console.log('[vlc-test] done')
-          markQuitting()
-          app.quit()
+          }, 12000)
         })()
       }, 2000)
     }

@@ -1,9 +1,10 @@
-import { app, BrowserWindow, dialog, nativeImage } from 'electron'
+﻿import { app, BrowserWindow, dialog, nativeImage } from 'electron'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { extname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { CacheInfo } from '@shared/api'
 import { store } from '../store'
+import { dataPaths } from './paths'
 
 // ---------------- 目录字节数 / 文件数 ----------------
 
@@ -51,14 +52,14 @@ function dirFileCount(dir: string): number {
 
 type CacheSettings = { cacheDir?: string }
 
-/** 缓存根目录：settings.cacheDir 优先，留空回退 userData/cache */
+/** 缓存根目录：settings.cacheDir 优先，留空回退**安装目录**下的 cache（v0.2.9 最后更新） */
 export function cacheRoot(): string {
   const s = store.get<CacheSettings>('settings', {})
   const custom = (s.cacheDir ?? '').trim()
-  return custom || join(app.getPath('userData'), 'cache')
+  return custom || dataPaths().cache
 }
 
-/** 是否使用用户自定义缓存目录（false = 默认 userData/cache） */
+/** 是否使用用户自定义缓存目录（false = 默认「安装目录/cache」） */
 export function cacheRootIsCustom(): boolean {
   const s = store.get<CacheSettings>('settings', {})
   return (s.cacheDir ?? '').trim().length > 0
@@ -68,11 +69,19 @@ export function cacheRootIsCustom(): boolean {
  * 参与缓存统计/清理的目录：
  * - <缓存根>/img：sakana-img 图片磁盘缓存
  * - <缓存根>/bangumi：日历/条目 JSON 缓存
- * - userData/galgame-covers：galgame 封面（固定目录，不随缓存根变化）
+ * - <缓存根>/galgame-covers：galgame 封面（v0.2.9 起也放进缓存根 ——
+ *   它过去固定在 userData 下，于是「清了缓存但封面还在」「C 盘占用说不清」两件事同时成立）
  */
 function imageCacheDirs(): string[] {
   const root = cacheRoot()
-  return [join(root, 'img'), join(root, 'bangumi'), join(app.getPath('userData'), 'galgame-covers')]
+  return [join(root, 'img'), join(root, 'bangumi'), join(root, 'galgame-covers')]
+}
+
+/** galgame 封面目录（v0.2.9：跟缓存根走，不再是 userData 下的固定目录） */
+export function galgameCoversDir(): string {
+  const dir = join(cacheRoot(), 'galgame-covers')
+  mkdirSync(dir, { recursive: true })
+  return dir
 }
 
 export function getCacheBytes(): CacheInfo {

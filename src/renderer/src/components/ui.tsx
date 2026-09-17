@@ -31,18 +31,34 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
   { variant = 'primary', size = 'md', icon: Icon, loading, className = '', children, disabled, ...rest },
   ref
 ) {
+  /*
+   * 小窗口（非最大化）下的排版修复：
+   * 中文标签的「最小内容宽度」只有一个字，flex 行一挤压，按钮就被压到很窄，
+   * 文字在固定高度（h-7 / h-9）里折成两行，被裁掉/重叠 —— 这就是用户看到的「文本显示不规范」。
+   * 处理：
+   *  1) 基类加 whitespace-nowrap：标签永远单行（行挤压时不再折行）；
+   *  2) 行容器负责让位（flex-wrap），标签本身保持完整；
+   *  3) 只有在按钮**宽度有约束**时（w-full / max-w-* / flex-1 / basis-*），
+   *     才让标签 span 变成 min-w-0 + truncate：按设计省略号截断，而不是溢出或折行。
+   */
+  const bounded = /(^|\s)(w-full|max-w-|flex-1|min-w-0|basis-)/.test(className)
+  const plainLabel = typeof children === 'string' || typeof children === 'number'
   return (
     <motion.button
       ref={ref}
       whileTap={{ scale: 0.97 }}
       disabled={disabled || loading}
-      className={`inline-flex items-center justify-center gap-1.5 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:pointer-events-none ${
+      className={`inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-lg font-medium transition-colors disabled:opacity-50 disabled:pointer-events-none ${
         size === 'sm' ? 'h-7 px-2.5 text-xs' : 'h-9 px-3.5 text-sm'
       } ${btnVariants[variant]} ${className}`}
       {...(rest as object)}
     >
       {loading ? <Loader2 size={size === 'sm' ? 12 : 15} className="animate-spin" /> : Icon ? <Icon size={size === 'sm' ? 13 : 15} /> : null}
-      {children}
+      {plainLabel ? (
+        <span className={bounded ? 'min-w-0 truncate' : 'whitespace-nowrap'}>{children}</span>
+      ) : (
+        children
+      )}
     </motion.button>
   )
 })
@@ -59,7 +75,7 @@ export function IconButton({ title, active, className = '', children, ...rest }:
     <motion.button
       whileTap={{ scale: 0.92 }}
       title={title}
-      className={`inline-flex h-8 w-8 items-center justify-center rounded-lg text-dim transition-colors hover:bg-elev2 hover:text-text disabled:opacity-40 disabled:pointer-events-none ${
+      className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-dim transition-colors hover:bg-elev2 hover:text-text disabled:opacity-40 disabled:pointer-events-none ${
         active ? 'bg-accent-soft text-accent' : ''
       } ${className}`}
       {...(rest as object)}
@@ -83,7 +99,7 @@ const badgeTones: Record<BadgeTone, string> = {
 
 export function Badge({ tone = 'neutral', className = '', children }: { tone?: BadgeTone; className?: string; children: ReactNode }) {
   return (
-    <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ${badgeTones[tone]} ${className}`}>
+    <span className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-[11px] font-medium ${badgeTones[tone]} ${className}`}>
       {children}
     </span>
   )

@@ -45,7 +45,7 @@ export function TrayPanelPage() {
           </span>
         </div>
         <button
-          className="rounded-md bg-accent-soft px-2 py-1 text-[10px] text-accent hover:bg-accent/20"
+          className="rounded-md bg-accent-soft px-2 py-1 text-[10px] text-accent hover:bg-accent/20 whitespace-nowrap"
           onClick={() => void api.window.showMain()}
         >
           打开主界面

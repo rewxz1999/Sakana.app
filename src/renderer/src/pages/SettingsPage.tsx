@@ -20,10 +20,10 @@ import {
   Wifi,
   WifiOff
 } from 'lucide-react'
-import type { UpdateInfo } from '@shared/types'
+import type { UpdateInfo, UpdateInstallState } from '@shared/types'
 import { api } from '@/lib/api'
 import { fmtDateTime } from '@/lib/format'
-import { useSettings } from '@/stores/app'
+import { toast, useSettings } from '@/stores/app'
 import { THEME_PRESETS } from '@/theme'
 import { Button, Input, Select, Spinner, Switch } from '@/components/ui'
 
@@ -84,17 +84,23 @@ const UPDATE_REPO_SLUG = 'rewxz1999/Sakana.app'
 const UPDATE_REPO_URL = `https://github.com/${UPDATE_REPO_SLUG}`
 
 /**
- * 「软件更新」区块：手动检查 git 仓库版本 + 展示结果 + 跳转下载页。
+ * 「软件更新」区块：检查 GitHub Releases → **应用内一键更新**（v0.2.9 最后更新）。
  *
- * 为什么抽成独立组件而不是把 state 摊在 SettingsPage 里：
- * 检查状态（结果 / 进行中 / 错误）只服务于这一块 UI，放进页面顶层会与缓存、主题等
- * 无关逻辑互相干扰；抽出来后又与 Section / OpenRow 的写法保持一致。
+ * 用户要求：安装包传到 GitHub Releases，应用以后都从 git 检测更新包，直接在应用内一键更新。
+ * 因此这里比旧版多了两件事：
+ * - 主进程能从 release 资产里拿到安装包 → 显示「下载更新」按钮与下载进度；
+ * - 下载完成后「立即重启更新」→ 主进程静默安装（`/S --force-run`）并自动拉起新版本。
+ * 只有版本号、没有资产时（旧 version.json 通道）保留「前往下载」的兜底。
+ *
  * 为什么不在挂载时自动检查：主进程启动后 8 秒已自动检查过一次，页面再触发一次纯属浪费。
  */
 function UpdateSection({ version }: { version: string }) {
   // null = 本次进入设置页后还没有手动检查过（此时不展示「已是最新版本」以免误导）
   const [info, setInfo] = useState<UpdateInfo | null>(null)
   const [checking, setChecking] = useState(false)
+  // 下载/安装状态（主进程推送）：进度条、失败原因、完成提示都靠它
+  const [phase, setPhase] = useState<UpdateInstallState>({ phase: 'idle' })
+  const [busy, setBusy] = useState(false)
   // IPC 层失败（preload 返回 ok:false）与业务失败（info.error）分开存，前者不能覆盖上一次的有效结果
   const [ipcError, setIpcError] = useState('')
 
@@ -109,9 +115,35 @@ function UpdateSection({ version }: { version: string }) {
     })
   }
 
+  // 进入页面时读一次当前下载状态（可能上次已经在下载了），并订阅后续推送
+  useEffect(() => {
+    void api.app.updateState().then((r) => {
+      if (r.ok) setPhase(r.data)
+    })
+    return api.app.onUpdateState((s) => setPhase(s))
+  }, [])
+
   // 用系统浏览器打开，避免更新下载页被应用内窗口拦截
   const openExternal = (url: string): void => {
     void api.app.openUrl(url)
+  }
+
+  const download = (): void => {
+    setBusy(true)
+    void api.app.updateDownload().then((r) => {
+      setBusy(false)
+      if (!r.ok) toast.error(r.error)
+      else if (!r.data.ok) toast.warn(r.data.message)
+      else toast.success('安装包已下载完成，可以立即更新')
+    })
+  }
+
+  const install = (): void => {
+    void api.app.updateInstall().then((r) => {
+      if (!r.ok) toast.error(r.error)
+      else if (!r.data.ok) toast.warn(r.data.message)
+      else toast.info(r.data.message)
+    })
   }
 
   // 主进程返回的 current 来自 app.getVersion()，是权威值；渲染层单独取的版本号只作兜底
@@ -123,9 +155,16 @@ function UpdateSection({ version }: { version: string }) {
   const hasUpdate = errorText === '' && info?.hasUpdate === true
   const latest = info?.latest ?? ''
   const notes = info?.notes ?? ''
+  const downloading = phase.phase === 'downloading'
+  const percent =
+    downloading && phase.total > 0 ? Math.min(100, Math.round((phase.received / phase.total) * 100)) : 0
+  const fmtMB = (n: number): string => `${(n / 1024 / 1024).toFixed(1)} MB`
 
   return (
-    <Section title="软件更新" desc={`应用启动时会自动检查一次；更新来自 GitHub 仓库 ${UPDATE_REPO_SLUG}。`}>
+    <Section
+      title="软件更新"
+      desc={`应用启动时会自动检查一次；更新包来自 GitHub Releases（${UPDATE_REPO_SLUG}），可直接在应用内下载安装。`}
+    >
       <div className="flex flex-col gap-3">
         {/* 当前版本 + 手动检查入口 */}
         <div className="flex items-center justify-between gap-3">
@@ -162,15 +201,49 @@ function UpdateSection({ version }: { version: string }) {
             <div className="flex items-center gap-2 text-xs font-medium text-accent">
               <Download size={13} /> 发现新版本 v{latest}
             </div>
-            {/* notes 来自 version.json，可能自带多行更新说明，必须保留换行 */}
+            {/* notes 来自 release 说明，可能自带多行内容，必须保留换行 */}
             {notes ? (
-              <div className="mt-1 whitespace-pre-wrap text-[11px] leading-relaxed text-dim">{notes}</div>
+              <div className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap text-[11px] leading-relaxed text-dim">
+                {notes}
+              </div>
             ) : null}
-            <div className="mt-2">
-              <Button size="sm" icon={ExternalLink} onClick={() => openExternal(repoUrl)}>
-                前往下载
+
+            {/* 下载进度：主进程按已收字节推送，这里只画条 */}
+            {downloading ? (
+              <div className="mt-2">
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-elev3">
+                  <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${percent}%` }} />
+                </div>
+                <div className="mt-1 text-[11px] text-dim">
+                  正在下载安装包… {percent}%（{fmtMB(phase.received)} / {fmtMB(phase.total)}）
+                </div>
+              </div>
+            ) : null}
+
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              {phase.phase === 'done' || phase.phase === 'installing' ? (
+                <Button size="sm" icon={Download} loading={phase.phase === 'installing'} onClick={install}>
+                  {phase.phase === 'installing' ? '正在安装…' : `立即重启更新到 v${latest}`}
+                </Button>
+              ) : (
+                <Button size="sm" icon={Download} loading={downloading || busy} onClick={download}>
+                  {downloading ? '下载中…' : `下载更新（v${latest}${info?.assetSize ? ` · ${fmtMB(info.assetSize)}` : ''}）`}
+                </Button>
+              )}
+              <Button variant="outline" size="sm" icon={ExternalLink} onClick={() => void api.app.updateOpenReleases()}>
+                打开 Releases 页面
               </Button>
             </div>
+            {phase.phase === 'failed' ? (
+              <div className="mt-1.5 text-[11px] leading-relaxed text-danger">
+                下载失败：{phase.message}（可点「打开 Releases 页面」手动下载）
+              </div>
+            ) : null}
+            {!info?.canInstall ? (
+              <div className="mt-1.5 text-[11px] leading-relaxed text-faint">
+                这一版在 Releases 上没有找到 Windows 安装包，请到 Releases 页面手动下载。
+              </div>
+            ) : null}
           </div>
         ) : info ? (
           <div className="flex items-center gap-2 text-[11px] text-dim">
@@ -284,7 +357,7 @@ export function SettingsPage() {
             <OpenRow
               icon={MonitorPlay}
               title="播放器设置"
-              desc="播放内核、FFmpeg / libVLC 路径与播放器快捷键"
+              desc="播放内核（libmpv）、FFmpeg 路径与播放器快捷键"
               onOpen={() => openSmall('/player-settings', 700, 620, '播放器设置')}
             />
             <RowDivider />

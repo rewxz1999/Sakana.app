@@ -22,7 +22,9 @@ export const SHORTCUTS: ShortcutDef[] = [
   { action: 'screenshot', label: '截屏', desc: '保存当前画面', defaultKey: 's' },
   { action: 'episodes', label: '选集', desc: '打开/关闭选集面板', defaultKey: 'l' },
   { action: 'info', label: '详情', desc: '显示/隐藏番剧详情', defaultKey: 'i' },
-  { action: 'subtitle', label: '字幕切换', desc: '循环切换字幕（HTML5 模式）', defaultKey: 'c' }
+  { action: 'subtitle', label: '字幕切换', desc: '循环切换字幕（HTML5 模式）', defaultKey: 'c' },
+  // v0.2.9 最后更新：倍速（README 一直宣称有、实际缺失，对照 Kazumi 时补上）
+  { action: 'speed', label: '倍速切换', desc: '循环切换播放倍速（0.5x → 3x）', defaultKey: 'x' }
 ]
 
 export type ShortcutMap = Record<string, string>

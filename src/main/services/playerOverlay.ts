@@ -4,12 +4,40 @@ import { CH } from '@shared/channels'
 import { log } from '../log'
 
 /**
- * 全屏控制栏悬浮窗
+ * 控制栏悬浮窗
  *
  * 为什么需要它：libmpv / libVLC 的画面是**原生子窗口**，永远绘制在网页内容之上，
  * 所以页面里的控制栏无法叠在画面上。全屏时若要让画面铺满整屏、控制栏又能浮在画面上，
- * 只能另开一个**透明、无边框、置顶**的窗口来承载控制栏（electron-vlc-player 的
- * overlay 窗口也是同样的思路）。
+ * 只能另开一个**透明、无边框**的窗口来承载控制栏。
+ *
+ * ## z 序（v0.2.9 彻底改掉，用户第三次反馈同一个现象）
+ *
+ * 用户的现象：把播放器放到别的应用窗口后面时，**播放器会强行占住最前面那个窗口的位置**，
+ * 同时控制栏按钮全部失灵，而播放快捷键仍然有效。
+ *
+ * 根因（Windows 的窗口分层规则）：
+ * 1. 视频是**主窗口的 WS_CHILD 子窗口**（见 native/mpv/src/addon.cc 的 CreateChildWindow），
+ *    它只会跟着主窗口一起被盖住，本身不会抢全局 z 序；
+ * 2. 真正抢位的是这个悬浮窗。它过去是 `alwaysOnTop('screen-saver')`（最高的置顶层），
+ *    于是主窗口退到后台时，铺满整个窗口区域的悬浮窗**仍然浮在别人的窗口上面** ——
+ *    看起来就是「播放器抢占最前面窗口的位置」；
+ * 3. 更关键的是：`setAlwaysOnTop(false)` 走的是 `SetWindowPos(HWND_NOTOPMOST)`，
+ *    它的语义是「放到**非置顶窗口的最上面**」—— 也就是说「降级」这个动作本身
+ *    又把悬浮窗提到了其它应用窗口之上。所以 v0.2.8 那版「失焦就降 topmost」的修法
+ *    根本没能让它退到别人窗口后面（这正是用户说「修了很多次都没解决」的原因）；
+ * 4. 按钮失灵：悬浮窗默认是**点击穿透**的（`setIgnoreMouseEvents(true)`），
+ *    由渲染层的「控制栏可见」心跳切成可点击。主窗口一旦不在前台，心跳状态与实际状态就会错位，
+ *    于是控制栏可见却仍然穿透 —— 点下去落到别人窗口上，什么都不会发生；
+ *    而快捷键由主进程的全局快捷键处理，所以照旧有效。
+ *
+ * 现在的做法（只有一条规则，没有看护进程）：
+ * - **任何情况下都不调用 setAlwaysOnTop**。悬浮窗是主窗口的 owned window
+ *   （Windows 上 owned window 始终在主窗口之上、并随主窗口一起被别的窗口盖住），
+ *   主窗口退到后台时它就跟着退到后台，不可能再「抢占最前面的位置」；
+ * - 显隐只跟主窗口的最小化/隐藏走，失焦不再改变显隐；
+ * - 「是否接收点击」由**主进程**统一裁决：既要渲染层希望可点击（控制栏真的显示着），
+ *   也要主窗口确实在前台（`owner.isFocused() && !isMinimized()`）；不满足就是点击穿透。
+ *   这样「看得见却点不动」和「点到了看不见的窗口」两类问题都不可能出现。
  *
  * 职责边界：
  * - 本模块只负责窗口的创建/定位/显示/销毁，以及「状态下行、动作上行」的消息中转；
@@ -20,51 +48,6 @@ let overlayWin: BrowserWindow | null = null
 let ownerWin: BrowserWindow | null = null
 /** 跟随主窗口尺寸/位置的监听器解绑函数（悬浮窗销毁时必须解绑，否则会泄漏监听） */
 let followDisposers: (() => void)[] = []
-/** 前台状态轮询定时器（见 startFocusWatch） */
-let focusWatchTimer: NodeJS.Timeout | null = null
-
-function stopFocusWatch(): void {
-  if (focusWatchTimer) {
-    clearInterval(focusWatchTimer)
-    focusWatchTimer = null
-  }
-}
-
-/**
- * 前台状态看护（v0.2.8 附加五，用户定位的显示 bug）。
- *
- * 现象：播放器窗口被别的窗口盖住时，**控制栏悬浮窗仍然浮在那个窗口上面**
- * （视频是主窗口的原生子窗口，会跟着一起被盖住，而悬浮窗是 `alwaysOnTop`），
- * 于是控制栏「卡」在别人窗口的位置上、点什么都没反应；等这个状态结束后，播放器按钮全部失灵。
- *
- * 为什么不能只靠 `blur` 事件：窗口被别的应用盖住但未真正失焦、
- * 或者事件在我们的时序里被别的操作盖掉时，blur 不一定送达 —— 状态就会卡住。
- * 这里用 500ms 轮询**主动核对**「主窗口是否前台」，不前台就收起控制栏，
- * 回到前台再恢复；顺带把点击穿透状态复位，避免留下「看得见但点不动」的窗口。
- */
-function startFocusWatch(owner: BrowserWindow): void {
-  stopFocusWatch()
-  focusWatchTimer = setInterval(() => {
-    if (!overlayWin || overlayWin.isDestroyed()) {
-      stopFocusWatch()
-      return
-    }
-    if (owner.isDestroyed()) {
-      stopFocusWatch()
-      return
-    }
-    const foreground = owner.isFocused() && !owner.isMinimized() && owner.isVisible()
-    const shown = overlayWin.isVisible()
-    if (!foreground && shown) {
-      overlayWin.hide()
-      setOverlayInteractive(false)
-      log.append('info', 'overlay', '主窗口不在前台，控制栏已收起（避免浮在其它窗口之上）')
-    } else if (foreground && !shown && !owner.isDestroyed()) {
-      overlayWin.showInactive()
-      log.append('info', 'overlay', '主窗口回到前台，控制栏已恢复')
-    }
-  }, 500)
-}
 
 function stopFollowing(): void {
   for (const off of followDisposers) {
@@ -78,33 +61,37 @@ function stopFollowing(): void {
 }
 
 /**
- * 让悬浮窗跟随主窗口的移动与缩放。
+ * 让悬浮窗跟随主窗口的移动、缩放与显隐。
  *
  * v0.2.5 起主窗口恢复自由缩放：不跟随的话，窗口拉大后悬浮窗仍是旧尺寸，
  * 控制栏按钮的实际位置与命中区域错位 —— 表现为「点了全屏按钮没反应」。
+ *
+ * v0.2.9（用户第三次反馈「播放器会强行抢占最前面窗口的位置」）——这一版把 z 序彻底理顺：
+ * **不再对悬浮窗调用 setAlwaysOnTop**（见文件头注释），悬浮窗只作为主窗口的
+ * owned window 跟随主窗口的 z 序；这里只处理显隐与几何跟随。
  */
 function startFollowing(owner: BrowserWindow): void {
   stopFollowing()
   const sync = (): void => syncBounds()
-  /**
-   * 主窗口失焦 / 最小化时把悬浮窗一并藏起来。
-   *
-   * 悬浮窗是 `alwaysOnTop('screen-saver')` 的置顶窗口 —— 用户切到别的应用后它依然浮在最上层
-   * （反馈里的「播放器退到后台了控制栏还在前台」就是它，出现次数少是因为多数时候控制栏刚好是隐藏态）。
-   * 重新获得焦点 / 还原窗口时再显示。
-   */
+  /** 最小化 / 隐藏（关闭到托盘）时跟着主窗口一起收起来 */
   const hideForOwner = (): void => {
     if (overlayWin && !overlayWin.isDestroyed()) overlayWin.hide()
   }
+  const onForegroundChange = (): void => {
+    // 主窗口被激活时 Windows 会把主窗口提到同层顶端，悬浮窗要重新插回它上方
+    raiseAboveOwner()
+    applyInteractive()
+  }
   const showForOwner = (): void => {
     if (overlayWin && !overlayWin.isDestroyed()) overlayWin.showInactive()
+    raiseAboveOwner()
   }
-  owner.on('blur', hideForOwner)
   owner.on('minimize', hideForOwner)
   owner.on('hide', hideForOwner)
-  owner.on('focus', showForOwner)
   owner.on('restore', showForOwner)
   owner.on('show', showForOwner)
+  owner.on('focus', onForegroundChange)
+  owner.on('blur', onForegroundChange)
   owner.on('resize', sync)
   owner.on('move', sync)
   owner.on('maximize', sync)
@@ -112,12 +99,12 @@ function startFollowing(owner: BrowserWindow): void {
   owner.on('enter-full-screen', sync)
   owner.on('leave-full-screen', sync)
   followDisposers = [
-    () => owner.off('blur', hideForOwner),
     () => owner.off('minimize', hideForOwner),
     () => owner.off('hide', hideForOwner),
-    () => owner.off('focus', showForOwner),
     () => owner.off('restore', showForOwner),
     () => owner.off('show', showForOwner),
+    () => owner.off('focus', onForegroundChange),
+    () => owner.off('blur', onForegroundChange),
     () => owner.off('resize', sync),
     () => owner.off('move', sync),
     () => owner.off('maximize', sync),
@@ -129,6 +116,29 @@ function startFollowing(owner: BrowserWindow): void {
 
 function rendererUrl(): string {
   return join(__dirname, '../renderer/index.html')
+}
+
+/**
+ * 把悬浮窗插到主窗口**正上方**（v0.2.9 的关键一步）。
+ *
+ * 为什么需要它：去掉 `alwaysOnTop` 之后，控制栏不能再抢全局最前面（这正是用户要的），
+ * 但主窗口被激活时 Windows 会把**主窗口**提到同层顶端，owned window 不一定跟着回去 ——
+ * 实测窗口化状态下 `WindowFromPoint` 在控制栏位置命中的是主窗口的页面窗口，
+ * 也就是控制栏被自己的页面盖住了（全屏时反而正常，因为那时主窗口没有页面区域压在上面）。
+ *
+ * `moveAbove(owner)` 在 Windows 上就是 `SetWindowPos(overlay, owner, …)`：
+ * 把悬浮窗**紧贴在主窗口上方**，而不是提到「最上层」——
+ * 于是主窗口在别的应用后面时，悬浮窗也跟着在后面（不抢位），
+ * 主窗口在前台时悬浮窗又在主窗口之上（控制栏看得见、点得到）。
+ * 这一步是「既要在自己窗口之上、又不许抢别人位置」的正解。
+ */
+function raiseAboveOwner(): void {
+  if (!overlayWin || overlayWin.isDestroyed() || !ownerWin || ownerWin.isDestroyed()) return
+  try {
+    overlayWin.moveAbove(ownerWin.getMediaSourceId())
+  } catch (err) {
+    log.append('warn', 'overlay', `把控制栏插到主窗口上方失败: ${String((err as Error)?.message ?? err)}`)
+  }
 }
 
 export function isOverlayOpen(): boolean {
@@ -157,13 +167,17 @@ export function showOverlay(owner: BrowserWindow): number {
   if (overlayWin && !overlayWin.isDestroyed()) {
     syncBounds()
     /*
-     * v0.2.8 附加三/五：窗口还在但**被隐藏**时也要重新显示 ——
-     * 但**只有主窗口在前台时才恢复**：否则控制栏又会浮到别的窗口上面（用户定位的那个 bug）。
+     * 窗口还在但**被隐藏**时重新显示。
+     * v0.2.9 起不再需要「只有主窗口在前台才恢复」这个前提：悬浮窗不置顶，
+     * 主窗口在后台时它本来就会被一起盖住，显示了也不会浮在别人窗口上。
+     * 只排除「主窗口已最小化」——那种情况下显示没有任何意义。
      */
-    if (!overlayWin.isVisible() && owner.isFocused() && !owner.isMinimized()) {
+    if (!overlayWin.isVisible() && !owner.isMinimized()) {
       overlayWin.showInactive()
       log.append('info', 'overlay', '悬浮窗此前处于隐藏状态，已重新显示')
     }
+    raiseAboveOwner()
+    applyInteractive()
     overlayGen += 1
     return overlayGen
   }
@@ -207,8 +221,13 @@ export function showOverlay(owner: BrowserWindow): number {
   })
   // 默认点击穿透（鼠标移动仍会转发给本窗口，用于唤出控制栏）
   overlayWin.setIgnoreMouseEvents(true, { forward: true })
+  rendererWantsInteractive = false
   overlayInteractive = false
-  overlayWin.setAlwaysOnTop(true, 'screen-saver')
+  /*
+   * 注意：这里**故意不调用 setAlwaysOnTop**（任何层级都不调用）。
+   * 悬浮窗作为主窗口的 owned window 天然位于主窗口之上、且随主窗口一起被别的窗口盖住，
+   * 够用且永远不会「抢占最前面的位置」；理由详见文件头注释。
+   */
   overlayWin.on('closed', () => {
     overlayWin = null
   })
@@ -219,9 +238,11 @@ export function showOverlay(owner: BrowserWindow): number {
   const devUrl = process.env['ELECTRON_RENDERER_URL']
   if (!app.isPackaged && devUrl) void overlayWin.loadURL(`${devUrl}#/overlay`)
   else void overlayWin.loadFile(rendererUrl(), { hash: '/overlay' })
-  overlayWin.once('ready-to-show', () => overlayWin?.showInactive())
-  startFocusWatch(owner)
-  log.append('info', 'overlay', `控制栏悬浮窗已创建（第 ${myGen} 代）`)
+  overlayWin.once('ready-to-show', () => {
+    overlayWin?.showInactive()
+    raiseAboveOwner()
+  })
+  log.append('info', 'overlay', `控制栏悬浮窗已创建（第 ${myGen} 代，不置顶）`)
   logOverlayOwner('control bar owner')
   return myGen
 }
@@ -243,7 +264,6 @@ export function destroyOverlay(gen?: number): void {
   if (gen !== undefined && gen !== overlayGen) return
   overlayGen += 1 // 之后到达的旧 hide 请求一律作废
   stopFollowing()
-  stopFocusWatch()
   if (overlayWin && !overlayWin.isDestroyed()) {
     overlayWin.destroy()
   }
@@ -253,20 +273,50 @@ export function destroyOverlay(gen?: number): void {
 /** 是否把鼠标事件交给悬浮窗（控制栏可见时=true，可点击；隐藏时=false 点击穿透） */
 /** 当前悬浮窗是否在接收鼠标事件（点击穿透的反面）—— 自检用 */
 let overlayInteractive = false
+/** 渲染层**希望**的交互状态（控制栏是否真的显示着）；最终是否生效还要看主窗口在不在前台 */
+let rendererWantsInteractive = false
+
+/**
+ * 主进程统一裁决「悬浮窗是否接收鼠标事件」（v0.2.9）。
+ *
+ * 渲染层只说「我希望可点击」（控制栏显示时），主进程再叠加「主窗口必须在前台」这个条件。
+ * 这样就不会出现「控制栏显示着却点不动」或「点到了其实在后台的窗口上」。
+ */
+function applyInteractive(): void {
+  const want = rendererWantsInteractive
+  const foreground =
+    !!ownerWin && !ownerWin.isDestroyed() && ownerWin.isFocused() && !ownerWin.isMinimized()
+  const next = want && foreground
+  if (next !== overlayInteractive) {
+    // 只在真正变化时记一行：点击穿透状态是「按钮没反应」的第一嫌疑，排障时需要看到它的切换
+    log.append(
+      'info',
+      'overlay',
+      `悬浮窗鼠标交互：${next ? '接收点击' : '点击穿透'}` +
+        (want && !foreground ? '（主窗口不在前台，控制栏不接受点击）' : '')
+    )
+  }
+  overlayInteractive = next
+  if (!overlayWin || overlayWin.isDestroyed()) return
+  overlayWin.setIgnoreMouseEvents(!next, { forward: true })
+}
 
 export function setOverlayInteractive(interactive: boolean): void {
-  if (interactive !== overlayInteractive) {
-    // 只在真正变化时记一行：点击穿透状态是「按钮没反应」的第一嫌疑，排障时需要看到它的切换
-    log.append('info', 'overlay', `悬浮窗鼠标交互：${interactive ? '接收点击' : '点击穿透'}`)
-  }
-  overlayInteractive = interactive
-  if (!overlayWin || overlayWin.isDestroyed()) return
-  overlayWin.setIgnoreMouseEvents(!interactive, { forward: true })
+  rendererWantsInteractive = interactive
+  applyInteractive()
 }
 
 /** 自检：读当前是否可交互 */
 export function isOverlayInteractive(): boolean {
   return overlayInteractive
+}
+
+/**
+ * 自检：悬浮窗当前是否处于置顶状态。
+ * v0.2.9 的预期值**永远是 false** —— 一旦变成 true 就说明又有代码在抢 z 序。
+ */
+export function isOverlayAlwaysOnTop(): boolean {
+  return !!overlayWin && !overlayWin.isDestroyed() && overlayWin.isAlwaysOnTop()
 }
 
 /** 播放页 → 悬浮窗：同步控制栏所需状态 */

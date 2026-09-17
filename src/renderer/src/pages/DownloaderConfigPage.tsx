@@ -196,14 +196,14 @@ export function DownloaderConfigPage() {
               <div className="mt-0.5 text-[11px] text-faint">外部下载器不随应用分发，需要自行安装</div>
             </div>
             <button
-              className="text-accent hover:underline"
+              className="text-accent hover:underline whitespace-nowrap"
               onClick={() => void api.app.openPath('https://www.qbittorrent.org/download')}
             >
               qbittorrent.org/download
             </button>
           </div>
           <p className="text-[11px] leading-relaxed text-faint">
-            提示：应用已内置 aria2c 与 FFmpeg、libVLC；若自行下载 aria2，解压后把「aria2c.exe 路径」指向该文件即可。
+            提示：应用已内置 aria2c 与 FFmpeg、libmpv；若自行下载 aria2，解压后把「aria2c.exe 路径」指向该文件即可。
             点击 aria2 下载链接时，若检测到已内置会先提示「已内置，通常无需下载」，再次点击才会打开下载页。
           </p>
         </div>

@@ -1,24 +1,6 @@
 import type { BrowserWindow } from 'electron'
 import { getSettings } from '../net'
-import { log } from '../log'
 import { proxyHlsUrl } from './adFilter'
-import {
-  attachVlc,
-  destroyVlc,
-  vlcAddSubtitleFile,
-  vlcGetState,
-  vlcNotifyLayout,
-  vlcPlay,
-  vlcSeekSec,
-  vlcSetAspect,
-  vlcSetMute,
-  vlcSetPlaylist,
-  vlcSetSubtitle,
-  vlcSetVolume,
-  vlcSnapshot,
-  vlcSubtitleTracks,
-  vlcTogglePause
-} from './vlc'
 import {
   mpvAddSubtitleFile,
   mpvAttach,
@@ -32,6 +14,7 @@ import {
   mpvSetBounds,
   mpvSetMute,
   mpvSetPlaylist,
+  mpvSetSpeed,
   mpvSetSubtitle,
   mpvSetVolume,
   mpvSnapshot,
@@ -40,9 +23,15 @@ import {
 } from './mpv'
 
 /**
- * 播放内核调度器：渲染层只调用一套 API，
- * 由这里按设置（settings.playerEngine）在 libVLC 与 libmpv 之间分发。
- * libmpv 不可用时自动回退 libVLC，保证任何环境下都能播放。
+ * 播放内核门面（v0.2.9：VLC 内核已整体删除，只保留 libmpv）。
+ *
+ * 保留这一层的原因：
+ * - 渲染层与 IPC 一直只调用这套 `engine*` 接口，视频区域矩形上报、HLS 广告过滤、
+ *   字幕/截图/画面比例等**跨切面逻辑**都收敛在这里；
+ * - 删掉 VLC 后不需要把这些调用点全部重写（那正是「为了稳定」最不该做的事）。
+ *
+ * 历史包袱已清掉的部分：内核选择设置（playerEngine）、挂载失败时回退 libVLC 的兜底、
+ * `mounted` 状态跟踪 —— 现在只有一个内核，不存在错配问题。
  */
 
 export interface PlayerBounds {
@@ -52,52 +41,21 @@ export interface PlayerBounds {
   height: number
 }
 
-/**
- * 实际已挂载的内核。
- * 必须记录它：engineAttach 在 libmpv 初始化失败时会回退 libVLC，
- * 若后续仍按"偏好"选 mpv，就会出现「画面挂的是 VLC、播放却调用 mpv」的错配
- * （mpvPlay 抛「libmpv 尚未就绪」、getState 返回 null → 完全不能播）。
- */
-let mounted: 'mpv' | 'vlc' | null = null
-
-/** 按设置/自检开关得到"期望使用"的内核（未挂载时的偏好） */
-function preferredEngine(): 'mpv' | 'vlc' {
-  // 自检/排障：SAKANA_FORCE_ENGINE=mpv|vlc 可临时指定内核，不修改用户设置
-  const forced = process.env.SAKANA_FORCE_ENGINE
-  if (forced === 'vlc') return 'vlc'
-  if (forced === 'mpv') return mpvAvailable() ? 'mpv' : 'vlc'
-  const wantMpv = getSettings().playerEngine === 'mpv'
-  if (wantMpv && mpvAvailable()) return 'mpv'
-  return 'vlc'
-}
-
-/** 当前实际使用的内核（已挂载则一律以挂载结果为准） */
-export function activeEngine(): 'mpv' | 'vlc' {
-  return mounted ?? preferredEngine()
+/** 当前内核：恒定 libmpv（保留函数是为了让调用方与日志继续有单一出处） */
+export function activeEngine(): 'mpv' {
+  return 'mpv'
 }
 
 export function engineAttach(
   win: BrowserWindow,
   bounds?: PlayerBounds
 ): Promise<{ ok: boolean; message: string }> {
-  const engine = preferredEngine()
-  if (engine === 'mpv') {
-    const b = bounds ?? { x: 0, y: 56, width: 1280, height: 640 }
-    const r = mpvAttach(win, b)
-    if (r.ok) {
-      mounted = 'mpv'
-      return Promise.resolve(r)
-    }
-    log.append('warn', 'player', `libmpv 启用失败，回退 libVLC: ${r.message}`)
-  }
-  return attachVlc(win).then((r) => {
-    mounted = r.ok ? 'vlc' : null
-    return r
-  })
+  const b = bounds ?? { x: 0, y: 56, width: 1280, height: 640 }
+  return Promise.resolve(mpvAttach(win, b))
 }
 
 export function engineSetBounds(bounds: PlayerBounds): void {
-  if (activeEngine() === 'mpv') mpvSetBounds(bounds)
+  mpvSetBounds(bounds)
 }
 
 export function enginePlay(path: string, referer?: string, cookies?: string): void {
@@ -107,29 +65,28 @@ export function enginePlay(path: string, referer?: string, cookies?: string): vo
    * 非 .m3u8 输入、过滤关闭、或中转服务未就绪时 proxyHlsUrl 原样返回，
    * 因此这里对本地文件与中转流是零副作用。
    */
-  const src = proxyHlsUrl(path, { referer, cookies })
-  if (activeEngine() === 'mpv') mpvPlay(src, referer, cookies)
-  else vlcPlay(src, referer, cookies)
+  mpvPlay(proxyHlsUrl(path, { referer, cookies }), referer, cookies)
 }
 
 export function engineTogglePause(): void {
-  if (activeEngine() === 'mpv') mpvTogglePause()
-  else vlcTogglePause()
+  mpvTogglePause()
 }
 
 export function engineSeekSec(sec: number): void {
-  if (activeEngine() === 'mpv') mpvSeekSec(sec)
-  else vlcSeekSec(sec)
+  mpvSeekSec(sec)
 }
 
 export function engineSetVolume(volume: number): void {
-  if (activeEngine() === 'mpv') mpvSetVolume(volume)
-  else vlcSetVolume(volume)
+  mpvSetVolume(volume)
+}
+
+/** 播放倍速（v0.2.9 最后更新：README 一直宣称有，实际缺失，这里补上） */
+export function engineSetSpeed(speed: number): void {
+  mpvSetSpeed(speed)
 }
 
 export function engineSetMute(muted: boolean): void {
-  if (activeEngine() === 'mpv') mpvSetMute(muted)
-  else vlcSetMute(muted)
+  mpvSetMute(muted)
 }
 
 export function engineGetState(): {
@@ -139,60 +96,53 @@ export function engineGetState(): {
   volume: number
   muted: boolean
 } | null {
-  if (activeEngine() === 'mpv') {
-    const st = mpvGetState()
-    if (!st || !st.ready) return null
-    return { time: st.time, length: st.length, playing: !st.paused, volume: st.volume, muted: st.mute }
-  }
-  return vlcGetState()
+  const st = mpvGetState()
+  if (!st || !st.ready) return null
+  return { time: st.time, length: st.length, playing: !st.paused, volume: st.volume, muted: st.mute }
 }
 
 export function engineSubtitleTracks(): { id: number; label: string }[] {
-  return activeEngine() === 'mpv' ? mpvSubtitleTracks() : vlcSubtitleTracks()
+  return mpvSubtitleTracks()
 }
 
 export function engineSetSubtitle(id: number): void {
-  if (activeEngine() === 'mpv') mpvSetSubtitle(id)
-  else vlcSetSubtitle(id)
+  mpvSetSubtitle(id)
 }
 
 export function engineAddSubtitleFile(path: string): void {
-  if (activeEngine() === 'mpv') mpvAddSubtitleFile(path)
-  else vlcAddSubtitleFile(path)
+  mpvAddSubtitleFile(path)
 }
 
 export function engineSnapshot(file: string): void {
-  if (activeEngine() === 'mpv') mpvSnapshot(file)
-  else vlcSnapshot(file)
+  mpvSnapshot(file)
 }
 
 export function engineNotifyLayout(bounds?: PlayerBounds): void {
   if (bounds) engineSetBounds(bounds)
-  if (activeEngine() === 'mpv') mpvNotifyLayout()
-  else vlcNotifyLayout()
+  mpvNotifyLayout()
 }
 
 /** 画面比例：fit=适应 / cover=裁剪铺满 / stretch=拉伸铺满 */
-export function engineSetAspect(
-  mode: 'fit' | 'cover' | 'stretch',
-  areaW: number,
-  areaH: number
-): void {
-  if (activeEngine() === 'mpv') mpvSetAspect(mode)
-  else vlcSetAspect(mode, areaW, areaH)
+export function engineSetAspect(mode: 'fit' | 'cover' | 'stretch'): void {
+  mpvSetAspect(mode)
 }
 
 export function engineDetach(): void {
-  // 两个后端都清理，避免切换内核后残留
   mpvDestroy()
-  destroyVlc()
-  mounted = null
 }
 
 export function engineSetPlaylist(paths: string[]): void {
-  if (activeEngine() === 'mpv') {
-    mpvSetPlaylist(paths)
-    return
-  }
-  vlcSetPlaylist(paths)
+  mpvSetPlaylist(paths)
+}
+
+/** 内核运行时是否就绪（libmpv DLL + 原生插件都在）——设置页与自检共用 */
+export function engineAvailable(): boolean {
+  return mpvAvailable()
+}
+
+/** 供设置页显示：当前内核名（固定 mpv） */
+export function engineName(): string {
+  const s = getSettings() as unknown as { playerEngine?: string }
+  // 兼容历史设置文件里残留的 playerEngine 字段：不再影响行为，仅用于日志提示
+  return s.playerEngine === 'vlc' ? 'mpv（已移除 VLC 内核，强制使用 libmpv）' : 'libmpv'
 }

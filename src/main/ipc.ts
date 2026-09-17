@@ -7,6 +7,7 @@ import type {
   AddDownloadInput,
   GalRecentShot,
   GalToolsConfig,
+  LocalTargetInput,
   SubHistoryItem,
   SubscribeAndDownloadInput,
   Subscription
@@ -18,6 +19,7 @@ import { store } from './store'
 import { bangumi } from './services/bangumi'
 import { mikan } from './services/mikan'
 import { downloadManager } from './services/downloader/manager'
+import { deleteLocalResources, localDirInfo, removeDownloadRecords } from './services/downloader/localCleanup'
 import { aria2 } from './services/downloader/aria2'
 import { listVideos } from './services/media'
 import { ruleEpisodes, rulePlay, ruleSearch, rulesRepoImport, rulesRepoIndex } from './services/rules'
@@ -29,13 +31,20 @@ import {
   stopRuleProbe
 } from './services/ruleProbe'
 import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
-import { mpvRuntimeAvailable } from './services/mpv'
+import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending } from './services/mpv'
 import { buildStreamInfo } from './services/playerInfo'
-import { checkUpdate, REPO_URL } from './services/updater'
-import { fetchDanmaku, loadDanmaku, matchDanmaku, prefetchDanmaku } from './services/danmaku'
+import {
+  checkUpdate,
+  downloadUpdate,
+  installUpdate,
+  onUpdateInstallState,
+  openReleases,
+  REPO_URL,
+  updateInstallState
+} from './services/updater'
+import { fetchDanmaku, loadDanmaku, matchDanmaku, prefetchDanmaku, writeDanmakuXml } from './services/danmaku'
 import { saveDirsInfo, setSaveDirs } from './services/saveDirs'
 import { ffmpegExe, inspectMedia, startLive, startLiveUrl, stopLive } from './services/transcode'
-import { resolveVlcDir } from './services/vlc'
 import {
   engineAddSubtitleFile,
   engineAttach,
@@ -46,6 +55,7 @@ import {
   engineSeekSec,
   engineSetAspect,
   engineSetMute,
+  engineSetSpeed,
   engineSetPlaylist,
   engineSetSubtitle,
   engineSetVolume,
@@ -77,13 +87,16 @@ import {
   galgameService
 } from './services/galgame'
 import {
+  galListShots,
   galPickDir,
+  galRecentShots,
   galScreenshotNow,
   galToolsCleanup,
   galToolsGet,
   galToolsInit,
   galToolsSet
 } from './services/galgameTools'
+import { galSearchSites } from './services/galgameSearch'
 import { statExportImage } from './services/statExport'
 import { maybeShowSaveHint } from './services/onboarding'
 import { ensureSaveDirs } from './services/saveDirs'
@@ -98,6 +111,33 @@ function addSubHistory(kind: SubHistoryItem['kind'], title: string, detail: stri
   const list = store.get<SubHistoryItem[]>('subHistory', [])
   list.unshift({ id: randomUUID(), kind, title, detail, at: Date.now() })
   store.set('subHistory', list.slice(0, 500))
+}
+
+/**
+ * 播放器截图路径（v0.2.9，用户指定的新规则）。
+ *
+ * - **目录**：`<截图目录>/<番剧名>图片/` —— 每部番剧一个文件夹，
+ *   否则上百张截图全堆在根目录里没法找（用户明确要求「文件夹名字为番剧名+图片」）；
+ * - **文件名**：`<番剧名>_<集数>_<分.秒>.png`，例如 `无职转生_12_17.26.png`
+ *   （`17.26` = 第 12 集播到 17 分 26 秒）；
+ * - 时间取**内核当前播放位置**而不是墙上时间 —— 用户要的是「当前播放集的几分几秒」，
+ *   用系统时间的话同一集的截图完全无法按剧情定位；
+ *   注意 `engineGetState().time` 的单位是**毫秒**（原生插件里是 `time-pos * 1000`），
+ *   这里必须除以 1000 再换算「分.秒」—— 第一版漏了这步，截出来是 `282.13` 这种离谱值；
+ * - 集数未知（本地文件没解析出集数）时省略该段，退化成 `<番剧名>_<分.秒>.png`。
+ */
+function snapshotPath(title?: string, episode?: number): string {
+  const settings = store.get<{ screenshotDir?: string }>('settings', {})
+  const root = settings.screenshotDir || join(app.getPath('userData'), 'screenshots')
+  const safe = (s: string): string => s.replace(/[\\/:*?"<>|]/g, '_').trim()
+  const name = title ? safe(title).slice(0, 60) || 'sakana' : 'sakana'
+  const dir = join(root, `${name}图片`)
+  mkdirSync(dir, { recursive: true })
+  const st = engineGetState()
+  const sec = Math.max(0, Math.floor((st?.time ?? 0) / 1000))
+  const stamp = `${Math.floor(sec / 60)}.${String(sec % 60).padStart(2, '0')}`
+  const ep = episode && episode > 0 ? `_${episode}` : ''
+  return join(dir, `${name}${ep}_${stamp}.png`)
 }
 
 export function registerIpc(): void {
@@ -137,6 +177,9 @@ export function registerIpc(): void {
   ipcMain.handle(CH.bgmSubject, (_e, id: number) => bangumi.subject(id))
   ipcMain.handle(CH.bgmSearch, (_e, keyword: string) => bangumi.search(keyword))
   ipcMain.handle(CH.bgmRatings, (_e, ids: number[]) => bangumi.ratings(ids))
+  ipcMain.handle(CH.bgmSeason, (_e, year: number, month: number, force?: boolean) =>
+    bangumi.season(Number(year), Number(month), !!force)
+  )
   ipcMain.handle(CH.bgmTestMirrors, () => bangumi.testMirrors())
 
   // ---------- 蜜柑计划 ----------
@@ -240,6 +283,19 @@ export function registerIpc(): void {
   ipcMain.handle(CH.dlStatus, () => downloadManager.test())
   ipcMain.handle(CH.dlTest, () => downloadManager.test())
 
+  // ---------- 本地资源（自动推导下载目录 / 删除本地资源 / 只删下载记录） ----------
+  /** 卡片上的「本地播放」先问这里：目录自动推导，不再弹文件夹选择框 */
+  ipcMain.handle(CH.dlLocalDir, (_e, input: LocalTargetInput) => localDirInfo(input))
+  /**
+   * 删除本地资源：磁盘文件 + 下载记录 + 订阅集数复位（界面已做二次确认）。
+   * 删除明细写进运行日志（订阅历史是给用户看的「订阅/下载」流水，不适合塞路径）。
+   */
+  ipcMain.handle(CH.dlDeleteLocal, (_e, input: LocalTargetInput) => deleteLocalResources(input))
+  /** 只删下载记录，绝不删文件 */
+  ipcMain.handle(CH.dlRemoveRecords, (_e, input: { animeTitle?: string; ids?: string[] }) =>
+    removeDownloadRecords(input)
+  )
+
   // ---------- 播放规则引擎 ----------
   ipcMain.handle(CH.rulesSearch, (_e, ruleId: string, keyword: string) => ruleSearch(ruleId, keyword))
   ipcMain.handle(CH.rulesEpisodes, (_e, ruleId: string, entry) => ruleEpisodes(ruleId, entry))
@@ -280,7 +336,7 @@ export function registerIpc(): void {
   // 规则仓库导入（KazumiRules 镜像优先）
   ipcMain.handle(CH.rulesRepoIndex, () => rulesRepoIndex())
   ipcMain.handle(CH.rulesRepoImport, (_e, names: string[]) => rulesRepoImport(names))
-  // 播放页流嗅探（隐藏窗口捕获 m3u8/mp4 → libVLC 直连）
+  // 播放页流嗅探（隐藏窗口捕获 m3u8/mp4 → 交给 libmpv 直连）
   ipcMain.handle(CH.ruleProbeStart, (_e, url: string, referer?: string) => {
     const w = getMainWindow()
     if (!w) return false
@@ -352,83 +408,110 @@ export function registerIpc(): void {
       startLiveUrl(url, opts)
   )
 
-  // ---------- libVLC 播放器 ----------
-  ipcMain.handle(CH.vlcAttach, (_e, bounds?: { x: number; y: number; width: number; height: number }) => {
+  // ---------- 播放内核（libmpv） ----------
+  ipcMain.handle(CH.playerAttach, (_e, bounds?: { x: number; y: number; width: number; height: number }) => {
     const w = focused()
     if (!w) return { ok: false, message: '窗口不存在' }
     return engineAttach(w, bounds)
   })
-  ipcMain.handle(CH.vlcPlay, (_e, path: string, referer?: string, cookies?: string) => {
+  ipcMain.handle(CH.playerPlay, (_e, path: string, referer?: string, cookies?: string) => {
     enginePlay(path, referer, cookies)
     return true
   })
-  ipcMain.handle(CH.vlcSetPlaylist, (_e, paths: string[]) => {
+  ipcMain.handle(CH.playerSetPlaylist, (_e, paths: string[]) => {
     engineSetPlaylist(paths)
     return true
   })
-  ipcMain.handle(CH.vlcTogglePause, () => {
+  ipcMain.handle(CH.playerTogglePause, () => {
     engineTogglePause()
     return true
   })
-  ipcMain.handle(CH.vlcSeek, (_e, sec: number) => {
+  ipcMain.handle(CH.playerSeek, (_e, sec: number) => {
     engineSeekSec(sec)
     return true
   })
-  ipcMain.handle(CH.vlcSetVolume, (_e, volume: number) => {
+  ipcMain.handle(CH.playerSetVolume, (_e, volume: number) => {
     engineSetVolume(volume)
     return true
   })
-  ipcMain.handle(CH.vlcGetState, () => {
+  ipcMain.handle(CH.playerGetState, () => {
     try {
       return engineGetState()
     } catch {
       return { time: 0, length: 0, playing: false, volume: 100, muted: false }
     }
   })
-  ipcMain.handle(CH.vlcSetMute, (_e, muted: boolean) => {
+  // v0.2.9 最后更新：播放倍速（0.25–4）
+  ipcMain.handle(CH.playerSetSpeed, (_e, speed: number) => {
+    engineSetSpeed(speed)
+    return true
+  })
+  ipcMain.handle(CH.playerSetMute, (_e, muted: boolean) => {
     engineSetMute(muted)
     return true
   })
-  ipcMain.handle(CH.vlcSubtitleTracks, () => engineSubtitleTracks())
-  ipcMain.handle(CH.vlcSetSubtitle, (_e, id: number) => {
+  ipcMain.handle(CH.playerSubtitleTracks, () => engineSubtitleTracks())
+  ipcMain.handle(CH.playerSetSubtitle, (_e, id: number) => {
     engineSetSubtitle(id)
     return true
   })
-  ipcMain.handle(CH.vlcAddSubtitleFile, (_e, path: string) => {
+  ipcMain.handle(CH.playerAddSubtitleFile, (_e, path: string) => {
     engineAddSubtitleFile(path)
     return true
   })
-  ipcMain.handle(CH.vlcSnapshot, (_e, title?: string) => {
-    const settings = store.get<{ screenshotDir?: string }>('settings', {})
-    const dir = settings.screenshotDir || join(app.getPath('userData'), 'screenshots')
-    mkdirSync(dir, { recursive: true })
-    const ts = new Date()
-    const pad = (n: number): string => String(n).padStart(2, '0')
-    const timeStr = `${ts.getFullYear()}${pad(ts.getMonth() + 1)}${pad(ts.getDate())}_${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}`
-    // 命名规则：番剧名_时间.png（无番剧名时退回 sakana_时间.png）
-    const prefix = title ? title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 60) : 'sakana'
-    const file = join(dir, `${prefix}_${timeStr}.png`)
+  ipcMain.handle(CH.playerSnapshot, (_e, title?: string, episode?: number) => {
+    const file = snapshotPath(title, episode)
     engineSnapshot(file)
     log.append('info', 'player', `播放器截图已保存: ${file}`)
     maybeShowSaveHint()
     return file
   })
-  ipcMain.handle(CH.vlcDetach, () => {
-    // 异步销毁：libVLC 的 stop/destroy 可能阻塞主进程（表现为退出播放时界面卡死）
+  ipcMain.handle(CH.playerDetach, () => {
+    // 异步销毁：内核的 stop/destroy 可能阻塞主进程（表现为退出播放时界面卡死）
     setImmediate(() => engineDetach())
     return true
   })
-  ipcMain.handle(CH.vlcNotifyLayout, (_e, bounds?: { x: number; y: number; width: number; height: number }) => {
+  ipcMain.handle(CH.playerNotifyLayout, (_e, bounds?: { x: number; y: number; width: number; height: number }) => {
     engineNotifyLayout(bounds)
     return true
   })
   ipcMain.handle(
-    CH.vlcSetAspect,
-    (_e, mode: 'fit' | 'cover' | 'stretch', areaW: number, areaH: number) => {
-      engineSetAspect(mode, areaW, areaH)
+    CH.playerSetAspect,
+    (_e, mode: 'fit' | 'cover' | 'stretch') => {
+      engineSetAspect(mode)
       return true
     }
   )
+  // v0.2.8 附加七：把播放页地址告知 mpv 的 B 站弹幕脚本（我们播的是直链，脚本无法自行反推页面）
+  ipcMain.handle(CH.playerDanmakuSource, (_e, pageUrl: string) => {
+    mpvSetDanmakuSource(pageUrl)
+    return true
+  })
+  /*
+   * v0.2.9：uosc_danmaku（mpv 弹幕插件）集成。
+   * 渲染层只发「语义」，插件真正的能力（菜单、搜索、样式、延迟）由它自己实现 ——
+   * 这样上游插件更新时我们只需要替换资源目录，不用改业务代码。
+   */
+  ipcMain.handle(CH.playerUoscStatus, () => ({
+    requested: uoscDanmakuRequested(),
+    active: uoscDanmakuActive(),
+    // v2.1.0 没有「条数」属性，只有 has-danmaku 布尔值：够用来判断插件到底有没有把弹幕挂上
+    loaded: mpvUoscDanmakuLoaded(),
+    // 有弹幕在排队等 mpv 载入文件：渲染层此时应当「再等等」而不是回落到画布
+    pending: mpvPluginDanmakuPending()
+  }))
+  ipcMain.handle(CH.playerUoscMenu, (_e, which: 'search' | 'total' | 'style' | 'delay' | 'add') =>
+    mpvOpenDanmakuMenu(which)
+  )
+  ipcMain.handle(CH.playerUoscVisible, (_e, on: boolean) => mpvSetUoscDanmakuVisible(Boolean(on)))
+  ipcMain.handle(CH.playerUoscClear, () => {
+    mpvClearUoscDanmakuSource()
+    return true
+  })
+  ipcMain.handle(CH.playerUoscDelay, (_e, offsetMs: number) => {
+    mpvPushDanmakuDelay(offsetMs)
+    return true
+  })
   // ---------- 全屏控制栏悬浮窗 ----------
   /*
    * v0.2.8 附加 修「控制栏按钮点了没反应」：
@@ -461,28 +544,19 @@ export function registerIpc(): void {
   ipcMain.on(CH.overlayPoke, () => pokeOverlay())
   // 悬浮窗 → 播放页
   ipcMain.on(CH.overlayAction, (_e, action: Record<string, unknown>) => sendOverlayAction(action))
-  ipcMain.handle(CH.playerScreenshot, async (_e, title?: string) => {
+  ipcMain.handle(CH.playerScreenshot, async (_e, title?: string, episode?: number) => {
     const w = focused()
     if (!w) throw new Error('窗口不存在')
     const image = await w.webContents.capturePage()
-    const settings = store.get<{ screenshotDir?: string }>('settings', {})
-    const dir = settings.screenshotDir || join(app.getPath('userData'), 'screenshots')
-    mkdirSync(dir, { recursive: true })
-    const ts = new Date()
-    const pad = (n: number): string => String(n).padStart(2, '0')
-    const timeStr = `${ts.getFullYear()}${pad(ts.getMonth() + 1)}${pad(ts.getDate())}_${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}`
-    // 命名规则：番剧名_时间.png
-    const prefix = title ? title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 60) : 'sakana'
-    const file = join(dir, `${prefix}_${timeStr}.png`)
+    const file = snapshotPath(title, episode)
     writeFileSync(file, image.toPNG())
     log.append('info', 'player', `截图已保存: ${file}`)
     maybeShowSaveHint()
     return file
   })
 
-  // 内置组件探测：libVLC / FFmpeg / aria2 / libmpv 是否随包内置
+  // 内置组件探测：libmpv / FFmpeg / aria2 是否随包内置
   ipcMain.handle(CH.playerAssets, async () => ({
-    vlc: resolveVlcDir() !== null,
     ffmpeg: ffmpegExe() !== null,
     aria2: (await aria2.findBinary()) !== null,
     mpv: mpvRuntimeAvailable()
@@ -599,25 +673,12 @@ export function registerIpc(): void {
   ipcMain.handle(CH.galPickDir, async () => galPickDir())
   ipcMain.handle(CH.galScreenshotNow, async () => galScreenshotNow())
   ipcMain.handle(CH.galOverlayShot, async () => galScreenshotNow())
-  // 最近截图：读取截图目录，返回最新 30 个图片文件
-  ipcMain.handle(CH.galRecentShots, () => {
-    const dir = galToolsGet().dir || join(app.getPath('userData'), 'screenshots', 'galgame')
-    if (!existsSync(dir)) return [] as GalRecentShot[]
-    const exts = new Set(['.png', '.jpg', '.jpeg', '.webp'])
-    const out: GalRecentShot[] = []
-    for (const name of readdirSync(dir)) {
-      if (!exts.has(extname(name).toLowerCase())) continue
-      try {
-        const st = statSync(join(dir, name))
-        if (!st.isFile()) continue
-        out.push({ path: join(dir, name), mtime: st.mtimeMs, name })
-      } catch {
-        /* 忽略单个文件读取失败 */
-      }
-    }
-    out.sort((a, b) => b.mtime - a.mtime)
-    return out.slice(0, 30)
-  })
+  // 最近截图：截图目录 + 各游戏子目录里最新的 30 张（兼容旧版直接放在根目录的截图）
+  ipcMain.handle(CH.galRecentShots, () => galRecentShots(30))
+  // 某款游戏自己的截图：只读 <截图目录>/<游戏名>/，供游戏卡片上的「最近截图」使用
+  ipcMain.handle(CH.galListShots, (_e, gameName: string) => galListShots(String(gameName ?? '')))
+  // 站点搜索统计：并行查 7 个资源站，只回「数量 + 跳转链接」，绝不回传站点内容
+  ipcMain.handle(CH.galSearchSites, (_e, keyword: string) => galSearchSites(String(keyword ?? '')))
   // 统计工具：导出列表为图片（自选保存位置）
   ipcMain.handle(CH.statExportImage, (_e, listId: string) => statExportImage(listId))
 
@@ -660,6 +721,24 @@ export function registerIpc(): void {
   // ---------- v0.2.4：播放状态栏 / 更新检查 / 弹幕 ----------
   ipcMain.handle(CH.playerStreamInfo, () => buildStreamInfo())
   ipcMain.handle(CH.appUpdateCheck, () => checkUpdate(true))
+  /*
+   * v0.2.9 最后更新：应用内一键更新。
+   * - download：下载安装包到「安装目录/data/updates」，进度通过 ev:update-state 下行；
+   * - install：`installer.exe /S --force-run` 静默安装并自动重启（本进程先退出，避免文件占用）；
+   * - openReleases：该版本没有可用安装包资产时的兜底（引导用户去 Releases 页面）。
+   */
+  ipcMain.handle(CH.appUpdateDownload, () => downloadUpdate())
+  ipcMain.handle(CH.appUpdateInstall, () => installUpdate())
+  ipcMain.handle(CH.appUpdateOpenReleases, () => {
+    openReleases()
+    return true
+  })
+  ipcMain.handle(CH.appUpdateState, () => updateInstallState())
+  onUpdateInstallState((s) => {
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (!w.isDestroyed()) w.webContents.send(CH.evUpdateState, s)
+    }
+  })
   ipcMain.handle(CH.appOpenUrl, async (_e, url: string) => {
     const target = /^https?:\/\//i.test(String(url ?? '')) ? String(url) : REPO_URL
     await shell.openExternal(target)
@@ -667,11 +746,23 @@ export function registerIpc(): void {
   })
   ipcMain.handle(CH.danmakuMatch, (_e, title: string, episode: number) => matchDanmaku(title, episode))
   ipcMain.handle(CH.danmakuComments, (_e, episodeId: number) => fetchDanmaku(episodeId))
-  // v0.2.8：播放器与本地播放共用的一步到位接口（opts.aliases / aliasMode 用于「别名检测弹幕」）
+  /*
+   * v0.2.8：播放器与本地播放共用的一步到位接口（opts.aliases / aliasMode 用于「别名检测弹幕」）
+   *
+   * v0.2.9：如果用户把弹幕渲染方式选成了 uosc_danmaku（mpv 插件），
+   * 这里顺手把**同一份**合并后的弹幕写成 B 站格式 XML 交给插件渲染 ——
+   * 两个渲染器数据完全一致，插件不需要自己再请求一次（也不会出现两边数量不一样的困惑）。
+   */
   ipcMain.handle(
     CH.danmakuLoad,
-    (_e, title: string, episode: number, opts?: { aliases?: string[]; aliasMode?: boolean }) =>
-      loadDanmaku(title, episode, opts)
+    async (_e, title: string, episode: number, opts?: { aliases?: string[]; aliasMode?: boolean }) => {
+      const r = await loadDanmaku(title, episode, opts)
+      if (r && r.comments.length > 0 && uoscDanmakuRequested()) {
+        const file = writeDanmakuXml(r.comments, `${r.episodeId}:${r.episodeTitle}`)
+        if (file) mpvPushDanmakuFile(file)
+      }
+      return r
+    }
   )
   // v0.2.8 附加：预取（只预热缓存，不回传弹幕本体），用于「进播放/切集时提前加载」
   ipcMain.handle(

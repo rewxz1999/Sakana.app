@@ -60,24 +60,25 @@ export function SubPage({
   return (
     <div className="h-full overflow-y-auto px-5 py-4">
       <div className={`mx-auto flex flex-col ${gap} pb-8 ${maxWidth}`}>
-        <div className="flex items-start gap-3">
+        {/* 窄窗口（小窗口 / 非最大化）下让标题先换行，右侧操作按钮组保持完整，不被挤到折行 */}
+        <div className="flex flex-wrap items-start gap-3">
           {api.window.isSmallWindow ? null : (
             <button
               onClick={() => navigate(-1)}
               title="返回上一页"
-              className="mt-0.5 flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-border px-2.5 text-xs text-dim transition-colors hover:border-accent hover:text-accent"
+              className="mt-0.5 flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-border px-2.5 text-xs text-dim transition-colors hover:border-accent hover:text-accent whitespace-nowrap"
             >
               <ArrowLeft size={13} /> 返回
             </button>
           )}
-          <div className="min-w-0 flex-1">
+          <div className="min-w-[10rem] flex-1">
             <h1 className="flex items-center gap-2 text-base font-bold">
               {Icon ? <Icon size={17} className="text-accent" /> : null}
               {title}
             </h1>
             {desc ? <p className="mt-0.5 text-[11px] leading-relaxed text-faint">{desc}</p> : null}
           </div>
-          {actions ? <div className="flex shrink-0 items-center gap-2">{actions}</div> : null}
+          {actions ? <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div> : null}
         </div>
         {children}
       </div>
@@ -89,10 +90,9 @@ export function SubPage({
 // 下载链接：已内置时先提示、二次点击才打开下载页
 // ============================================================
 
-export type BuiltinAsset = 'vlc' | 'ffmpeg' | 'aria2'
+export type BuiltinAsset = 'ffmpeg' | 'aria2'
 
 const ASSET_NAME: Record<BuiltinAsset, string> = {
-  vlc: 'libVLC',
   ffmpeg: 'FFmpeg',
   aria2: 'aria2c'
 }
@@ -138,7 +138,7 @@ export function AssetLink({
   }
 
   return (
-    <button className={className} onClick={onClick}>
+    <button className={`whitespace-nowrap ${className}`} onClick={onClick}>
       {label ?? `${name} 下载页`}
       {builtin ? <span className="ml-1 text-[10px] text-ok">已内置</span> : null}
     </button>

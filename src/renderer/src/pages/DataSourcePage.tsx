@@ -206,7 +206,7 @@ export function DataSourcePage() {
                   m === main && m !== ''
                     ? 'border-accent bg-accent-soft text-accent'
                     : 'border-border text-faint hover:border-accent/50'
-                }`}
+                } whitespace-nowrap `}
               >
                 {m === main && m !== '' ? <Check size={12} /> : null}
                 {m === main && m !== '' ? '主' : '设为主'}
@@ -225,7 +225,7 @@ export function DataSourcePage() {
             <div className="py-4 text-center text-xs text-faint">暂无数据源，点击下方「+ 新增数据源」开始添加</div>
           ) : null}
         </div>
-        <div className="mt-3 flex items-center gap-2">
+        <div className="mt-3 flex flex-wrap items-center gap-2">
           <Button size="sm" variant="outline" icon={CirclePlus} onClick={addMirror}>
             新增数据源
           </Button>

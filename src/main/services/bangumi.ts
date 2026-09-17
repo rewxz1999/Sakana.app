@@ -6,13 +6,18 @@ import axios from 'axios'
 import type {
   CalendarDay,
   CalendarResult,
+  CoverImages,
   MirrorTestResult,
+  Rating,
   SearchResult,
   SearchResultItem,
+  SeasonItem,
+  SeasonResult,
   SourceError,
   SubjectDetail,
   SubjectResult
 } from '@shared/types'
+import { monthsOfSeason, seasonIndexOfMonth } from '@shared/season'
 import { log } from '../log'
 import { BROWSER_UA, buildProxyAgents, getSettings } from '../net'
 import { store } from '../store'
@@ -31,6 +36,22 @@ const TTL_CALENDAR = 30 * 60 * 1000
 const TTL_SUBJECT = 30 * 24 * 3600 * 1000
 const TTL_SEARCH = 30 * 60 * 1000
 const TTL_RATING = 30 * 24 * 3600 * 1000
+/**
+ * 季度条目缓存（v0.2.9 附加）。
+ *
+ * 一个季度的条目（名称/封面/放送日/评分）是**几乎不变**的数据，
+ * 而这个接口一次要打三个月份（见 season()），是反代上最贵的查询之一。
+ * 7 天足以覆盖「当季新番陆续追加」的节奏，同时让「关掉弹窗再打开」完全不联网。
+ */
+const TTL_SEASON = 7 * 24 * 3600 * 1000
+/**
+ * 每个月份的取数上限。
+ *
+ * 实测反代支持 `limit=100`：2026 年 4 月（新番最多的一个月）`total=75`，
+ * 一页就能取全；余下月份都在 10 条量级。超过 100 条的月份现实中不存在，
+ * 因此这里不做分页，只取一页（真出现时也只会少几条尾巴，不会报错）。
+ */
+const SEASON_PAGE_LIMIT = 100
 const REQUEST_TIMEOUT = 12000
 /**
  * 自建反代的并发闸门（v0.2.7 附加）。
@@ -612,6 +633,109 @@ class BangumiService {
         return { fromCache: true, stale: true, fetchedAt: cache.fetchedAt, days: cache.data, error }
       }
       return { fromCache: false, fetchedAt: null, days: [], error }
+    }
+  }
+
+  /**
+   * 取某个季度的番剧列表（v0.2.9 附加：「预览 20xx年春」弹窗）。
+   *
+   * 数据源用的是官方 v0 的条目检索：`GET /v0/subjects?type=2&year=<y>&month=<m>&sort=rank&limit=100`。
+   * 它按「放送月份（air_date 的月份）」过滤，所以**一个季度 = 三个月份合并 + 按 id 去重**；
+   * 月份与季度的对应关系（1–3 月 冬 / 4–6 月 春 / 7–9 月 夏 / 10–12 月 秋）统一放在
+   * `@shared/season` 里，主进程与渲染层共用，避免「文案说春季、实际查的是 1 月」。
+   *
+   * 实测反代（sankana-bangumi.de5.net/api）：
+   * - `?type=2&year=2026&month=4&sort=rank&limit=100` → 200，`total=75`，一页取全（4.4s，首次）
+   * - 只给 `month` 不给 `year` → `total=3062`（历年所有 4 月番），所以 year 必传
+   * - 返回体是 `{data, total, limit, offset}`，条目里放送日期字段是 `date`
+   *   （不是放送接口的 `air_date`），封面已被反代改写成 `/img/r/400/…` 的缩放地址。
+   *
+   * month 允许传该季度里的任意一个月，内部会规范化到季度（缓存键也只认季度）。
+   */
+  async season(year: number, month: number, force = false): Promise<SeasonResult> {
+    const y = Math.trunc(year) || new Date().getFullYear()
+    const season = seasonIndexOfMonth(month)
+    const key = `season-${y}-${season}`
+    const cache = this.readCache<SeasonItem[]>(key)
+    if (!force && cache && Date.now() - cache.fetchedAt < TTL_SEASON) {
+      return { year: y, season, fromCache: true, fetchedAt: cache.fetchedAt, items: cache.data }
+    }
+    try {
+      const items = await this.fetchSeason(y, season)
+      this.writeCache(key, items)
+      return { year: y, season, fromCache: false, fetchedAt: Date.now(), items }
+    } catch (err) {
+      const error: SourceError =
+        err && typeof err === 'object' && 'kind' in err
+          ? (err as SourceError)
+          : makeSourceError('NETWORK', String(err), [])
+      log.append('warn', 'bangumi', `获取季度番剧失败 (${y}-Q${season}): ${error.message}`)
+      // 过期缓存照样可用：季度条目几乎不变，宁可给旧数据也不要空弹窗
+      if (cache) {
+        return { year: y, season, fromCache: true, stale: true, fetchedAt: cache.fetchedAt, items: cache.data, error }
+      }
+      return { year: y, season, fromCache: false, fetchedAt: null, items: [], error }
+    }
+  }
+
+  /**
+   * 拉取一个季度的三个月份并合并去重。
+   *
+   * 三个月并行发（`requestBest` 内部的并发闸门会把实际并发压到 2，不会打爆个人反代）；
+   * **只要有一个月成功就返回该月的数据** —— 某个月偶发 5xx 时，
+   * 用户看到的是「少了几条、但列表照常可用」，而不是整块「该季度数据暂不可用」。
+   */
+  private async fetchSeason(year: number, season: number): Promise<SeasonItem[]> {
+    const months = monthsOfSeason(season)
+    const settled = await Promise.allSettled(months.map((m) => this.fetchSeasonMonth(year, m)))
+    const lists = settled.filter((r) => r.status === 'fulfilled').map((r) => r.value)
+    if (lists.length === 0) {
+      const first = settled.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined
+      throw first?.reason ?? new Error('季度取数失败')
+    }
+    const seen = new Set<number>()
+    const items: SeasonItem[] = []
+    // 保持接口给的顺序（sort=rank：热度/排名靠前的在前），仅按 id 去重
+    for (const list of lists) {
+      for (const item of list) {
+        if (item.id <= 0 || seen.has(item.id)) continue
+        seen.add(item.id)
+        items.push(item)
+      }
+    }
+    return items
+  }
+
+  /** 取某个季度的单个月份（`/v0/subjects?type=2&year=&month=&sort=rank`） */
+  private async fetchSeasonMonth(year: number, month: number): Promise<SeasonItem[]> {
+    const path = `/v0/subjects?type=2&year=${year}&month=${month}&sort=rank&limit=${SEASON_PAGE_LIMIT}`
+    /*
+     * 三个路径都给同一个地址：季度检索只有 v0 JSON 接口有（官方网页版的 /anime/browser
+     * 是另一套 HTML，解析成本高且公共镜像已基本不可达）。
+     * 配了自建反代时 requestBest 只会用反代；若用户把数据源切回纯网页镜像，
+     * 这里会拿到 HTML —— 下面 isApiMirror 判定后直接报错，界面显示「该季度数据暂不可用」，
+     * 而不是把 HTML 当 JSON 解析崩掉。
+     */
+    const { text, mirror } = await this.requestBest({ api: path, web: path, customApi: path })
+    if (!isApiMirror(mirror)) {
+      throw makeSourceError('PARSE', '当前数据源不支持季度接口（需要用 API 型数据源，如自建反代）', [mirror])
+    }
+    const parsed = JSON.parse(text) as { data?: Record<string, unknown>[] }
+    const list = Array.isArray(parsed?.data) ? parsed.data : []
+    return list.map((raw) => this.normalizeSeasonItem(raw))
+  }
+
+  private normalizeSeasonItem(raw: Record<string, unknown>): SeasonItem {
+    // 与 normalizeSubject 同样的坑：v0 的放送日期字段是 `date`，两种命名都读
+    const airDate = raw.air_date ?? raw.date
+    return {
+      id: Number(raw.id ?? 0),
+      name: String(raw.name ?? ''),
+      name_cn: String(raw.name_cn ?? ''),
+      images: (raw.images as CoverImages | null) ?? null,
+      rating: (raw.rating as Rating | null) ?? null,
+      air_date: airDate ? String(airDate) : null,
+      platform: raw.platform ? String(raw.platform) : undefined
     }
   }
 

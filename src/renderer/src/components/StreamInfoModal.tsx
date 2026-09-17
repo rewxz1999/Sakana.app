@@ -65,7 +65,7 @@ export function StreamInfoModal({
           <span className="text-sm font-semibold text-text">播放状态 · 流详情</span>
           <div className="flex items-center gap-2">
             <button
-              className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-dim transition-colors hover:bg-elev2 hover:text-text"
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-dim transition-colors hover:bg-elev2 hover:text-text whitespace-nowrap"
               onClick={() => void load()}
               disabled={loading}
             >

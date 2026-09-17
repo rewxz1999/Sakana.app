@@ -35,7 +35,7 @@ interface MarksState {
   showcase: string[]
   loaded: boolean
   load: () => Promise<void>
-  createList: (name?: string) => MarkList
+  createList: (name?: string, keyword?: string) => MarkList
   renameList: (id: string, name: string) => void
   removeList: (id: string) => void
   addMark: (listId: string, subject: MarkSubjectInput) => void
@@ -86,11 +86,18 @@ export const useMarks = create<MarksState>((set, get) => ({
       loaded: true
     })
   },
-  createList: (name) => {
+  /**
+   * 新建书签。
+   * keyword = 创建时搜索框里的关键词：搜索页书签弹窗的「重新搜索」靠它重跑一次搜索
+   * （老书签没有这个字段，页面会退化成用条目标题去搜）。
+   */
+  createList: (name, keyword) => {
+    const kw = keyword?.trim()
     const list: MarkList = {
       id: crypto.randomUUID(),
       name: name?.trim() || defaultListName(get().lists),
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      ...(kw ? { keyword: kw } : {})
     }
     const next = [...get().lists, list]
     set({ lists: next })

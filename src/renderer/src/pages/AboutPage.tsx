@@ -151,21 +151,20 @@ export function AboutPage() {
       <Card title="内置组件" desc="随安装包一同分发，无需额外安装">
         <AssetItem name="libmpv（播放内核 / 默认推荐）" ok={assets?.mpv ?? null} />
         <div className="border-t border-border" />
-        <AssetItem name="libVLC（播放内核 / 备选）" ok={assets?.vlc ?? null} />
         <div className="border-t border-border" />
         <AssetItem name="FFmpeg（转码 / 在线流中转）" ok={assets?.ffmpeg ?? null} />
         <div className="border-t border-border" />
         <AssetItem name="aria2c（内置下载器）" ok={assets?.aria2 ?? null} />
         <p className="mt-2 text-[11px] leading-relaxed text-faint">
-          未内置时可在「播放器设置」「下载器配置」中填写自行安装的路径；libmpv 不可用时会自动回退 libVLC。
+          未内置时可在「播放器设置」「下载器配置」中填写自行安装的路径。
         </p>
       </Card>
 
       {/* 技术栈 */}
       <Card title="技术栈">
         <div className="flex flex-wrap gap-1.5">
-          {['Electron', 'React', 'TypeScript', 'Vite', 'Node.js', 'libmpv', 'libVLC', 'aria2', 'FFmpeg'].map((t) => (
-            <span key={t} className="rounded-full bg-elev2 px-2.5 py-0.5 text-[11px] text-dim">
+          {['Electron', 'React', 'TypeScript', 'Vite', 'Node.js', 'libmpv', 'aria2', 'FFmpeg'].map((t) => (
+            <span key={t} className="rounded-full bg-elev2 px-2.5 py-0.5 text-[11px] text-dim whitespace-nowrap">
               {t}
             </span>
           ))}
@@ -194,7 +193,7 @@ export function AboutPage() {
           <li>参考项目 Kazumi（在线播放规则引擎与规则仓库格式）</li>
           <li>galgame 数据来自月幕 galgame 与 VNDB</li>
           <li>番剧数据来自 Bangumi，资源来自蜜柑计划</li>
-          <li>内置播放内核 libmpv 与 libVLC、内置下载器 aria2、转码组件 FFmpeg</li>
+          <li>内置播放内核 libmpv、内置下载器 aria2、转码组件 FFmpeg</li>
         </ul>
       </Card>
     </SubPage>

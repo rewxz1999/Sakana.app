@@ -49,6 +49,27 @@ export function DanmakuSettingsPage() {
         </Button>
       }
     >
+      <Card title="渲染方式" desc="两种方式用的是同一份弹幕数据（季集判定与多来源合并都由应用完成）">
+        <Row
+          label="由谁绘制"
+          desc="内置画布与控制栏同层，几乎不吃性能；mpv 插件用字幕层渲染，自带样式/搜索菜单"
+        >
+          <Pill active={d.renderer !== 'uosc'} onClick={() => patch({ renderer: 'canvas' })}>
+            内置画布
+          </Pill>
+          <Pill active={d.renderer === 'uosc'} onClick={() => patch({ renderer: 'uosc' })}>
+            mpv 插件（uosc_danmaku）
+          </Pill>
+        </Row>
+        <div className="border-t border-border pt-2.5 text-[11px] leading-relaxed text-faint">
+          选择「mpv 插件」后，进入播放器时应用会把这一集的弹幕交给内置的 <code className="font-mono">uosc_danmaku</code>{' '}
+          插件渲染（附带 uosc 菜单）：画面上的弹幕由 mpv 的字幕层绘制，
+          播放器控制栏的「弹幕设置」里会多出一行<b>插件菜单</b>（搜索弹幕 / 弹幕样式 / 源延迟 / 总菜单）。
+          改动在<b>下次进入播放器</b>时生效（插件随播放内核一起加载）。
+          插件取不到弹幕时会自动回落到内置画布，不会出现「两边都没有」。
+        </div>
+      </Card>
+
       <Card title="显示" desc="影响画面上的弹幕观感">
         <Toggle label="显示弹幕" desc="关闭后完全不绘制弹幕（数据仍会匹配）" value={d.enabled} onChange={(v) => patch({ enabled: v })} />
         <Row label="覆盖区域" desc="弹幕只占画面上方多大范围">
@@ -179,7 +200,7 @@ function Pill({
       onClick={onClick}
       className={`rounded-lg border px-2.5 py-1 text-[11px] transition-colors ${
         active ? 'border-accent bg-accent-soft text-accent' : 'border-border text-dim hover:border-accent/50'
-      }`}
+      } whitespace-nowrap `}
     >
       {children}
     </button>

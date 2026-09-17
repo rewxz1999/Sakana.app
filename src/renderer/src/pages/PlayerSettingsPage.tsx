@@ -46,81 +46,46 @@ export function PlayerSettingsPage() {
 
   const builtinOf = (a: BuiltinAsset): boolean | null => {
     if (!assets) return null
-    return a === 'vlc' ? assets.vlc : a === 'ffmpeg' ? assets.ffmpeg : assets.aria2
+    return a === 'ffmpeg' ? assets.ffmpeg : assets.aria2
   }
 
-  // libmpv 可用（运行时 + 原生插件都在）时才允许选择，否则回退 libVLC
+  // libmpv 可用（运行时 + 原生插件都在）——VLC 内核已删除，这里只用于提示是否缺运行时
   const mpvUsable = !!assets?.mpv
-  const engine: 'vlc' | 'mpv' = settings.playerEngine === 'mpv' && mpvUsable ? 'mpv' : 'vlc'
 
   return (
     <SubPage
       icon={MonitorPlay}
       title="播放器设置"
-      desc="播放内核、FFmpeg / libVLC 路径与播放器快捷键"
+      desc="播放内核（libmpv）、FFmpeg 路径与播放器快捷键"
       actions={
         <Button size="sm" variant="outline" icon={RefreshCw} loading={checking} onClick={() => void detect()}>
           重新检测
         </Button>
       }
     >
-      {/* 播放器内核 */}
-      <Card title="播放器内核" desc="选择用于播放本地/在线视频的解码内核">
+      {/*
+        播放器内核（v0.2.9）：VLC 内核已整体删除，这里不再让用户选内核，
+        只显示当前内核状态 —— 免得留一个「选了也没用」的开关。
+      */}
+      <Card title="播放内核" desc="应用内置 libmpv（原生插件 + 子窗口输出），无需安装其它播放器">
         <div className="flex flex-col gap-3">
-          <div className="flex gap-2">
-            <button
-              onClick={() => save({ playerEngine: 'vlc' })}
-              className={`flex-1 rounded-xl border px-4 py-3 text-left transition-colors ${
-                engine === 'vlc' ? 'border-accent bg-accent-soft' : 'border-border hover:border-accent/50'
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="text-sm font-semibold text-text">libmpv</div>
+            <span
+              className={`shrink-0 whitespace-nowrap rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                mpvUsable ? 'bg-ok/15 text-ok' : 'bg-elev2 text-faint'
               }`}
             >
-              <div className="text-sm font-semibold">libVLC</div>
-              <div className="mt-0.5 text-[11px] text-faint">内置播放内核，兼容性最好；libmpv 不可用时自动回退</div>
-            </button>
-            <button
-              onClick={() => {
-                if (!mpvUsable) {
-                  toast.warn('libmpv 运行时或原生插件缺失（开发环境请运行 npm run libmpv:fetch 与 npm run mpv:build）')
-                  return
-                }
-                save({ playerEngine: 'mpv' })
-                toast.info('已切换为 libmpv（下次进入播放器生效）')
-              }}
-              disabled={!mpvUsable}
-              title={mpvUsable ? '使用内置 libmpv 播放（原生插件 + 子窗口输出）' : '缺少 libmpv 运行时'}
-              className={`flex-1 rounded-xl border px-4 py-3 text-left transition-colors ${
-                engine === 'mpv'
-                  ? 'border-accent bg-accent-soft'
-                  : mpvUsable
-                    ? 'border-border hover:border-accent/50'
-                    : 'cursor-not-allowed border-dashed border-border opacity-60'
-              }`}
-            >
-              <div className="flex items-center gap-2 text-sm font-semibold">
-                libmpv
-                <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10px] font-medium text-accent">
-                  推荐
-                </span>
-                <span
-                  className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                    mpvUsable ? 'bg-ok/15 text-ok' : 'bg-elev2 text-faint'
-                  }`}
-                >
-                  {mpvUsable ? '可用' : '缺失'}
-                </span>
-              </div>
-              <div className="mt-0.5 text-[11px] text-faint">
-                mpv v0.41 内核，原生插件驱动（默认，建议优先使用）；与 libVLC 共用同一套控制栏
-              </div>
-            </button>
+              {assets === null ? '检测中' : mpvUsable ? '可用' : '缺失'}
+            </span>
           </div>
           <div className="rounded-lg border border-border bg-elev2/50 px-3 py-2.5 text-[11px] leading-relaxed text-dim">
-            <span className="font-semibold text-text">内核说明：</span>
+            <span className="font-semibold text-text">说明：</span>
             <span className="text-faint">
-              两个内核都已内置并由应用自动管理：libVLC 走
-              electron-vlc-player，libmpv 走项目自带原生插件（N-API 动态加载 libmpv-2.dll，在窗口内创建输出子窗口）。
-              渲染层 UI 完全一致（同一套控制栏/选集/字幕），切换后立即生效（下次进入播放器）；若 libmpv
-              初始化失败会自动回退 libVLC。
+              libmpv 由项目自带原生插件驱动（N-API 动态加载 libmpv-2.dll，在窗口内创建输出子窗口），
+              控制栏 / 选集 / 字幕 / 弹幕全部走同一套实现。原生运行时缺失时开发环境需运行
+              <code className="mx-1 font-mono">npm run libmpv:fetch</code> 与
+              <code className="mx-1 font-mono">npm run mpv:build</code>。
             </span>
           </div>
         </div>
@@ -170,42 +135,93 @@ export function PlayerSettingsPage() {
         </div>
       </Card>
 
-      {/* libVLC 路径 */}
-      <Card title="libVLC 路径" desc="播放内核所在目录（留空自动探测内置 libvlc → 系统 VLC → 各盘符 VLC 文件夹）">
-        <div className="flex flex-col gap-2.5">
-          <Input
-            placeholder="libVLC 路径（如 E:\VLC，或 libvlc.dll 所在目录）"
-            value={settings.vlcPath}
-            onChange={(e) => save({ vlcPath: e.target.value })}
-          />
-          <p className="text-[11px] leading-relaxed text-faint">
-            留空时应用按「内置 libvlc → 系统安装的 VLC → 各盘符下的 VLC 文件夹」顺序自动探测；仅在希望改用其它
-            播放引擎（或内置运行时缺失）时才需要手动填写。
-          </p>
-        </div>
-      </Card>
-
       {/* 播放器快捷键（原独立小窗口内容已并入本页） */}
       <Card title="播放器快捷键" desc="自定义播放器控件快捷键（播放/暂停、快进、音量、选集、截屏等）">
         <ShortcutsPanel />
       </Card>
 
+      {/* B 站弹幕（mpv 脚本，v0.2.8 附加七） */}
+      <Card title="B 站弹幕（mpv 脚本）" desc="播放 B 站视频时用 yt-dlp + biliass 抓取并显示弹幕（仅 libmpv 内核生效）">
+        <div className="flex flex-col gap-2.5">
+          <label className="flex items-center gap-2 text-xs text-text">
+            <input
+              type="checkbox"
+              checked={settings.biliDanmaku?.enabled === true}
+              onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, enabled: e.target.checked } })}
+              className="h-3.5 w-3.5 accent-accent"
+            />
+            启用 B 站弹幕（需要自行准备 yt-dlp 与 biliass）
+          </label>
+          <Input
+            placeholder="yt-dlp 可执行文件路径（留空按 PATH 里的 yt-dlp）"
+            value={settings.biliDanmaku?.ytdlpPath ?? ''}
+            onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, ytdlpPath: e.target.value } })}
+          />
+          <Input
+            placeholder="biliass 可执行文件路径（留空按 PATH 里的 biliass）"
+            value={settings.biliDanmaku?.biliassPath ?? ''}
+            onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, biliassPath: e.target.value } })}
+          />
+          <Input
+            placeholder="临时目录 tmpdir（必填；留空用应用数据目录下的 tmp/danmaku）"
+            value={settings.biliDanmaku?.tmpdir ?? ''}
+            onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, tmpdir: e.target.value } })}
+          />
+          <Input
+            placeholder="自定义 mpv 脚本路径（留空使用内置的 sakana-bdanmaku.lua；也可指向你下载的 bdanmaku.lua）"
+            value={settings.biliDanmaku?.scriptPath ?? ''}
+            onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, scriptPath: e.target.value } })}
+          />
+          <p className="text-[11px] leading-relaxed text-faint">
+            管线：yt-dlp 取弹幕字幕（xml）→ biliass 转 ASS → 挂到播放器上。
+            <span className="text-dim"> biliass 在 Windows 上必须有一个可写的临时目录</span>，否则弹幕下载会失败 ——
+            留空时应用会自动用「应用数据目录/tmp/danmaku」并把它通过 <code className="font-mono">script-opts=tmpdir=…</code> 传给脚本。
+            <span className="text-dim">开关或路径改动在下次进入播放器时生效</span>（libmpv 启动时才加载脚本）。
+            运行日志里能看到 <code className="font-mono">[mpv] B 站弹幕脚本已启用</code> 与脚本自己的进度；
+            脚本日志写在上面 tmpdir 下的 <code className="font-mono">sakana-bdanmaku.log</code>。
+          </p>
+          <p className="text-[11px] leading-relaxed text-faint">
+            <span className="text-dim">与「弹幕 → 渲染方式」的关系</span>：如果同时把渲染方式选成了 mpv 插件
+            （uosc_danmaku），同一部 B 站番剧会出现两份弹幕（一份由本脚本挂成字幕、一份由插件画在画面上），
+            建议按需二选一。
+          </p>
+          <div className="rounded-lg border border-border bg-elev2/50 px-3 py-2 text-[11px] leading-relaxed text-faint">
+            需要自行下载的两个组件（本机网络到 GitHub Release 不通，无法随包分发）：
+            <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1">
+              <button
+                className="text-accent hover:underline whitespace-nowrap"
+                onClick={() => void api.app.openPath('https://github.com/yt-dlp/yt-dlp/releases')}
+              >
+                yt-dlp 下载页
+              </button>
+              <button
+                className="text-accent hover:underline whitespace-nowrap"
+                onClick={() => void api.app.openPath('https://github.com/yutto-dev/biliass/releases')}
+              >
+                biliass 下载页
+              </button>
+            </div>
+            <div className="mt-1">
+              也可以直接使用社区里的 <code className="font-mono">bdanmaku</code> 脚本：把它下载到本地后填进上面的「自定义 mpv 脚本路径」，
+              应用会自动把 tmpdir / ytdlp / biliass 三个参数拼进 <code className="font-mono">script-opts</code> 一并传过去。
+            </div>
+          </div>
+        </div>
+      </Card>
+
       {/* 内置组件与下载链接 */}
-      <Card title="内置组件" desc="应用已内置 libVLC / libmpv 与 FFmpeg，无需安装">
+      <Card title="内置组件" desc="应用已内置 libmpv 与 FFmpeg，无需安装">
         <div className="flex flex-col gap-2">
           <div className="rounded-lg border border-border bg-elev2/50 px-3 py-2.5 text-[11px] leading-relaxed text-dim">
             <div className="mb-1 font-semibold text-text">开箱即用</div>
             <div className="text-faint">
-              安装包已自带 libVLC 与 libmpv 两套播放内核（含 libmpv 原生插件）以及 FFmpeg（转码/在线流中转），无需额外安装；
+              安装包已自带 libmpv 播放内核（含原生插件）以及 FFmpeg（转码/在线流中转），无需额外安装；
               aria2c 同样内置，供内置下载器使用。
-              仅当你希望改用系统安装的播放引擎时才需要填写上面的路径。点击下面的下载链接时，若检测到已内置会先提示「已内置，通常无需下载」，
-              再次点击才会打开下载页。
+              点击下面的下载链接时，若检测到已内置会先提示「已内置，通常无需下载」，再次点击才会打开下载页。
             </div>
           </div>
 
           <div className="rounded-lg border border-border bg-elev1 px-3 py-1.5">
-            <AssetRow name="libVLC（播放内核）" ok={assets?.vlc ?? null} hint="已内置，可播放" />
-            <div className="border-t border-border" />
             <AssetRow
               name="libmpv（播放内核 + 原生插件）"
               ok={assets?.mpv ?? null}
@@ -218,7 +234,6 @@ export function PlayerSettingsPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px]">
-            <AssetLink asset="vlc" url="https://www.videolan.org/vlc/" label="下载 VLC（可选）" builtin={builtinOf('vlc')} />
             <AssetLink
               asset="ffmpeg"
               url="https://www.gyan.dev/ffmpeg/builds/"

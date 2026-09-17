@@ -28,7 +28,8 @@ export const NAV_ITEMS: NavItem[] = [
   { to: '/dashboard', label: '仪表盘', icon: LayoutDashboard },
   { to: '/subs', label: '订阅', icon: Rss },
   { to: '/favorites', label: '收藏', icon: Heart },
-  { to: '/galgame', label: 'Galgame', icon: Gamepad2 },
+  // 这一轮改版把「galgame 导航」改名成「galgame 库」（页面默认是卡片网格，整屏壁纸改叫沉浸模式）
+  { to: '/galgame', label: 'Galgame 库', icon: Gamepad2 },
   { to: '/tools', label: '工具', icon: Puzzle },
   { to: '/settings', label: '设置', icon: Settings }
 ]
@@ -75,7 +76,7 @@ export function SideNav() {
           const isActive = active.to === item.to
           const Icon = item.icon
           return (
-            <NavLink key={item.to} to={item.to} className="relative">
+            <NavLink key={item.to} to={item.to} className="relative" title={item.label}>
               {({ isActive: navActive }) => (
                 <div
                   className={`relative flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors ${
@@ -89,8 +90,11 @@ export function SideNav() {
                       transition={{ type: 'spring', stiffness: 380, damping: 30 }}
                     />
                   )}
-                  <Icon size={16} className="relative z-10" />
-                  <span className="relative z-10">{item.label}</span>
+                  <Icon size={16} className="relative z-10 shrink-0" />
+                  {/* 标签单行显示：窄栏时省略号截断，完整文本走 title 悬停查看 */}
+                  <span className="relative z-10 min-w-0 flex-1 truncate" title={item.label}>
+                    {item.label}
+                  </span>
                   {isActive && (
                     <motion.span
                       layoutId="nav-dot"

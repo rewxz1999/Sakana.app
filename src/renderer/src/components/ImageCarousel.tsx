@@ -104,10 +104,10 @@ export function ImageCarousel({
           /* 空列表：虚线框 + 提示。右键是产品指定的入口，但空框上的左键也顺手支持，否则没人知道要点右键 */
           <button
             onClick={onUpload}
-            className="absolute inset-0 flex flex-col items-center justify-center gap-1 border border-dashed border-border text-faint transition-colors hover:border-accent hover:text-accent"
+            className="absolute inset-0 flex flex-col items-center justify-center gap-1 whitespace-nowrap border border-dashed border-border text-faint transition-colors hover:border-accent hover:text-accent"
           >
             <ImagePlus size={16} />
-            <span className="text-[11px]">右键上传展示图片</span>
+            <span className="whitespace-nowrap text-[11px]">右键上传展示图片</span>
           </button>
         ) : (
           <>
@@ -143,7 +143,7 @@ export function ImageCarousel({
             <span className="pointer-events-none absolute bottom-1.5 right-1.5 rounded-full bg-black/45 px-1.5 py-0.5 text-[10px] tabular-nums text-white">
               {active + 1}/{total}
             </span>
-            <span className="pointer-events-none absolute bottom-1.5 left-1.5 rounded-full bg-black/45 px-1.5 py-0.5 text-[10px] text-white/85 opacity-0 transition-opacity group-hover:opacity-100">
+            <span className="pointer-events-none absolute bottom-1.5 left-1.5 rounded-full bg-black/45 px-1.5 py-0.5 text-[10px] text-white/85 opacity-0 transition-opacity group-hover:opacity-100 whitespace-nowrap">
               右键管理
             </span>
           </>
@@ -158,7 +158,7 @@ export function ImageCarousel({
           onMouseDown={(e) => e.stopPropagation()}
         >
           <button
-            className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-xs hover:bg-elev2"
+            className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-xs hover:bg-elev2 whitespace-nowrap"
             onClick={() => {
               setMenu(null)
               onUpload()
@@ -168,7 +168,7 @@ export function ImageCarousel({
           </button>
           <button
             disabled={total === 0}
-            className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-xs text-danger hover:bg-danger/10 disabled:pointer-events-none disabled:opacity-40"
+            className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-xs text-danger hover:bg-danger/10 disabled:pointer-events-none disabled:opacity-40 whitespace-nowrap"
             onClick={() => {
               setMenu(null)
               if (current) onDeleteCurrent(current)
@@ -178,7 +178,7 @@ export function ImageCarousel({
           </button>
           <button
             disabled={total === 0}
-            className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-xs text-dim hover:bg-elev2 disabled:pointer-events-none disabled:opacity-40"
+            className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-xs text-dim hover:bg-elev2 disabled:pointer-events-none disabled:opacity-40 whitespace-nowrap"
             onClick={() => {
               setMenu(null)
               setAskClear(true)

@@ -5,7 +5,7 @@ import type { DanmakuComment, DanmakuSettings } from '@shared/types'
  * 弹幕渲染层（v0.2.8）。
  *
  * ## 为什么画在悬浮窗里
- * 画面由**原生子窗口**（libmpv / libVLC）绘制，它永远盖在网页内容之上 ——
+ * 画面由**原生子窗口**（libmpv）绘制，它永远盖在网页内容之上 ——
  * 画在播放页里的弹幕会被视频整个挡住（控制栏与详情面板已经踩过同一个坑）。
  * 所以弹幕和它们一样画在独立的透明悬浮窗里，用 `pointer-events: none` 让点击穿透到控制栏。
  *

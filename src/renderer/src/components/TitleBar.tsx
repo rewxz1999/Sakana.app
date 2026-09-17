@@ -19,7 +19,7 @@ function WinBtn({
       title={title}
       className={`flex h-6 w-9 items-center justify-center rounded-md text-dim transition-colors ${
         danger ? 'hover:bg-danger hover:text-white' : 'hover:bg-elev2 hover:text-text'
-      }`}
+      } whitespace-nowrap `}
     >
       {children}
     </button>
@@ -41,7 +41,7 @@ export function TitleBar() {
       <div className="flex items-center gap-2">
         <span className="text-sm">🐟</span>
         <span className="text-[13px] font-semibold tracking-wide">Sakana</span>
-        <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10px] font-medium text-accent">番剧管理</span>
+        <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10px] font-medium text-accent whitespace-nowrap">番剧管理</span>
       </div>
       <div className="no-drag flex items-center gap-0.5">
         <WinBtn title="最小化" onClick={() => void api.window.minimize()}>

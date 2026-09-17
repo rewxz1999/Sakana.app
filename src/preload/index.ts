@@ -48,6 +48,7 @@ const api: SakanaApi = {
     subject: (id) => call(CH.bgmSubject, id),
     search: (keyword) => call(CH.bgmSearch, keyword),
     ratings: (ids) => call(CH.bgmRatings, ids),
+    season: (year, month, force) => call(CH.bgmSeason, year, month, force),
     testMirrors: () => call(CH.bgmTestMirrors)
   },
   mikan: {
@@ -73,6 +74,10 @@ const api: SakanaApi = {
     remove: (id) => call(CH.dlRemove, id),
     list: () => call(CH.dlList),
     test: () => call(CH.dlTest),
+    // 本地资源：目录自动推导（不再弹文件夹选择框）/ 删除文件+记录 / 只删记录
+    localDir: (input) => call(CH.dlLocalDir, input),
+    deleteLocal: (input) => call(CH.dlDeleteLocal, input),
+    removeRecords: (input) => call(CH.dlRemoveRecords, input),
     onChanged: (cb) => subscribe(CH.evDownloads, cb)
   },
   rules: {
@@ -93,23 +98,38 @@ const api: SakanaApi = {
     stopLive: (sessionId) => call(CH.mediaStopLive, sessionId),
     startLiveUrl: (url, opts) => call(CH.mediaStartLiveUrl, url, opts)
   },
-  vlc: {
-    attach: (bounds) => call(CH.vlcAttach, bounds),
-    play: (path, referer, cookies) => call(CH.vlcPlay, path, referer, cookies),
-    setPlaylist: (paths) => call(CH.vlcSetPlaylist, paths),
-    togglePause: () => call(CH.vlcTogglePause),
-    seek: (sec) => call(CH.vlcSeek, sec),
-    setVolume: (volume) => call(CH.vlcSetVolume, volume),
-    getState: () => call(CH.vlcGetState),
-    setMute: (muted) => call(CH.vlcSetMute, muted),
-    subtitleTracks: () => call(CH.vlcSubtitleTracks),
-    setSubtitle: (id) => call(CH.vlcSetSubtitle, id),
-    addSubtitleFile: (path) => call(CH.vlcAddSubtitleFile, path),
-    snapshot: (title) => call(CH.vlcSnapshot, title),
-    detach: () => call(CH.vlcDetach),
-    notifyLayout: (bounds) => call(CH.vlcNotifyLayout, bounds),
-    setAspect: (mode, areaW, areaH) => call(CH.vlcSetAspect, mode, areaW, areaH),
-    onEvent: (cb) => subscribe(CH.evVlc, cb)
+  player: {
+    attach: (bounds) => call(CH.playerAttach, bounds),
+    play: (path, referer, cookies) => call(CH.playerPlay, path, referer, cookies),
+    setPlaylist: (paths) => call(CH.playerSetPlaylist, paths),
+    togglePause: () => call(CH.playerTogglePause),
+    seek: (sec) => call(CH.playerSeek, sec),
+    setVolume: (volume) => call(CH.playerSetVolume, volume),
+    getState: () => call(CH.playerGetState),
+    setMute: (muted) => call(CH.playerSetMute, muted),
+    setSpeed: (speed) => call(CH.playerSetSpeed, speed),
+    subtitleTracks: () => call(CH.playerSubtitleTracks),
+    setSubtitle: (id) => call(CH.playerSetSubtitle, id),
+    addSubtitleFile: (path) => call(CH.playerAddSubtitleFile, path),
+    snapshot: (title, episode) => call(CH.playerSnapshot, title, episode),
+    // v0.2.9：截图 / 组件探测 / 流信息合并进同一个 player 命名空间（此前它们在第二个同名对象里）
+    screenshot: (title, episode) => call(CH.playerScreenshot, title, episode),
+    assets: () => call(CH.playerAssets),
+    streamInfo: () => call(CH.playerStreamInfo),
+    detach: () => call(CH.playerDetach),
+    notifyLayout: (bounds) => call(CH.playerNotifyLayout, bounds),
+    setAspect: (mode, areaW, areaH) => call(CH.playerSetAspect, mode, areaW, areaH),
+    // v0.2.8 附加七：告知 mpv 的 B 站弹幕脚本「当前播放页地址」
+    setDanmakuSource: (pageUrl) => call(CH.playerDanmakuSource, pageUrl),
+    onEvent: (cb) => subscribe(CH.evPlayer, cb)
+  },
+  // v0.2.9：uosc_danmaku（mpv 弹幕插件）集成（与 api.uosc 命名空间对应）
+  uosc: {
+    status: () => call(CH.playerUoscStatus),
+    menu: (which) => call(CH.playerUoscMenu, which),
+    setVisible: (on) => call(CH.playerUoscVisible, on),
+    clear: () => call(CH.playerUoscClear),
+    delay: (offsetMs) => call(CH.playerUoscDelay, offsetMs)
   },
   overlay: {
     isOverlay: process.argv.includes('--sakana-overlay'),
@@ -128,11 +148,6 @@ const api: SakanaApi = {
     onState: (cb) => subscribe(CH.overlayState, cb),
     onPoke: (cb) => subscribe<[]>(CH.overlayPoke, cb),
     onAction: (cb) => subscribe(CH.overlayAction, cb)
-  },
-  player: {
-    screenshot: (title) => call(CH.playerScreenshot, title),
-    assets: () => call(CH.playerAssets),
-    streamInfo: () => call(CH.playerStreamInfo)
   },
   tools: {
     import: () => call(CH.toolImport),
@@ -196,6 +211,8 @@ const api: SakanaApi = {
     dirsGet: () => call(CH.galDirsGet),
     dirsSet: (dir) => call(CH.galDirsSet, dir),
     recentShots: () => call(CH.galRecentShots),
+    listShots: (gameName) => call(CH.galListShots, gameName),
+    searchSites: (keyword) => call(CH.galSearchSites, keyword),
     onEvent: (cb) => subscribe(CH.evGal, cb)
   },
   stat: {
@@ -207,6 +224,12 @@ const api: SakanaApi = {
     openDataDir: () => call(CH.openDataDir),
     openPath: (path) => call(CH.openPath, path),
     checkUpdate: () => call(CH.appUpdateCheck),
+    // v0.2.9 最后更新：应用内一键更新（下载 → 静默安装 → 自动重启）
+    updateDownload: () => call(CH.appUpdateDownload),
+    updateInstall: () => call(CH.appUpdateInstall),
+    updateOpenReleases: () => call(CH.appUpdateOpenReleases),
+    updateState: () => call(CH.appUpdateState),
+    onUpdateState: (cb) => subscribe(CH.evUpdateState, cb),
     openUrl: (url) => call(CH.appOpenUrl, url)
   },
   danmaku: {

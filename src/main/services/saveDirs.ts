@@ -1,4 +1,3 @@
-import { app } from 'electron'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { SaveDirsInfo } from '@shared/api'
@@ -7,6 +6,7 @@ import { store } from '../store'
 import { aria2 } from './downloader/aria2'
 import { allowMediaRoot } from './media'
 import { galToolsGet, galToolsSet } from './galgameTools'
+import { dataPaths } from './paths'
 
 type SaveSettings = { downloadDir?: string; screenshotDir?: string }
 
@@ -20,16 +20,23 @@ function patchSaveSettings(patch: SaveSettings): void {
 
 /**
  * 自动创建保存文件夹（方案：设置页「文件保存配置」）。
- * baseDir = userData/saves；未配置的番剧下载/番剧截图/galgame 截图目录回填默认值并持久化。
- * 应在 app ready 且 store.init() 之后调用一次（ipc.ts 中）。
+ *
+ * v0.2.9 最后更新（用户要求）：默认保存位置改到**安装目录**下 ——
+ * `下载` → `<安装目录>/downloads`、番剧截图 → `<安装目录>/screenshots`、
+ * galgame 截图 → `<安装目录>/galgame-screenshots`，
+ * 而不是过去那个 `userData/saves/...`（哪怕 userData 现在也在安装目录里，
+ * 少一层 `data/userData/saves` 用户更容易自己找到文件）。
+ * 只影响**默认值**：用户已经显式指定过目录时一律尊重用户设置。
+ * 应该在 app ready 且 store.init() 之后调用一次（ipc.ts 中）。
  */
 export function ensureSaveDirs(): SaveDirsInfo {
-  const baseDir = join(app.getPath('userData'), 'saves')
+  const p = dataPaths()
+  const baseDir = p.root
   mkdirSync(baseDir, { recursive: true })
 
   const s = getSaveSettings()
-  const downloadDir = s.downloadDir || join(baseDir, 'downloads')
-  const screenshotDir = s.screenshotDir || join(baseDir, 'screenshots')
+  const downloadDir = s.downloadDir || p.downloads
+  const screenshotDir = s.screenshotDir || p.screenshots
 
   const patch: SaveSettings = {}
   if (!s.downloadDir) patch.downloadDir = downloadDir
@@ -40,7 +47,7 @@ export function ensureSaveDirs(): SaveDirsInfo {
   mkdirSync(screenshotDir, { recursive: true })
 
   const gal = galToolsGet()
-  const galDir = gal.dir || join(baseDir, 'galgame-screenshots')
+  const galDir = gal.dir || p.galgameShots
   if (!gal.dir) galToolsSet({ dir: galDir })
   mkdirSync(galDir, { recursive: true })
 
@@ -49,14 +56,15 @@ export function ensureSaveDirs(): SaveDirsInfo {
 
 /** 返回当前（已回填后的）保存目录信息，不修改存储。 */
 export function saveDirsInfo(): SaveDirsInfo {
-  const baseDir = join(app.getPath('userData'), 'saves')
+  const p = dataPaths()
+  const baseDir = p.root
   const s = getSaveSettings()
   const gal = galToolsGet()
   return {
     baseDir,
-    downloadDir: s.downloadDir || join(baseDir, 'downloads'),
-    screenshotDir: s.screenshotDir || join(baseDir, 'screenshots'),
-    galDir: gal.dir || join(baseDir, 'galgame-screenshots')
+    downloadDir: s.downloadDir || p.downloads,
+    screenshotDir: s.screenshotDir || p.screenshots,
+    galDir: gal.dir || p.galgameShots
   }
 }
 

@@ -109,9 +109,9 @@ export function CacheSettingsPage() {
       <Card title="缓存目录" desc="图片缓存、封面缓存与条目 JSON 缓存存放位置">
         <div className="flex flex-col gap-3">
           <div className="rounded-lg border border-border bg-elev2/50 px-3 py-2.5">
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-xs text-dim">当前缓存根目录</span>
-              <span className={`rounded-full px-2 py-0.5 text-[10px] ${custom ? 'bg-accent-soft text-accent' : 'bg-elev2 text-faint'}`}>
+              <span className={`shrink-0 whitespace-nowrap rounded-full px-2 py-0.5 text-[10px] ${custom ? 'bg-accent-soft text-accent' : 'bg-elev2 text-faint'}`}>
                 {custom ? '自定义' : '默认（userData/cache）'}
               </span>
             </div>

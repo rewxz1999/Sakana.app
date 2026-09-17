@@ -32,7 +32,7 @@ function GhostCard({ icon: Icon, name, desc }: { icon: typeof Camera; name: stri
           <Icon size={15} />
         </div>
         <span className="text-sm font-medium">{name}</span>
-        <Badge className="ml-auto" tone="neutral">开发中</Badge>
+        <Badge className="ml-auto whitespace-nowrap" tone="neutral">开发中</Badge>
       </div>
       <p className="text-[11px] leading-relaxed text-faint">{desc}</p>
     </div>
@@ -137,7 +137,7 @@ export function GalgameToolsPage() {
         {api.window.isSmallWindow ? null : (
           <button
             onClick={() => navigate(-1)}
-            className="flex items-center gap-1.5 text-xs text-dim hover:text-text"
+            className="flex items-center gap-1.5 text-xs text-dim hover:text-text whitespace-nowrap"
           >
             <ArrowLeft size={14} /> 返回
           </button>
@@ -145,7 +145,7 @@ export function GalgameToolsPage() {
         <div>
           <div className="flex items-center gap-2">
             <h1 className="text-lg font-bold">Galgame 工具</h1>
-            <span className="rounded-full bg-accent/15 px-2 py-0.5 text-[10px] font-medium text-accent">截屏助手</span>
+            <span className="rounded-full bg-accent/15 px-2 py-0.5 text-[10px] font-medium text-accent whitespace-nowrap">截屏助手</span>
           </div>
           <p className="mt-0.5 text-xs text-faint">配置截图快捷方式，游戏内随时截图不打断</p>
         </div>
@@ -227,10 +227,16 @@ export function GalgameToolsPage() {
 
         {/* 保存位置 */}
         <section className="rounded-xl border border-border bg-elev1 p-4">
-          <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+          <div className="mb-1 flex items-center gap-2 text-sm font-semibold">
             <FolderOpen size={15} className="text-accent" /> 截图保存位置
           </div>
-          <div className="flex gap-2">
+          {/* 新版命名规则：按游戏名建子目录 + 文件名带游戏名与时间，这里必须写清楚，否则用户找不到截图 */}
+          <p className="mb-3 text-[11px] leading-relaxed text-faint">
+            截图会按游戏名自动建子目录，文件名为「游戏名_日期_时间.png」，例如
+            <span className="text-dim"> CLANNAD\CLANNAD_20260917_143512.png</span>；
+            游戏名里的非法字符会自动替换为下划线。游戏卡片上的「最近截图」只显示这一款游戏自己的截图。
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
             <Input
               value={cfg.dir}
               placeholder="未设置（默认用户目录 screenshots/galgame）"

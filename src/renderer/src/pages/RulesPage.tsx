@@ -115,7 +115,7 @@ export function RulesPage() {
       <div className="flex items-center justify-between border-b border-border bg-elev1/70 px-5 py-3 backdrop-blur">
         <div className="flex items-center gap-3">
           {api.window.isSmallWindow ? null : (
-            <button onClick={() => navigate(-1)} className="flex items-center gap-1.5 text-xs text-dim hover:text-text">
+            <button onClick={() => navigate(-1)} className="flex items-center gap-1.5 text-xs text-dim hover:text-text whitespace-nowrap">
               <ArrowLeft size={14} /> 返回
             </button>
           )}
@@ -124,7 +124,7 @@ export function RulesPage() {
             播放规则（Kazumi 风格：XPath / API）· 已启用 {enabledCount} / {rules.length}
           </div>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <Button
             variant="outline"
             size="sm"
@@ -175,7 +175,7 @@ export function RulesPage() {
               }`}
             >
               <div className="flex items-center justify-between gap-2">
-                <span className="line-clamp-1 text-[13px] font-medium">{rule.name || '未命名规则'}</span>
+                <span className="line-clamp-1 min-w-0 text-[13px] font-medium">{rule.name || '未命名规则'}</span>
                 <button
                   className="text-faint hover:text-danger"
                   onClick={(e) => {
@@ -186,7 +186,7 @@ export function RulesPage() {
                   <Trash2 size={13} />
                 </button>
               </div>
-              <div className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <Badge tone={rule.enabled ? 'ok' : 'neutral'}>{rule.enabled ? '启用' : '停用'}</Badge>
                 <Badge>{rule.search.type === 'xpath' ? 'XPath' : 'API'}</Badge>
                 <span className="text-[10px] text-faint">v{rule.version}</span>
@@ -473,7 +473,7 @@ export function RulesPage() {
             ) : null}
           </div>
         )}
-        <div className="mt-4 flex justify-end gap-2">
+        <div className="mt-4 flex flex-wrap justify-end gap-2">
           <Button variant="ghost" onClick={() => setRepoOpen(false)}>
             取消
           </Button>

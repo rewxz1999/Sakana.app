@@ -51,7 +51,7 @@ function WatchedAtEditor({ value, onSave }: { value: string | null; onSave: (v: 
       title="点击编辑看完时间"
       className={`h-7 w-full rounded-md px-2 text-left text-xs transition-colors hover:bg-elev2 ${
         value ? 'text-text' : 'text-faint'
-      }`}
+      } whitespace-nowrap `}
     >
       {value ?? '点击填写'}
     </button>
@@ -248,7 +248,7 @@ function EntryCard({ entry, onDelete }: { entry: StatEntry; onDelete: () => void
             reviewCount > 0
               ? 'bg-accent-soft text-accent'
               : 'border border-dashed border-border text-faint hover:border-accent hover:text-accent'
-          }`}
+          } whitespace-nowrap `}
         >
           <MessageSquare size={12} />
           {reviewCount > 0 ? `${reviewCount} 条` : '撰写'}
@@ -395,7 +395,7 @@ export function StatToolPage() {
           <button
             title="返回上一页"
             onClick={() => navigate(-1)}
-            className="flex h-8 items-center gap-1.5 rounded-lg border border-border bg-elev1 px-3 text-xs text-dim transition-colors hover:border-accent hover:text-accent"
+            className="flex h-8 items-center gap-1.5 rounded-lg border border-border bg-elev1 px-3 text-xs text-dim transition-colors hover:border-accent hover:text-accent whitespace-nowrap"
           >
             <ArrowLeft size={13} /> 返回
           </button>
@@ -461,7 +461,7 @@ export function StatToolPage() {
                 <h2 className="text-base font-semibold">{selectedList.name}</h2>
                 <span className="text-[11px] text-faint">{listEntries.length} 个条目</span>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <Button
                   variant="outline"
                   icon={ImageDown}
@@ -506,7 +506,7 @@ export function StatToolPage() {
           }}
           placeholder="列表名称"
         />
-        <div className="mt-5 flex justify-end gap-2">
+        <div className="mt-5 flex flex-wrap justify-end gap-2">
           <Button variant="ghost" onClick={() => setCreateOpen(false)}>
             取消
           </Button>
