@@ -428,7 +428,7 @@ export function GalgameLibraryPage() {
                         e.stopPropagation()
                         void onLaunch(game)
                       }}
-                      className="absolute inset-x-0 bottom-0 flex items-center justify-center gap-1.5 bg-gradient-to-t from-black/70 to-transparent py-2 text-[11px] font-medium text-white opacity-0 transition-opacity group-hover:opacity-100"
+                      className="absolute inset-x-0 bottom-0 flex items-center justify-center gap-1.5 whitespace-nowrap bg-gradient-to-t from-black/70 to-transparent py-2 text-[11px] font-medium text-white opacity-0 transition-opacity group-hover:opacity-100"
                     >
                       <Play size={12} /> {isRunning ? '游戏中' : '启动游戏'}
                     </button>

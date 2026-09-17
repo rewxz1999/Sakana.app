@@ -1754,7 +1754,7 @@ if (!gotLock) {
                           var txt=(b.innerText||'').trim();
                           if(!txt)return;
                           var lh=parseFloat(cs.lineHeight)||(parseFloat(cs.fontSize)*1.5);
-                          var intrinsicMulti = txt.indexOf('\n')>=0 || !!b.querySelector('div,p,ul,li,h1,h2,h3');
+                          var intrinsicMulti = txt.indexOf('\\n')>=0 || !!b.querySelector('div,p,ul,li,h1,h2,h3');
                           var canWrap = cs.whiteSpace!=='nowrap';
                           if(canWrap && !intrinsicMulti && b.clientHeight>lh*1.6){out.push('wrap:'+txt.slice(0,18))}
                           else if(b.scrollWidth>b.clientWidth+2&&cs.textOverflow!=='ellipsis'&&cs.overflowX!=='auto'){out.push('clip:'+txt.slice(0,18))}

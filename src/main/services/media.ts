@@ -14,6 +14,7 @@ import iconv from 'iconv-lite'
 import type { LocalSubFile, LocalVideoFile } from '@shared/types'
 import { parseEpisode } from '../lib/parse'
 import { log } from '../log'
+import { dataPaths } from './paths'
 import { BROWSER_UA, getSettings } from '../net'
 import { rewriteImageUrl, unresizedImageUrl } from './bangumi'
 import { liveStream } from './transcode'
@@ -113,10 +114,27 @@ export function allowMediaRoot(dir: string): void {
 
 function registerDefaultRoots(): void {
   const s = getSettings()
+  const p = dataPaths()
   const dirs = [
+    // 用户显式设置过的目录（可能在任何盘）
     s.downloadDir,
     s.cacheDir,
     s.screenshotDir,
+    /*
+     * v0.2.9 最后更新：数据根改到安装目录后，**必须注册真实的默认目录**。
+     * 此前这里只注册 `userData/cache` 这类写死的旧位置，而 `settings.cacheDir` 默认是空串 ——
+     * 于是「默认缓存根」从未进入白名单，galgame 封面（走 sakana-img://local）被全部拒读：
+     * 日志里一排 `[img] 拒绝读取白名单外的路径: <安装目录>\cache\galgame-covers\…`，
+     * 表现就是「所有 galgame 封面都不显示，自定义封面也不行（同一个目录）」。
+     * 现在统一以 dataPaths() 为准，避免再次出现「改了目录忘了改白名单」。
+     */
+    p.cache,
+    p.downloads,
+    p.screenshots,
+    p.galgameShots,
+    p.root,
+    p.userData,
+    // 兜底：即便 dataPaths 回退了，也要保证 userData 下的老目录仍可读
     join(app.getPath('userData'), 'downloads'),
     join(app.getPath('userData'), 'cache'),
     join(app.getPath('userData'), 'screenshots'),
