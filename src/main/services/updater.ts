@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -276,6 +277,40 @@ function updatesDir(): string {
   const dir = dataPaths().updates
   mkdirSync(dir, { recursive: true })
   return dir
+}
+
+/**
+ * 清理 `data/updates` 里过期的下载（v0.2.11）。
+ *
+ * 为什么需要：完整安装包一个 200MB，而且新版安装器**会保留 data/**（以前升级会清空安装目录，
+ * 现在为了保住用户数据改成保留了），于是每次下载完的安装包都会一直躺在安装目录里 ——
+ * 用户明明只用一次，却要长期占几百 MB 磁盘。
+ * 规则：超过 7 天的下载（安装包 / 补丁 / 解包残留 / 日志）一律删掉；
+ * 「上次更新未完成」的标记留着，别把待排查的线索清了。
+ */
+export function cleanupUpdatesDir(): void {
+  const dir = updatesDir()
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000
+  let freed = 0
+  try {
+    for (const name of readdirSync(dir)) {
+      if (name === PENDING_MARKER) continue
+      const full = join(dir, name)
+      try {
+        const st = statSync(full)
+        if (st.mtimeMs > cutoff) continue
+        freed += st.isDirectory() ? 0 : st.size
+        rmSync(full, { recursive: true, force: true })
+      } catch {
+        /* 单个条目失败不影响其它 */
+      }
+    }
+  } catch {
+    /* 目录读不到就算了，不值得打断启动 */
+  }
+  if (freed > 0) {
+    log.append('info', 'update', `已清理过期的更新下载：${(freed / 1024 / 1024).toFixed(1)}MB`)
+  }
 }
 
 /** 已下载好的安装包（存在且大小与 release 一致才算完整） */
@@ -786,4 +821,6 @@ export function scheduleAutoCheck(): void {
   setTimeout(() => {
     void checkUpdate(false)
   }, 8000)
+  // 顺手清掉过期的更新下载（安装包 200MB 一个，留着纯占地方）
+  setTimeout(() => cleanupUpdatesDir(), 12000)
 }
