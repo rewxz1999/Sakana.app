@@ -1,6 +1,6 @@
 {
   "name": "sakana",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "Sakana - 番剧管理及播放桌面客户端",
   "main": "./out/main/index.js",
   "author": "Sakana Team",
@@ -28,16 +28,12 @@
       "buildResources": "resources"
     },
     "files": [
-      "!src/**",
-      "!scripts/**",
-      "!native/**",
-      "!release/**",
+      "out/**/*",
+      "package.json",
       "!**/*.map",
       "!**/*.md",
-      "!electron.vite.config.*",
-      "!tsconfig*.json",
-      "!.npm-cache/**",
-      "!.vscode/**"
+      "!**/*.d.mts",
+      "!**/{test,tests,__tests__,example,examples,docs,doc}/**"
     ],
     "extraResources": [
       {

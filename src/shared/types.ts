@@ -427,18 +427,27 @@ export interface UpdateInfo {
   assetName?: string
   /** 安装包字节数（下载进度与完整性校验用） */
   assetSize?: number
+  /**
+   * v0.2.10：GitHub Releases 里找到了**增量补丁**（`patch-<当前>-to-<新>.zip`）。
+   * 有补丁时优先用它 —— 只下变化的文件（几 MB），用户不用为一次小更新重下 361MB 安装包。
+   */
+  patchName?: string
+  /** 补丁字节数（界面显示「增量更新（x MB）」） */
+  patchSize?: number
 }
 
 /**
  * 应用内一键更新的下载/安装状态（主进程 → 渲染层推送）。
  * `received/total` 用来画进度条；`file` 在下载完成后给出本地路径。
+ * `mode` 区分这次下的是增量补丁还是完整安装包（决定安装方式与界面文案）。
  */
 export type UpdateInstallState =
   | { phase: 'idle' }
   | { phase: 'downloading'; received: number; total: number; version: string }
-  | { phase: 'done'; file: string; version: string }
+  | { phase: 'done'; file: string; version: string; mode?: 'patch' | 'installer' }
   | { phase: 'installing'; file: string }
-  | { phase: 'failed'; message: string }
+  /** reason='download' 是没下下来；'apply' 是包已经下好但没装上（补丁校验不过/脚本没起来/上次没跑完） */
+  | { phase: 'failed'; message: string; reason?: 'download' | 'apply' }
 
 // ---------------- 弹幕（预留：弹弹play） ----------------
 

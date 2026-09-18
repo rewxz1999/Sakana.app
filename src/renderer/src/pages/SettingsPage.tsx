@@ -84,12 +84,12 @@ const UPDATE_REPO_SLUG = 'rewxz1999/Sakana.app'
 const UPDATE_REPO_URL = `https://github.com/${UPDATE_REPO_SLUG}`
 
 /**
- * 「软件更新」区块：检查 GitHub Releases → **应用内一键更新**（v0.2.9 最后更新）。
+ * 「软件更新」区块：检查 GitHub Releases → **应用内一键更新**（v0.2.9 最后更新 / v0.2.10 增量补丁）。
  *
  * 用户要求：安装包传到 GitHub Releases，应用以后都从 git 检测更新包，直接在应用内一键更新。
- * 因此这里比旧版多了两件事：
- * - 主进程能从 release 资产里拿到安装包 → 显示「下载更新」按钮与下载进度；
- * - 下载完成后「立即重启更新」→ 主进程静默安装（`/S --force-run`）并自动拉起新版本。
+ * v0.2.10 追加：用户要「安装包层面的小更新」—— 为此 release 里会同时传一份增量补丁
+ * （`patch-<旧版本>-to-<新版本>.zip`，只含变化的文件）。有补丁时这里显示的就是
+ * 「增量更新（x MB）」而不是几百 MB 的完整安装包，主进程负责下载 → 校验 → 覆盖安装目录。
  * 只有版本号、没有资产时（旧 version.json 通道）保留「前往下载」的兜底。
  *
  * 为什么不在挂载时自动检查：主进程启动后 8 秒已自动检查过一次，页面再触发一次纯属浪费。
@@ -134,7 +134,7 @@ function UpdateSection({ version }: { version: string }) {
       setBusy(false)
       if (!r.ok) toast.error(r.error)
       else if (!r.data.ok) toast.warn(r.data.message)
-      else toast.success('安装包已下载完成，可以立即更新')
+      else toast.success(r.data.message || '更新包已下载完成，可以立即更新')
     })
   }
 
@@ -159,11 +159,19 @@ function UpdateSection({ version }: { version: string }) {
   const percent =
     downloading && phase.total > 0 ? Math.min(100, Math.round((phase.received / phase.total) * 100)) : 0
   const fmtMB = (n: number): string => `${(n / 1024 / 1024).toFixed(1)} MB`
+  // v0.2.10：有增量补丁就按补丁走（几 MB），否则回落到完整安装包（几百 MB）
+  const patchSize = info?.patchSize ?? 0
+  const usingPatch = patchSize > 0
+  const packSize = usingPatch ? patchSize : (info?.assetSize ?? 0)
+  const packLabel = usingPatch ? '增量补丁' : '完整安装包'
+  // 这次下的是哪种包：主进程已经决定了就听它的（避免「检查」和「下载」之间补丁被换掉导致文案撒谎）
+  const doneMode = phase.phase === 'done' ? phase.mode : undefined
+  const donePatch = doneMode ? doneMode === 'patch' : usingPatch
 
   return (
     <Section
       title="软件更新"
-      desc={`应用启动时会自动检查一次；更新包来自 GitHub Releases（${UPDATE_REPO_SLUG}），可直接在应用内下载安装。`}
+      desc={`应用启动时会自动检查一次；更新包来自 GitHub Releases（${UPDATE_REPO_SLUG}），有增量补丁时只需下载变化的文件即可在应用内一键更新。`}
     >
       <div className="flex flex-col gap-3">
         {/* 当前版本 + 手动检查入口 */}
@@ -215,7 +223,7 @@ function UpdateSection({ version }: { version: string }) {
                   <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${percent}%` }} />
                 </div>
                 <div className="mt-1 text-[11px] text-dim">
-                  正在下载安装包… {percent}%（{fmtMB(phase.received)} / {fmtMB(phase.total)}）
+                  正在下载{packLabel}… {percent}%（{fmtMB(phase.received)} / {fmtMB(phase.total)}）
                 </div>
               </div>
             ) : null}
@@ -223,25 +231,39 @@ function UpdateSection({ version }: { version: string }) {
             <div className="mt-2 flex flex-wrap items-center gap-2">
               {phase.phase === 'done' || phase.phase === 'installing' ? (
                 <Button size="sm" icon={Download} loading={phase.phase === 'installing'} onClick={install}>
-                  {phase.phase === 'installing' ? '正在安装…' : `立即重启更新到 v${latest}`}
+                  {phase.phase === 'installing'
+                    ? '正在安装…'
+                    : donePatch
+                      ? `立即重启更新到 v${latest}（增量）`
+                      : `立即重启更新到 v${latest}`}
                 </Button>
               ) : (
                 <Button size="sm" icon={Download} loading={downloading || busy} onClick={download}>
-                  {downloading ? '下载中…' : `下载更新（v${latest}${info?.assetSize ? ` · ${fmtMB(info.assetSize)}` : ''}）`}
+                  {downloading
+                    ? '下载中…'
+                    : `${usingPatch ? '增量更新' : '下载更新'}（v${latest}${packSize ? ` · ${fmtMB(packSize)}` : ''}）`}
                 </Button>
               )}
               <Button variant="outline" size="sm" icon={ExternalLink} onClick={() => void api.app.updateOpenReleases()}>
                 打开 Releases 页面
               </Button>
             </div>
+            {/* 增量更新的说明：让用户知道为什么这次只有几 MB，以及和完整安装包的关系 */}
+            {usingPatch ? (
+              <div className="mt-1.5 text-[11px] leading-relaxed text-faint">
+                本次为增量更新：只下载变化的文件（{fmtMB(patchSize)}），校验通过后自动覆盖到安装目录并重启，
+                无需重新下载 {info?.assetSize ? fmtMB(info.assetSize) : '完整安装包'}。
+              </div>
+            ) : null}
             {phase.phase === 'failed' ? (
               <div className="mt-1.5 text-[11px] leading-relaxed text-danger">
-                下载失败：{phase.message}（可点「打开 Releases 页面」手动下载）
+                {phase.reason === 'apply' ? '更新未完成：' : '下载失败：'}
+                {phase.message}（可点「打开 Releases 页面」手动下载）
               </div>
             ) : null}
             {!info?.canInstall ? (
               <div className="mt-1.5 text-[11px] leading-relaxed text-faint">
-                这一版在 Releases 上没有找到 Windows 安装包，请到 Releases 页面手动下载。
+                这一版在 Releases 上没有找到 Windows 安装包或增量补丁，请到 Releases 页面手动下载。
               </div>
             ) : null}
           </div>

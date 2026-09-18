@@ -2517,6 +2517,46 @@ if (!gotLock) {
         })()
       }, 2500)
     }
+
+    /*
+     * 增量更新自检（SAKANA_PATCH_TEST=<补丁 zip 路径>）：
+     * 真实走一遍「解包校验 → 还原字节增量 → 写出覆盖脚本 → 辅助进程覆盖安装目录 → 重新拉起应用」，
+     * 用的是用户点「立即重启更新」时的同一段代码（updater.installUpdateFrom）。
+     * 之所以要有这个口子：增量更新是直接覆盖安装目录里的可执行文件，错了用户就打不开应用了，
+     * 不能只靠「算法看起来对」就发布。
+     * 加 `SAKANA_PATCH_TEST_FOREGROUND=1` 时只写出脚本、不启动辅助进程：自检环境会把「比命令活得久」
+     * 的进程统统杀掉，那时由测试自己在前台执行这个脚本（见 .e2e/run-e2e.ps1）。
+     */
+    if (process.env.SAKANA_PATCH_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const { join: pjoin } = await import('node:path')
+          const { existsSync: fexists, mkdirSync: fmkdir, writeFileSync: fwrite } = await import('node:fs')
+          const { installUpdateFrom } = await import('./services/updater')
+          const marker = pjoin(app.getPath('userData'), 'updates', '.patch-test-done')
+          if (fexists(marker)) {
+            // 覆盖完成后脚本会重新拉起应用，新进程会继承这个环境变量：靠标记文件避免重复打补丁
+            console.log('[patch-test] 已执行过，跳过（这次是覆盖完成后的重启实例）')
+            return
+          }
+          const zip = String(process.env.SAKANA_PATCH_TEST)
+          console.log(`[patch-test] 开始应用增量补丁：${zip}`)
+          const r = installUpdateFrom(zip, 'patch')
+          console.log(`[patch-test] 结果 ok=${r.ok}: ${r.message}`)
+          if (r.ok) {
+            fmkdir(pjoin(marker, '..'), { recursive: true })
+            fwrite(marker, new Date().toISOString())
+            console.log('[patch-test] 已写入完成标记')
+          } else {
+            console.log('[patch-test] 失败，保持应用运行以便排查')
+          }
+        })()
+      }, 3000)
+    }
+
+    // 启动时检查「上次增量更新没走完」（辅助进程被杀/被拦时会留下标记）：
+    // 结论会写进更新状态，用户在「设置 → 软件更新」里能直接看到并重试，日志里也有记录
+    void import('./services/updater').then((m) => m.checkPendingUpdate())
   })
 
   app.on('window-all-closed', () => {
