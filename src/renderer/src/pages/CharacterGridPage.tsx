@@ -299,6 +299,13 @@ function drawPoster(state: GridState, producer: string): { canvas: HTMLCanvasEle
   if (!ctx) throw new Error('无法创建画布上下文')
   ctx.scale(EX.S, EX.S)
   ctx.textBaseline = 'alphabetic'
+  /*
+   * 图像重采样质量（v0.2.14，用户反馈「立绘太模糊」）：
+   * canvas 默认 'low' 是速度优先的近似实现，立绘缩到格子尺寸（少数小图还要放大）时边缘发虚。
+   * 设为 'high' 用更好的插值核，同分辨率下观感明显更锐；导出只多几十毫秒。
+   */
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
 
   ctx.fillStyle = '#f5f6fa'
   ctx.fillRect(0, 0, W, H)

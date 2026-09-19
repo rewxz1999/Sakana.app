@@ -1,6 +1,6 @@
 {
-  "version": "0.2.13",
-  "important": true,
-  "notes": "修复「补丁解包失败：EPERM, Permission denied」（0.2.11 应用内更新到 0.2.12 时出现）：增量补丁的解包不再调用外部 tar 子进程，改为纯 JS 解压（EOCD→中央目录→inflateRawSync），并且先在内存里把哈希全部校验通过、再写磁盘；解包目录改用唯一名字，避开 Windows 上「删不掉又建不出来」的待删除状态。另外把校验失败的每一步都写进运行日志（之前复用已下载补丁失败时一声不吭，排查很困难）。",
+  "version": "0.2.14",
+  "important": false,
+  "notes": "提高「最XX的角色 9宫格」立绘清晰度。① app 内：导出取图不再走反代的 /r/400/ 缩放路径（实测同一个角色 large=800x2767、medium=400x1384，之前一直被压到 400px 再放大回格子尺寸，糊是必然的），现在取未缩放原图；② 格子里的立绘预览也与导出一致（原来预览用 medium、导出用 large，屏幕上和导出结果不是同一张图）；③ 画布重采样质量从默认的 low 提到 high，小图放大时边缘不再发虚。独立网页版同步更新并已推到 Sakana-tool 仓库。",
   "url": "https://github.com/rewxz1999/Sakana.app/releases"
 }

@@ -521,14 +521,26 @@ async function readResponseBuffer(res: Response): Promise<Buffer> {
  * **失败不抛异常**：任何单张失败都返回 `dataUrl: ''` + `error`，由调用方按格降级。
  */
 export async function imageDataUrl(rawUrl: string): Promise<ImageDataUrlResult> {
-  const target = String(rawUrl ?? '').trim()
+  const raw = String(rawUrl ?? '').trim()
   const fail = (error: string): ImageDataUrlResult => ({ dataUrl: '', mime: '', bytes: 0, error })
-  if (!target) return fail('图片地址为空')
+  if (!raw) return fail('图片地址为空')
   // 已经是 data URL 就直接回传（同源，画进 canvas 不会污染）
-  if (target.startsWith('data:')) {
-    const mime = /^data:([^;,]+)/.exec(target)?.[1] ?? 'image/jpeg'
-    return { dataUrl: target, mime, bytes: target.length }
+  if (raw.startsWith('data:')) {
+    const mime = /^data:([^;,]+)/.exec(raw)?.[1] ?? 'image/jpeg'
+    return { dataUrl: raw, mime, bytes: raw.length }
   }
+  /*
+   * v0.2.14：导出取**未缩放的原图**（用户反馈「立绘太模糊」）。
+   *
+   * 起因：`fetchImageWithCache` 内部固定 `rewriteImageUrl(target)`，默认宽度 400 ——
+   * 界面与导出一直用的是「反代缩到 400px 宽」的版本。实测同一个角色
+   * medium=400x1384、large=800x2767，被压到 400px 再画进 2 倍图（格子宽 460px）
+   * 等于先砍掉一半分辨率再放大回去，糊是必然的。
+   *
+   * `rewriteImageUrl(url, 0)` 保留原始路径、不加 `/r/<宽>/` 前缀（反代按原路径转发原图）。
+   * 这里先改写一次；`fetchImageWithCache` 内部再改写时域名已不是图床域名，会原样返回、不会重复处理。
+   */
+  const target = rewriteImageUrl(raw, 0)
   try {
     const res = await fetchImageWithCache(target)
     if (!res.ok) return fail(`取图失败（HTTP ${res.status}）`)
