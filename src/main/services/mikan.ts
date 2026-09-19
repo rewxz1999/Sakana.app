@@ -52,7 +52,9 @@ import {
   sameBase,
   sameSeason,
   seasonLabel,
-  type TitleKind
+  type TitleKind,
+  // parseTitleSeason 的返回类型：过滤链内部要给它起名（strict 模式下的 parsed 数组）
+  type TitleSeasonInfo as TitleParse
 } from '@shared/titleSeason'
 
 export { matchesSubGroup, normGroup } from '@shared/subgroup'
@@ -96,6 +98,22 @@ function keywordCandidates(sub: Subscription): string[] {
 /** 订阅条目自身的类型（用于判断「订阅本身就是电影/OVA」） */
 function subKindOf(cn: TitleKind, name: TitleKind): TitleKind {
   return cn !== 'unknown' ? cn : name
+}
+
+/**
+ * 资源是否比「上次检测到的发布日期」更新（v0.2.16 抽出为独立函数，严格/宽松两条路共用）。
+ *
+ * 注意 pubDate 解析失败时**算通过**（返回 true）：蜜柑的 pubDate 偶尔缺失或格式特殊，
+ * 若把「解析不出时间」当成「不够新」，用户会看到订阅明明有资源却一个都不提示 ——
+ * 这正是「什么资源都订阅不到」的一种成因，所以这里宁可放过。
+ */
+function isNewerThanLast(item: MikanItem, lastPubDate?: string | null): boolean {
+  if (!lastPubDate) return true
+  const itemTime = new Date(item.pubDate).getTime()
+  if (Number.isNaN(itemTime)) return true
+  const lastTime = new Date(lastPubDate).getTime()
+  if (Number.isNaN(lastTime)) return true
+  return itemTime > lastTime
 }
 
 class MikanService {
@@ -179,120 +197,163 @@ class MikanService {
               d.group === item.group))
       )
 
-    // ---------- 搜索阶段：多关键词合并去重 ----------
+    const label = sub.nameCn || sub.name || sub.mikanKeyword
     const keywords = keywordCandidates(sub)
+
+    // ---------- 搜索阶段（v0.2.16 重写）----------
+    /*
+     * 用户实测「什么资源都订阅不到」，日志是：
+     *   候选 38 条 → 同字幕组 0 → 基名一致 0 → 命中 0
+     * 而用真 RSS 一探就明白：主关键词（订阅的完整标题）能搜到 **100 条**、里面正有该字幕组的资源；
+     * 另外两个派生关键词只搜到 36 + 2 条，且全是别的字幕组 —— **36+2 正好等于日志里的 38**。
+     * 也就是说：**主关键词那次搜索在应用里失败了，而合并逻辑一声不吭地用剩下两个无关关键词继续跑**，
+     * 于是字幕组过滤全灭。旧代码只搜一个关键词，失败会明确报错；多关键词合并把这个失败掩盖了。
+     *
+     * 所以这一版：① 每次搜索失败都重试一次并写日志（不再静默降级）；
+     * ② 严格规则筛出 0 条时，追加「按字幕组名搜索」的候选再来一遍；
+     * ③ 仍然 0 条就放宽成「只按字幕组」（旧行为）并标出来 ——
+     *    宁可多给几条，也绝不出现「订阅了一个都搜不到」这种把功能整个关掉的失败模式。
+     */
     const merged = new Map<string, MikanItem>()
-    let firstError: string | undefined
-    for (const kw of keywords) {
-      const res = await this.search(kw)
-      if (res.error && !firstError) firstError = res.error
-      for (const item of res.items) {
-        // 按 guid 合并去重（guid 就是蜜柑的种子 id，跨搜索词唯一）；
-        // torrentUrl 兜一层底：search() 为了「勾一条别全勾上」会给同响应内的重复 guid
-        // 加 `#2` 后缀，跨响应时同一资源的 guid 可能带不同后缀。
+    const addItems = (items: MikanItem[]): void => {
+      for (const item of items) {
+        // 按 guid 合并去重（guid 就是蜜柑的种子 id）；torrentUrl 兜一层底：同响应里的重复 guid
+        // 会被 search() 加上 `#2` 后缀，跨响应时同一资源可能带不同后缀
         const key = item.torrentUrl ? `t:${item.torrentUrl}` : `g:${item.guid}`
         if (!merged.has(key)) merged.set(key, item)
       }
     }
-    const all = [...merged.values()]
-    if (all.length === 0 && firstError) {
-      log.append('warn', 'mikan', `订阅《${sub.nameCn || sub.name}》检测失败：${firstError}`)
+    const searchLog: string[] = []
+    const searchInto = async (kw: string): Promise<void> => {
+      let res = await this.search(kw)
+      if (res.error) {
+        // 首次失败最常见的原因是瞬时网络/上游抖动 —— 直接放弃会让「候选」悄悄少掉一整批
+        log.append('warn', 'mikan', `订阅《${label}》搜索失败「${kw}」，2 秒后重试一次：${res.error}`)
+        await new Promise((r) => setTimeout(r, 2000))
+        res = await this.search(kw)
+        if (res.error) log.append('warn', 'mikan', `订阅《${label}》搜索仍然失败「${kw}」：${res.error}`)
+      }
+      searchLog.push(`${kw}=${res.items.length}${res.error ? '(失败)' : ''}`)
+      addItems(res.items)
     }
+    for (const kw of keywords) await searchInto(kw)
 
     // ---------- 过滤阶段 ----------
-    const label = sub.nameCn || sub.name || sub.mikanKeyword
     const cnInfo = parseTitleSeason(sub.nameCn || '')
     const nameInfo = parseTitleSeason(sub.name || '')
     const subBase = cnInfo.base || nameInfo.base
     // 季数以中文名优先：nameCn 认不出季数时才退回日文名（两个名字来自同一个 Bangumi 条目）
     const subSeason = cnInfo.season ?? nameInfo.season
     const subKind = subKindOf(cnInfo.kind, nameInfo.kind)
-
-    const parsed = all.map((item) => ({ item, info: parseTitleSeason(item.title) }))
-
-    // ① 字幕组（保持现状：订阅指定了字幕组时，解析不出字幕组的资源一律不要）
-    const byGroup = parsed.filter((p) => matchesSubGroup(sub.group, p.item.group))
-
-    // ② 基名一致。跨语言的边界就在这里：同一部番剧的中文名/日文名互不包含，
-    //    能匹配上是因为搜索阶段把两边的名字都搜了一遍；本地不做（也做不了）跨语言字符串匹配。
-    const baseMatched: typeof parsed = []
-    const baseSamples: string[] = []
-    for (const p of byGroup) {
-      if (sameBase(subBase, p.info.base)) {
-        baseMatched.push(p)
-      } else if (baseSamples.length < 3) {
-        baseSamples.push(`${p.info.base || '(空)'} ← ${p.item.title}`)
-      }
-    }
-    const baseRejected = byGroup.length - baseMatched.length
-
-    // 规则 ④ 的第二个条件：基名一致的条目里一条带集数的都没有（纯剧场版/OVA 番剧）
-    const noneHasEpisode = baseMatched.length > 0 && baseMatched.every((p) => p.item.episode == null)
+    const noneHasEpisodeOf = (candidates: { item: MikanItem; info: TitleParse }[]): boolean =>
+      candidates.length > 0 && candidates.every((p) => p.item.episode == null)
     const subIsMovieLike = subKind === 'movie' || subKind === 'ova'
-    const allowNoEpisode = subIsMovieLike || noneHasEpisode
 
-    const newItems: MikanItem[] = []
-    let seasonRejected = 0
-    let episodeRejected = 0
-    let handledRejected = 0
-    let oldRejected = 0
-    const seasonSamples: string[] = []
-
-    for (const p of baseMatched) {
-      const { item, info } = p
-
-      // ③ 同季（movie/ova 没有季概念，见 sameSeason）
-      if (!sameSeason(subSeason, info.season, info.kind)) {
-        seasonRejected++
-        if (seasonSamples.length < 3) {
-          seasonSamples.push(`${seasonLabel(info.season)} ← ${item.title}`)
+    /**
+     * 过滤链。`mode='strict'` 是用户要的「同字幕组 + 同基名 + 同季 + 有集数/OVA」；
+     * `mode='loose'` 只保留字幕组（等价于旧版本的行为），作为兜底。
+     */
+    const applyFilters = (
+      candidates: MikanItem[],
+      mode: 'strict' | 'loose'
+    ): {
+      newItems: MikanItem[]
+      stats: string
+    } => {
+      // ① 字幕组（订阅指定了字幕组时，解析不出字幕组的资源一律不要）
+      const byGroup = candidates.filter((item) => matchesSubGroup(sub.group, item.group))
+      if (mode === 'loose') {
+        const out = byGroup.filter((item) => !handled(item) && isNewerThanLast(item, sub.lastPubDate))
+        return {
+          newItems: out.map((item) => ({ ...item, isNew: true })),
+          stats: `候选 ${candidates.length} → 同字幕组 ${byGroup.length} → 命中 ${out.length}（宽松模式：只看字幕组）`
         }
-        continue
       }
 
-      // ④ 有集数，或本身就是 OVA/剧场版/特别篇，或订阅侧允许没有集数的条目
-      const hasEpisode = item.episode != null
-      const specialKind = info.kind === 'movie' || info.kind === 'ova' || info.kind === 'special'
-      if (!hasEpisode && !specialKind && !allowNoEpisode) {
-        episodeRejected++
-        continue
-      }
+      const parsed = byGroup.map((item) => ({ item, info: parseTitleSeason(item.title) }))
+      // ② 基名一致。跨语言的边界就在这里：同一部番剧的中文名/日文名互不包含，
+      //    能匹配上是因为搜索阶段把两边的名字都搜了一遍；本地不做（也做不了）跨语言匹配。
+      const baseMatched = parsed.filter((p) => sameBase(subBase, p.info.base))
+      const baseSamples = parsed
+        .filter((p) => !sameBase(subBase, p.info.base))
+        .slice(0, 3)
+        .map((p) => `${p.info.base || '(空)'} ← ${p.item.title}`)
+      const allowNoEpisode = subIsMovieLike || noneHasEpisodeOf(baseMatched)
 
-      // ⑤ 原有逻辑：已处理过的不算、不比 lastPubDate 新不算
-      if (handled(item)) {
-        handledRejected++
-        continue
-      }
-      if (sub.lastPubDate) {
-        const itemTime = new Date(item.pubDate).getTime()
-        const lastTime = new Date(sub.lastPubDate).getTime()
-        if (!(!Number.isNaN(itemTime) && itemTime > lastTime)) {
+      const newItems: MikanItem[] = []
+      let seasonRejected = 0
+      let episodeRejected = 0
+      let oldRejected = 0
+      const seasonSamples: string[] = []
+      for (const p of baseMatched) {
+        const { item, info } = p
+        // ③ 同季（movie/ova 没有季概念，见 sameSeason）
+        if (!sameSeason(subSeason, info.season, info.kind)) {
+          seasonRejected++
+          if (seasonSamples.length < 3) seasonSamples.push(`${seasonLabel(info.season)} ← ${item.title}`)
+          continue
+        }
+        // ④ 有集数，或本身就是 OVA/剧场版/特别篇，或订阅侧允许没有集数的条目
+        const specialKind = info.kind === 'movie' || info.kind === 'ova' || info.kind === 'special'
+        if (item.episode == null && !specialKind && !allowNoEpisode) {
+          episodeRejected++
+          continue
+        }
+        // ⑤ 已处理过的不算、不比 lastPubDate 新不算
+        if (handled(item)) continue
+        if (!isNewerThanLast(item, sub.lastPubDate)) {
           oldRejected++
           continue
         }
+        newItems.push({ ...item, isNew: true })
       }
-      newItems.push({ ...item, isNew: true })
+      const stats =
+        `候选 ${candidates.length} → 同字幕组 ${byGroup.length} → 基名一致 ${baseMatched.length} → 命中 ${newItems.length}` +
+        `（判掉：基名 ${parsed.length - baseMatched.length}、季数 ${seasonRejected}、无集数 ${episodeRejected}、早于上次 ${oldRejected}）` +
+        (seasonSamples.length ? `；季数不符示例：${seasonSamples.join(' | ')}` : '') +
+        (!baseMatched.length && baseSamples.length ? `；基名不符示例：${baseSamples.join(' | ')}` : '')
+      return { newItems, stats }
     }
 
-    /**
-     * 规则是否太严要能被看见：只要出现「基名/季数判掉了东西」或「一条基名都没匹配上」，
-     * 就往运行日志写一行统计（干净的检测不写，避免每次启动刷一屏）。
+    let result = applyFilters([...merged.values()], 'strict')
+    let mode: 'strict' | 'group-search' | 'loose' = 'strict'
+
+    // ② 严格规则一条没命中 → 再用**字幕组名**搜一遍（同一个番剧在标题里换了名字时，只有这条路能捞到）
+    if (result.newItems.length === 0 && sub.group) {
+      const before = merged.size
+      await searchInto(sub.group)
+      if (merged.size > before) {
+        const retry = applyFilters([...merged.values()], 'strict')
+        if (retry.newItems.length > 0) {
+          mode = 'group-search'
+          result = retry
+        }
+      }
+    }
+
+    // ③ 还是 0 条 → 放宽成「只按字幕组」（旧行为）。宁可多给几条，也不能让订阅功能整个失效。
+    if (result.newItems.length === 0 && sub.group) {
+      const loose = applyFilters([...merged.values()], 'loose')
+      if (loose.newItems.length > 0) {
+        mode = 'loose'
+        result = loose
+      }
+    }
+
+    /*
+     * 只在「有问题」时写日志：有判掉、一条基名都没匹配上、或者用了兜底路径、或有搜索失败。
+     * 干净的检测不写，避免每次启动刷一屏。
      */
-    if (baseRejected > 0 || seasonRejected > 0 || baseMatched.length === 0) {
-      const parts = [
-        `订阅《${label}》${seasonLabel(subSeason)}`,
-        `搜索词 ${keywords.join(' / ') || '(空)'}`,
-        `候选 ${all.length} 条 → 同字幕组 ${byGroup.length} → 基名一致 ${baseMatched.length} → 命中 ${newItems.length}`,
-        `判掉：基名 ${baseRejected}、季数 ${seasonRejected}、无集数 ${episodeRejected}、已处理 ${handledRejected}、早于上次 ${oldRejected}`
-      ]
-      if (seasonSamples.length > 0) parts.push(`季数不符示例：${seasonSamples.join(' | ')}`)
-      if (baseMatched.length === 0 && baseSamples.length > 0) {
-        parts.push(`基名不符示例：${baseSamples.join(' | ')}`)
-      }
-      log.append('info', 'mikan', parts.join('；'))
+    const keywordFailed = searchLog.some((s) => s.includes('(失败)'))
+    if (mode !== 'strict' || keywordFailed || result.newItems.length === 0) {
+      log.append(
+        'info',
+        'mikan',
+        `订阅《${label}》${seasonLabel(subSeason)}；搜索 ${searchLog.join(' / ') || '(无关键词)'}；${result.stats}` +
+          (mode === 'strict' ? '' : `；**使用了兜底路径：${mode}**`)
+      )
     }
-
-    return { subId: sub.id, newItems, checkedAt: Date.now() }
+    return { subId: sub.id, newItems: result.newItems, checkedAt: Date.now() }
   }
 
   /** 应用启动时自动检测全部订阅（方案 4.2） */

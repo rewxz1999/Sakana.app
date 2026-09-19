@@ -2695,6 +2695,51 @@ if (!gotLock) {
     }
 
     /*
+     * 订阅检测自检（SAKANA_SUB_MATCH_TEST=标题|字幕组|搜索词;标题2|字幕组2）—— v0.2.16 新增。
+     *
+     * 起因：用户报「什么资源都订阅不到」，日志显示候选 38 条里一条字幕组都匹配不上，
+     * 而真实 RSS 里主关键词明明能搜到 100 条且含该字幕组 —— 问题出在搜索阶段的静默失败。
+     * 这类问题必须能用**应用自己的代码路径 + 真实 RSS** 一键复现与回归，
+     * 所以这里直接构造订阅对象跑 checkSub，打印命中条数与标题。
+     * 注意：变量名不能叫 SAKANA_SUBS_TEST —— 那是订阅页 UI 自检（更早的版本）在用的名字，会互相顶掉。
+     */
+    if (process.env.SAKANA_SUB_MATCH_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const { mikan } = await import('./services/mikan')
+          const specs = String(process.env.SAKANA_SUB_MATCH_TEST)
+            .split(';')
+            .map((s) => s.trim())
+            .filter(Boolean)
+          for (const spec of specs) {
+            const [name, group, kw] = spec.split('|').map((s) => s.trim())
+            const sub = {
+              id: `e2e-${Math.random().toString(36).slice(2, 8)}`,
+              name,
+              nameCn: name,
+              group: group || null,
+              mikanKeyword: kw || name,
+              createdAt: Date.now(),
+              status: 'complete'
+            } as unknown as Parameters<typeof mikan.checkSub>[0]
+            try {
+              const r = await mikan.checkSub(sub)
+              console.log(`[subs-test] 《${name}》+ ${group || '(未指定字幕组)'} → 命中 ${r.newItems.length} 条`)
+              for (const it of r.newItems.slice(0, 5)) {
+                console.log(`    [${it.group ?? '?'}] ${it.title.slice(0, 95)}`)
+              }
+            } catch (err) {
+              console.log(`[subs-test] 《${name}》异常：${String((err as Error)?.message ?? err)}`)
+            }
+          }
+          console.log('[subs-test] done')
+          markQuitting()
+          app.quit()
+        })()
+      }, 3000)
+    }
+
+    /*
      * 搜索自检（SAKANA_SEARCH_TEST=关键词1,关键词2）：
      * 走应用真实的搜索链路（自建反代 → v0 → 老接口兜底 → 关键词变体 → 缓存），
      * 打印每个关键词命中几条、前几条标题；命中了哪条路写在服务日志里。
