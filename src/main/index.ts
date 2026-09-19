@@ -2753,7 +2753,7 @@ if (!gotLock) {
           }
           const zip = String(process.env.SAKANA_PATCH_TEST)
           console.log(`[patch-test] 开始应用增量补丁：${zip}`)
-          const r = installUpdateFrom(zip, 'patch')
+          const r = await installUpdateFrom(zip, 'patch')
           console.log(`[patch-test] 结果 ok=${r.ok}: ${r.message}`)
           if (r.ok) {
             fmkdir(pjoin(marker, '..'), { recursive: true })

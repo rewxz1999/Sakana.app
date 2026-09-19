@@ -811,9 +811,18 @@ export function installUpdateFrom(file: string, mode: 'patch' | 'installer'): { 
       } catch {
         /* ignore */
       }
+      /*
+       * ⚠️ 必须写 **UTF-8 BOM**（v0.2.15，用户实测「更新脚本没有启动（PowerShell 未能运行）」）。
+       *
+       * 原因：Windows PowerShell 5.1 读取**没有 BOM** 的文件时按系统 ANSI 代码页解析。
+       * 脚本里必然含用户安装路径（例如 `D:\动画应用\sakana\sakana.data`），于是中文路径全变乱码 ——
+       * 脚本还能跑，但 `Out-File` 写到的是乱码路径，应用在**正确**的路径上等 `helper started`，
+       * 永远等不到，握手超时 → 报「更新脚本没有启动」。加 BOM 后 PS 正确识别 UTF-8，路径不再被破坏。
+       * （同一个坑在本项目的 .ps1 自检脚本上踩过两次。）
+       */
       writeFileSync(
         scriptPath,
-        buildApplyScript(stage, installDir, exe, logFile, removedFilesFor(stage)),
+        `\uFEFF${buildApplyScript(stage, installDir, exe, logFile, removedFilesFor(stage))}`,
         'utf8'
       )
       // 更新进行中的标记：辅助进程成功后会删掉它，留着就说明上次没走完

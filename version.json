@@ -1,6 +1,6 @@
 {
-  "version": "0.2.14",
+  "version": "0.2.15",
   "important": false,
-  "notes": "提高「最XX的角色 9宫格」立绘清晰度。① app 内：导出取图不再走反代的 /r/400/ 缩放路径（实测同一个角色 large=800x2767、medium=400x1384，之前一直被压到 400px 再放大回格子尺寸，糊是必然的），现在取未缩放原图；② 格子里的立绘预览也与导出一致（原来预览用 medium、导出用 large，屏幕上和导出结果不是同一张图）；③ 画布重采样质量从默认的 low 提到 high，小图放大时边缘不再发虚。独立网页版同步更新并已推到 Sakana-tool 仓库。",
+  "notes": "修复「增量更新未能启动：更新脚本没有启动（PowerShell 未能运行）」：覆盖脚本改为带 UTF-8 BOM 写出——Windows PowerShell 5.1 读无 BOM 文件时按 ANSI 解析，脚本里的中文安装路径（如 D:\\\\动画应用\\\\…）被破坏成乱码，于是它把启动日志写到错误路径，应用在正确路径上永远等不到握手而报错。",
   "url": "https://github.com/rewxz1999/Sakana.app/releases"
 }
