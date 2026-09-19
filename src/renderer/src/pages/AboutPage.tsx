@@ -15,6 +15,16 @@ import deepseekThanks from '@/assets/deepseek-1.png'
 /** 版本号兜底（正常情况下由主进程 app.getVersion() 提供，避免多处硬编码漂移） */
 const APP_VERSION_FALLBACK = '0.2.7'
 
+/**
+ * 项目作者（v0.2.12）。
+ *
+ * 名字**不在仓库里**：构建时由 `electron.vite.config.ts` 从被 gitignore 的
+ * `sakana.local.json` 读到，再通过 `define` 注入成这个全局常量
+ * （用户要求「关于页加上项目作者，但 git 上不要传作者名字」）。
+ * 没配置时是空串，页面会整行隐藏 —— 所以源码与提交历史里都找不到这个名字。
+ */
+const PROJECT_AUTHOR: string = typeof __SAKANA_AUTHOR__ === 'string' ? __SAKANA_AUTHOR__ : ''
+
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="flex items-start justify-between gap-4 py-1.5">
@@ -105,6 +115,10 @@ export function AboutPage() {
         <div className="text-base font-bold">Sakana</div>
         <div className="text-xs text-faint">版本 v{version}</div>
         <div className="text-[11px] text-faint">番剧管理及播放桌面客户端</div>
+        {/* 项目作者：用户要求「不需要太显眼」，所以只放一行浅色小字；未配置就整行不渲染 */}
+        {PROJECT_AUTHOR ? (
+          <div className="mt-1 text-[10px] tracking-wide text-faint/80">项目作者：{PROJECT_AUTHOR}</div>
+        ) : null}
       </div>
 
       {/* 数据来源 */}

@@ -11,6 +11,7 @@ import {
   FolderOpen,
   Gamepad2,
   HardDrive,
+  Rocket,
   Image,
   Info,
   MessagesSquare,
@@ -246,6 +247,10 @@ function UpdateSection({ version }: { version: string }) {
               )}
               <Button variant="outline" size="sm" icon={ExternalLink} onClick={() => void api.app.updateOpenReleases()}>
                 打开 Releases 页面
+              </Button>
+              {/* v0.2.12：更新有了独立的可视化窗口（进度/速度/剩余时间），设置页留一个入口 */}
+              <Button variant="ghost" size="sm" icon={Rocket} onClick={() => void api.app.updateOpenWindow()}>
+                打开更新窗口
               </Button>
             </div>
             {/* 增量更新的说明：让用户知道为什么这次只有几 MB，以及和完整安装包的关系 */}

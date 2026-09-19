@@ -45,6 +45,18 @@ export function closeSmallWindow(win: BrowserWindow): void {
   if (win && !win.isDestroyed() && isSmallWindow(win)) win.close()
 }
 
+/**
+ * 打开**更新窗口**（v0.2.12）。
+ *
+ * 用户要求「更新程序现在需要一个可视化界面让用户看到更新进度，更新程序现在也是一个
+ * 十分重要、且优先级较高的模块」——所以给它一个独立窗口：不占主窗口版面、
+ * 不影响用户继续浏览番剧，进度条与阶段说明始终在眼前。
+ * 直接复用小窗口那套壳（自绘标题栏 + 单例 + 崩溃重建），只有尺寸与标题不同。
+ */
+export function openUpdateWindow(): BrowserWindow {
+  return openSmallWindow('/update', { width: 660, height: 560, title: 'Sakana 更新' })
+}
+
 function rendererUrl(): string {
   return join(__dirname, '../renderer/index.html')
 }

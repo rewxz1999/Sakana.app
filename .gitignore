@@ -62,3 +62,9 @@ Thumbs.db
 .e2e/
 .patchpeek/
 
+# ---- v0.2.12：只留在本地的构建期信息 ----
+# 用户要求「关于页显示项目作者，但作者名字不要传到 git 仓库」：
+# 名字放在这个被忽略的文件里，构建时由 electron.vite.config.ts 读进 __SAKANA_AUTHOR__。
+# 仓库里只有变量名、没有名字本身；删掉这个文件也能正常构建（关于页只是不显示作者）。
+sakana.local.json
+

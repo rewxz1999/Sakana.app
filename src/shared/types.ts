@@ -124,6 +124,52 @@ export interface SearchResult {
   error?: SourceError
 }
 
+/**
+ * 角色条目（「最XX的角色 9宫格」工具用）。
+ *
+ * 两条路都能拿到，字段名不完全一样（见 main/services/bangumi.ts 的 characters()）：
+ * - v0：`GET {base}/v0/subjects/{id}/characters` → `{id,name,relation,images}`
+ * - 老接口：`GET {base}/subject/{id}?responseGroup=large` → `crt[]` 的 `{id,name,role_name,images}`
+ */
+export interface CharacterItem {
+  id: number
+  name: string
+  /** 中文名：v0 的角色接口不返回该字段（老接口偶尔有），没有时为空串 */
+  name_cn: string
+  /** 与作品的关系：主角 / 配角 / 客串…（老接口的字段名是 role_name） */
+  relation: string
+  images: CoverImages | null
+}
+
+/** 角色列表结果：`source` 用来在界面上如实标出「数据来自哪条路」 */
+export interface CharactersResult {
+  subjectId: number
+  items: CharacterItem[]
+  /**
+   * - `v0`：首选接口，字段最全；
+   * - `legacy`：老接口兜底，**角色数可能比 v0 少**（实测它只给主要角色），界面要照实提示。
+   */
+  source: 'v0' | 'legacy'
+  fromCache: boolean
+  /** 命中的是**已过期**的缓存（数据照常可用，后台已在尝试刷新） */
+  stale?: boolean
+  error?: SourceError
+}
+
+/**
+ * 远程图片 → data URL 的结果（九宫格导出把立绘画进 canvas 用）。
+ *
+ * **失败不抛异常**：单张立绘取不到时返回 `dataUrl: ''` + `error`，
+ * 导出链路按「这一格用占位色块」降级，而不是让整张图导出失败。
+ */
+export interface ImageDataUrlResult {
+  /** 成功时形如 `data:image/jpeg;base64,…`；失败为空串 */
+  dataUrl: string
+  mime: string
+  bytes: number
+  error?: string
+}
+
 export interface MirrorTestResult {
   url: string
   ok: boolean
@@ -434,6 +480,13 @@ export interface UpdateInfo {
   patchName?: string
   /** 补丁字节数（界面显示「增量更新（x MB）」） */
   patchSize?: number
+  /**
+   * v0.2.12：是否为**重要更新**。
+   * 判定来源：Release 说明里带 `【重要更新】` 标记（或 version.json 里 `important: true`）。
+   * 重要的版本在应用启动后会**弹窗强提醒**（用户要求：「之后只要是十分重要的更新，
+   * 都要在应用启动后弹窗强烈提醒用户更新」）。
+   */
+  important?: boolean
 }
 
 /**

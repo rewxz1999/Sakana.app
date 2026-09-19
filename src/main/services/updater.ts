@@ -1,4 +1,4 @@
-import { app, shell } from 'electron'
+import { app, BrowserWindow, shell } from 'electron'
 import { createHash } from 'node:crypto'
 import {
   createWriteStream,
@@ -14,8 +14,10 @@ import {
 import { dirname, join } from 'node:path'
 import axios from 'axios'
 import type { UpdateInfo, UpdateInstallState } from '@shared/types'
+import { CH } from '@shared/channels'
 import { log } from '../log'
 import { httpGetText } from '../net'
+import { store } from '../store'
 import { dataPaths } from './paths'
 
 /**
@@ -141,6 +143,20 @@ interface VersionFile {
   version?: string
   notes?: string
   url?: string
+  /** v0.2.12：重要更新标记（与 Release 说明里的 `【重要更新】` 等价） */
+  important?: boolean
+}
+
+/**
+ * 是否为「重要更新」（v0.2.12）。
+ *
+ * 用户要求：「本次更新十分重要，之后只要是十分重要的更新都要在应用启动后弹窗强烈提醒用户更新」。
+ * 判定做成**发布侧可控、不用改代码**：Release 的标题或说明里写上 `【重要更新】` 即可
+ * （`[重要更新]` / `【重要】` 也认）。以后哪次发布重要，带上标记就会触发强提醒。
+ */
+function isImportantRelease(release: GithubRelease): boolean {
+  const text = `${release.name ?? ''}\n${release.body ?? ''}`
+  return /【重要更新】|\[重要更新\]|【重要】/.test(text)
 }
 
 /** 旧通道：version.json 多镜像竞速（只用于「没有 release 资产」时的提示） */
@@ -181,7 +197,8 @@ export async function checkUpdate(manual = false): Promise<UpdateInfo> {
       assetName: asset?.name,
       assetSize: asset?.size,
       patchName: patch?.name,
-      patchSize: patch?.size
+      patchSize: patch?.size,
+      important: isImportantRelease(release)
     }
     cached = info
     log.append(
@@ -220,7 +237,8 @@ export async function checkUpdate(manual = false): Promise<UpdateInfo> {
       notes: remote.notes,
       url: remote.url || `${REPO_URL}/releases`,
       checkedAt: Date.now(),
-      canInstall: false
+      canInstall: false,
+      important: remote.important === true
     }
     cached = info
     log.append(
@@ -823,4 +841,45 @@ export function scheduleAutoCheck(): void {
   }, 8000)
   // 顺手清掉过期的更新下载（安装包 200MB 一个，留着纯占地方）
   setTimeout(() => cleanupUpdatesDir(), 12000)
+  // 重要更新的强提醒（用户要求：重要更新要在启动后弹窗提醒）
+  setTimeout(() => void notifyImportantUpdate(), 14000)
+}
+
+/** 用户点过「稍后」的版本号（存在 store 里，重启后仍然不打扰同一版本） */
+const SNOOZE_KEY = 'updateImportantSnoozed'
+
+/**
+ * 发现**重要更新**时弹窗强提醒（v0.2.12）。
+ *
+ * 为什么用弹窗而不是通知中心/气泡：用户的原话是「十分重要的更新都要在应用启动后
+ * **弹窗强烈提醒**」—— 这次更新本身就属于这类（安装器/数据保护那批修复）。
+ * 但也不能变成每 8 秒骚扰一次：同一个版本点过「稍后」就一直安静到下次版本变化，
+ * 而且**登录/启动时只提醒一次**（这个函数只在启动后调用一次）。
+ */
+export async function notifyImportantUpdate(): Promise<void> {
+  try {
+    const info = await checkUpdate(false)
+    if (!info.hasUpdate || !info.important) return
+    if (store.get<string>(SNOOZE_KEY, '') === info.latest) {
+      log.append('info', 'update', `重要版本 ${info.latest} 已被用户标记「稍后」，本次不再提醒`)
+      return
+    }
+    log.append('info', 'update', `发现重要更新 ${info.latest}，向主窗口弹强提醒`)
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (w.isDestroyed()) continue
+      try {
+        w.webContents.send(CH.evUpdateImportant, info)
+      } catch {
+        /* 单个窗口发送失败不影响其它窗口 */
+      }
+    }
+  } catch (err) {
+    log.append('warn', 'update', `重要更新提醒失败: ${String((err as Error)?.message ?? err)}`)
+  }
+}
+
+/** 重要更新弹窗里点「稍后」：记下版本号，本次启动不再打扰 */
+export function snoozeImportantUpdate(version: string): void {
+  store.set(SNOOZE_KEY, version)
+  log.append('info', 'update', `用户选择稍后更新到 ${version}（下次启动仍会提醒）`)
 }

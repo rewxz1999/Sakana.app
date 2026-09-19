@@ -5,6 +5,7 @@ import {
   BookmarkCheck,
   BookmarkPlus,
   Check,
+  ChevronDown,
   ChevronLeft,
   GripVertical,
   History,
@@ -239,6 +240,34 @@ export function SearchPage() {
   /** 书签多于 STRIP_ROWS 时是否铺全（默认只铺前几行 + 「+N」） */
   const [showAllMarks, setShowAllMarks] = useState(false)
   const stripRef = useRef<HTMLDivElement | null>(null)
+
+  /*
+   * 搜索历史下拉面板（v0.2.12，用户要求「搜索历史需要改成下拉式标签页」）。
+   *
+   * 旧做法是一条常驻横条，永远占着顶部一行高度；词多了还要横向滚动。
+   * 现在收进搜索框左侧的下拉按钮里，面板内用标签页分区：
+   * 「搜索历史」= 最近搜过的关键词，「书签」= 每个书签当初用的关键词（点一下重搜）。
+   * 两个标签页都是「点了就重搜」，所以合在一个下拉里最顺手。
+   */
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [historyTab, setHistoryTab] = useState<'history' | 'marks'>('history')
+  const historyPanelRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    if (!historyOpen) return
+    // 点击面板/按钮之外、或按 Esc 都收起；拖拽等其它交互不受影响
+    const onDown = (e: MouseEvent): void => {
+      if (historyPanelRef.current && !historyPanelRef.current.contains(e.target as Node)) setHistoryOpen(false)
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setHistoryOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [historyOpen])
 
   const [dragSubject, setDragSubject] = useState<DragSubject | null>(null)
   const [draggingOver, setDraggingOver] = useState(false)
@@ -629,10 +658,26 @@ export function SearchPage() {
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') void doSearch(query)
+                  if (e.key === 'Escape') setHistoryOpen(false)
                 }}
                 placeholder="搜索番剧，回车开始搜索；结果可拖到右侧书签条…"
-                className="h-10 w-full rounded-xl border border-border bg-elev1 pl-4 pr-24 text-sm outline-none transition-colors placeholder:text-faint focus:border-accent"
+                className="h-10 w-full rounded-xl border border-border bg-elev1 pl-11 pr-24 text-sm outline-none transition-colors placeholder:text-faint focus:border-accent"
               />
+              {/*
+                搜索历史下拉触发器（v0.2.12）：放在搜索框左侧内部，不再单独占一整行。
+                面板里分「搜索历史 / 书签」两个标签页，点任一条都是重跑搜索。
+              */}
+              <button
+                ref={historyPanelRef as unknown as React.RefObject<HTMLButtonElement>}
+                title="搜索历史与书签"
+                onClick={() => setHistoryOpen((v) => !v)}
+                className={`absolute left-1.5 top-1/2 flex h-7 -translate-y-1/2 items-center gap-0.5 rounded-lg px-1.5 text-faint transition-colors hover:bg-elev2 hover:text-text ${
+                  historyOpen ? 'bg-accent-soft text-accent' : ''
+                }`}
+              >
+                <History size={14} />
+                <ChevronDown size={12} className={`transition-transform ${historyOpen ? 'rotate-180' : ''}`} />
+              </button>
               <div className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
                 {query ? (
                   <button
@@ -651,6 +696,112 @@ export function SearchPage() {
                   {searching ? <Spinner size={14} /> : <Search size={14} />}
                 </button>
               </div>
+
+              {/* 下拉面板：标签页 = 搜索历史 / 书签 */}
+              {historyOpen ? (
+                <div
+                  className="absolute left-0 right-0 top-12 z-30 overflow-hidden rounded-xl border border-border bg-elev1 shadow-xl"
+                  onMouseDown={(e) => e.stopPropagation()}
+                >
+                  <div className="flex items-center gap-1 border-b border-border bg-elev2/60 px-2 pt-2">
+                    {(
+                      [
+                        { id: 'history' as const, label: '搜索历史', count: history.length },
+                        { id: 'marks' as const, label: '书签', count: lists.length }
+                      ]
+                    ).map((t) => (
+                      <button
+                        key={t.id}
+                        onClick={() => setHistoryTab(t.id)}
+                        className={`rounded-t-lg px-3 py-1.5 text-xs transition-colors whitespace-nowrap ${
+                          historyTab === t.id
+                            ? 'bg-elev1 font-medium text-accent'
+                            : 'text-faint hover:text-text'
+                        }`}
+                      >
+                        {t.label}
+                        <span className="ml-1 tabular-nums text-[10px] text-faint">{t.count}</span>
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="max-h-64 overflow-y-auto p-2">
+                    {historyTab === 'history' ? (
+                      history.length === 0 ? (
+                        <div className="px-2 py-6 text-center text-[11px] text-faint">
+                          暂无搜索记录（上限 {HISTORY_LIMIT} 条）
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap gap-1.5">
+                          {history.map((h) => (
+                            <button
+                              key={`${h.kw}-${h.at}`}
+                              title={`${h.kw}\n${dayjs(h.at).format('YYYY-MM-DD HH:mm')}`}
+                              onClick={() => {
+                                setHistoryOpen(false)
+                                void doSearch(h.kw)
+                              }}
+                              className="max-w-full truncate rounded-full border border-border bg-elev2 px-2.5 py-1 text-[11px] text-dim transition-colors hover:border-accent hover:text-accent"
+                            >
+                              {h.kw}
+                            </button>
+                          ))}
+                        </div>
+                      )
+                    ) : lists.length === 0 ? (
+                      <div className="px-2 py-6 text-center text-[11px] text-faint">还没有书签</div>
+                    ) : (
+                      <ul className="flex flex-col">
+                        {lists.map((l) => {
+                          const kw = (l.keyword ?? '').trim()
+                          const count = markedCountOf(l.id)
+                          return (
+                            <li key={l.id}>
+                              <button
+                                onClick={() => {
+                                  setHistoryOpen(false)
+                                  // 有当初的关键词就重搜；没有（老数据）就直接打开这本书签
+                                  if (kw) void doSearch(kw)
+                                  else {
+                                    setView('bookmark')
+                                    setCurrentListId(l.id)
+                                  }
+                                }}
+                                className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-elev2"
+                              >
+                                <Bookmark size={12} className="shrink-0 text-accent" />
+                                <span className="min-w-0 flex-1 truncate text-xs">{l.name}</span>
+                                <span className="min-w-0 flex-1 truncate text-[11px] text-faint">
+                                  {kw || '（未记录关键词）'}
+                                </span>
+                                <span className="shrink-0 text-[11px] text-faint tabular-nums">{count} 条</span>
+                              </button>
+                            </li>
+                          )
+                        })}
+                      </ul>
+                    )}
+                  </div>
+
+                  {/* 底部：数量 + 清空（只有历史页需要） */}
+                  <div className="flex items-center justify-between gap-2 border-t border-border bg-elev2/40 px-3 py-1.5">
+                    <span className="text-[10px] text-faint">
+                      {historyTab === 'history' ? `${history.length}/${HISTORY_LIMIT} 条记录` : `${lists.length} 本书签`}
+                    </span>
+                    {historyTab === 'history' && history.length > 0 ? (
+                      <button
+                        className="flex items-center gap-1 text-[11px] text-faint transition-colors hover:text-danger"
+                        onClick={() => {
+                          clearHistory()
+                          toast.info('已清空搜索历史')
+                        }}
+                      >
+                        <Trash2 size={12} /> 清空历史
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
             </div>
           </div>
           <Button icon={BookmarkPlus} className="shrink-0" onClick={openCreate}>
@@ -659,42 +810,11 @@ export function SearchPage() {
         </div>
       </div>
 
-      {/* 搜索历史：始终显示在结果上方，点击即重新搜索 */}
-      <div className="flex items-center gap-2 border-b border-border bg-elev1/40 px-4 py-2 sm:px-5">
-        <span className="flex shrink-0 items-center gap-1 text-[11px] text-faint">
-          <History size={12} /> 搜索历史
-        </span>
-        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto">
-          {history.map((h) => (
-            <button
-              key={`${h.kw}-${h.at}`}
-              title={dayjs(h.at).format('YYYY-MM-DD HH:mm')}
-              onClick={() => void doSearch(h.kw)}
-              className="shrink-0 rounded-full border border-border bg-elev1 px-2.5 py-1 text-[11px] text-dim transition-colors hover:border-accent hover:text-accent whitespace-nowrap"
-            >
-              {h.kw}
-            </button>
-          ))}
-          {history.length === 0 ? <span className="text-[11px] text-faint">暂无记录</span> : null}
-        </div>
-        <span className="shrink-0 text-[11px] text-faint tabular-nums">
-          {history.length}/{HISTORY_LIMIT}
-        </span>
-        {history.length > 0 ? (
-          <Button
-            variant="ghost"
-            size="sm"
-            icon={Trash2}
-            className="shrink-0"
-            onClick={() => {
-              clearHistory()
-              toast.info('已清空搜索历史')
-            }}
-          >
-            清空历史
-          </Button>
-        ) : null}
-      </div>
+      {/*
+        搜索历史曾经是这里的一条常驻横条；v0.2.12 起收进搜索框左侧的**下拉式标签页**
+        （见上方输入框内的按钮与面板）—— 用户要求「搜索历史需要改成下拉式标签页」，
+        顺带把顶部这一整行高度还给搜索结果。
+      */}
 
       {/*
         主体：结果占满整宽，书签做成贴着右边缘的悬浮长条卡片。

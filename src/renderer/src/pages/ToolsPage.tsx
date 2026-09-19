@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { motion } from 'framer-motion'
-import { BarChart3, FileDown, FileText, Play, Puzzle, SquareTerminal, Trash2 } from 'lucide-react'
+import { BarChart3, FileDown, FileText, LayoutGrid, Play, Puzzle, SquareTerminal, Trash2 } from 'lucide-react'
 import { useTools } from '@/stores/tools'
 import { timeAgo } from '@/lib/format'
 import { api } from '@/lib/api'
@@ -14,6 +14,21 @@ const BUILTIN_STAT_TOOL = {
   name: '统计工具',
   description: '内置统计工具：管理「看过 / 在看 / 计划」等自定义列表，记录个人评分、看完时间，从收藏一键添加条目。',
   icon: BarChart3
+}
+
+/**
+ * 内置「最XX的角色 9宫格」（v0.2.11）。
+ *
+ * 选角色（数据来自 Bangumi）→ 排成 3×3～4×10 的格子 → 导出 PNG。
+ * 与统计工具一样在新窗口里打开：这个页面是画布式编辑器，主窗口里塞不下。
+ */
+const BUILTIN_CHARACTER_GRID_TOOL = {
+  id: '__character-grid',
+  name: '最XX的角色 9宫格',
+  description:
+    '搜索作品并挑选角色，排成「最喜欢 / 最遗憾 / 最神秘 …」的九宫格（最多 4×10 = 40 格，标签可改写），导出 PNG（导出前需填写制作人）。',
+  icon: LayoutGrid,
+  hash: '/tools/character-grid'
 }
 
 export function ToolsPage() {
@@ -87,6 +102,45 @@ export function ToolsPage() {
           <Button size="sm" icon={Play} onClick={(e) => {
             e.stopPropagation()
             void api.window.openSmall('/stattool', { width: 1180, height: 820, title: '统计工具' })
+          }}>
+            启动
+          </Button>
+        </div>
+      </motion.div>
+
+      {/* 内置「最XX的角色 9宫格」（v0.2.11，同样在新窗口中打开） */}
+      <motion.div
+        layout
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        onClick={() =>
+          void api.window.openSmall(BUILTIN_CHARACTER_GRID_TOOL.hash, {
+            width: 1320,
+            height: 880,
+            title: BUILTIN_CHARACTER_GRID_TOOL.name
+          })
+        }
+        whileHover={{ y: -3 }}
+        className="mt-4 flex cursor-pointer flex-col overflow-hidden rounded-xl border border-accent/40 bg-elev1 transition-colors hover:border-accent"
+      >
+        <div className="flex items-center gap-4 p-4">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-accent/15 text-accent">
+            <BUILTIN_CHARACTER_GRID_TOOL.icon size={24} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold">{BUILTIN_CHARACTER_GRID_TOOL.name}</span>
+              <span className="rounded-full bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent whitespace-nowrap">内置</span>
+            </div>
+            <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-dim">{BUILTIN_CHARACTER_GRID_TOOL.description}</p>
+          </div>
+          <Button size="sm" icon={Play} onClick={(e) => {
+            e.stopPropagation()
+            void api.window.openSmall(BUILTIN_CHARACTER_GRID_TOOL.hash, {
+              width: 1320,
+              height: 880,
+              title: BUILTIN_CHARACTER_GRID_TOOL.name
+            })
           }}>
             启动
           </Button>

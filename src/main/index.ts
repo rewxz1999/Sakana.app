@@ -1523,7 +1523,8 @@ if (!gotLock) {
           const busy = await readOverlay()
           console.log(
             `[input-test] 别的应用窗口盖住控制栏位置后：最上层含悬浮窗=${chainHasOverlay()}（**期望 false**：不抢位）` +
-              ` 可交互=${isOverlayInteractive()}（期望 false：不在前台就不接受点击）` +
+              ` 可交互=${isOverlayInteractive()}（**期望 true**：v0.2.12 起不再要求主窗口在前台；` +
+              `被盖住时点击本来就到不了悬浮窗）` +
               ` 控制栏可见=${busy.visible}`
           )
           await desktopShot('zorder-other-app-window')
@@ -1616,11 +1617,175 @@ if (!gotLock) {
           win.setFullScreen(false)
           await sleep(2000)
 
+          /*
+           * ⑩ v0.2.12：用户反馈的两种「控制栏按钮失灵」场景，直接断言可交互状态。
+           *
+           * 用户原话：「播放器控制按钮会在以下两种情况失灵：1.播放器窗口位于另一个应用窗口之下
+           * 2.窗口被隐藏后」。真凶是主进程那条「主窗口必须在前台才接收点击」的规则
+           * （见 services/playerOverlay.ts 的 applyInteractive）——它会造成死锁：
+           * 点击穿透 → 点击落到别人窗口 → 主窗口永远拿不到焦点 → 控制栏永远点不动。
+           * 这两段就是回归断言：两种情况下都必须是「控制栏可见 + 可交互 = true」。
+           */
+          {
+            const pokeBar = async (): Promise<void> => {
+              const b = overlayWindow()?.getContentBounds()
+              if (!b) return
+              overlayWindow()?.webContents.sendInputEvent({
+                type: 'mouseMove',
+                x: Math.round(b.width / 2),
+                y: b.height - 140
+              })
+              // 渲染层的心跳是 1.5 秒一次，等它把「我要可点击」重新声明一遍
+              await sleep(2200)
+            }
+            win.blur()
+            await sleep(600)
+            await pokeBar()
+            const lostInfo = await readOverlay()
+            console.log(
+              `[input-test] 场景1·主窗口失焦（播放器在别的窗口下面）：控制栏可见=${lostInfo.visible}` +
+                ` 可交互=${isOverlayInteractive()}（**期望 true**，旧版这里是 false = 按钮失灵）` +
+                ` 主窗口聚焦=${win.isFocused()}`
+            )
+
+            win.hide()
+            await sleep(1200)
+            win.show()
+            await sleep(1200)
+            await pokeBar()
+            const shownInfo = await readOverlay()
+            console.log(
+              `[input-test] 场景2·窗口隐藏后再显示：控制栏可见=${shownInfo.visible}` +
+                ` 可交互=${isOverlayInteractive()}（**期望 true**）` +
+                ` 悬浮窗可见=${overlayWindow()?.isVisible()} 主窗口聚焦=${win.isFocused()}`
+            )
+            win.focus()
+            await sleep(800)
+          }
+
           console.log('[input-test] done')
           markQuitting()
           app.quit()
         })()
       }, 2500)
+    }
+
+    /*
+     * 控制栏交互回归自检（SAKANA_OVERLAY_TEST=1）——v0.2.12 新增。
+     *
+     * 为什么单独做一个：用户反馈的「控制栏按钮失灵」有两个明确场景
+     * （①播放器窗口在别的应用窗口之下 ②窗口被隐藏后再显示），
+     * 根因是主进程那条「主窗口必须在前台才接收点击」的规则造成的死锁。
+     * 原有的 SAKANA_PLAYER_INPUT_TEST 需要在线播放（依赖第三方站点，不稳定），
+     * 这个自检直接驱动悬浮窗服务，不需要任何网络，专门盯住这两条回归。
+     */
+    if (process.env.SAKANA_OVERLAY_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const {
+            showOverlay,
+            destroyOverlay,
+            setOverlayInteractive,
+            isOverlayInteractive,
+            isOverlayAlwaysOnTop,
+            overlayWindow
+          } = await import('./services/playerOverlay')
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
+          const say = (ok: boolean, name: string, extra = ''): void => {
+            console.log(`[overlay-test] ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ` | ${extra}` : ''}`)
+          }
+          if (!win) {
+            console.log('[overlay-test] 没有可用窗口')
+            markQuitting()
+            app.quit()
+            return
+          }
+          showOverlay(win)
+          const ov = overlayWindow()
+          if (!ov) {
+            console.log('[overlay-test] 悬浮窗创建失败')
+            markQuitting()
+            app.quit()
+            return
+          }
+          await new Promise<void>((resolve) => {
+            if (!ov.webContents.isLoading()) return resolve()
+            ov.webContents.once('did-finish-load', () => resolve())
+            setTimeout(resolve, 6000)
+          })
+          const bounds = ov.getContentBounds()
+          /** 模拟鼠标移入控制栏区域：渲染层据此把控制栏显示出来并声明「我要可点击」 */
+          const pokeBar = async (): Promise<void> => {
+            ov.webContents.sendInputEvent({
+              type: 'mouseMove',
+              x: Math.round(bounds.width / 2),
+              y: Math.max(10, bounds.height - 140)
+            })
+            await new Promise((r) => setTimeout(r, 2200)) // 等 1.5 秒一次的心跳
+          }
+
+          await pokeBar()
+          say(isOverlayInteractive(), '控制栏显示时可接收点击', `可见=${ov.isVisible()}`)
+
+          /*
+           * 场景 ①：主窗口**真正失焦**（用户说的「播放器窗口位于另一个应用窗口之下」）。
+           *
+           * 关键：`win.blur()` 在 Windows 上并不足以让窗口失去焦点（实测调用后 isFocused 仍为 true，
+           * 那样断言会「假通过」），用外部进程的窗口抢焦点在这台机器上也不稳定。
+           * 这里改成**开一个我们自己的普通窗口并让它聚焦** —— 焦点转移是确定性的，
+           * 并且会**先验证前提成立**（主窗口确实不聚焦了）再断言，避免测试自己骗自己。
+           */
+          const focusThief = new BrowserWindow({
+            width: 420,
+            height: 260,
+            title: '接管焦点的测试窗口',
+            show: true
+          })
+          focusThief.focus()
+          await new Promise((r) => setTimeout(r, 1500))
+          const unfocused = !win.isFocused()
+          await pokeBar()
+          say(
+            unfocused && isOverlayInteractive(),
+            '主窗口失焦后控制栏仍可点击（用户场景①）',
+            `主窗口聚焦=${win.isFocused()}${unfocused ? '' : ' ← 前提未成立，本次断言不算数'}`
+          )
+          focusThief.close()
+          await new Promise((r) => setTimeout(r, 800))
+
+          /*
+           * 场景 ②：窗口隐藏后再显示，且**显示时不抢焦点**（`showInactive`）。
+           * 这是我们「从托盘/隐藏状态恢复」的真实路径 —— 旧逻辑要求前台才可点击，
+           * 于是恢复后控制栏看得见却点不动。
+           */
+          win.hide()
+          await new Promise((r) => setTimeout(r, 1200))
+          win.showInactive()
+          await new Promise((r) => setTimeout(r, 1200))
+          await pokeBar()
+          say(
+            isOverlayInteractive(),
+            '窗口隐藏再显示后控制栏仍可点击（用户场景②）',
+            `悬浮窗可见=${ov.isVisible()} 主窗口聚焦=${win.isFocused()}`
+          )
+
+          say(!isOverlayAlwaysOnTop(), '悬浮窗从不置顶（不抢别人窗口的位置）')
+
+          /*
+           * 收起时必须恢复点击穿透：透明悬浮窗铺满整个窗口，
+           * 若一直接收点击，页面本身的控件就点不到了。
+           * 渲染层的心跳是 1.5 秒一次，这里只等 600ms，避免被心跳覆盖。
+           */
+          setOverlayInteractive(false)
+          await new Promise((r) => setTimeout(r, 600))
+          say(!isOverlayInteractive(), '控制栏收起后恢复点击穿透')
+
+          destroyOverlay()
+          console.log('[overlay-test] done')
+          markQuitting()
+          app.quit()
+        })()
+      }, 3000)
     }
 
     // 小窗口自检（SAKANA_SMALLWIN_TEST=1）：逐个打开副窗口并输出渲染层错误/内容长度
@@ -1661,6 +1826,17 @@ if (!gotLock) {
             // 工具页是仪表盘卡片的跳转目标，路由级错误要能第一时间发现）
             '/subs',
             '/tools',
+            /*
+             * v0.2.11：工具页新增「最XX的角色 9宫格」，纳入自检 ——
+             * 这个页面在挂载时就会读本地盘面（localStorage）并渲染动态列数的格子盘，
+             * 路由级/初始化错误必须能第一时间发现（内容长度 + 渲染层报错两个信号）。
+             */
+            '/tools/character-grid',
+            /*
+             * v0.2.12：独立的更新窗口也纳入自检 —— 它一挂载就同时问「当前进度」和
+             * 「有没有新版本」，任何一边的 IPC 出问题都会让窗口一片空白，必须能自动发现。
+             */
+            '/update',
             '/downloads-win?title=%E6%B5%8B%E8%AF%95'
           ]
           for (const hash of hashes) {
@@ -2516,6 +2692,42 @@ if (!gotLock) {
           app.quit()
         })()
       }, 2500)
+    }
+
+    /*
+     * 搜索自检（SAKANA_SEARCH_TEST=关键词1,关键词2）：
+     * 走应用真实的搜索链路（自建反代 → v0 → 老接口兜底 → 关键词变体 → 缓存），
+     * 打印每个关键词命中几条、前几条标题；命中了哪条路写在服务日志里。
+     * 起因：用户反馈「little busters 搜不到」，而探针发现反代的 v0 搜索整条 502 ——
+     * 这类问题必须能在应用内一键复现，不能靠手写 curl 猜。
+     */
+    if (process.env.SAKANA_SEARCH_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const { bangumi } = await import('./services/bangumi')
+          const kws = String(process.env.SAKANA_SEARCH_TEST)
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+          for (const kw of kws) {
+            try {
+              const r = await bangumi.search(kw)
+              const top = r.items
+                .slice(0, 5)
+                .map((i) => `#${i.id} ${i.name_cn || i.name}`)
+                .join(' | ')
+              console.log(
+                `[search-test] 「${kw}」→ ${r.items.length} 条${r.error ? `（错误：${r.error.message}）` : ''}\n    ${top}`
+              )
+            } catch (err) {
+              console.log(`[search-test] 「${kw}」→ 异常：${String((err as Error)?.message ?? err)}`)
+            }
+          }
+          console.log('[search-test] done')
+          markQuitting()
+          app.quit()
+        })()
+      }, 3000)
     }
 
     /*

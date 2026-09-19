@@ -6,6 +6,8 @@ import axios from 'axios'
 import type {
   CalendarDay,
   CalendarResult,
+  CharacterItem,
+  CharactersResult,
   CoverImages,
   MirrorTestResult,
   Rating,
@@ -44,6 +46,14 @@ const TTL_RATING = 30 * 24 * 3600 * 1000
  * 7 天足以覆盖「当季新番陆续追加」的节奏，同时让「关掉弹窗再打开」完全不联网。
  */
 const TTL_SEASON = 7 * 24 * 3600 * 1000
+/**
+ * 角色表缓存（「最XX的角色 9宫格」工具，v0.2.11 附加）。
+ *
+ * 一个条目的角色表（名字/立绘/关系）和详情一样属于**几乎不变**的数据，
+ * 而九宫格工具会反复切作品、来回看角色，走 30 天缓存能省掉大量反代往返
+ * （反代是个人的 Worker，能少打一次就少打一次）。
+ */
+const TTL_CHARACTERS = 30 * 24 * 3600 * 1000
 /**
  * 每个月份的取数上限。
  *
@@ -162,6 +172,37 @@ function isApiMirror(mirror: string): boolean {
   } catch {
     return mirror.includes('api.')
   }
+}
+
+/**
+ * 搜索关键词变体（v0.2.12）。
+ *
+ * 起因：用户搜「little busters」搜不到，但 Bangumi 网页能搜到。
+ * 除了接口本身的问题（见 `searchRace` 的注释），还有一个真实存在的匹配差异：
+ * 官方条目标题是 `リトルバスターズ！` / `Little Busters!`，
+ * 而搜索端对**标点、全角半角、大小写**的处理规则各不相同 ——
+ * 实测老接口对 `little busters` 能命中（5 条），但对带 `!` 的写法在 v0 上更容易踩到分词问题。
+ *
+ * 所以这里生成一组「同一意图的写法」，按顺序重试：
+ *   ① 原样；
+ *   ② 去掉英文/日文标点与波浪线、合并空格（`Little Busters!` → `Little Busters`）；
+ *   ③ 全角转半角 + 去掉多余的 `～`/`〜`/`・`（`無職転生 ～…～` → `無職転生`）。
+ * 变体只在「上一条路没结果」时才用，正常关键词还是原样发一次，不会拖慢搜索。
+ */
+function searchKeywordVariants(keyword: string): string[] {
+  const raw = keyword.trim()
+  if (!raw) return [raw]
+  const out: string[] = [raw]
+  const push = (v: string): void => {
+    const s = v.replace(/\s+/g, ' ').trim()
+    if (s && !out.includes(s)) out.push(s)
+  }
+  // ② 去标点
+  push(raw.replace(/[!！?？~～〜・:：,，.。、'’"“”\-–—_/\\]+/g, ' '))
+  // ③ 全角转半角后再去标点（中文全角括号、英文字母全角等）
+  const half = raw.replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+  push(half.replace(/[!?~:,.、'"_\-/\\]+/g, ' '))
+  return out.slice(0, 3)
 }
 
 /**
@@ -919,29 +960,64 @@ class BangumiService {
   /**
    * 搜索竞速（v0.2.7）：API 源走 POST JSON，网页镜像走 GET 搜索页，
    * 与 requestBest 一样「第一个成功就返回」。
+   *
+   * v0.2.12 大修：用户反馈「有些番剧搜不到，例如 little busters，但 bangumi 网页上能搜到」。
+   * 实测（`node .e2e/probe-search.js`）真因不是关键词，而是**自建反代的 v0 搜索整条 502**：
+   *   · `POST /v0/search/subjects`（带不带 body / 带不带 responseGroup / 换成 GET / 加 Origin+Referer）
+   *     → 全部 502 Bad Gateway；
+   *   · 同一个反代的 `GET /v0/subjects/400602` → 200（所以不是反代挂了，是搜索那一段的上游挂了）；
+   *   · 老的 `GET /search/subject/{关键词}?type=2&responseGroup=large` → 200，字段齐全
+   *     （id/name/name_cn/images/rating/eps/air_date/rank），中文关键词也正常。
+   * 也就是说：只要主数据源是 API 型反代，搜索功能整体是坏的，用户看到的「有些搜不到」只是
+   * 部分关键词命中了缓存或恰好赶上上游可用。修法就是给 v0 加上**老接口兜底** +
+   * **关键词变体重试**（去标点/合并空格），任一条路拿到结果就返回，并把「哪条路命中」写进日志，
+   * 以后再出问题一眼能看出是接口变了还是关键词的问题。
    */
   private async searchRace(keyword: string): Promise<SearchResultItem[]> {
-    const enc = encodeURIComponent(keyword)
-    /** API 源搜索：v0 与自建反代都要求 POST + JSON body */
-    const viaApi = async (base: string): Promise<SearchResultItem[]> => {
-      const res = await axios.post(
-        `${base}/v0/search/subjects?limit=24&responseGroup=small`,
-        { keyword },
-        {
-          timeout: REQUEST_TIMEOUT,
-          headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json', Accept: 'application/json' },
-          ...buildProxyAgents(getSettings().proxy)
-        }
-      )
-      if (res.status !== 200) throw new Error(`${base}: HTTP ${res.status}`)
-      const list = (res.data as { data?: Record<string, unknown>[] })?.data ?? []
-      return list.map((raw) => this.normalizeItem(raw))
+    /** 网页镜像：直接抓搜索页 HTML */
+    const viaMirror = async (mirror: string, kw: string): Promise<SearchResultItem[]> => {
+      const text = await this.fetchMirror(`${mirror}/subject_search/${encodeURIComponent(kw)}?cat=2`, false)
+      return parseSearchPage(text)
     }
+
+    /**
+     * 一个数据源上的完整尝试链：v0 → 老接口，每个接口再按关键词变体各试一次。
+     * 只有「全部接口都抛错」才算失败；「接口通了但没结果」返回空数组（由上层继续试别的源）。
+     */
+    const viaBase = async (base: string, isApi: boolean, kw: string): Promise<SearchResultItem[]> => {
+      if (!isApi) return await viaMirror(base, kw)
+      let firstError: unknown = null
+      for (const variant of searchKeywordVariants(kw)) {
+        try {
+          const items = await this.searchViaV0(base, variant)
+          if (items.length > 0) {
+            log.append('info', 'bangumi', `搜索命中：v0「${variant}」→ ${items.length} 条（${base}）`)
+            return items
+          }
+        } catch (err) {
+          firstError = firstError ?? err
+          log.append('warn', 'bangumi', `v0 搜索失败「${variant}」（${base}）：${String((err as Error)?.message ?? err)}`)
+        }
+        try {
+          const items = await this.searchViaLegacy(base, variant)
+          if (items.length > 0) {
+            log.append('info', 'bangumi', `搜索命中：老接口「${variant}」→ ${items.length} 条（${base}）`)
+            return items
+          }
+        } catch (err) {
+          firstError = firstError ?? err
+          log.append('warn', 'bangumi', `老接口搜索失败「${variant}」（${base}）：${String((err as Error)?.message ?? err)}`)
+        }
+      }
+      if (firstError) throw firstError
+      return []
+    }
+
     // 与 requestBest 一致：配了自建反代就只用它，失败直接提示用户手动切换镜像（不再自动回退）
     const custom = (getSettings().bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
     if (custom) {
       try {
-        return await viaApi(custom)
+        return await viaBase(custom, true, keyword)
       } catch (err) {
         const reason = String((err as Error)?.message ?? err)
         log.append('error', 'bangumi', `自建反代搜索失败: ${reason}`)
@@ -952,12 +1028,7 @@ class BangumiService {
         )
       }
     }
-    const attempts = this.mirrors().map(async (mirror) => {
-      const isApi = isApiMirror(mirror)
-      if (isApi) return await viaApi(mirror)
-      const text = await this.fetchMirror(`${mirror}/subject_search/${enc}?cat=2`, false)
-      return parseSearchPage(text)
-    })
+    const attempts = this.mirrors().map(async (mirror) => await viaBase(mirror, isApiMirror(mirror), keyword))
     return await new Promise<SearchResultItem[]>((resolve, reject) => {
       let pending = attempts.length
       const errors: string[] = []
@@ -971,6 +1042,46 @@ class BangumiService {
         })
       }
     })
+  }
+
+  /** v0 搜索：POST + JSON body（带 type=2 过滤，免得把游戏/书籍也搜出来） */
+  private async searchViaV0(base: string, keyword: string): Promise<SearchResultItem[]> {
+    const res = await axios.post(
+      `${base}/v0/search/subjects?limit=24&responseGroup=small`,
+      { keyword, filter: { type: [2] } },
+      {
+        timeout: REQUEST_TIMEOUT,
+        headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json', Accept: 'application/json' },
+        ...buildProxyAgents(getSettings().proxy)
+      }
+    )
+    if (res.status !== 200) throw new Error(`${base}: HTTP ${res.status}`)
+    const list = (res.data as { data?: Record<string, unknown>[] })?.data ?? []
+    return list.map((raw) => this.normalizeItem(raw))
+  }
+
+  /**
+   * 老接口搜索：`GET /search/subject/{关键词}?type=2&responseGroup=large`。
+   *
+   * 字段与 v0 不完全同名（都叫 name/name_cn/images/rating，日期是 air_date），
+   * 所以走同一个 `normalizeItem`。返回的图片是 `http://lain.bgm.tv/...`，
+   * 交给 `rewriteImageUrl` 在取图时改写到自建图片反代即可（`media.ts` 已统一处理）。
+   */
+  private async searchViaLegacy(base: string, keyword: string): Promise<SearchResultItem[]> {
+    const res = await axios.get(
+      `${base}/search/subject/${encodeURIComponent(keyword)}?type=2&responseGroup=large`,
+      {
+        timeout: REQUEST_TIMEOUT,
+        headers: { 'User-Agent': BROWSER_UA, Accept: 'application/json' },
+        ...buildProxyAgents(getSettings().proxy)
+      }
+    )
+    if (res.status !== 200) throw new Error(`${base}: HTTP ${res.status}`)
+    const body = res.data as { list?: Record<string, unknown>[] } | Record<string, unknown>[]
+    const list = Array.isArray(body) ? body : (body?.list ?? [])
+    return list
+      .filter((it) => it?.type == null || Number(it.type) === 2) // 只要动画条目（老接口偶尔会混进书籍/游戏）
+      .map((raw) => this.normalizeItem(raw))
   }
 
   private normalizeItem(raw: Record<string, unknown>): SearchResultItem {
@@ -1012,6 +1123,188 @@ class BangumiService {
       platform: raw.platform ? String(raw.platform) : undefined,
       totalEpisodes: raw.total_episodes != null ? Number(raw.total_episodes) : undefined
     }
+  }
+
+  // ---------------- 角色列表（「最XX的角色 9宫格」工具，v0.2.11 附加） ----------------
+
+  /**
+   * 取一个条目的角色列表。
+   *
+   * 两条路，都遵循「自建反代优先 → 老接口兜底」：
+   *   ① 首选 `GET {base}/v0/subjects/{id}/characters`
+   *      → `[{id,name,relation,images:{grid,small,medium,large}}]`（字段最全）
+   *   ② 兜底 `GET {base}/subject/{id}?responseGroup=large` → `crt` 数组
+   *      （`id/name/role_name/images`）
+   *
+   * 为什么要兜底：实测自建反代的 v0 **搜索**整条 502（见 `searchRace` 的注释），
+   * v0 的角色段与搜索同属上游容易挂的部分，而老接口在同一反代上是 200；
+   * 另外部分条目 v0 角色段会返回空数组，这时也必须交给老接口再试一次。
+   *
+   * ⚠️ 老接口给的**角色数可能比 v0 少**（实测它只列主要角色），
+   * 所以结果里带 `source`，界面照实标注「数据来自哪条路」，避免用户误以为网站缺数据。
+   */
+  async characters(subjectId: number): Promise<CharactersResult> {
+    const id = Math.trunc(Number(subjectId))
+    if (!id || id <= 0) {
+      return {
+        subjectId: id,
+        items: [],
+        source: 'v0',
+        fromCache: false,
+        error: makeSourceError('PARSE', '条目 id 无效', [])
+      }
+    }
+    const key = `chars-${id}`
+    const cache = this.readCache<{ items: CharacterItem[]; source: CharactersResult['source'] }>(key)
+    if (cache && Date.now() - cache.fetchedAt < TTL_CHARACTERS) {
+      return { subjectId: id, items: cache.data.items, source: cache.data.source, fromCache: true }
+    }
+    try {
+      const fresh = await this.fetchCharacters(id)
+      this.writeCache(key, fresh)
+      return { subjectId: id, items: fresh.items, source: fresh.source, fromCache: false }
+    } catch (err) {
+      const error: SourceError =
+        err && typeof err === 'object' && 'kind' in err
+          ? (err as SourceError)
+          : makeSourceError('NETWORK', String((err as Error)?.message ?? err), [])
+      log.append('warn', 'bangumi', `获取角色列表失败 (#${id}): ${error.message}`)
+      // 角色表几乎不变：过期缓存照样能用，宁可给旧数据也不要空列表
+      if (cache) {
+        return {
+          subjectId: id,
+          items: cache.data.items,
+          source: cache.data.source,
+          fromCache: true,
+          stale: true,
+          error
+        }
+      }
+      return { subjectId: id, items: [], source: 'v0', fromCache: false, error }
+    }
+  }
+
+  /**
+   * 角色取数的完整尝试链：v0 → 老接口。
+   *
+   * 写法与 `searchRace` 里的 `viaBase` 一致（同一个数据源上把接口挨个试完再罢休），
+   * 只有**全部接口都失败**才算失败；「接口通了但没有角色」也会继续走下一步。
+   */
+  private async fetchCharacters(id: number): Promise<{ items: CharacterItem[]; source: CharactersResult['source'] }> {
+    let firstError: unknown = null
+    try {
+      /*
+       * v0 角色接口：与详情一致，必须显式带 `/v0/` 前缀 ——
+       * 自建反代在去掉前缀的路径上返回的是旧版 API 形态（没有 characters 段）。
+       */
+      const { text, mirror } = await this.requestBest({
+        api: `/v0/subjects/${id}/characters`,
+        web: `/v0/subjects/${id}/characters`,
+        customApi: `/v0/subjects/${id}/characters`
+      })
+      if (!isApiMirror(mirror)) throw new Error(`${mirror}: 网页镜像不提供 v0 角色接口`)
+      const items = this.normalizeCharactersV0(JSON.parse(text) as unknown)
+      if (items.length > 0) return { items, source: 'v0' }
+      firstError = new Error('v0 角色接口返回为空')
+    } catch (err) {
+      firstError = err
+    }
+    log.append(
+      'warn',
+      'bangumi',
+      `v0 角色接口不可用 (#${id})，改用老接口兜底：${String((firstError as Error)?.message ?? firstError)}`
+    )
+    try {
+      const items = await this.charactersLegacy(id)
+      if (items.length > 0) {
+        log.append('info', 'bangumi', `角色命中：老接口 (#${id}) → ${items.length} 位（可能少于 v0）`)
+        return { items, source: 'legacy' }
+      }
+      firstError = firstError ?? new Error('老接口未返回角色')
+    } catch (err) {
+      firstError = firstError ?? err
+    }
+    throw firstError
+  }
+
+  /**
+   * 老接口角色兜底：`GET {base}/subject/{id}?responseGroup=large` 的 `crt` 数组。
+   *
+   * 竞速/兜底写法复用 `requestBest` 的策略：
+   * - 配了自建反代就**只用反代**（失败把错误抛给界面，由用户去「设置 → 数据源配置」切换，
+   *   不在用户不知情的情况下偷偷换源）；
+   * - 没配反代时所有 API 型镜像并行发，第一个成功就立刻返回，不等其余。
+   * 只对 API 型数据源发起：网页镜像的同一个地址返回的是 HTML 页面，里面没有结构化角色列表。
+   */
+  private async charactersLegacy(id: number): Promise<CharacterItem[]> {
+    const custom = (getSettings().bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
+    const bases = (custom ? [custom] : this.mirrors()).filter((m) => isApiMirror(m))
+    if (bases.length === 0) {
+      throw makeSourceError('PARSE', '当前数据源不支持角色接口（需要用 API 型数据源，如自建反代）', [])
+    }
+    const attempts = bases.map(async (base): Promise<CharacterItem[]> => {
+      const url = `${base}/subject/${id}?responseGroup=large`
+      try {
+        const text = await this.fetchMirror(url, true)
+        const items = this.normalizeCharactersLegacy(JSON.parse(text) as unknown)
+        if (items.length === 0) throw new Error('响应里没有 crt 角色数组')
+        return items
+      } catch (err) {
+        throw new Error(`${base}: ${String((err as Error)?.message ?? err)}`)
+      }
+    })
+    return await new Promise<CharacterItem[]>((resolve, reject) => {
+      let pending = attempts.length
+      const errors: string[] = []
+      for (const p of attempts) {
+        p.then((v) => resolve(v)).catch((err) => {
+          errors.push(String((err as Error)?.message ?? err))
+          pending -= 1
+          if (pending === 0) reject(makeSourceError('ALL_DOWN', '所有 API 数据源都没有取到角色列表', errors))
+        })
+      }
+    })
+  }
+
+  /** v0 角色接口：`[{id,name,relation,images}]`（不带中文名，`name_cn` 一律为空串） */
+  private normalizeCharactersV0(raw: unknown): CharacterItem[] {
+    if (!Array.isArray(raw)) return []
+    return raw
+      .map((it) => {
+        const o = (it ?? {}) as Record<string, unknown>
+        return {
+          id: Number(o.id ?? 0),
+          name: String(o.name ?? ''),
+          name_cn: String(o.name_cn ?? ''),
+          relation: String(o.relation ?? ''),
+          images: (o.images as CoverImages | null) ?? null
+        }
+      })
+      .filter((c) => c.id > 0 || c.name.length > 0)
+  }
+
+  /**
+   * 老接口（`responseGroup=large`）的角色数组 `crt`。
+   *
+   * 字段名与 v0 不同：关系叫 `role_name`（不是 `relation`），中文名偶尔出现在 `name_cn`；
+   * 立绘地址是 `http://lain.bgm.tv/...` 这种 http 链接 —— 交给 `rewriteImageUrl`
+   * 在取图时改写到自建图片反代（`media.ts` 已统一处理），这里保持原样返回。
+   */
+  private normalizeCharactersLegacy(raw: unknown): CharacterItem[] {
+    const list = Array.isArray(raw) ? raw : ((raw as { crt?: unknown } | null)?.crt ?? [])
+    if (!Array.isArray(list)) return []
+    return list
+      .map((it) => {
+        const o = (it ?? {}) as Record<string, unknown>
+        return {
+          id: Number(o.id ?? 0),
+          name: String(o.name ?? ''),
+          name_cn: String(o.name_cn ?? ''),
+          relation: String(o.role_name ?? o.relation ?? ''),
+          images: (o.images as CoverImages | null) ?? null
+        }
+      })
+      .filter((c) => c.id > 0 || c.name.length > 0)
   }
 }
 

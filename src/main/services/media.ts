@@ -11,7 +11,7 @@ import {
 } from 'node:fs'
 import { basename, dirname, extname, join, resolve, sep } from 'node:path'
 import iconv from 'iconv-lite'
-import type { LocalSubFile, LocalVideoFile } from '@shared/types'
+import type { ImageDataUrlResult, LocalSubFile, LocalVideoFile } from '@shared/types'
 import { parseEpisode } from '../lib/parse'
 import { log } from '../log'
 import { dataPaths } from './paths'
@@ -476,6 +476,84 @@ async function fetchImageWithCache(rawTarget: string): Promise<Response> {
   })
   inflight.set(target, p)
   return p
+}
+
+/**
+ * 转 data URL 时允许的单张图片上限（v0.2.11 附加：「最XX的角色 9宫格」导出用）。
+ *
+ * 6MB 的源图 base64 之后约 8MB，而一次导出最多有 40 格（4×10）；
+ * 不设上限时一张 25MB 的大图就能把主进程的内存顶起来（base64 还要再翻 1/3），
+ * 所以宁可让这一格退回占位色块，也不让整个导出把进程拖死。
+ */
+const MAX_DATA_URL_BYTES = 6 * 1024 * 1024
+
+/**
+ * 把 Response 读成 Buffer。
+ *
+ * 为什么要单独写：`fetchImageWithCache` 有两种响应体 ——
+ * - 走网络时是普通的 web ReadableStream（`arrayBuffer()` 直接可用）；
+ * - **磁盘缓存命中**时 body 是 Node 可读流（sakana-img 协议的既有写法）。
+ * 第二种在 Node 里通常也能被 `arrayBuffer()` 正常读取，但为了不让「第二次导出」
+ * 因为响应体形态不同而全部退回占位块，这里两种都显式支持。
+ */
+async function readResponseBuffer(res: Response): Promise<Buffer> {
+  const body = res.body as unknown as { getReader?: unknown } | null
+  if (body && typeof body.getReader !== 'function') {
+    const chunks: Buffer[] = []
+    for await (const chunk of body as AsyncIterable<Uint8Array>) chunks.push(Buffer.from(chunk))
+    return Buffer.concat(chunks)
+  }
+  return Buffer.from(await res.arrayBuffer())
+}
+
+/**
+ * 把一张**原始图片地址**取回来转成 data URL（`data:image/jpeg;base64,…`）。
+ *
+ * 为什么需要它（渲染层不能自己画远程图）：
+ * 界面里的图片都走自定义协议 `sakana-img://`（主进程代取，带 UA/Referer + 磁盘缓存）。
+ * 自定义协议在渲染层看是**跨源资源**，把它 drawImage 进 canvas 会污染画布，
+ * 之后 `canvas.toBlob()` 直接抛 SecurityError —— 导出整条链路就断在这里。
+ * 由主进程把字节取回来转 data URL（data URL 同源、永不污染画布）才彻底绕开这个问题。
+ *
+ * 复用情况：取数完全走 `fetchImageWithCache`（即 sakana-img 协议那条路）——
+ * 图片反代改写、磁盘缓存、UA/Referer、并发闸门、缩放路径兜底一个都不另写。
+ *
+ * **失败不抛异常**：任何单张失败都返回 `dataUrl: ''` + `error`，由调用方按格降级。
+ */
+export async function imageDataUrl(rawUrl: string): Promise<ImageDataUrlResult> {
+  const target = String(rawUrl ?? '').trim()
+  const fail = (error: string): ImageDataUrlResult => ({ dataUrl: '', mime: '', bytes: 0, error })
+  if (!target) return fail('图片地址为空')
+  // 已经是 data URL 就直接回传（同源，画进 canvas 不会污染）
+  if (target.startsWith('data:')) {
+    const mime = /^data:([^;,]+)/.exec(target)?.[1] ?? 'image/jpeg'
+    return { dataUrl: target, mime, bytes: target.length }
+  }
+  try {
+    const res = await fetchImageWithCache(target)
+    if (!res.ok) return fail(`取图失败（HTTP ${res.status}）`)
+    // 先看 Content-Length：大图在读进内存之前就拒掉（缓存命中的响应没有该头，下面再兜一次）
+    const declared = Number(res.headers.get('content-length') ?? 0)
+    if (declared > MAX_DATA_URL_BYTES) {
+      return fail(`图片过大（${(declared / 1048576).toFixed(1)}MB，上限 6MB）`)
+    }
+    const buf = await readResponseBuffer(res)
+    if (buf.length === 0) return fail('图片内容为空')
+    if (buf.length > MAX_DATA_URL_BYTES) {
+      return fail(`图片过大（${(buf.length / 1048576).toFixed(1)}MB，上限 6MB）`)
+    }
+    /*
+     * 保留上游声明的图片类型；反代偶尔不回 content-type，这时按 jpeg 兜底
+     * （bgm 图床本身就是 jpeg，声明错类型的概率极低）。
+     */
+    const declaredMime = (res.headers.get('content-type') ?? '').split(';')[0].trim()
+    const mime = declaredMime.startsWith('image/') ? declaredMime : 'image/jpeg'
+    return { dataUrl: `data:${mime};base64,${buf.toString('base64')}`, mime, bytes: buf.length }
+  } catch (err) {
+    const reason = String((err as Error)?.message ?? err)
+    log.append('warn', 'img', `转 data URL 失败 (${target.slice(0, 90)}): ${reason}`)
+    return fail(reason)
+  }
 }
 
 // ---------------- 本地媒体扫描 ----------------

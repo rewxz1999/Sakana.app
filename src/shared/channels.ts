@@ -25,6 +25,14 @@ export const CH = {
   // 季度（新番季）预览：年份 + 该季度内任意月份
   bgmSeason: 'bgm:season',
   bgmTestMirrors: 'bgm:test-mirrors',
+  /** 角色列表（「最XX的角色 9宫格」工具）：v0 优先 + 老接口兜底 */
+  bgmCharacters: 'bgm:characters',
+  /**
+   * 远程图片 → data URL（九宫格导出画 canvas 用）。
+   * 走主进程取字节：自定义协议 sakana-img:// 是跨源资源，直接画进 canvas 会污染画布，
+   * toBlob() 会抛 SecurityError；data URL 永不污染。
+   */
+  bgmImageDataUrl: 'bgm:image-data-url',
 
   // 蜜柑计划
   mikanSearch: 'mikan:search',
@@ -161,6 +169,15 @@ export const CH = {
   appUpdateState: 'app:update-state',
   /** 下载/安装状态下行（进度条） */
   evUpdateState: 'ev:update-state',
+  /**
+   * v0.2.12：打开**更新窗口**（独立可视化界面，用户要求「更新程序需要可视化界面看到进度」）。
+   * 设置页、重要更新弹窗、托盘菜单都通过它打开同一个窗口。
+   */
+  appUpdateOpenWindow: 'app:update-open-window',
+  /** v0.2.12：重要更新提醒里点「稍后」——记下这个版本，本次不再打扰 */
+  appUpdateSnooze: 'app:update-snooze',
+  /** v0.2.12：发现**重要更新**时下行给主窗口，由应用外壳弹出强提醒 */
+  evUpdateImportant: 'ev:update-important',
   appOpenUrl: 'app:open-url',
 
   // 弹幕（预留：弹弹play）

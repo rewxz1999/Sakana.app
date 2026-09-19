@@ -3,6 +3,7 @@ import type {
   AppSettings,
   AspectMode,
   CalendarResult,
+  CharactersResult,
   DanmakuComment,
   DanmakuLoadResult,
   DanmakuMatch,
@@ -15,6 +16,7 @@ import type {
   GalRecentShot,
   GalSiteSearchResult,
   GalToolsConfig,
+  ImageDataUrlResult,
   LiveStartResult,
   LocalDirInfo,
   LocalTargetInput,
@@ -190,6 +192,22 @@ export interface SakanaApi {
      */
     season(year: number, month: number, force?: boolean): Promise<ApiResult<SeasonResult>>
     testMirrors(): Promise<ApiResult<MirrorTestResult[]>>
+    /**
+     * 角色列表（「最XX的角色 9宫格」工具）。
+     *
+     * 首选 `GET {base}/v0/subjects/{id}/characters`，失败或返回为空时回退老接口
+     * `GET {base}/subject/{id}?responseGroup=large` 的 `crt` 数组 ——
+     * 老接口的**角色数可能比 v0 少**，结果里的 `source` 会如实标出来源，界面照实提示。
+     */
+    characters(subjectId: number): Promise<ApiResult<CharactersResult>>
+    /**
+     * 把一张远程图片取回来转成 data URL（导出 PNG 时画进 canvas 用）。
+     *
+     * 参数是**原始图片地址**（例如 `http://lain.bgm.tv/pic/crt/m/xx.jpg`），
+     * 主进程内部自己做图片反代改写 + 磁盘缓存 + UA/Referer。
+     * 单张失败**不抛异常**（返回空 dataUrl + error），由调用方按格降级。
+     */
+    imageDataUrl(url: string): Promise<ApiResult<ImageDataUrlResult>>
   }
   mikan: {
     search(keyword: string): Promise<ApiResult<MikanSearchResult>>
@@ -434,6 +452,12 @@ export interface SakanaApi {
     updateState(): Promise<ApiResult<UpdateInstallState>>
     /** 订阅下载/安装状态推送 */
     onUpdateState(cb: (state: UpdateInstallState) => void): () => void
+    /** v0.2.12：打开独立的更新窗口（可视化进度界面） */
+    updateOpenWindow(): Promise<ApiResult<boolean>>
+    /** v0.2.12：重要更新提醒里点「稍后」——记下版本号，本次启动不再弹窗 */
+    updateSnooze(version: string): Promise<ApiResult<boolean>>
+    /** v0.2.12：订阅「发现重要更新」（由应用外壳弹强提醒） */
+    onUpdateImportant(cb: (info: UpdateInfo) => void): () => void
     /** 用系统浏览器打开链接（更新下载页等） */
     openUrl(url: string): Promise<ApiResult<boolean>>
   }

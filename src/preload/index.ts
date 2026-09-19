@@ -49,7 +49,10 @@ const api: SakanaApi = {
     search: (keyword) => call(CH.bgmSearch, keyword),
     ratings: (ids) => call(CH.bgmRatings, ids),
     season: (year, month, force) => call(CH.bgmSeason, year, month, force),
-    testMirrors: () => call(CH.bgmTestMirrors)
+    testMirrors: () => call(CH.bgmTestMirrors),
+    // 「最XX的角色 9宫格」：角色列表（v0 优先 + 老接口兜底）与导出用的图片 data URL
+    characters: (id) => call(CH.bgmCharacters, id),
+    imageDataUrl: (url) => call(CH.bgmImageDataUrl, url)
   },
   mikan: {
     search: (keyword) => call(CH.mikanSearch, keyword),
@@ -230,6 +233,10 @@ const api: SakanaApi = {
     updateOpenReleases: () => call(CH.appUpdateOpenReleases),
     updateState: () => call(CH.appUpdateState),
     onUpdateState: (cb) => subscribe(CH.evUpdateState, cb),
+    // v0.2.12：独立的更新窗口 + 重要更新强提醒
+    updateOpenWindow: () => call(CH.appUpdateOpenWindow),
+    updateSnooze: (version) => call(CH.appUpdateSnooze, version),
+    onUpdateImportant: (cb) => subscribe(CH.evUpdateImportant, cb),
     openUrl: (url) => call(CH.appOpenUrl, url)
   },
   danmaku: {

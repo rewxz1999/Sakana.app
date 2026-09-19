@@ -29,14 +29,28 @@
 ; ============================================================================
 
 ; ---------------------------------------------------------------------------
+; 应用文件名（本地定义一份，**不要**用 `${APP_EXECUTABLE_FILENAME}`）
+;
+; 为什么不用 electron-builder 的 `${APP_EXECUTABLE_FILENAME}`：
+; 那份 define 在 `common.nsh` 里，而我们的 include 排在它**前面**。
+; 宏体是「插入时才展开」，所以宏里用没问题；但 `Function` 的函数体是**在 include 阶段就编译**的，
+; 那时这个 define 还不存在 → makensis 报
+;   `warning 6000: unknown variable/constant "{APP_EXECUTABLE_FILENAME}" detected, ignoring`
+; 而 electron-builder 把 NSIS 告警当错误（warning treated as error），整个打包直接失败。
+; 所以这里固定一份自己的常量给「include 期就要编译」的地方用（就是下面的 .onVerifyInstDir）。
+; ---------------------------------------------------------------------------
+!define SAKANA_APP_EXE "Sakana.exe"
+!define SAKANA_UNINSTALL_EXE "Uninstall Sakana.exe"
+
+; ---------------------------------------------------------------------------
 ; 内部：结束还在运行的 Sakana 及其辅助进程
 ;
 ; 用 cmd 的 taskkill/tasklist 而不是插件，避免额外的 include 依赖与 32/64 位插件问题。
 ; nsExec::Exec 会把退出码压栈，每个都要 Pop 掉（不 Pop 会把栈搞脏，后面读到的值全是错的）。
 ; ---------------------------------------------------------------------------
-!macro sakanaStopApp
+!macro sakanaStopApp ID
   StrCpy $0 0
-  sakana_stop_retry:
+  sakana_stop_retry_${ID}:
     IntOp $0 $0 + 1
     ; 先温和请求退出（应用自己会保存状态），再强制结束
     nsExec::Exec 'cmd /c taskkill /T /IM "${APP_EXECUTABLE_FILENAME}" >nul 2>nul'
@@ -57,16 +71,68 @@
     nsExec::Exec 'cmd /c tasklist /NH /FI "IMAGENAME eq ${APP_EXECUTABLE_FILENAME}" | find /I "${APP_EXECUTABLE_FILENAME}" >nul 2>nul'
     Pop $1
     ; $1 == 0 → 还在运行，再试一轮；最多 6 轮
-    IntCmp $1 0 0 sakana_stop_done sakana_stop_done
-    IntCmp $0 6 sakana_stop_done sakana_stop_retry sakana_stop_retry
-  sakana_stop_done:
+    IntCmp $1 0 0 sakana_stop_done_${ID} sakana_stop_done_${ID}
+    IntCmp $0 6 sakana_stop_done_${ID} sakana_stop_retry_${ID} sakana_stop_retry_${ID}
+  sakana_stop_done_${ID}:
 !macroend
 
 ; ---------------------------------------------------------------------------
-; 安装最开始（.onInit）：结束进程 + 备份用户数据 + 清掉旧卸载项
+; 内部：确保应用装在**自己的文件夹**里（v0.2.12）
+;
+; 用户反馈：「安装到某个文件夹时本身就生成了一个文件夹来存放所有应用文件，这非常危险 ——
+; 万一用户把应用直接装在 C 盘、D 盘之下，卸载时可能导致应用删掉那个盘下的所有内容」。
+; 规则：
+;   · 目录已经以 `\Sakana` 结尾（默认的 %LOCALAPPDATA%\Programs\Sakana 就是这样）→ 不动；
+;   · 目录里已经有旧版本（有 Sakana.exe 或卸载器）→ **沿用原目录**：
+;     覆盖升级必须装回同一个地方，否则用户的数据、快捷方式、注册表全对不上；
+;   · 其余情况（含用户直接选盘根 D:\）→ 追加 `\Sakana`。
+; 只改 $INSTDIR 这一件事。`ID` 只是为了让宏可以安全地插入多次（NSIS 的标签是全局的）。
+; ---------------------------------------------------------------------------
+!macro sakanaEnsureAppFolder ID
+  IfFileExists "$INSTDIR\${SAKANA_APP_EXE}" sakana_dir_done_${ID}
+  IfFileExists "$INSTDIR\${SAKANA_UNINSTALL_EXE}" sakana_dir_done_${ID}
+    ; 去掉末尾的反斜杠，避免拼出 "D:\\Sakana"
+    StrCpy $R1 $INSTDIR 1 -1
+    StrCmp $R1 "\" 0 +2
+      StrCpy $INSTDIR $INSTDIR -1
+    ; 目录名本身就叫 Sakana 就不再套一层
+    StrCpy $R1 $INSTDIR 7 -7
+    StrCmp $R1 "\Sakana" sakana_dir_done_${ID}
+    StrCmp $R1 "\sakana" sakana_dir_done_${ID}
+    StrCpy $INSTDIR "$INSTDIR\Sakana"
+    DetailPrint "安装目录已调整为应用专属文件夹：$INSTDIR"
+  sakana_dir_done_${ID}:
+!macroend
+
+/*
+ * 目录页的校验回调（NSIS 标准回调，electron-builder 的模板没有占用）。
+ * 用户手输 `D:\` 这类路径时，这里同样把应用文件夹补上；并把修正后的路径写回输入框，
+ * 避免出现「界面上显示 D:\、实际装到 D:\Sakana」这种看不懂的状态。
+ *
+ * ⚠️ 必须用 `!ifndef BUILD_UNINSTALLER` 包起来：这份 include 在**卸载器编译分支**里也会被处理，
+ * 而那一支没有 `APP_EXECUTABLE_FILENAME` 这个 define（它定义在 common.nsh 的安装器分支里），
+ * 于是 makensis 报 `warning 6000: unknown variable/constant`，又因 electron-builder 把
+ * NSIS 告警当错误（warning treated as error）导致整个打包失败 —— 实测踩过。
+ * 目录页本来也只存在于安装器里，包起来语义上也更正确。
+ */
+!ifndef BUILD_UNINSTALLER
+Function .onVerifyInstDir
+  StrCpy $R2 $INSTDIR
+  !insertmacro sakanaEnsureAppFolder verify
+  StrCmp $R2 $INSTDIR sakana_verify_done
+    FindWindow $R2 "#32770" "" $HWNDPARENT
+    GetDlgItem $R3 $R2 1201 ; 目录页的路径输入框（NSIS 固定 ID）
+    SendMessage $R3 0x000C 0 "STR:$INSTDIR" ; WM_SETTEXT
+  sakana_verify_done:
+FunctionEnd
+!endif
+
+; ---------------------------------------------------------------------------
+; 安装最开始（.onInit）：结束进程 + 定好安装目录 + 备份用户数据 + 清掉旧卸载项
 ; ---------------------------------------------------------------------------
 !macro customInit
-  !insertmacro sakanaStopApp
+  !insertmacro sakanaStopApp init
+  !insertmacro sakanaEnsureAppFolder init
 
   ; 备份用户数据（几 MB 的 JSON）：旧卸载器升级时会清空安装目录
   IfFileExists "$INSTDIR\data\userData\data\*.*" 0 sakana_no_backup
@@ -130,7 +196,7 @@
 ; 卸载器这样一来退出码就是 2，新安装器随即报错中止 —— 这是我们这一版要根除的故障。
 ; ---------------------------------------------------------------------------
 !macro customCheckAppRunning
-  !insertmacro sakanaStopApp
+  !insertmacro sakanaStopApp check
 
   nsExec::Exec 'cmd /c tasklist /NH /FI "IMAGENAME eq ${APP_EXECUTABLE_FILENAME}" | find /I "${APP_EXECUTABLE_FILENAME}" >nul 2>nul'
   Pop $1
@@ -150,12 +216,39 @@
 ;
 ; 默认行为是 RMDir /r $INSTDIR —— 会把安装目录里的用户数据一起删掉。
 ; 这里改成：只删应用文件，保留 data（用户数据），覆盖升级时连缓存与用户文件一起保留。
+;
+; v0.2.12 追加**安全闸**：用户担心「装在 C:\ 或 D:\ 根目录下，卸载会把整个盘删掉」。
+; 安装器那边已经保证会装进 `<所选目录>\Sakana`（见 sakanaEnsureAppFolder），
+; 卸载器这边再兜一层：一旦发现 $INSTDIR 是磁盘根目录或系统目录，**一个文件都不删**。
+; 删错一个盘是不可逆的，宁可留下残留文件让用户手动删。
 ; ---------------------------------------------------------------------------
 !macro customRemoveFiles
   StrCpy $2 ""
   ${if} ${isUpdated}
     StrCpy $2 "1"
   ${endif}
+
+  ; —— 安全闸：磁盘根目录（形如 "D:\"）——
+  StrCpy $R2 $INSTDIR 1 1
+  StrCmp $R2 ":" 0 sakana_rm_not_drive_root
+    StrCpy $R3 $INSTDIR 1 2
+    StrCmp $R3 "\" 0 sakana_rm_not_drive_root
+      DetailPrint "安装目录是磁盘根目录，出于安全考虑不删除任何文件：$INSTDIR"
+      Goto sakana_rm_done
+  sakana_rm_not_drive_root:
+  ; —— 安全闸：系统目录 / 用户主目录 ——
+  StrCmp $INSTDIR $WINDIR sakana_rm_abort
+  StrCmp $INSTDIR $SYSDIR sakana_rm_abort
+  StrCmp $INSTDIR $PROGRAMFILES sakana_rm_abort
+  StrCmp $INSTDIR $PROGRAMFILES64 sakana_rm_abort
+  StrCmp $INSTDIR $PROFILE sakana_rm_abort
+  StrCmp $INSTDIR $DESKTOP sakana_rm_abort
+  StrCmp $INSTDIR $DOCUMENTS sakana_rm_abort
+  Goto sakana_rm_begin
+  sakana_rm_abort:
+    DetailPrint "安装目录是系统目录，出于安全考虑不删除任何文件：$INSTDIR"
+    Goto sakana_rm_done
+  sakana_rm_begin:
 
   ClearErrors
   FindFirst $0 $1 "$INSTDIR\*.*"

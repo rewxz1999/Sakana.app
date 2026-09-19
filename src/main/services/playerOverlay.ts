@@ -85,6 +85,13 @@ function startFollowing(owner: BrowserWindow): void {
   const showForOwner = (): void => {
     if (overlayWin && !overlayWin.isDestroyed()) overlayWin.showInactive()
     raiseAboveOwner()
+    /*
+     * v0.2.12：重新显示后立刻按当前状态重算交互。
+     * `showInactive()` 不会让主窗口获得焦点，而旧的裁决逻辑要求「在前台才可点击」，
+     * 于是「窗口隐藏再显示」之后控制栏一直是点击穿透状态（用户反馈的第二种失灵场景）。
+     * 现在只等渲染层的心跳/下一次鼠标移动就行，但仍然在这里补一次，缩短窗口期。
+     */
+    applyInteractive()
   }
   owner.on('minimize', hideForOwner)
   owner.on('hide', hideForOwner)
@@ -273,27 +280,43 @@ export function destroyOverlay(gen?: number): void {
 /** 是否把鼠标事件交给悬浮窗（控制栏可见时=true，可点击；隐藏时=false 点击穿透） */
 /** 当前悬浮窗是否在接收鼠标事件（点击穿透的反面）—— 自检用 */
 let overlayInteractive = false
-/** 渲染层**希望**的交互状态（控制栏是否真的显示着）；最终是否生效还要看主窗口在不在前台 */
+/** 渲染层**希望**的交互状态（控制栏是否真的显示着） */
 let rendererWantsInteractive = false
 
 /**
- * 主进程统一裁决「悬浮窗是否接收鼠标事件」（v0.2.9）。
+ * 主进程统一裁决「悬浮窗是否接收鼠标事件」。
  *
- * 渲染层只说「我希望可点击」（控制栏显示时），主进程再叠加「主窗口必须在前台」这个条件。
- * 这样就不会出现「控制栏显示着却点不动」或「点到了其实在后台的窗口上」。
+ * ## v0.2.12：去掉「主窗口必须在前台」这个条件（用户第三次反馈按钮失灵的真凶）
+ *
+ * 用户的现象（这次描述得很具体）：**播放器窗口位于另一个应用窗口之下**时、
+ * 以及**窗口被隐藏后再显示**时，控制栏看得见但按钮全都没反应。
+ *
+ * 旧规则要求 `ownerWin.isFocused()`，理由写在 v0.2.9 的注释里（怕「点到看不见的窗口」）。
+ * 但 v0.2.9 之后悬浮窗已经是 owned window 且**从不 setAlwaysOnTop**，
+ * 它不可能浮在别的应用窗口之上 —— 那条理由已经不成立了，而它留下一个**死锁**：
+ *
+ *   主窗口不在前台 → 控制栏点击穿透 → 用户点控制栏，点击落到别的窗口上
+ *   → 主窗口永远拿不到焦点 → 控制栏永远不可点。
+ *
+ * 窗口隐藏后再显示也是同一回事：`showInactive()` 不聚焦，状态一直卡在「不可点」。
+ * （渲染层其实每 1.5 秒都在重申「控制栏显示着、我要可点击」，但被这道门槛全部否掉。）
+ *
+ * 现在的规则只有一条：**渲染层说控制栏显示着，就接收点击**，另加两个物理前提 ——
+ * 悬浮窗确实可见、主窗口没被最小化。真正被别的窗口盖住时，点击本来就到不了悬浮窗，
+ * 不需要（也不应该）用焦点状态去猜。
  */
 function applyInteractive(): void {
-  const want = rendererWantsInteractive
-  const foreground =
-    !!ownerWin && !ownerWin.isDestroyed() && ownerWin.isFocused() && !ownerWin.isMinimized()
-  const next = want && foreground
+  const visible = !!overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()
+  const minimized = !!ownerWin && !ownerWin.isDestroyed() && ownerWin.isMinimized()
+  const next = rendererWantsInteractive && visible && !minimized
   if (next !== overlayInteractive) {
     // 只在真正变化时记一行：点击穿透状态是「按钮没反应」的第一嫌疑，排障时需要看到它的切换
     log.append(
       'info',
       'overlay',
       `悬浮窗鼠标交互：${next ? '接收点击' : '点击穿透'}` +
-        (want && !foreground ? '（主窗口不在前台，控制栏不接受点击）' : '')
+        (rendererWantsInteractive && !visible ? '（悬浮窗不可见）' : '') +
+        (rendererWantsInteractive && visible && minimized ? '（主窗口已最小化）' : '')
     )
   }
   overlayInteractive = next
@@ -352,6 +375,17 @@ export function sendOverlayAction(action: Record<string, unknown>): void {
      */
     log.append('warn', 'overlay', `控制栏动作无法投递（owner 缺失或已销毁）: ${JSON.stringify(action).slice(0, 80)}`)
     return
+  }
+  /*
+   * v0.2.12：控制栏来的动作**都是用户点出来的**（播放/暂停、进度、音量、选集…），
+   * 此时把主窗口带到前台：一是符合 Windows 的常规行为（点后台窗口上的控件会激活它），
+   * 二是让紧接着的键盘快捷键立即生效（快捷键依赖主窗口的输入焦点）。
+   * 悬浮窗自己 `focusable: false`，永远不会抢焦点，这里是我们主动把焦点给 owner。
+   */
+  try {
+    if (!ownerWin.isFocused() && !ownerWin.isMinimized()) ownerWin.focus()
+  } catch {
+    /* 窗口正在销毁时 focus 可能抛错，不影响动作投递 */
   }
   ownerWin.webContents.send(CH.overlayAction, action)
 }

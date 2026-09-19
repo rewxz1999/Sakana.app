@@ -10,6 +10,7 @@ import { SubscriptionsPage } from '@/pages/SubscriptionsPage'
 import { FavoritesPage } from '@/pages/FavoritesPage'
 import { SearchPage } from '@/pages/SearchPage'
 import { ToolsPage } from '@/pages/ToolsPage'
+import { CharacterGridPage } from '@/pages/CharacterGridPage'
 import { SettingsPage } from '@/pages/SettingsPage'
 import { SubjectDetailPage } from '@/pages/SubjectDetailPage'
 import { PlayerPage } from '@/pages/PlayerPage'
@@ -27,6 +28,8 @@ import { PlayerSettingsPage } from '@/pages/PlayerSettingsPage'
 import { CacheSettingsPage } from '@/pages/CacheSettingsPage'
 import { DanmakuSettingsPage } from '@/pages/DanmakuSettingsPage'
 import { AnnouncementModal } from '@/components/AnnouncementModal'
+import { ImportantUpdateModal } from '@/components/ImportantUpdateModal'
+import { UpdatePage } from '@/pages/UpdatePage'
 import { LogsPage } from '@/pages/LogsPage'
 import { AboutPage } from '@/pages/AboutPage'
 import { SaveDirsPage } from '@/pages/SaveDirsPage'
@@ -48,7 +51,11 @@ const SMALL_WINDOW_TITLES: Record<string, string> = {
   '/cache-settings': '缓存设置',
   '/danmaku-settings': '弹幕设置',
   '/downloads-win': '下载详情',
-  '/galgame/tools': 'Galgame 工具'
+  '/galgame/tools': 'Galgame 工具',
+  // v0.2.11：最XX的角色 9宫格（工具页入口，独立小窗口里用）
+  '/tools/character-grid': '最XX的角色 9宫格',
+  // v0.2.12：独立的更新窗口
+  '/update': '软件更新'
 }
 
 function smallWindowTitle(pathname: string): string {
@@ -81,6 +88,8 @@ function AnimatedRoutes() {
         <Route path="/favorites" element={<PageTransition><FavoritesPage /></PageTransition>} />
         <Route path="/search" element={<PageTransition><SearchPage /></PageTransition>} />
         <Route path="/tools" element={<PageTransition><ToolsPage /></PageTransition>} />
+        {/* v0.2.11：最XX的角色 9宫格（工具页卡片入口指向这里） */}
+        <Route path="/tools/character-grid" element={<PageTransition><CharacterGridPage /></PageTransition>} />
         <Route path="/settings" element={<PageTransition><SettingsPage /></PageTransition>} />
         <Route path="/rules" element={<PageTransition><RulesPage /></PageTransition>} />
         <Route path="/datasource" element={<PageTransition><DataSourcePage /></PageTransition>} />
@@ -97,6 +106,8 @@ function AnimatedRoutes() {
         <Route path="/galgame" element={<PageTransition><GalgamePage /></PageTransition>} />
         <Route path="/galgame/tools" element={<PageTransition><GalgameToolsPage /></PageTransition>} />
         <Route path="/downloads-win" element={<DownloadDetailPage />} />
+        {/* v0.2.12：独立的更新窗口（可视化进度界面，由 app.updateOpenWindow() 打开） */}
+        <Route path="/update" element={<UpdatePage />} />
         <Route path="/subject/:id" element={<PageTransition><SubjectDetailPage /></PageTransition>} />
         <Route path="/player" element={<PlayerRoute />} />
         <Route path="/overlay" element={<PlayerOverlayPage />} />
@@ -218,6 +229,8 @@ function AppFrame() {
       <ToastHost />
       {/* v0.2.8 附加：启动公告（只在主界面弹，小窗口/播放器/悬浮窗不弹） */}
       <AnnouncementModal />
+      {/* v0.2.12：重要更新的强提醒（用户要求「十分重要的更新要在启动后弹窗强烈提醒」） */}
+      <ImportantUpdateModal />
     </div>
   )
 }

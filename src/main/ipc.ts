@@ -21,7 +21,7 @@ import { mikan } from './services/mikan'
 import { downloadManager } from './services/downloader/manager'
 import { deleteLocalResources, localDirInfo, removeDownloadRecords } from './services/downloader/localCleanup'
 import { aria2 } from './services/downloader/aria2'
-import { listVideos } from './services/media'
+import { imageDataUrl, listVideos } from './services/media'
 import { ruleEpisodes, rulePlay, ruleSearch, rulesRepoImport, rulesRepoIndex } from './services/rules'
 import {
   getCachedStreamOrWait,
@@ -40,6 +40,7 @@ import {
   onUpdateInstallState,
   openReleases,
   REPO_URL,
+  snoozeImportantUpdate,
   updateInstallState
 } from './services/updater'
 import { fetchDanmaku, loadDanmaku, matchDanmaku, prefetchDanmaku, writeDanmakuXml } from './services/danmaku'
@@ -76,7 +77,7 @@ import {
 import { toolService } from './services/tools'
 import { listSubscriptions, mutateSubscriptions } from './services/subsStore'
 import { hidePanelNow } from './tray'
-import { focusedOrMain, getMainWindow, openSmallWindow } from './window'
+import { focusedOrMain, getMainWindow, openSmallWindow, openUpdateWindow } from './window'
 import {
   galApplyYmgal as galApplyYmgalFn,
   galImport as galImportFn,
@@ -181,6 +182,13 @@ export function registerIpc(): void {
     bangumi.season(Number(year), Number(month), !!force)
   )
   ipcMain.handle(CH.bgmTestMirrors, () => bangumi.testMirrors())
+  // 「最XX的角色 9宫格」：角色列表（v0 优先 + 老接口兜底）与导出用的图片 data URL
+  ipcMain.handle(CH.bgmCharacters, (_e, id: number) => bangumi.characters(Number(id)))
+  /*
+   * 图片 → data URL。必须走主进程：渲染层直接用 sakana-img:// 画 canvas 会污染画布，
+   * toBlob() 会抛 SecurityError（导出整条链路断在这里），data URL 则永不污染。
+   */
+  ipcMain.handle(CH.bgmImageDataUrl, (_e, url: string) => imageDataUrl(String(url ?? '')))
 
   // ---------- 蜜柑计划 ----------
   ipcMain.handle(CH.mikanSearch, (_e, keyword: string) => mikan.search(keyword))
@@ -734,6 +742,18 @@ export function registerIpc(): void {
     return true
   })
   ipcMain.handle(CH.appUpdateState, () => updateInstallState())
+  /*
+   * v0.2.12：把「更新」做成一个独立可视化窗口（用户要求更新程序要有进度界面、
+   * 且是优先级较高的模块）。设置页、重要更新弹窗、托盘菜单都调这一个入口。
+   */
+  ipcMain.handle(CH.appUpdateOpenWindow, () => {
+    openUpdateWindow()
+    return true
+  })
+  ipcMain.handle(CH.appUpdateSnooze, (_e, version: string) => {
+    snoozeImportantUpdate(String(version ?? ''))
+    return true
+  })
   onUpdateInstallState((s) => {
     for (const w of BrowserWindow.getAllWindows()) {
       if (!w.isDestroyed()) w.webContents.send(CH.evUpdateState, s)
