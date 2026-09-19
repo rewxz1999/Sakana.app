@@ -11,11 +11,12 @@ import {
   unlinkSync,
   writeFileSync
 } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import axios from 'axios'
 import type { UpdateInfo, UpdateInstallState } from '@shared/types'
 import { CH } from '@shared/channels'
 import { log } from '../log'
+import { unzipEntries } from '../lib/zip'
 import { httpGetText } from '../net'
 import { store } from '../store'
 import { dataPaths } from './paths'
@@ -376,10 +377,16 @@ export async function downloadUpdate(): Promise<{ ok: boolean; file?: string; me
     setState({ phase: 'done', file: reuse, version: info.latest, mode: patch ? 'patch' : 'installer' })
     const ready = patch ? verifyPatch(reuse) : { ok: true as const }
     if (ready.ok) return { ok: true, file: reuse, message: '更新包已就绪（复用已下载的文件）' }
+    /*
+     * 复用失败要把原因写进日志（v0.2.13）。之前这里一声不吭就把它删掉重下，
+     * 用户看到的是「下载完了又下载一遍，最后说解包失败」，日志里却查不到任何线索 ——
+     * 上一轮排查那个 EPERM 就是被这一点拖了很久。
+     */
+    if (patch) log.append('warn', 'update', `已下载的补丁不可用，将重新下载：${ready.message}`)
     try {
       unlinkSync(reuse)
-    } catch {
-      /* ignore */
+    } catch (err) {
+      log.append('warn', 'update', `清理旧补丁失败（不影响继续下载）：${String((err as Error)?.message ?? err)}`)
     }
   }
 
@@ -425,11 +432,13 @@ export async function downloadUpdate(): Promise<{ ok: boolean; file?: string; me
       if (patch) {
         const ver = verifyPatch(file)
         if (!ver.ok) {
+          // 校验失败是有价值的信息（补丁损坏/被中间设备改写/解析器不支持），必须留痕
+          log.append('warn', 'update', `补丁校验未通过：${ver.message}`)
           lastMessage = ver.message
           try {
             unlinkSync(file)
-          } catch {
-            /* ignore */
+          } catch (err) {
+            log.append('warn', 'update', `清理未通过的补丁失败：${String((err as Error)?.message ?? err)}`)
           }
           continue
         }
@@ -475,51 +484,122 @@ interface PatchJson {
   removed: string[]
 }
 
+/**
+ * 解包目录里落盘时的**安全后缀**（v0.2.13 关键修复）。
+ *
+ * Electron 给主进程的 `fs` 打过 asar 补丁：**任何以 `.asar` 结尾的路径都会被当成 asar 包解析**。
+ * 我们的补丁里恰好有一个 `resources/app.asar`，于是应用进程一读一写它就炸 ——
+ * 用户实测报的那个 `EPERM, Permission denied: '…zip.unpacked' -> '…同名'`，
+ * 以及我在应用内复现出来的 `Invalid package …\app.asar`，根因都是它
+ * （用 Node 单独跑同一段逻辑三遍全过，正是因为 Node 没有这个补丁）。
+ *
+ * 所以落盘时统一加这个后缀，让**应用进程**永远不碰 `.asar` 路径；
+ * 覆盖脚本是独立的 PowerShell 进程（没有 asar 补丁），由它把后缀去掉、写回真实文件名。
+ * 生成端（`scripts/make-patch.js`）与脚本端必须用同一个常量，改动要同步。
+ */
+const STAGED_SUFFIX = '.sakana-staged'
+
 /** 补丁解包目录（每次校验都重建，避免残留旧文件污染） */
 function patchStageDir(zip: string): string {
   return `${zip}.unpacked`
 }
 
+/** 已校验通过的补丁：zip 路径 → 解包目录。installUpdateFrom 用它，避免重复解包 */
+const verifiedStage = new Map<string, string>()
+
 /**
- * 解包并**逐文件校验**补丁。
+ * 校验补丁并把「整文件」落盘到解包目录。
  *
- * 为什么必须校验：补丁是「直接覆盖安装目录里正在用的文件」，一旦压缩包损坏或被中间设备
- * 塞了东西，覆盖完可能连应用都起不来 —— 所以在真正覆盖之前先把每个文件的 sha256 对一遍，
- * 对不上就整包作废（宁可回落到完整安装包）。
+ * ## v0.2.13：不再调用外部 tar，也不再先删目录
+ *
+ * 用户实测（0.2.11 应用内更新到 0.2.12 时）报：
+ *   `补丁解包失败：EPERM, Permission denied: '…patch-0.2.11-to-0.2.12.zip.unpacked' -> '…同路径'`
+ * 同一个补丁、同一个带中文的目录，用 Node 单独跑三遍全过 —— 说明失败来自**应用进程特有的上下文**
+ * （子进程创建 / 文件句柄 / 杀软扫描），而不是补丁或路径本身。补丁解包是更新链路的关键一步，
+ * 不该依赖外部程序，所以这一版改成：
+ *   ① **纯 JS 解压**（`src/main/lib/zip.ts`：EOCD → 中央目录 → inflateRawSync），没有任何子进程；
+ *   ② **先在内存里把哈希全算完**，全部对得上才往磁盘写 —— 不会再出现「删目录失败」或
+ *      「半个 app.asar 落进安装目录」这类中间状态；
+ *   ③ 解包目录用**唯一名字**（带进程号与时间戳），彻底避开 Windows 上「删不掉又建不出来」的
+ *      待删除状态；旧目录交给启动时的过期清理。
+ * 另外每一处失败都把**是哪一步**写清楚（读文件 / 解压 / 哈希），下次再出问题一眼能定位。
  */
-function verifyPatch(zip: string): { ok: true } | { ok: false; message: string } {
-  const stage = patchStageDir(zip)
+function verifyPatch(zip: string): { ok: true; stage: string } | { ok: false; message: string } {
+  let zipBuf: Buffer
   try {
-    rmSync(stage, { recursive: true, force: true })
-    mkdirSync(stage, { recursive: true })
-    const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
-    // Windows 10+ 自带 bsdtar，能解 zip（我们生成补丁也是用它，格式对称）
-    execFileSync('tar', ['-x', '-f', zip, '-C', stage], { stdio: 'ignore' })
-    const manifestPath = join(stage, 'patch.json')
-    if (!existsSync(manifestPath)) return { ok: false, message: '补丁里缺少 patch.json' }
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as PatchJson
-    if (!Array.isArray(manifest.files)) return { ok: false, message: 'patch.json 结构不正确' }
-    for (const f of manifest.files) {
-      const target = join(stage, f.path)
-      if (!existsSync(target)) return { ok: false, message: `补丁缺少文件：${f.path}` }
-      const hash = createHash('sha256').update(readFileSync(target)).digest('hex')
-      if (hash !== f.sha256) return { ok: false, message: `补丁文件校验失败：${f.path}` }
+    zipBuf = readFileSync(zip)
+  } catch (err) {
+    return { ok: false, message: `读取补丁失败（${String((err as Error)?.message ?? err)}）` }
+  }
+
+  let entries: { name: string; data: Buffer }[]
+  try {
+    entries = unzipEntries(zipBuf)
+  } catch (err) {
+    return { ok: false, message: `解压补丁失败（${String((err as Error)?.message ?? err)}）` }
+  }
+
+  const manifestEntry = entries.find((e) => e.name === 'patch.json' || e.name === './patch.json')
+  if (!manifestEntry) return { ok: false, message: '补丁里缺少 patch.json' }
+  let manifest: PatchJson
+  try {
+    manifest = JSON.parse(manifestEntry.data.toString('utf8')) as PatchJson
+  } catch (err) {
+    return { ok: false, message: `patch.json 解析失败（${String((err as Error)?.message ?? err)}）` }
+  }
+  if (!Array.isArray(manifest.files)) return { ok: false, message: 'patch.json 结构不正确' }
+
+  // ① 内存里逐个核对整文件：这一轮**不碰磁盘**
+  const staged = new Map<string, Buffer>()
+  for (const f of manifest.files) {
+    const hit = entries.find((e) => e.name === f.path || e.name === `./${f.path}`)
+    if (!hit) return { ok: false, message: `补丁缺少文件：${f.path}` }
+    const hash = createHash('sha256').update(hit.data).digest('hex')
+    if (hash !== f.sha256) {
+      return { ok: false, message: `补丁文件校验失败（哈希不一致）：${f.path}` }
     }
-    // 增量条目只需检查结构：真正的字节写入放在安装前（那时才读安装目录里的旧文件）
-    for (const d of manifest.deltas ?? []) {
-      if (!d.baseSha256 || !Array.isArray(d.spans) || d.spans.length === 0) {
-        return { ok: false, message: `补丁增量信息不完整：${d.path}` }
+    staged.set(f.path, hit.data)
+  }
+  // 增量条目只检查结构：真正的字节写入放在安装前（那时才读安装目录里的旧文件）
+  for (const d of manifest.deltas ?? []) {
+    if (!d.baseSha256 || !Array.isArray(d.spans) || d.spans.length === 0) {
+      return { ok: false, message: `补丁增量信息不完整：${d.path}` }
+    }
+  }
+
+  // ② 全部通过后才写盘：解包目录用唯一名字，失败重试也不会撞上"待删除"的旧目录
+  const stage = `${patchStageDir(zip)}-${process.pid}-${Date.now()}`
+  try {
+    mkdirSync(stage, { recursive: true })
+    for (const [rel, data] of staged) {
+      // 加安全后缀：应用进程绝不直接读写 `.asar` 路径（见 STAGED_SUFFIX 注释）
+      const dest = join(stage, `${rel}${STAGED_SUFFIX}`)
+      mkdirSync(dirname(dest), { recursive: true })
+      writeFileSync(dest, data)
+    }
+    // patch.json 一并写出：覆盖脚本与 removed 清单都要读它
+    writeFileSync(join(stage, 'patch.json'), manifestEntry.data)
+  } catch (err) {
+    return { ok: false, message: `写入解包目录失败（${String((err as Error)?.message ?? err)}）` }
+  }
+
+  verifiedStage.set(zip, stage)
+  log.append(
+    'info',
+    'update',
+    `增量补丁校验通过：${manifest.files.length} 个整文件 + ${manifest.deltas?.length ?? 0} 个增量文件（${manifest.from} → ${manifest.to}），解包到 ${stage}`
+  )
+  // 顺手清掉同名补丁的历史解包目录（本次没用上的那些）
+  try {
+    for (const name of readdirSync(dirname(zip))) {
+      if (name.startsWith(`${basename(zip)}.unpacked-`) && join(dirname(zip), name) !== stage) {
+        rmSync(join(dirname(zip), name), { recursive: true, force: true })
       }
     }
-    log.append(
-      'info',
-      'update',
-      `增量补丁校验通过：${manifest.files.length} 个整文件 + ${manifest.deltas?.length ?? 0} 个增量文件（${manifest.from} → ${manifest.to}）`
-    )
-    return { ok: true }
-  } catch (err) {
-    return { ok: false, message: `补丁解包失败：${String((err as Error)?.message ?? err)}` }
+  } catch {
+    /* 清不掉就算了，启动时的过期清理会处理 */
   }
+  return { ok: true, stage }
 }
 
 /**
@@ -586,7 +666,7 @@ function materializeDeltas(stage: string): { ok: true } | { ok: false; message: 
     if (createHash('sha256').update(buf).digest('hex') !== d.sha256) {
       return { ok: false, message: `增量还原校验失败：${d.path}（请改用完整安装包更新）` }
     }
-    const dest = join(stage, d.path)
+    const dest = join(stage, `${d.path}${STAGED_SUFFIX}`)
     mkdirSync(dirname(dest), { recursive: true })
     writeFileSync(dest, buf)
     log.append(
@@ -639,6 +719,10 @@ function buildApplyScript(stage: string, target: string, exe: string, logFile: s
     `Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object {`,
     `  if ($_.Name -eq 'patch.json') { return }`,
     `  $rel = $_.FullName.Substring($stage.Length + 1)`,
+    // v0.2.13：应用进程落盘时给每个文件加了 .sakana-staged 后缀（避开 Electron 的 asar 补丁，
+    // 详见 updater.ts 的 STAGED_SUFFIX 注释）。这里是独立进程，没有那个补丁 —— 负责把后缀去掉，
+    // 写回真实文件名。两边的后缀必须一致。
+    `  if ($rel.EndsWith('${STAGED_SUFFIX}')) { $rel = $rel.Substring(0, $rel.Length - ${STAGED_SUFFIX.length}) }`,
     `  $dst = Join-Path $target $rel`,
     `  $dir = Split-Path -Parent $dst`,
     `  if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }`,
@@ -710,7 +794,7 @@ export function installUpdateFrom(file: string, mode: 'patch' | 'installer'): { 
         setState({ phase: 'failed', message: verified.message, reason: 'apply' })
         return { ok: false, message: `${verified.message}（可在下方点「打开 Releases 页面」下载完整安装包）` }
       }
-      const stage = patchStageDir(file)
+      const stage = verified.stage
       // 再把字节增量还原成完整文件（本进程还活着，能读安装目录里的旧 exe/asar）
       const built = materializeDeltas(stage)
       if (!built.ok) {
