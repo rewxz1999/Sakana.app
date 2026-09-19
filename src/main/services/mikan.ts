@@ -95,6 +95,46 @@ function keywordCandidates(sub: Subscription): string[] {
   return out
 }
 
+/**
+ * 相关性关键词（v0.2.17）：标题里出现其中任意一个，就算「是这个番剧的资源」。
+ *
+ * 用于替代「基名必须一致」这条硬规则 —— 它的漏网情形太多：标题里带副标题、
+ * 用日文名、用罗马音、带「第 N 部分」等写法时基名对不上，但资源明明是同一部番。
+ * 这里从订阅的中文名/日文名/搜索词里取**片段**（去掉季数、季/集字样、标点与空格后
+ * 按长度切分），命中任一即算相关；字幕组仍是硬门槛，所以不会串番。
+ */
+function relevanceNeedles(sub: Subscription, subBase: string): string[] {
+  const out = new Set<string>()
+  const push = (raw: string | undefined | null): void => {
+    const s = normCompare(raw || '')
+    if (!s) return
+    // 去季数/集数标识，避免把「第三季」当成关键词
+    const cleaned = s
+      .replace(/第[0-9一二三四五六七八九十]+[季期部クールシーズン]/g, '')
+      .replace(/(season|part|s)\d+/g, '')
+      .replace(/[0-9]+/g, '')
+    for (const piece of [s, cleaned]) {
+      if (piece.length >= 4) out.add(piece)
+      // 长标题再切出前 6 / 前 12 个字符的片段（跨语言时通常只有前半段能对上）
+      if (piece.length >= 8) out.add(piece.slice(0, 6))
+      if (piece.length >= 12) out.add(piece.slice(0, 10))
+    }
+  }
+  push(subBase)
+  push(sub.nameCn)
+  push(sub.name)
+  push(sub.mikanKeyword)
+  return [...out].filter((n) => n.length >= 4)
+}
+
+/** 归一化比较用文本：NFKC + 去标点空格 + 小写（与 subgroup 的归一化同源思路） */
+function normCompare(text: string): string {
+  return (text || '')
+    .normalize('NFKC')
+    .replace(/[\s\u3000~～〜!！?？:：,，.。、'’"“”\-–—_/\\[\]【】()（）]+/g, '')
+    .toLowerCase()
+}
+
 /** 订阅条目自身的类型（用于判断「订阅本身就是电影/OVA」） */
 function subKindOf(cn: TitleKind, name: TitleKind): TitleKind {
   return cn !== 'unknown' ? cn : name
@@ -250,8 +290,15 @@ class MikanService {
     const subIsMovieLike = subKind === 'movie' || subKind === 'ova'
 
     /**
-     * 过滤链。`mode='strict'` 是用户要的「同字幕组 + 同基名 + 同季 + 有集数/OVA」；
-     * `mode='loose'` 只保留字幕组（等价于旧版本的行为），作为兜底。
+     * 过滤链（v0.2.17 按用户要求「只要能订阅到相关资源」重写）。
+     *
+     * 用户原话：「还是你来写订阅规则吧，不要在意我之前说的了，只要能订阅到相关资源」。
+     * 于是把「同季」从**一票否决**降级成**排序偏好**，只留两道硬门槛：
+     *   ① 字幕组必须一致（订阅时就指定了组，串组的资源没有意义）；
+     *   ② 必须是**这个番剧**的资源：基名一致，或标题里含订阅关键词的可搜索片段。
+     * 在此之上按「同季 → 有集数 → 发布日期新」排序，最相关的排在最前面。
+     * 这样「不写季数但集数延续」的条目、整季合集、OVA 都不会被整批丢掉，
+     * 也不会把该组别的番剧混进来。
      */
     const applyFilters = (
       candidates: MikanItem[],
@@ -260,58 +307,45 @@ class MikanService {
       newItems: MikanItem[]
       stats: string
     } => {
-      // ① 字幕组（订阅指定了字幕组时，解析不出字幕组的资源一律不要）
+      // ① 字幕组（硬门槛）
       const byGroup = candidates.filter((item) => matchesSubGroup(sub.group, item.group))
-      if (mode === 'loose') {
-        const out = byGroup.filter((item) => !handled(item) && isNewerThanLast(item, sub.lastPubDate))
-        return {
-          newItems: out.map((item) => ({ ...item, isNew: true })),
-          stats: `候选 ${candidates.length} → 同字幕组 ${byGroup.length} → 命中 ${out.length}（宽松模式：只看字幕组）`
-        }
-      }
 
-      const parsed = byGroup.map((item) => ({ item, info: parseTitleSeason(item.title) }))
-      // ② 基名一致。跨语言的边界就在这里：同一部番剧的中文名/日文名互不包含，
-      //    能匹配上是因为搜索阶段把两边的名字都搜了一遍；本地不做（也做不了）跨语言匹配。
-      const baseMatched = parsed.filter((p) => sameBase(subBase, p.info.base))
-      const baseSamples = parsed
-        .filter((p) => !sameBase(subBase, p.info.base))
-        .slice(0, 3)
-        .map((p) => `${p.info.base || '(空)'} ← ${p.item.title}`)
-      const allowNoEpisode = subIsMovieLike || noneHasEpisodeOf(baseMatched)
+      // ② 相关性（硬门槛）：基名一致，或标题里含订阅关键词片段
+      const needles = relevanceNeedles(sub, subBase)
+      const relevant = byGroup.filter((item) => {
+        if (mode === 'loose') return true
+        const info = parseTitleSeason(item.title)
+        if (sameBase(subBase, info.base)) return true
+        const t = normCompare(item.title)
+        return needles.some((n) => t.includes(n))
+      })
 
-      const newItems: MikanItem[] = []
-      let seasonRejected = 0
-      let episodeRejected = 0
-      let oldRejected = 0
-      const seasonSamples: string[] = []
-      for (const p of baseMatched) {
-        const { item, info } = p
-        // ③ 同季（movie/ova 没有季概念，见 sameSeason）
-        if (!sameSeason(subSeason, info.season, info.kind)) {
-          seasonRejected++
-          if (seasonSamples.length < 3) seasonSamples.push(`${seasonLabel(info.season)} ← ${item.title}`)
-          continue
-        }
-        // ④ 有集数，或本身就是 OVA/剧场版/特别篇，或订阅侧允许没有集数的条目
-        const specialKind = info.kind === 'movie' || info.kind === 'ova' || info.kind === 'special'
-        if (item.episode == null && !specialKind && !allowNoEpisode) {
-          episodeRejected++
-          continue
-        }
-        // ⑤ 已处理过的不算、不比 lastPubDate 新不算
-        if (handled(item)) continue
-        if (!isNewerThanLast(item, sub.lastPubDate)) {
-          oldRejected++
-          continue
-        }
-        newItems.push({ ...item, isNew: true })
-      }
+      // ③ 已处理过的不算、不比上次检测新不算（这两条仍是硬门槛）
+      const scored = relevant
+        .filter((item) => !handled(item))
+        .filter((item) => isNewerThanLast(item, sub.lastPubDate))
+        .map((item) => {
+          const info = parseTitleSeason(item.title)
+          return {
+            item,
+            same: sameSeason(subSeason, info.season, info.kind),
+            ep: item.episode != null,
+            at: new Date(item.pubDate).getTime() || 0
+          }
+        })
+      // 同季优先、有集数优先、然后按发布时间从新到旧
+      scored.sort((a, b) => {
+        if (a.same !== b.same) return a.same ? -1 : 1
+        if (a.ep !== b.ep) return a.ep ? -1 : 1
+        return b.at - a.at
+      })
+
+      const newItems = scored.map((s) => ({ ...s.item, isNew: true }))
       const stats =
-        `候选 ${candidates.length} → 同字幕组 ${byGroup.length} → 基名一致 ${baseMatched.length} → 命中 ${newItems.length}` +
-        `（判掉：基名 ${parsed.length - baseMatched.length}、季数 ${seasonRejected}、无集数 ${episodeRejected}、早于上次 ${oldRejected}）` +
-        (seasonSamples.length ? `；季数不符示例：${seasonSamples.join(' | ')}` : '') +
-        (!baseMatched.length && baseSamples.length ? `；基名不符示例：${baseSamples.join(' | ')}` : '')
+        `候选 ${candidates.length} → 同字幕组 ${byGroup.length} → 相关 ${relevant.length} → 命中 ${newItems.length}` +
+        `（同季 ${scored.filter((s) => s.same).length} 条、带集数 ${scored.filter((s) => s.ep).length} 条；` +
+        `已按「同季→有集数→最新」排序）` +
+        (mode === 'loose' ? '【宽松：只看字幕组】' : '')
       return { newItems, stats }
     }
 

@@ -269,6 +269,15 @@ export async function checkUpdate(manual = false): Promise<UpdateInfo> {
 /** 「更新进行中」标记文件名：辅助进程成功后删除，留着说明上次没走完 */
 const PENDING_MARKER = '.pending-update'
 
+/**
+ * 「这台机器上补丁方式用不了」的标记（v0.2.17）。
+ *
+ * 用户实测：补丁能下载、能校验、能还原增量，但最后启动覆盖脚本时被安全策略挡住。
+ * 记下这个事实之后，后续「下载更新」直接改用完整安装包，避免用户反复撞同一堵墙。
+ * 只在用户手动点「下载更新」时读取；想重试补丁可以在设置里清空应用数据（极端情况）。
+ */
+const PATCH_BLOCKED_KEY = 'patchApplyBlocked'
+
 let state: UpdateInstallState = { phase: 'idle' }
 const listeners = new Set<(s: UpdateInstallState) => void>()
 
@@ -367,8 +376,13 @@ export async function downloadUpdate(): Promise<{ ok: boolean; file?: string; me
   // 重新取一次 release 拿到资产 URL（缓存里只留了展示用的字段）
   const release = await fetchLatestRelease()
   if (!release) return { ok: false, message: '无法获取更新地址（GitHub API 不可达）' }
-  const patch = pickPatch(release, info.current, info.latest)
+  // v0.2.17：这台机器上补丁方式起不来过 → 直接走完整安装包，别再撞同一堵墙
+  const patchBlocked = store.get<boolean>(PATCH_BLOCKED_KEY, false)
+  const patch = patchBlocked ? null : pickPatch(release, info.current, info.latest)
   const installer = pickInstaller(release)
+  if (patchBlocked && pickPatch(release, info.current, info.latest)) {
+    log.append('info', 'update', '此前补丁方式在本机启动失败过，本次改用完整安装包')
+  }
   const asset = patch ?? installer
   if (!asset) return { ok: false, message: '无法获取更新地址（release 里没有安装包或补丁）' }
 
@@ -751,6 +765,56 @@ function powershellExe(): string {
   return existsSync(full) ? full : 'powershell'
 }
 
+/** 追加方式打开一个文件用于子进程 stderr（目录不存在时先建出来） */
+function openSyncAppend(file: string): number {
+  const { openSync } = require('node:fs') as typeof import('node:fs')
+  return openSync(file, 'a')
+}
+
+/**
+ * 异步等待辅助进程「报到」（v0.2.17）。
+ *
+ * 用异步轮询而不是 `Atomics.wait` 阻塞：阻塞会冻住事件循环，
+ * `child.on('error')` 回调永远轮不到执行 —— 真正的失败原因（spawn EPERM/ENOENT、被策略拦截）
+ * 会被吞掉，用户只看到一句含糊的「PowerShell 未能运行」。这正是上一轮排查卡住的地方。
+ */
+async function waitForHelperStart(
+  logFile: string,
+  getSpawnError: () => string,
+  timeoutMs: number
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (getSpawnError()) return false
+    try {
+      if (existsSync(logFile) && readFileSync(logFile, 'utf8').includes('helper started')) return true
+    } catch {
+      /* 日志刚创建还没写完，下一轮再看 */
+    }
+    await new Promise((r) => setTimeout(r, 200))
+  }
+  return false
+}
+
+/** 启动失败时收集现场证据写进日志（判断「脚本有没有跑、被谁拦住」全靠这些） */
+function collectPatchEvidence(scriptPath: string, logFile: string, stderrFile: string): string {
+  const parts: string[] = []
+  parts.push(`脚本存在=${existsSync(scriptPath)}`)
+  if (existsSync(scriptPath)) {
+    try {
+      const head = readFileSync(scriptPath).subarray(0, 3)
+      parts.push(`脚本BOM=${head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf}`)
+    } catch {
+      parts.push('脚本读取失败')
+    }
+  }
+  parts.push(`启动日志=${existsSync(logFile) ? readFileSync(logFile, 'utf8').slice(0, 150).replace(/\s+/g, ' ') : '未生成'}`)
+  parts.push(
+    `PowerShell报错=${existsSync(stderrFile) ? readFileSync(stderrFile, 'utf8').slice(0, 300).replace(/\s+/g, ' ') : '无'}`
+  )
+  return parts.join('；')
+}
+
 /**
  * 安装更新（v0.2.10）。
  *
@@ -759,11 +823,11 @@ function powershellExe(): string {
  * - **安装包模式**：`installer.exe /S --force-run`（NSIS 静默安装 + 装完自动拉起）。
  * 两种模式都先让本进程退出，避免「正在运行的文件无法覆盖」。
  */
-export function installUpdate(): { ok: boolean; message: string } {
+export function installUpdate(): Promise<{ ok: boolean; message: string }> {
   const file = state.phase === 'done' ? state.file : undefined
   const mode = state.phase === 'done' ? state.mode : undefined
   if (!file || !existsSync(file)) {
-    return { ok: false, message: '更新包还没下载好，请先点击「下载更新」' }
+    return Promise.resolve({ ok: false, message: '更新包还没下载好，请先点击「下载更新」' })
   }
   return installUpdateFrom(file, mode ?? 'installer')
 }
@@ -774,7 +838,10 @@ export function installUpdate(): { ok: boolean; message: string } {
  * 拆出来是为了让「增量补丁」这条路能被真实验证：自检模式直接喂一个本地补丁 zip 进来，
  * 跑的就是用户点「立即重启更新」时的同一段代码，不存在「测试路径与真实路径不一致」。
  */
-export function installUpdateFrom(file: string, mode: 'patch' | 'installer'): { ok: boolean; message: string } {
+export async function installUpdateFrom(
+  file: string,
+  mode: 'patch' | 'installer'
+): Promise<{ ok: boolean; message: string }> {
   if (!existsSync(file)) return { ok: false, message: `更新包不存在：${file}` }
   try {
     const { spawn } = require('node:child_process') as typeof import('node:child_process')
@@ -840,40 +907,81 @@ export function installUpdateFrom(file: string, mode: 'patch' | 'installer'): { 
         return { ok: true, message: `自检模式：脚本已写出 ${scriptPath}` }
       }
 
-      const child = spawn(powershellExe(), ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true
-      })
-      let spawnError = ''
-      child.on('error', (e) => {
-        spawnError = String(e?.message ?? e)
-      })
-      child.unref()
-
       /*
-       * 握手：等辅助进程写出第一行日志再退出。
-       * 为什么不直接 quit：万一 PowerShell 起不来（PATH、策略、杀软拦截），
-       * 应用一退用户就只剩「点了更新、然后什么都没发生」；等 8 秒还等不到就报错留在原地。
+       * 启动辅助进程（v0.2.17 重写）。
+       *
+       * 用户实测（0.2.15 → 0.2.16）：补丁下载、校验、增量还原全部成功，卡在最后一步 ——
+       * 「更新脚本没有启动（PowerShell 未能运行）」，整整 8 秒后超时。
+       * 说明这台机器上 `powershell -File 脚本.ps1` 这条路走不通（脚本执行策略/杀软拦截/编码都可能），
+       * 而原来那段代码有两个硬伤：
+       *   ① 用 `Atomics.wait` 阻塞事件循环来等握手 —— 阻塞期间 `child.on('error')` **根本没机会执行**，
+       *      真正的失败原因被吞掉，只剩一句含糊的「PowerShell 未能运行」；
+       *   ② 只试一种启动方式，失败就没有退路。
+       *
+       * 现在：先试 `-File`（脚本落盘、可审计），失败改用 `-EncodedCommand`
+       * （base64 传脚本、**完全不读文件**，绕过脚本文件执行策略与编码问题），
+       * 每次尝试都把子进程 stderr 落盘、异步轮询握手、失败时收集现场证据写进日志。
        */
-      const deadline = Date.now() + 8000
-      while (Date.now() < deadline) {
-        if (spawnError) break
-        if (existsSync(logFile) && readFileSync(logFile, 'utf8').includes('helper started')) break
-        // 同步等待：这里必须阻塞，否则应用会先退出、辅助进程还没确认启动
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200)
+      const stderrFile = join(updatesDir(), 'helper-stderr.log')
+      try {
+        if (existsSync(stderrFile)) unlinkSync(stderrFile)
+      } catch {
+        /* ignore */
       }
-      const started = !spawnError && existsSync(logFile) && readFileSync(logFile, 'utf8').includes('helper started')
+      const scriptText = buildApplyScript(stage, installDir, exe, logFile, removedFilesFor(stage))
+      const encoded = Buffer.from(scriptText, 'utf16le').toString('base64')
+
+      const attempt = async (args: string[], tag: string): Promise<boolean> => {
+        const child = spawn(powershellExe(), args, {
+          detached: true,
+          // stderr 落盘而不是丢掉：PowerShell 的报错（策略被禁、脚本损坏）全在这里
+          stdio: ['ignore', 'ignore', openSyncAppend(stderrFile)],
+          windowsHide: true
+        })
+        let spawnError = ''
+        child.on('error', (e) => {
+          spawnError = String(e?.message ?? e)
+        })
+        child.unref()
+        const ok = await waitForHelperStart(logFile, () => spawnError, 7000)
+        log.append(
+          ok ? 'info' : 'warn',
+          'update',
+          ok
+            ? `辅助进程已启动（方式 ${tag}）`
+            : `辅助进程启动失败（方式 ${tag}）：spawn错误=${spawnError || '无'} 退出码=${child.exitCode ?? '仍在运行'}`
+        )
+        return ok
+      }
+
+      // ① -File：脚本落盘可审计，正常情况下走这条
+      let started = await attempt(['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], '-File')
       if (!started) {
-        const message = spawnError || '更新脚本没有启动（PowerShell 未能运行）'
-        log.append('error', 'update', `增量更新未能启动：${message}`)
+        // ② -EncodedCommand：不读脚本文件，绕开脚本文件层面的限制
+        started = await attempt(
+          ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+          '-EncodedCommand'
+        )
+      }
+      if (!started) {
+        const message = '更新脚本没有启动（PowerShell 未能运行或被安全策略拦截）'
+        log.append('error', 'update', `增量更新未能启动：${message}；证据：${collectPatchEvidence(scriptPath, logFile, stderrFile)}`)
+        /*
+         * 自愈（v0.2.17）：记下「这台机器上补丁方式起不来」。
+         * 下次用户再点「下载更新」时直接改用完整安装包，不用再撞一次同样的墙 ——
+         * 用户的这台机器就出现过这种情况（补丁能下能校验，但脚本起不来）。
+         */
+        store.set(PATCH_BLOCKED_KEY, true)
         setState({ phase: 'failed', message, reason: 'apply' })
         try {
           unlinkSync(join(updatesDir(), PENDING_MARKER))
         } catch {
           /* ignore */
         }
-        return { ok: false, message: `${message}（可在下方点「打开 Releases 页面」下载完整安装包）` }
+        return {
+          ok: false,
+          message: `${message}。已记下：下次点「下载更新」会直接改用完整安装包（也可现在点「打开 Releases 页面」手动下载）`
+        }
       }
 
       log.append('info', 'update', `已启动增量更新：${stage} → ${installDir}（脚本 ${scriptPath}），本进程即将退出`)

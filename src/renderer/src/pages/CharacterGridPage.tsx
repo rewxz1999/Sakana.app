@@ -231,6 +231,19 @@ function drawCover(
   const iw = img.naturalWidth || img.width
   const ih = img.naturalHeight || img.height
   if (!iw || !ih) return false
+  /*
+   * v0.2.17（用户反馈「立绘还是不清晰」）：**小图不放大**。
+   *
+   * 实测 Bangumi 角色立绘尺寸差异极大：常见 800x2767（很清晰），但也有不少角色
+   * 官方最大档只有 250x300；而导出格子是 230x276 逻辑像素、2 倍图后 460x552 ——
+   * 把 250px 宽的图 cover 拉到 460px 等于放大 1.84 倍，插值再好也是糊的。
+   * 所以源图比目标框小时改成「原始像素、居中、不放大」（宁可留白）；够大时仍然 cover 裁剪。
+   */
+  const containScale = Math.min(dw / iw, dh / ih)
+  if (containScale > 1) {
+    ctx.drawImage(img, dx + (dw - iw) / 2, dy + (dh - ih) / 2, iw, ih)
+    return true
+  }
   const scale = Math.max(dw / iw, dh / ih)
   const sw = iw * scale
   const sh = ih * scale
