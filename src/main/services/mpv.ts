@@ -2,6 +2,8 @@ import { app, BrowserWindow, screen } from 'electron'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { CH } from '@shared/channels'
+import type { OverlayAction } from '@shared/api'
+import type { DanmakuSettings } from '@shared/types'
 import { BROWSER_UA, getSettings } from '../net'
 import { danmakuApiBase } from './danmaku'
 import { log } from '../log'
@@ -76,6 +78,8 @@ let timeTimer: NodeJS.Timeout | null = null
 let lastPlaying = false
 let lastLength = 0
 let lastEof = false
+/** 上一次同步给渲染层的音量（v0.2.18：uosc 的音量滑杆直接改 mpv 属性，必须同步回来） */
+let lastVolume = -1
 let currentBounds: MpvBounds | null = null
 /** 视频输出窗口是否可见（探针网页视图占用同一区域时置 false） */
 let surfaceVisible = true
@@ -350,6 +354,22 @@ function startTimePump(win: BrowserWindow): void {
       }
       if (!st.eof) lastEof = false
       if (playing) sendEvent(win, { type: 'time', time: st.time, length: st.length, playing: true })
+      /*
+       * v0.2.18：音量同步。uosc 的竖排音量滑杆直接改 mpv 的 volume 属性
+       * （不经过应用的 IPC），不同步的话渲染层那份 playerVolume 会一直是旧值 ——
+       * 表现就是「鼠标拖过音量之后再按 ↑ 键，音量突然跳回拖之前的档位」。
+       * 只在变化超过 0.5 时发，避免浮点抖动刷屏。
+       */
+      if (Math.abs((st.volume ?? 0) - lastVolume) >= 0.5) {
+        lastVolume = st.volume ?? 0
+        sendEvent(win, { type: 'volume', volume: lastVolume })
+      }
+      /*
+       * v0.2.18：uosc 控制栏的动作回传（按钮/菜单项/快捷键）。
+       * 挂在同一个 250ms 泵上：读一个字符串属性，开销可以忽略；
+       * 只有桥接脚本挂上了才读（见 pollUoscCtrl）。
+       */
+      pollUoscCtrl(win)
     } catch {
       /* ignore */
     }
@@ -407,20 +427,44 @@ function biliDanmakuConfig(): { options: Record<string, string>; scriptPath: str
   ].join(',')
   log.append('info', 'mpv', `B 站弹幕脚本已启用：${script}（tmpdir=${tmpdir}）`)
   /*
-   * 注意：这里**不能**用 `script` 选项来加载脚本。
-   * 实测（原生插件探针）：`mpv_set_option_string(mpv, 'script', <lua>)` 静默失败，
-   * 回读 `options/script` 仍是 null，脚本一行都没跑；只有运行时命令 `load-script` 有效。
-   * 所以这里只带 `load-scripts` 与 `script-opts`，真正的加载在 mpvAttach 里用命令做。
+   * ⚠️ v0.2.18：这里**故意不再带 `load-scripts=yes`**。
+   *
+   * 它过去是多余的（libmpv 里脚本一律用运行时命令 `load-script` 按路径加载，
+   * 而 `load-scripts` 只管「要不要自动扫描 <config-dir>/scripts/」），
+   * 过去因为 `config=no` 连配置目录都不认，所以它一直是个空操作。
+   * 现在 uosc 控制栏要求 `config=yes`（否则读不到 uosc.conf / input.conf），
+   * 一旦此时还留着 `load-scripts=yes`，mpv 会在初始化时自动加载
+   * `<config-dir>/scripts/uosc` 与 `uosc_danmaku`，我们再显式 load-script 一次
+   * 就会得到**两份 uosc**（两套控制栏）与两份弹幕插件 —— 探针实测过这个坑。
+   * 所以脚本加载顺序完全由 mpvAttach 掌握：shim → uosc_danmaku → uosc。
+   *
+   * 另外注意：`script` 选项同样不能用（实测 mpv_set_option_string(mpv,'script',…) 静默失败），
+   * 所以真正的加载都在 mpvAttach 里用运行时命令做。
    */
-  return { options: { 'load-scripts': 'yes', 'script-opts': scriptOpts }, scriptPath: script }
+  return { options: { 'script-opts': scriptOpts }, scriptPath: script }
 }
 
 /** 内置的 B 站弹幕脚本路径（打包后在 resources/mpv-scripts 下） */
 export function bundledBiliScript(): string {
+  return bundledScript('sakana-bdanmaku.lua')
+}
+
+/**
+ * 内置的 uosc 控制栏桥接脚本（v0.2.18）。
+ *
+ * 它与 B 站弹幕脚本放在同一个目录（resources/mpv-scripts），
+ * 会被 electron-builder 原样复制到安装目录的 `resources/mpv-scripts`。
+ */
+export function bundledUoscCtrlScript(): string {
+  return bundledScript('sakana-uosc-ctrl.lua')
+}
+
+/** 在「打包后的 resources/mpv-scripts」与「开发态仓库 resources/mpv-scripts」里找一个脚本 */
+function bundledScript(name: string): string {
   const candidates = [
-    join(process.resourcesPath ?? '', 'mpv-scripts', 'sakana-bdanmaku.lua'),
-    join(app.getAppPath(), '..', 'mpv-scripts', 'sakana-bdanmaku.lua'),
-    join(app.getAppPath(), 'resources', 'mpv-scripts', 'sakana-bdanmaku.lua')
+    join(process.resourcesPath ?? '', 'mpv-scripts', name),
+    join(app.getAppPath(), '..', 'mpv-scripts', name),
+    join(app.getAppPath(), 'resources', 'mpv-scripts', name)
   ]
   for (const p of candidates) {
     try {
@@ -453,16 +497,25 @@ export function mpvSetDanmakuSource(pageUrl: string): void {
   }
 }
 
-/* ─────────────────────────── uosc + uosc_danmaku（v0.2.9） ─────────────────────────── */
+/* ─────────────────── uosc 控制栏 + uosc_danmaku（v0.2.9 / v0.2.18） ─────────────────── */
 
 /**
  * 内置 mpv 插件目录（uosc + uosc_danmaku）。
  *
- * 为什么不能靠 `--config-dir` 自动加载（实测结论，见 `.probe-mpv.js` 探针）：
- * 给 libmpv 设 `config-dir` 后，**`<config-dir>/scripts/*` 不会自动加载**，
- * `<config-dir>/script-opts/*.conf` 也不会被读到（脚本与 read_options 都拿不到值），
- * 所以插件必须用运行时命令 `load-script <目录>` 逐个挂载，配置只能靠 `script-opts` 选项传。
- * `config-dir` 仍然设置 —— 字体（uosc 的图标字体）要从 `<config-dir>/fonts` 取。
+ * v0.2.18 更正了一处旧结论：以前这里写着「设了 config-dir 也读不到
+ * `<config-dir>/script-opts/*.conf`」——那其实不是 config-dir 的问题，而是
+ * **libmpv 默认 `config=no`**（native/mpv/src/addon.cc 也显式设过它），
+ * 此时 `mp.find_config_file()` 一律返回 nil（无窗口探针实测：
+ * `find_config_file('script-opts/uosc.conf')` → nil）。
+ * 现在 mpvAttach 里显式给了 `config=yes`，uosc 启动日志会打印
+ * `[uosc] Opened config file script-opts/uosc.conf.`，布局与快捷键都按文件生效。
+ *
+ * 另外两个仍然成立、必须记住的点：
+ * 1. `<config-dir>/scripts/*` 是否自动加载由 `load-scripts` 决定，libmpv 下默认是 **yes**
+ *    （探针实测），所以必须显式给 `load-scripts=no`，否则脚本会被加载两份；
+ * 2. 插件依旧用运行时 `load-script` 挂载 —— 这样加载顺序完全可控
+ *    （uosc_danmaku 必须先于 uosc，见 loadUoscPlugins 的注释）。
+ * `config-dir` 还负责另一件事：uosc 的图标字体从 `<config-dir>/fonts` 取。
  */
 export function bundledMpvConfigDir(): string {
   const candidates = [
@@ -484,15 +537,39 @@ export function uoscPluginAvailable(): boolean {
   return bundledMpvConfigDir() !== ''
 }
 
-/** 插件模式是否生效：用户在设置里选了 uosc 渲染，且内置插件存在 */
+/** 弹幕插件模式是否生效：用户在设置里选了 uosc 渲染，且内置插件存在 */
 export function uoscDanmakuRequested(): boolean {
   return getSettings().danmaku?.renderer === 'uosc' && uoscPluginAvailable()
 }
 
-/** 插件是否**真的**挂上了（两个目录都 load-script 成功）；渲染层据此决定要不要画内置画布 */
-let uoscLoaded = false
+/**
+ * uosc 控制栏是否接管（v0.2.18）。
+ *
+ * 默认开启；用户在「设置 → 播放器设置 → 播放器控制栏」里可以关掉，
+ * 那时应用回落到自己那套悬浮窗控制栏（代码原样保留，见 playerOverlay.ts）。
+ * 内置 uosc 缺失（安装目录不完整）时也回落到旧控制栏 —— 不能让人没有控制栏可用。
+ */
+export function uoscControlBarRequested(): boolean {
+  const s = getSettings() as unknown as { uoscControlBar?: boolean }
+  return s.uoscControlBar !== false && uoscPluginAvailable()
+}
+
+/** uosc 本体（控制栏/进度条/菜单）是否真的挂上了 */
+let uoscBarLoaded = false
+export function uoscControlBarActive(): boolean {
+  return uoscBarLoaded && ready
+}
+
+/** uosc_danmaku（弹幕插件）是否真的挂上了；渲染层据此决定要不要画内置画布 */
+let uoscDanmakuLoaded = false
 export function uoscDanmakuActive(): boolean {
-  return uoscLoaded && ready
+  return uoscDanmakuLoaded && ready
+}
+
+/** 控制栏桥接脚本（sakana-uosc-ctrl.lua）是否挂上了 —— 动作回传与状态下行都靠它 */
+let uoscCtrlLoaded = false
+export function uoscCtrlActive(): boolean {
+  return uoscCtrlLoaded && ready
 }
 
 /**
@@ -574,58 +651,259 @@ function clamp01(n: number): number {
   return Math.max(0, Math.min(1, n))
 }
 
-/** 加载 uosc + uosc_danmaku（必须在 create 之后用 load-script；理由见 bundledMpvConfigDir） */
-function loadUoscPlugins(mod: MpvNative, cfgDir: string): boolean {
+/**
+ * 挂载 uosc 控制栏三件套（必须在 mpv create 之后用 load-script；理由见 bundledMpvConfigDir）。
+ *
+ * 加载顺序**不能改**：
+ *   ① sakana-uosc-ctrl.lua（控制栏桥接脚本；它比 uosc 先加载，uosc 就绪后会广播
+ *      uosc-version，脚本据此把按钮数据强制重发一次 —— 见脚本里的注释）
+ *   ② uosc_danmaku（弹幕插件，仅当用户选了插件渲染；它要赶在 uosc 广播之前注册监听）
+ *   ③ uosc（控制栏本身：按钮、进度条、音量、菜单）
+ *
+ * @param wantDanmaku 是否加载 uosc_danmaku（弹幕渲染方式 = uosc 时才加载）
+ */
+function loadUoscPlugins(mod: MpvNative, cfgDir: string, wantDanmaku: boolean): boolean {
   const uoscDir = slashPath(join(cfgDir, 'scripts', 'uosc'))
   const danmakuDir = slashPath(join(cfgDir, 'scripts', 'uosc_danmaku'))
-  /*
-   * 加载顺序有讲究：**uosc_danmaku 先、uosc 后**。
-   * uosc 是「加载时广播一次 uosc-version」，插件收到才认为 uosc 可用（否则菜单降级成 mp.input）；
-   * 广播不会重放，所以先加载 uosc 的话插件永远收不到。
-   * 后面再补发一次 uosc-version 作为兜底（顺序被改动时也不会静默降级）。
-   */
+
+  // ① 控制栏桥接脚本
+  const ctrlScript = bundledUoscCtrlScript()
+  if (ctrlScript) {
+    try {
+      uoscCtrlLoaded = mod.command(['load-script', slashPath(ctrlScript)])
+      log.append(
+        uoscCtrlLoaded ? 'info' : 'warn',
+        'mpv',
+        uoscCtrlLoaded
+          ? `uosc 控制栏桥接脚本已加载: ${ctrlScript}`
+          : `uosc 控制栏桥接脚本加载失败: ${ctrlScript}`
+      )
+    } catch (err) {
+      uoscCtrlLoaded = false
+      log.append('warn', 'mpv', `加载 uosc 控制栏桥接脚本异常: ${String((err as Error)?.message ?? err)}`)
+    }
+  } else {
+    log.append('warn', 'mpv', '找不到 sakana-uosc-ctrl.lua，uosc 控制栏将只有画面没有按钮')
+  }
+
+  // ② 弹幕插件（可选）
+  if (wantDanmaku) {
+    try {
+      uoscDanmakuLoaded = mod.command(['load-script', danmakuDir])
+    } catch (err) {
+      uoscDanmakuLoaded = false
+      log.append('warn', 'mpv', `加载 uosc_danmaku 异常: ${String((err as Error)?.message ?? err)}`)
+    }
+  }
+
+  // ③ uosc 本体
   let ok = false
   try {
-    const a = mod.command(['load-script', danmakuDir])
-    const b = mod.command(['load-script', uoscDir])
-    ok = a && b
-    log.append(
-      ok ? 'info' : 'warn',
-      'mpv',
-      ok
-        ? `uosc_danmaku + uosc 已加载（${danmakuDir} / ${uoscDir}）`
-        : `uosc 插件加载失败（uosc_danmaku=${a} uosc=${b}）`
-    )
+    ok = mod.command(['load-script', uoscDir])
   } catch (err) {
-    log.append('warn', 'mpv', `加载 uosc 插件异常: ${String((err as Error)?.message ?? err)}`)
-    return false
+    log.append('warn', 'mpv', `加载 uosc 异常: ${String((err as Error)?.message ?? err)}`)
   }
+  uoscBarLoaded = ok
+  log.append(
+    ok ? 'info' : 'warn',
+    'mpv',
+    ok
+      ? `uosc 已加载（控制栏接管）：${uoscDir}${wantDanmaku ? ' + uosc_danmaku' : ''}`
+      : `uosc 加载失败：${uoscDir}`
+  )
   if (!ok) return false
+
+  /*
+   * 兜底：uosc 加载时只广播一次 uosc-version，而 uosc_danmaku 若在它之后才加载
+   * （或广播被错过）就会把菜单降级成 mp.input。这里补发一次，顺序被改动也不会静默降级。
+   * 控制栏桥接脚本也在监听同一条消息（它靠它决定何时重发按钮数据）。
+   */
   try {
-    // 兜底：告诉插件「uosc 在」（它的菜单靠这条判断走 uosc 还是 mp.input）
     mod.command(['script-message-to', 'uosc_danmaku', 'uosc-version', '5.13.0'])
   } catch {
     /* ignore */
   }
   /*
-   * 关掉 uosc 自己那套进度条/控制栏（本应用的控制栏在 Electron 悬浮窗里，两套会打架），
-   * 但保留它的菜单系统 —— uosc_danmaku 的搜索/样式/延迟菜单都由 uosc 渲染。
-   * 只能走 script-message：`disable_elements` 是逗号列表，塞不进 script-opts
-   * （`--script-opts` 以逗号分隔键值对，反斜杠转义也救不了）。
+   * v0.2.18：这里**删掉**了旧版那句 `disable-elements timeline,controls,volume,top_bar,window_border`。
+   * 以前应用的控制栏在 Electron 悬浮窗里，uosc 自带的那套必须关掉免得两套打架；
+   * 现在反过来 —— 控制栏就是 uosc 的，那些元素正要用（布局/按钮/时间显示全在
+   * resources/mpv-config/script-opts/uosc.conf 里配）。
    */
+  return true
+}
+
+/* ───────────────── uosc 控制栏：状态下行 + 动作上行（v0.2.18） ───────────────── */
+
+/**
+ * 动作上行通道：mpv 侧 → 应用。
+ *
+ * 数据流：uosc 按钮 / 菜单项 / input.conf 快捷键
+ *   → `script-message sakana-ctrl <动作> [参数…]`
+ *   → sakana-uosc-ctrl.lua 写 mpv 属性 `user-data/sakana-ctrl`
+ *   → 本文件的 250ms 状态泵读出来 → 转成 OverlayAction → 发给播放页（与悬浮窗同一条 IPC）
+ *
+ * 为什么不用 `--input-ipc-server`：那要在 libmpv 里再开一条本机命名管道，
+ * 等于多一条任何本机进程都能连的控制通道；而需求只是「点一下按钮要生效」，
+ * 250ms 的轮询完全够用，也不需要改原生插件。将来若要压到零延迟，
+ * 换 transport 只影响这里与脚本里的 emit()。
+ */
+const UOSC_CTRL_PROP = 'user-data/sakana-ctrl'
+
+/** 弹幕设置里允许被 uosc 菜单改的键（白名单：不接受脚本传什么就改什么） */
+const UOSC_DANMAKU_KEYS: (keyof DanmakuSettings)[] = [
+  'enabled',
+  'area',
+  'maxCount',
+  'offsetMs',
+  'showScroll',
+  'showTop',
+  'showBottom'
+]
+
+/**
+ * uosc 动作字符串 → 播放页认识的 OverlayAction。
+ * 认不出来的一律丢掉并记日志（宁可不动，也不要乱改播放状态）。
+ */
+function uoscActionToOverlay(raw: string): OverlayAction | null {
+  const sp = raw.indexOf(' ')
+  const name = (sp < 0 ? raw : raw.slice(0, sp)).trim()
+  // 参数可能自带空格（例如 danmaku-json 里的 JSON），所以按「第一个空格之后」整体取
+  const rest = sp < 0 ? '' : raw.slice(sp + 1).trim()
+  const parts = rest ? rest.split(/\s+/) : []
+  switch (name) {
+    case 'play-pause':
+      return { type: 'playPause' }
+    case 'prev-episode':
+      return { type: 'prevEpisode' }
+    case 'next-episode':
+      return { type: 'nextEpisode' }
+    case 'back10':
+      return { type: 'back10' }
+    case 'forward10':
+      return { type: 'forward10' }
+    case 'toggle-danmaku':
+      return { type: 'toggleDanmaku' }
+    case 'toggle-info':
+      return { type: 'toggleInfo' }
+    case 'snapshot':
+      return { type: 'snapshot' }
+    case 'toggle-fullscreen':
+      return { type: 'toggleFullscreen' }
+    case 'exit':
+      return { type: 'exitPlayer' }
+    case 'escape':
+      return { type: 'escape' }
+    case 'open-danmaku-settings':
+      return { type: 'openDanmakuSettings' }
+    case 'reload-danmaku':
+      return { type: 'reloadDanmaku' }
+    case 'detect-danmaku-alias':
+      return { type: 'detectDanmakuAlias' }
+    case 'uosc-menu': {
+      const k = parts[0]
+      if (k === 'search' || k === 'total' || k === 'style' || k === 'delay' || k === 'add') {
+        return { type: 'uoscMenu', key: k }
+      }
+      return null
+    }
+    case 'select-episode': {
+      const line = Number(parts[0])
+      const ep = Number(parts[1])
+      if (!Number.isFinite(line) || !Number.isFinite(ep)) return null
+      return { type: 'selectEpisode', line: Math.max(0, Math.trunc(line)), ep: Math.max(0, Math.trunc(ep)) }
+    }
+    case 'set-speed': {
+      const v = Number(parts[0])
+      if (!Number.isFinite(v)) return null
+      return { type: 'setSpeed', value: v }
+    }
+    case 'set-aspect': {
+      const m = parts[0]
+      if (m !== 'fit' && m !== 'cover' && m !== 'stretch') return null
+      return { type: 'setAspect', aspect: m }
+    }
+    case 'set-subtitle': {
+      const id = Number(parts[0])
+      if (!Number.isFinite(id)) return null
+      return { type: 'setSubtitle', id: Math.trunc(id) }
+    }
+    case 'danmaku-json': {
+      // 菜单项用 JSON 传参，类型（数字/布尔）不会在字符串里丢
+      try {
+        const o = JSON.parse(rest) as { key?: unknown; value?: unknown }
+        const key = typeof o.key === 'string' ? o.key : ''
+        const value = o.value
+        if (!UOSC_DANMAKU_KEYS.includes(key as keyof DanmakuSettings)) return null
+        if (typeof value !== 'number' && typeof value !== 'boolean' && typeof value !== 'string') return null
+        return { type: 'danmakuSetting', key: key as keyof DanmakuSettings, value }
+      } catch {
+        return null
+      }
+    }
+    default:
+      return null
+  }
+}
+
+/** 读一次动作属性；有动作就清空并把对应的 OverlayAction 发给播放页 */
+function pollUoscCtrl(win: BrowserWindow): void {
+  if (!uoscCtrlLoaded || !ready || !native) return
+  let raw = ''
   try {
-    mod.command([
-      'script-message-to',
-      'uosc',
-      'disable-elements',
-      'sakana',
-      'timeline,controls,volume,top_bar,window_border'
-    ])
-    log.append('info', 'mpv', '已关闭 uosc 自带的进度条/控制栏（保留其菜单供弹幕插件使用）')
+    const v = native.getProperty(UOSC_CTRL_PROP)
+    raw = typeof v === 'string' ? v.trim() : ''
+  } catch {
+    return
+  }
+  if (raw === '') return
+  // 先清空再派发：清空失败也照样派发（最坏情况是同一动作被重复触发一次，
+  // 比「读到了却不清空 → 每 250ms 触发一次」安全得多）
+  try {
+    native.setProperty(UOSC_CTRL_PROP, '')
   } catch {
     /* ignore */
   }
-  return true
+  const action = uoscActionToOverlay(raw)
+  if (!action) {
+    log.append('warn', 'mpv', `uosc 控制栏动作无法识别，已忽略: ${raw.slice(0, 80)}`)
+    return
+  }
+  try {
+    if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send(CH.overlayAction, action)
+    }
+  } catch (err) {
+    log.append('warn', 'mpv', `uosc 控制栏动作派发失败: ${String((err as Error)?.message ?? err)}`)
+  }
+}
+
+/** 上一次推给桥接脚本的状态（内容没变就不重发；控制栏状态是低频变化） */
+let lastUoscBarJson = ''
+
+/**
+ * 控制栏状态下行：播放页 → sakana-uosc-ctrl.lua。
+ *
+ * 按钮的图标/激活态/角标、以及选集/线路/字幕/倍速/比例/弹幕菜单的内容，
+ * 全部由这份状态决定。故意**不含播放进度**（每秒都在变，没必要推）。
+ */
+export function mpvPushUoscBar(payload: unknown): boolean {
+  if (!ready || !native || !uoscCtrlLoaded) return false
+  let json = ''
+  try {
+    json = JSON.stringify(payload ?? null)
+  } catch {
+    return false
+  }
+  if (!json || json === 'null' || json === lastUoscBarJson) return true
+  lastUoscBarJson = json
+  try {
+    const ok = native.command(['script-message', 'sakana-state', json])
+    if (!ok) log.append('warn', 'mpv', '控制栏状态推送被拒（sakana-state）')
+    return ok
+  } catch (err) {
+    log.append('warn', 'mpv', `控制栏状态推送异常: ${String((err as Error)?.message ?? err)}`)
+    return false
+  }
 }
 
 /**
@@ -640,7 +918,7 @@ function loadUoscPlugins(mod: MpvNative, cfgDir: string): boolean {
  * 所以这里只是**排队**，由 250ms 的状态轮询在 path 就绪后真正发出。
  */
 export function mpvPushDanmakuFile(file: string): boolean {
-  if (!ready || !native || !uoscLoaded || !file) return false
+  if (!ready || !native || !uoscDanmakuLoaded || !file) return false
   latestPluginDanmakuFile = file
   const curPath = mpvCurrentPath()
   if (curPath && injectedForPath !== curPath) return injectPluginDanmaku(file)
@@ -651,7 +929,7 @@ export function mpvPushDanmakuFile(file: string): boolean {
 
 /** 真正发出注入（内部使用：需要 path 已就绪） */
 function injectPluginDanmaku(file: string): boolean {
-  if (!ready || !native || !uoscLoaded) return false
+  if (!ready || !native || !uoscDanmakuLoaded) return false
   try {
     const ok = native.command(['script-message-to', 'uosc_danmaku', 'add-source-event', slashPath(file)])
     if (ok) injectedForPath = mpvCurrentPath()
@@ -690,7 +968,7 @@ function mpvCurrentPath(): string {
  * 也用插件自带消息（`load-danmaku <番剧名> <集标题> <episodeId>`），应用侧没有本地弹幕文件时用它。
  */
 export function mpvPushDanmakuEpisode(episodeId: number, animeTitle = '', episodeTitle = ''): boolean {
-  if (!ready || !native || !uoscLoaded || !episodeId) return false
+  if (!ready || !native || !uoscDanmakuLoaded || !episodeId) return false
   try {
     const ok = native.command([
       'script-message-to',
@@ -709,7 +987,7 @@ export function mpvPushDanmakuEpisode(episodeId: number, animeTitle = '', episod
 
 /** 弹幕时间轴微调（毫秒 → 插件接受的秒）；插件按自己的机制作用于当前所有来源 */
 export function mpvPushDanmakuDelay(offsetMs: number): void {
-  if (!ready || !native || !uoscLoaded) return
+  if (!ready || !native || !uoscDanmakuLoaded) return
   try {
     native.command(['script-message-to', 'uosc_danmaku', 'danmaku-delay', String(Math.round(offsetMs) / 1000)])
   } catch {
@@ -719,7 +997,7 @@ export function mpvPushDanmakuDelay(offsetMs: number): void {
 
 /** 打开插件的一个菜单（uosc 渲染）：search=搜索弹幕 / total=总菜单 / style=弹幕样式 / delay=源延迟 */
 export function mpvOpenDanmakuMenu(which: 'search' | 'total' | 'style' | 'delay' | 'add'): boolean {
-  if (!ready || !native || !uoscLoaded) return false
+  if (!ready || !native || !uoscDanmakuLoaded) return false
   const map: Record<string, string> = {
     search: 'open_search_danmaku_menu',
     total: 'open_add_total_menu',
@@ -739,7 +1017,7 @@ export function mpvOpenDanmakuMenu(which: 'search' | 'total' | 'style' | 'delay'
  * 插件把开关状态存在自己的 history 文件里，这条消息同时会同步给 uosc 的按钮状态。
  */
 export function mpvSetUoscDanmakuVisible(on: boolean): boolean {
-  if (!ready || !native || !uoscLoaded) return false
+  if (!ready || !native || !uoscDanmakuLoaded) return false
   try {
     return native.command(['script-message-to', 'uosc_danmaku', 'set', 'show_danmaku', on ? 'on' : 'off'])
   } catch {
@@ -749,7 +1027,7 @@ export function mpvSetUoscDanmakuVisible(on: boolean): boolean {
 
 /** 清空插件当前关联的弹幕源（切集时避免上一集的弹幕残留） */
 export function mpvClearUoscDanmakuSource(): void {
-  if (!ready || !native || !uoscLoaded) return
+  if (!ready || !native || !uoscDanmakuLoaded) return
   try {
     native.command(['script-message-to', 'uosc_danmaku', 'clear-source'])
   } catch {
@@ -779,8 +1057,10 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
   if (!mod) return { ok: false, message: '未找到 libmpv 运行时或原生插件（请运行 npm run libmpv:fetch）' }
   currentBounds = toPhysical(win, bounds)
   const bili = biliDanmakuConfig()
-  const wantUosc = uoscDanmakuRequested()
-  const cfgDir = wantUosc ? bundledMpvConfigDir() : ''
+  // 两件不同的事：控制栏交给 uosc（默认开）／弹幕交给 uosc_danmaku 插件（设置里选）
+  const wantUoscDanmaku = uoscDanmakuRequested()
+  const wantUoscBar = uoscControlBarRequested()
+  const cfgDir = wantUoscDanmaku || wantUoscBar ? bundledMpvConfigDir() : ''
   let hwnd: Buffer | undefined
   try {
     hwnd = win.getNativeWindowHandle()
@@ -788,11 +1068,11 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
     hwnd = undefined
   }
   /*
-   * 选项组装：verbose 日志 + B 站弹幕脚本 + uosc 插件族。
-   * uosc 的两项配置放在这里（create 之前）是因为脚本会在 load-script 时就读取选项，
-   * 之后再改就来不及了（read_options 只在加载时读一次）。
+   * 选项组装：verbose 日志 + B 站弹幕脚本 + uosc 控制栏。
+   * 所有选项都要在 create 之前给（脚本会在 load-script 时立刻 read_options，
+   * 之后再改就来不及了）。
    */
-  const scriptOptsParts = [bili.options['script-opts'], wantUosc ? uoscScriptOpts() : ''].filter(Boolean)
+  const scriptOptsParts = [bili.options['script-opts'], wantUoscDanmaku ? uoscScriptOpts() : ''].filter(Boolean)
   const ok = mod.create({
     x: currentBounds.x,
     y: currentBounds.y,
@@ -802,7 +1082,29 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
     options: {
       ...(process.env.SAKANA_MPV_VERBOSE ? { terminal: 'yes', 'msg-level': 'all=v' } : {}),
       ...bili.options,
-      ...(cfgDir ? { 'config-dir': slashPath(cfgDir) } : {}),
+      /*
+       * ── v0.2.18「uosc 接管控制栏」新增的启动参数，四条都必要 ──
+       *
+       * osc=no：mpv 自带的 OSC 与 uosc 是两套东西（uosc 自己也会设一次）。
+       *   这里显式给上：一是不依赖插件去关，二是防止将来 addon 默认值变化时静默多出一套控制栏。
+       *
+       * config=yes：**这条是整件事的前提**。libmpv 默认 config=no（addon.cc 里也设过），
+       *   此时 `mp.find_config_file()` 一律返回 nil，连
+       *   `<config-dir>/script-opts/uosc.conf`（布局/按钮/时间显示）与
+       *   `<config-dir>/input.conf`（快捷键）都不会被读到 —— 无窗口探针实测。
+       *   开启后 uosc 启动日志会打印 `Opened config file script-opts/uosc.conf.`。
+       *
+       * load-scripts=no：**必须显式关掉**。libmpv 下这个选项默认是 yes，配合 config=yes
+       *   会在 mpv_initialize 时自动扫描 `<config-dir>/scripts/` 把 uosc 与 uosc_danmaku
+       *   各加载一份，我们再 load-script 一次就会有两套控制栏（探针实测到这个坑）。
+       *
+       * config-dir=<安装目录>/resources/mpv-config：定位上面两个文件，
+       *   同时 uosc 的图标字体（uosc.conf 里的 MaterialIconsRound）也从
+       *   `<config-dir>/fonts` 取。开发态与打包态路径不同，由 bundledMpvConfigDir() 负责。
+       */
+      osc: 'no',
+      'load-scripts': 'no',
+      ...(cfgDir ? { 'config-dir': slashPath(cfgDir), config: 'yes' } : {}),
       ...(scriptOptsParts.length > 0 ? { 'script-opts': scriptOptsParts.join(',') } : {})
     }
   })
@@ -829,16 +1131,18 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
       loaded ? 'B 站弹幕脚本已加载（load-script）' : 'B 站弹幕脚本加载失败（load-script 命令被拒）'
     )
   }
-  // uosc + uosc_danmaku：同样只加载一次（见 uoscLoaded 注释）
-  if (cfgDir && !uoscLoaded) {
-    uoscLoaded = loadUoscPlugins(mod, cfgDir)
-  } else if (!cfgDir && uoscLoaded) {
-    /* 实例复用时保持原状 */
+  /*
+   * uosc 控制栏三件套：同样只加载一次（create() 在实例已存在时只更新尺寸，
+   * 重复 load-script 会出现两套控制栏 / 两份弹幕插件）。
+   */
+  if (cfgDir && !uoscBarLoaded) {
+    loadUoscPlugins(mod, cfgDir, wantUoscDanmaku)
   }
   attachedWin = win
   lastPlaying = false
   lastLength = 0
   lastEof = false
+  lastUoscBarJson = ''
   surfaceVisible = true
   startTimePump(win)
   startRaiseWatch(win)
@@ -1199,7 +1503,13 @@ export function mpvDestroy(): void {
   stopCursorWatch()
   surfaceVisible = true
   biliScriptLoaded = false
-  uoscLoaded = false
+  // 三个 uosc 相关的标记都要复位：实例销毁后脚本也随之消失，
+  // 保留为 true 会让「动作回传」「弹幕插件渲染」在下一个实例上误判成可用。
+  uoscBarLoaded = false
+  uoscDanmakuLoaded = false
+  uoscCtrlLoaded = false
+  lastUoscBarJson = ''
+  lastVolume = -1
   latestPluginDanmakuFile = ''
   injectedForPath = ''
   lastMpvPath = ''

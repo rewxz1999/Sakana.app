@@ -302,6 +302,15 @@ interface CellGeo {
 /** 画底稿（背景/标题/制作人/标签/名字/占位块），返回各格立绘的目标矩形 */
 function drawPoster(state: GridState, producer: string): { canvas: HTMLCanvasElement; geo: CellGeo[] } {
   const { cols, rows } = state
+  /*
+   * v0.3.0（用户要求「9格的时候适当减小格子大小」）：3×3 时把格子缩到 200x240，
+   * 画面更紧凑、不至于一张九宫格里大片空白；格子多了（4 列 / 更多行）仍用原尺寸保证可读。
+   * 这里直接改 EX 上的两个尺寸（EX 只在本文件用、每次导出都会重算），
+   * 这样下面所有按 EX.CELL_W/CELL_H 布局的代码不用逐个改 —— 改一处、全图生效。
+   */
+  const nine = cols === 3 && rows === 3
+  EX.CELL_W = nine ? 200 : 230
+  EX.CELL_H = nine ? 240 : 276
   const W = EX.OUTER * 2 + cols * EX.CELL_W + (cols - 1) * EX.GAP
   const H = EX.HEAD_H + EX.OUTER + rows * EX.CELL_H + (rows - 1) * EX.GAP + EX.OUTER + EX.FOOT_H
 
@@ -635,16 +644,47 @@ export function CharacterGridPage() {
     }
   }, [keyword])
 
-  const selectSubject = useCallback(async (item: SearchResultItem) => {
-    setSubject(item)
-    setChars([])
-    setCharSource(null)
+  /**
+   * 角色数据源（v0.3.0，用户要求「切换角色数据来源，使用 Jikan API，主要是为了角色立绘清晰度」）。
+   *
+   * - `jikan`：MyAnimeList 的角色图（**原图**，实测常见 350x500 上下）—— 默认，立绘更清晰；
+   * - `bangumi`：原来的 Bangumi（v0 优先、老接口兜底），中文名更准，但图偏小（不少只有 250x300）。
+   *
+   * 为什么 Jikan 按标题查：我们手里是 Bangumi 的条目 id，Jikan 认 MAL id，两边不通，标题是桥。
+   * 选了 jikan 但没取到角色时**自动回落到 Bangumi**，不会让用户空手而归。
+   */
+  const [charSrc, setCharSrc] = useState<'jikan' | 'bangumi'>(() => {
     try {
-      localStorage.setItem(SUBJECT_KEY, JSON.stringify(item))
+      return localStorage.getItem('sakana-character-grid-source') === 'bangumi' ? 'bangumi' : 'jikan'
     } catch {
-      /* 存储不可用时忽略：只是刷新后要重新搜一次 */
+      return 'jikan'
     }
+  })
+  const pickSource = (v: 'jikan' | 'bangumi'): void => {
+    setCharSrc(v)
+    try {
+      localStorage.setItem('sakana-character-grid-source', v)
+    } catch {
+      /* 存储不可用时忽略 */
+    }
+    // 换源后立刻按新源重新拉一次当前作品，用户能马上看到差别
+    if (subject) void loadChars(subject, v)
+  }
+
+  const loadChars = useCallback(async (item: SearchResultItem, src: 'jikan' | 'bangumi') => {
     setLoadingChars(true)
+    if (src === 'jikan') {
+      const r = await api.bangumi.charactersJikan(item.name_cn || item.name)
+      if (r.ok && r.data.items.length > 0) {
+        setLoadingChars(false)
+        setChars(r.data.items as never)
+        setCharSource({ source: 'v0', stale: undefined })
+        toast.success(`已从 Jikan 取到 ${r.data.items.length} 位角色（立绘为 MAL 原图）`)
+        return
+      }
+      // Jikan 没取到（网络/限流/对不上标题）→ 回落 Bangumi，并说明原因
+      toast.warn(r.ok ? 'Jikan 没取到角色，已回落到 Bangumi' : `Jikan 不可用（${r.error}），已回落到 Bangumi`)
+    }
     const r = await api.bangumi.characters(item.id)
     setLoadingChars(false)
     if (!r.ok) {
@@ -659,6 +699,21 @@ export function CharacterGridPage() {
     }
     if (r.data.source === 'legacy') toast.info('角色来自老接口兜底，数量可能少于完整角色表')
   }, [])
+
+  const selectSubject = useCallback(
+    async (item: SearchResultItem) => {
+      setSubject(item)
+      setChars([])
+      setCharSource(null)
+      try {
+        localStorage.setItem(SUBJECT_KEY, JSON.stringify(item))
+      } catch {
+        /* 存储不可用时忽略：只是刷新后要重新搜一次 */
+      }
+      await loadChars(item, charSrc)
+    },
+    [charSrc, loadChars]
+  )
 
   /** 恢复上次选中的作品（selectSubject 是稳定引用，这里只跑一次） */
   useEffect(() => {

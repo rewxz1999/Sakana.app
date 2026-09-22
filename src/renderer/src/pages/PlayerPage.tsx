@@ -1081,6 +1081,13 @@ export function PlayerPage() {
           if (awaitingStartRef.current) break
           if (typeof ev.length === 'number') setDuration(ev.length / 1000)
           break
+        /**
+         * v0.2.18：音量变化（uosc 的竖排滑杆直接改 mpv 的 volume 属性，不经过应用 IPC）。
+         * 不同步的话，鼠标拖过音量之后再按 ↑/↓ 会突然跳回拖之前的档位。
+         */
+        case 'volume':
+          if (typeof ev.volume === 'number') setPlayerVolume(Math.round(ev.volume))
+          break
         case 'playlistItem':
           if (typeof ev.index === 'number' && state.mode === 'local') {
             setCurrentIndex(ev.index)
@@ -1360,6 +1367,18 @@ export function PlayerPage() {
    * 同时修掉「详情按钮点了没反应」——面板过去画在页面里，被原生视频窗口完全盖住了。
    */
   const overlayActive = engineState !== 'fallback'
+  /**
+   * v0.2.18：控制栏是否由 uosc（mpv 侧绘制）接管。
+   *
+   * 三重条件：
+   *   ① 设置开关没被关掉（`uoscControlBar !== false`，默认开）；
+   *   ② 内核确实是 libmpv（HTML5 回退路径里没有 mpv，也就没有 uosc）；
+   *   ③ 内置 uosc 目录存在（安装不完整时主进程会回落，这里跟着一起回落）。
+   * 为 true 时悬浮窗只画弹幕与「uosc 给不了的浮层」，不再画控件。
+   */
+  const uoscBarMode = appSettings?.uoscControlBar !== false && engineState === 'active'
+  const uoscBarRef = useRef(false)
+  uoscBarRef.current = uoscBarMode
   /** 最近一次 show 拿到的悬浮窗代号（hide 时带回去，防止迟到的 hide 关掉新窗口） */
   const overlayGenRef = useRef<number | null>(null)
   useEffect(() => {
@@ -1569,6 +1588,17 @@ export function PlayerPage() {
         case 'exitPlayer':
           exitPlayer()
           break
+        /**
+         * v0.2.18：Esc（来自 uosc 控制栏的快捷键 / input.conf）。
+         * 语义与键盘 Esc 完全一致：依次关闭 选集 → 详情 → 退出全屏 → 退出播放，
+         * 避免「全屏时按 Esc 直接退出播放」这种意外。
+         */
+        case 'escape':
+          if (showEpisodes) setShowEpisodes(false)
+          else if (showInfo) setShowInfo(false)
+          else if (fullscreen) toggleFullscreen()
+          else exitPlayer()
+          break
       }
     })
     return off
@@ -1585,6 +1615,13 @@ export function PlayerPage() {
     changeAspect,
     state.title,
     poke,
+    /*
+     * v0.2.18：Esc 的「先关面板、再退全屏」这条链需要这三个状态，
+     * 所以它们必须进依赖表（否则会捕获到旧闭包，Esc 会直接退出播放）。
+     */
+    showEpisodes,
+    showInfo,
+    fullscreen,
     /*
      * v0.2.7 附加：本地播放的选集走悬浮窗后，这里必须跟着文件列表长度重新注册，
      * 否则「暂停时列表才加载完」的情况下会捕获到 files 为空的旧闭包，点了没反应。
@@ -1674,10 +1711,13 @@ export function PlayerPage() {
           return { x: Math.round(r.left), y: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) }
         }
         return { x: 0, y: 56, width: window.innerWidth, height: Math.max(120, window.innerHeight - 112) }
-      })()
+      })(),
+      // v0.2.18：控制栏已交给 uosc 时，悬浮窗不再绘制自己的控件
+      uoscBar: uoscBarMode
     })
   }, [
     overlayActive,
+    uoscBarMode,
     state.title,
     state.mode,
     state.groups,
@@ -1942,6 +1982,102 @@ export function PlayerPage() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [overlayActive, danmaku, danmakuSettings.enabled, danmakuSettings.area, danmakuSettings.maxCount, danmakuSettings.offsetMs, uoscActive])
+
+  /**
+   * v0.2.18：uosc 控制栏状态下行（按钮的图标/激活态/角标 + 各菜单的内容）。
+   *
+   * 为什么不复用上面那条 pushState：那条每次播放进度变化（每秒多次）都会推，
+   * 而这份状态里的字段都是**低频**的（选集列表可能几十项，不能每秒推）。
+   * 主进程还会按内容去重，所以这里「依赖变了就推」是安全的。
+   *
+   * 反方向的动作（点按钮/菜单项/快捷键）由主进程转成 OverlayAction 派发回来，
+   * 走的是同一条 overlayAction 通道 —— 也就是说按钮与旧控制栏的行为是同一套代码。
+   */
+  useEffect(() => {
+    if (!uoscBarMode) return
+    const groups = state.groups ?? []
+    const line = ruleCurrent?.line ?? 0
+    const lines =
+      state.mode === 'rule'
+        ? groups.map((g, i) => ({
+            name: g.lineName ?? `线路 ${i + 1}`,
+            episodes: g.episodes.map((e, j) => e.name || `第 ${j + 1} 集`)
+          }))
+        : files.length > 0
+          ? [
+              {
+                name: '本地文件',
+                episodes: files.map((f, i) =>
+                  f.episode != null ? `第 ${f.episode} 集` : f.name || `第 ${i + 1} 个`
+                )
+              }
+            ]
+          : []
+    void api.uosc.bar({
+      title: state.title,
+      subtitle:
+        state.mode === 'rule'
+          ? `${groups[line]?.episodes?.[ruleCurrent?.ep ?? 0]?.name ?? '规则播放'}${
+              groups.length > 1 ? ` · 线路 ${line + 1}/${groups.length}` : ''
+            }`
+          : currentFile
+            ? `${currentFile.episode != null ? `第 ${currentFile.episode} 集 · ` : ''}${currentFile.name}`
+            : `${currentIndex + 1} / ${files.length}`,
+      playing,
+      speed: playerSpeed,
+      aspect,
+      fullscreen,
+      canPrev: state.mode === 'rule' ? !!ruleCurrent && ruleCurrent.ep > 0 : currentIndex > 0,
+      canNext:
+        state.mode === 'rule'
+          ? !!ruleCurrent && ruleCurrent.ep + 1 < (groups[line]?.episodes.length ?? 0)
+          : currentIndex < files.length - 1,
+      lines,
+      currentLine: state.mode === 'rule' ? line : 0,
+      currentEp: state.mode === 'rule' ? (ruleCurrent?.ep ?? 0) : currentIndex,
+      subs: engineSubs,
+      subId: engineSubIdx >= 0 ? (engineSubs[engineSubIdx]?.id ?? -1) : -1,
+      danmaku: {
+        enabled: danmakuSettings.enabled,
+        count: danmaku.comments.length,
+        area: danmakuSettings.area,
+        maxCount: danmakuSettings.maxCount,
+        offsetMs: danmakuSettings.offsetMs,
+        showScroll: danmakuSettings.showScroll,
+        showTop: danmakuSettings.showTop,
+        showBottom: danmakuSettings.showBottom,
+        pluginActive: uoscActive,
+        source: danmaku.source
+      },
+      status: playStatus
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    uoscBarMode,
+    state.title,
+    state.mode,
+    state.groups,
+    ruleCurrent,
+    currentFile,
+    currentIndex,
+    files,
+    playing,
+    playerSpeed,
+    aspect,
+    fullscreen,
+    engineSubs,
+    engineSubIdx,
+    danmaku,
+    danmakuSettings.enabled,
+    danmakuSettings.area,
+    danmakuSettings.maxCount,
+    danmakuSettings.offsetMs,
+    danmakuSettings.showScroll,
+    danmakuSettings.showTop,
+    danmakuSettings.showBottom,
+    uoscActive,
+    playStatus
+  ])
 
   /** 换集（或首次进入）时自动拉弹幕：规则模式按当前集数，本地模式按文件集数 */
   useEffect(() => {

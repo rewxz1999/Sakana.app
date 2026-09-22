@@ -4,10 +4,12 @@ import {
   Camera,
   CircleCheck,
   Clock,
+  Ellipsis,
   FolderPlus,
   Gamepad2,
   Image as ImageIcon,
   LayoutGrid,
+  Minimize2,
   Play,
   RotateCcw,
   Search,
@@ -18,6 +20,7 @@ import {
 import type { GalGame } from '@shared/types'
 import { useGal } from '@/stores/galgame'
 import { toast } from '@/stores/app'
+import { useShell } from '@/stores/shell'
 import { api } from '@/lib/api'
 import { localImgUrl } from '@/lib/format'
 import { Button, ConfirmModal } from '@/components/ui'
@@ -42,6 +45,15 @@ import galgameDefaultBg from '@/assets/galgame-default.png'
  *
  * 由 GalgameLibraryPage 以「沉浸模式」按钮挂载；这里的「返回库」按钮 / Esc 只是
  * 回到卡片库，不改动原有能力：底部封面条、快捷启动、自定义背景图、最近截图、详情抽屉都还在。
+ *
+ * v0.3.0 起按用户要求「更沉浸」，额外做了四件事：
+ * 1. **铺满整窗**：挂载时通过 stores/shell.ts 让外壳（App.tsx）收起左侧导航栏，
+ *    本页的 absolute inset-0 壁纸于是连原来导航栏那一列一起铺满；
+ *    TitleBar 保留 —— 它承载窗口拖动/最小化/关闭，藏掉就真成了「出不去」。
+ * 2. **隐藏常驻按钮**：返回库 / 导入 galgame / 最近截图不再常驻，收进左下角小圆点的弹出层。
+ * 3. **弹出层**：点小按钮开合，点别处或 Esc 关闭，选中任一项即执行并收起。
+ * 4. **退出按钮优先级极高**：右上角 z-[999]（高于应用里所有浮层），Esc 也能退出，
+ *    保证任何情况下都不会卡在沉浸模式里出不来。
  */
 export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
   const { games, running, importing, load, startLive, importGame, removeGame, toggleFinished, launch } = useGal()
@@ -56,8 +68,19 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
   // 空态背景：复用「导航栏背景」里用户自己设置的图片（未设置时为空串）
   const [navBgPath, setNavBgPath] = useState('')
   const [navBgFailed, setNavBgFailed] = useState(false)
+  /** 左下角小按钮的弹出层：沉浸模式下被隐藏的那三个按钮都收在这里 */
+  const [overflowOpen, setOverflowOpen] = useState(false)
+  /**
+   * 窗口是否足够宽（详情抽屉打开时退出按钮要挪到抽屉左边）。
+   * 抽屉固定 max-w-[420px]，窗口窄到一定程度后「挪到左边」会把按钮挤到屏幕外，
+   * 所以这里跟着窗口宽度走，窄窗口就老老实实贴右边。
+   */
+  const [wideEnough, setWideEnough] = useState(() => window.innerWidth >= 760)
   const stripRef = useRef<HTMLDivElement>(null)
+  /** 包住「小按钮 + 弹出层」的容器：ref 判包含用来决定「点了别处才关」 */
+  const overflowRef = useRef<HTMLDivElement>(null)
   const dragState = useRef({ active: false, startX: 0, scrollLeft: 0, moved: false })
+  const setImmersive = useShell((s) => s.setImmersive)
 
   const finishedCount = useMemo(() => games.filter((g) => g.finished).length, [games])
 
@@ -114,19 +137,65 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
 
   useMenuDismiss(!!menu, useCallback(() => setMenu(null), []))
 
+  /*
+   * 通知外壳：进入沉浸模式 → 隐藏左侧导航栏；本页卸载（返回库 / Esc / 路由跳走）立即恢复。
+   * 用 effect 而不是在事件回调里写：这样「页面还在不在」与「导航栏隐不隐藏」永远一致，
+   * 即便以后加了别的离开路径（比如详情页跳转），也不会留下一屏没有导航栏的界面。
+   */
+  useEffect(() => {
+    setImmersive(true)
+    return () => setImmersive(false)
+  }, [setImmersive])
+
+  // 退出按钮避让详情抽屉要用到窗口宽度（抽屉是固定宽度，窄窗口下不让位）
+  useEffect(() => {
+    const onResize = (): void => setWideEnough(window.innerWidth >= 760)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  /*
+   * 左下角弹出层：点「小按钮 / 弹出层」以外的地方，或按 Esc 关闭。
+   *
+   * 为什么不直接用 useMenuDismiss：它在 window 上监听 click 并**一律关闭**，
+   * 而「点小按钮打开」也是一次 click —— 同一次点击里 onClick 先改变状态、接着冒泡到 window
+   * 触发刚注册的关闭回调，结果就是「刚打开就被自己关掉」。
+   * 这里改成 mousedown + ref 判包含（SearchPage 的搜索历史下拉也是这么修的），
+   * mousedown 永远早于 click，打开那一下不会自相残杀。
+   */
+  useEffect(() => {
+    if (!overflowOpen) return
+    const onDown = (e: MouseEvent): void => {
+      if (overflowRef.current && !overflowRef.current.contains(e.target as Node)) setOverflowOpen(false)
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setOverflowOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [overflowOpen])
+
   /**
    * Esc 返回卡片库。
-   * 只有在「没有开右键菜单、没有弹窗、没有抽屉」时才响应，避免按 Esc 关弹窗的同时被踢回库。
+   * 只有在「没有开右键菜单、没有弹窗、没有抽屉、左下角弹出层也关着」时才响应，
+   * 避免按 Esc 关弹窗的同时被踢回库。
+   * 顺序上不会冲突：弹出层监听在 document 上、这个退出监听在 window 上，
+   * Esc 冒泡先到 document 再到 window —— 于是「关弹出层的那一次 Esc」被弹出层自己吃掉，
+   * 这里读到的 overflowOpen 仍是 true，不会顺手退出沉浸模式（要再按一次才退出）。
    */
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
       if (e.key !== 'Escape') return
-      if (menu || ymgalGame || shotsOpen || shotsGame || removing || detailGame) return
+      if (menu || ymgalGame || shotsOpen || shotsGame || removing || detailGame || overflowOpen) return
       onBack()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [menu, ymgalGame, shotsOpen, shotsGame, removing, detailGame, onBack])
+  }, [menu, ymgalGame, shotsOpen, shotsGame, removing, detailGame, overflowOpen, onBack])
 
   const onImport = useCallback(async () => {
     await importGame()
@@ -215,6 +284,17 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
     dragState.current.active = false
   }
 
+  /**
+   * 沉浸模式下被隐藏、改由左下角小按钮弹出的三个动作。
+   * 复用右键菜单的条目结构（GalMenuItem），行为与原顶部按钮**完全一致**：
+   * 返回库 = onBack、导入 galgame = importGame、最近截图 = 打开全部截图弹窗。
+   */
+  const hiddenActions: GalMenuItem[] = [
+    { key: 'back', icon: LayoutGrid, label: '返回库', onSelect: onBack },
+    { key: 'import', icon: FolderPlus, label: '导入 galgame', onSelect: () => void onImport() },
+    { key: 'shots', icon: Camera, label: '最近截图', onSelect: () => setShotsOpen(true) }
+  ]
+
   const menuItems = (): GalMenuItem[] => {
     const g = menu?.game
     if (!g) return []
@@ -279,8 +359,12 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
 
       {/* 内容层 */}
       <div className="relative z-10 flex h-full flex-col">
-        {/* 头部 */}
-        <div className="flex shrink-0 items-start justify-between gap-3 px-6 pt-5">
+        {/*
+          头部：沉浸模式下只剩标题信息。
+          「返回库 / 最近截图 / 导入 galgame」三个按钮按用户要求**不常驻**，
+          全部收进左下角那个小圆点按钮的弹出层（见页面末尾），整屏只留壁纸与封面条。
+        */}
+        <div className="shrink-0 px-6 pt-5">
           <div>
             <div className="flex items-center gap-2">
               <h1 className="text-lg font-bold text-white drop-shadow">Galgame 库</h1>
@@ -291,24 +375,6 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
             <p className="mt-1 text-xs text-white/80 drop-shadow">
               已添加 {games.length} 款游戏 · 已玩完 {finishedCount} · 点击封面切换背景，再点一次看详情
             </p>
-          </div>
-          <div className="flex gap-2">
-            <button
-              onClick={onBack}
-              title="返回卡片库（Esc）"
-              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-white/25 bg-white/10 px-3.5 text-sm font-medium text-white backdrop-blur transition-colors hover:bg-white/20"
-            >
-              <LayoutGrid size={15} /> 返回库
-            </button>
-            <button
-              onClick={() => setShotsOpen(true)}
-              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-white/25 bg-white/10 px-3.5 text-sm font-medium text-white backdrop-blur transition-colors hover:bg-white/20"
-            >
-              <Camera size={15} /> 最近截图
-            </button>
-            <Button icon={FolderPlus} loading={importing} onClick={() => void onImport()}>
-              导入 galgame
-            </Button>
           </div>
         </div>
 
@@ -391,7 +457,9 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
               onPointerMove={onStripPointerMove}
               onPointerUp={onStripPointerUp}
               onPointerLeave={onStripPointerUp}
-              className="flex gap-3 overflow-x-auto scroll-smooth px-6 py-2 [scrollbar-width:thin] [touch-action:pan-y]"
+              /* pl-14：给左下角的小圆点按钮（bottom-4 left-4）让出位置，
+                 否则静止时它会压在第一张封面上；右侧仍是原来的 px-6 视觉 */
+              className="flex gap-3 overflow-x-auto scroll-smooth pl-14 pr-6 py-2 [scrollbar-width:thin] [touch-action:pan-y]"
             >
               {games.map((game) => {
                 const isSel = game.id === selectedId
@@ -481,6 +549,64 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
         }}
         onClose={() => setRemoving(null)}
       />
+
+      {/*
+        左下角小圆点：沉浸模式下唯一常驻的「入口」，点开就是被隐藏的那三个按钮。
+        用户原话「留一个小按钮弹出这些按钮」——所以它刻意做得小、半透明，
+        不抢画面，鼠标悬停才变实。
+      */}
+      <div ref={overflowRef} className="absolute bottom-4 left-4 z-30">
+        <button
+          title="显示被隐藏的按钮：返回库 / 导入 galgame / 最近截图"
+          onClick={() => setOverflowOpen((v) => !v)}
+          className={`flex h-8 w-8 items-center justify-center rounded-full border border-white/25 text-white shadow-lg backdrop-blur transition-colors ${
+            overflowOpen ? 'bg-white/25' : 'bg-black/45 hover:bg-black/70'
+          }`}
+        >
+          <Ellipsis size={15} />
+        </button>
+
+        {overflowOpen ? (
+          /* 弹出层浮在封面条上方：整体半透明深色，看得清也点得准，选中任一项立即关闭 */
+          <div className="absolute bottom-10 left-0 w-44 overflow-hidden rounded-xl border border-white/15 bg-black/80 py-1 text-white shadow-2xl backdrop-blur">
+            <div className="px-3.5 pb-1 pt-1.5 text-[10px] text-white/50">被隐藏的按钮</div>
+            {hiddenActions.map((it) => {
+              const Icon = it.icon
+              return (
+                <button
+                  key={it.key}
+                  onClick={() => {
+                    setOverflowOpen(false)
+                    it.onSelect()
+                  }}
+                  className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-xs whitespace-nowrap hover:bg-white/10"
+                >
+                  <Icon size={13} /> {it.label}
+                </button>
+              )
+            })}
+          </div>
+        ) : null}
+      </div>
+
+      {/*
+        退出沉浸：用户要求「留一个优先级极高的退出小按钮在右侧」，防止界面卡住出不来。
+        z-[999] 高于应用里所有浮层（Toast 99 / 公告 95 / 截图弹窗 90 / 通用弹窗 80 /
+        右键菜单 70 / 详情抽屉 40），任何情况下都能点到；Esc 同样可以退出（见上面的键盘 effect）。
+        放 absolute 而不是 fixed：本页根节点本身就是铺满 main 的定位上下文，
+        祖先上有 framer-motion 的 transform 时 fixed 会退化，absolute 反而更稳。
+        详情抽屉占右侧 420px：抽屉打开且窗口够宽时把按钮挪到抽屉左边，
+        免得和抽屉自己的「关闭 ×」叠在一起；窗口窄到挪不开就保持贴右边（层级最高，仍可点）。
+      */}
+      <button
+        onClick={onBack}
+        title="退出沉浸模式（Esc）"
+        className={`absolute top-3 z-[999] flex h-8 items-center gap-1.5 rounded-full border border-white/30 bg-black/60 px-3 text-xs font-medium text-white shadow-xl backdrop-blur transition-colors hover:bg-black/85 ${
+          detailGame && wideEnough ? 'right-[436px]' : 'right-3'
+        }`}
+      >
+        <Minimize2 size={13} /> 退出沉浸
+      </button>
     </div>
   )
 }

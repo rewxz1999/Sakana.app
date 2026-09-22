@@ -32,6 +32,8 @@ export const CH = {
    * 走主进程取字节：自定义协议 sakana-img:// 是跨源资源，直接画进 canvas 会污染画布，
    * toBlob() 会抛 SecurityError；data URL 永不污染。
    */
+  /** v0.3.0：按标题用 Jikan（MAL）取角色 —— 9宫格可切换到更清晰的立绘数据源 */
+  bgmCharactersJikan: 'bgm:characters-jikan',
   bgmImageDataUrl: 'bgm:image-data-url',
 
   // 蜜柑计划
@@ -125,6 +127,13 @@ export const CH = {
   playerUoscEpisode: 'player:uosc-episode',
   playerUoscClear: 'player:uosc-clear',
   playerUoscDelay: 'player:uosc-delay',
+  /**
+   * v0.2.18：uosc 控制栏的状态下行（播放页 → mpv 侧桥接脚本）。
+   *
+   * 与上面的插件接口是两件事：这里传的是**控制栏自己的状态**
+   * （选集/线路/字幕表/倍速/比例/弹幕设置…），桥接脚本据此刷新按钮与菜单。
+   */
+  playerUoscBar: 'player:uosc-bar',
 
   // 订阅（主进程为唯一写入方：变更后广播，渲染层只读 + 触发操作）
   subsList: 'subs:list',
@@ -225,8 +234,17 @@ export const CH = {
   galSearchSites: 'gal:search-sites',
   evGal: 'ev:gal',
 
-  // 统计工具
+  // 统计工具（v0.2：主进程为唯一写入方——get 拉全量，apply 发一个动作，改完广播 ev:stat）
+  statGet: 'stat:get',
+  statApply: 'stat:apply',
+  evStat: 'ev:stat',
   statExportImage: 'stat:export-image',
+  /** 详情窗口的剧照来源：番剧截图目录（<截图目录>/<番剧名>图片） */
+  statShots: 'stat:shots',
+  /** 在系统文件管理器里打开番剧截图目录 */
+  statShotsOpenDir: 'stat:shots-open-dir',
+  /** 详情窗口的观看进度（watchProgress + watchHistory 聚合，主进程算） */
+  statWatchProgress: 'stat:watch-progress',
 
   // 设置页扩展：日志文件 / 数据目录 / 缓存 / 保存目录 / 导航背景
   logRead: 'log:read',
@@ -245,5 +263,10 @@ export const CH = {
   galDirsGet: 'gal:dirs-get',
   galDirsSet: 'gal:dirs-set',
   pickDir: 'dialog:pick-dir',
-  saveDirsInfo: 'save-dirs:info'
+  saveDirsInfo: 'save-dirs:info',
+  /**
+   * 搜索页展示位（空态轮播图）：把用户挑的图片复制进应用数据目录并返回新路径。
+   * 必须过主进程：`sakana-img://local` 只放行白名单目录，用户随手选的图片路径不在白名单里。
+   */
+  showcaseImportImages: 'showcase:import-images'
 } as const

@@ -170,27 +170,12 @@ export function SchedulePage() {
         </Button>
       </div>
 
-      {/* 显示范围：三个开关彼此独立（AND），默认全关 = 全部显示 */}
-      <div className="flex flex-wrap items-center gap-1.5 border-b border-border bg-elev1/50 px-5 py-1.5">
-        <span className="mr-0.5 whitespace-nowrap text-[11px] text-faint">显示范围</span>
-        {FILTER_CHIPS.map((c) => (
-          <button
-            key={c.key}
-            title={c.title}
-            onClick={() => setFilter(c.key, !filters[c.key])}
-            className={`rounded-lg border px-2 py-1 text-[11px] transition-colors whitespace-nowrap ${
-              filters[c.key]
-                ? 'border-accent bg-accent-soft text-accent'
-                : 'border-border text-dim hover:border-accent/50'
-            }`}
-          >
-            {c.label}
-          </button>
-        ))}
-        {hiddenCount > 0 ? (
-          <span className="ml-auto whitespace-nowrap text-[11px] text-faint">本日已隐藏 {hiddenCount} 部</span>
-        ) : null}
-      </div>
+      {/*
+        番剧表的「显示范围」筛选条已按用户要求删除（v0.3.0：去掉番剧表中的显示范围）。
+        原先这里有三个开关（隐藏已抛弃/已收藏/已看过的番剧）。
+        过滤本身与设置字段（scheduleFilters）保留在代码里但界面不再暴露，
+        这样旧数据不会报错，将来若要恢复只需把这段 UI 加回来。
+      */}
 
       {/* 内容区 */}
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">

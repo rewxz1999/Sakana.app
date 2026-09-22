@@ -21,6 +21,14 @@ export interface Announcement {
 
 export const ANNOUNCEMENTS: Announcement[] = [
   {
+    // v0.3.0（用户给定文案：开发者寄语「感谢大家的使用，0.3版本将会更加完善」；
+    // 更新说明「修复了部分已知问题」；图片不变 —— 沿用 DeepSeek 那张）
+    version: '0.3.0',
+    notes: ['修复了部分已知问题'],
+    messages: ['感谢大家的使用，0.3 版本将会更加完善'],
+    image: deepseekThanks
+  },
+  {
     // v0.2.9 最后更新（用户给定的文案：
     // 更新内容：1.优化了ui 2.项目趋于稳定；开发者寄语：大力感谢kazumi、deepseek；图片不变）
     version: '0.2.9',

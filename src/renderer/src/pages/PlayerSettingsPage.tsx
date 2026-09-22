@@ -91,6 +91,39 @@ export function PlayerSettingsPage() {
         </div>
       </Card>
 
+      {/* 播放器控制栏（v0.2.18：uosc 接管 / 旧悬浮窗） */}
+      <Card
+        title="播放器控制栏"
+        desc="控制栏由 mpv 内置的 uosc 绘制，还是用应用自己的悬浮窗控制栏"
+      >
+        <div className="flex flex-col gap-2.5">
+          <label className="flex items-center gap-2 text-xs text-text">
+            <input
+              type="checkbox"
+              checked={settings.uoscControlBar !== false}
+              onChange={(e) => save({ uoscControlBar: e.target.checked })}
+              className="h-3.5 w-3.5 accent-accent"
+            />
+            用 uosc 接管控制栏（推荐）
+          </label>
+          <p className="text-[11px] leading-relaxed text-faint">
+            控制栏画在**视频画面上**（mpv 自己绘制），因此不再受「透明悬浮窗 + 原生视频子窗口」
+            的层叠与点击穿透问题影响。布局与时间显示在
+            <code className="mx-1 font-mono">resources/mpv-config/script-opts/uosc.conf</code>
+            ，快捷键在
+            <code className="mx-1 font-mono">resources/mpv-config/input.conf</code>
+            ，按钮与菜单由
+            <code className="mx-1 font-mono">resources/mpv-scripts/sakana-uosc-ctrl.lua</code>
+            驱动。
+            <span className="text-dim">
+              {' '}
+              取消勾选即回落到应用自己的悬浮窗控制栏（弹幕画布、番剧详情浮层等不受影响），
+              遇到渲染异常时可以随时切回来。切换在**下次进入播放器**时生效。
+            </span>
+          </p>
+        </div>
+      </Card>
+
       {/* 画面比例 */}
       <Card title="画面比例" desc="视频与屏幕比例不一致时的填充方式（播放器控制栏右下角也可随时切换）">
         <div className="flex gap-2">

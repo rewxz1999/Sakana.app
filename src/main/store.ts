@@ -56,10 +56,29 @@ class JsonStore {
   private merge<T>(fallback: T, parsed: unknown): T {
     if (parsed === null || parsed === undefined) return fallback
     if (Array.isArray(fallback)) {
+      // fallback 是数组时 parsed 也是数组就直接用 parsed；否则用 fallback
       return (Array.isArray(parsed) ? parsed : fallback) as T
     }
     if (fallback && typeof fallback === 'object') {
-      return { ...fallback, ...(typeof parsed === 'object' ? (parsed as object) : {}) } as T
+      /*
+       * 浅合并要**跳过 fallback 里的 undefined**（v0.2 统计工具修复）。
+       *
+       * fallback 通常是一个"字段样例/默认值"对象（如 `{ lists: [], entries: [], revision: 0 }`），
+       * 用它给新字段兜底是对的；但过去的 `{...fallback, ...parsed}` 会让 fallback 里
+       * **值为 undefined 的键**把磁盘上已有的值覆盖掉：
+       *   fallback = { pinned: undefined }，parsed = { pinned: true } → 结果是 undefined
+       * 统计列表的「置顶」与统计数据的 revision 都是这样被悄悄吃掉的
+       * （表现：置顶后重启应用置顶消失；渲染层的"等广播确认"永远收敛不了）。
+       * 现在只让 fallback 提供 parsed 里**没有的**键。
+       */
+      const merged: Record<string, unknown> = {}
+      if (typeof parsed === 'object') {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) merged[k] = v
+      }
+      for (const [k, v] of Object.entries(fallback as Record<string, unknown>)) {
+        if (!(k in merged)) merged[k] = v
+      }
+      return merged as T
     }
     return (parsed ?? fallback) as T
   }

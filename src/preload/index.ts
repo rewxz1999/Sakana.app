@@ -52,6 +52,8 @@ const api: SakanaApi = {
     testMirrors: () => call(CH.bgmTestMirrors),
     // 「最XX的角色 9宫格」：角色列表（v0 优先 + 老接口兜底）与导出用的图片 data URL
     characters: (id) => call(CH.bgmCharacters, id),
+    // v0.3.0：按标题用 Jikan（MAL）取角色（工具里可切换的数据源，主进程侧统一节流）
+    charactersJikan: (title) => call(CH.bgmCharactersJikan, title),
     imageDataUrl: (url) => call(CH.bgmImageDataUrl, url)
   },
   mikan: {
@@ -132,7 +134,9 @@ const api: SakanaApi = {
     menu: (which) => call(CH.playerUoscMenu, which),
     setVisible: (on) => call(CH.playerUoscVisible, on),
     clear: () => call(CH.playerUoscClear),
-    delay: (offsetMs) => call(CH.playerUoscDelay, offsetMs)
+    delay: (offsetMs) => call(CH.playerUoscDelay, offsetMs),
+    // v0.2.18：控制栏状态下行（uosc 按钮的图标/激活态/角标、各菜单的内容）
+    bar: (payload) => call(CH.playerUoscBar, payload)
   },
   overlay: {
     isOverlay: process.argv.includes('--sakana-overlay'),
@@ -172,6 +176,10 @@ const api: SakanaApi = {
     pickDir: (defaultPath) => call(CH.pickDir, defaultPath),
     pickVideo: () => call(CH.dialogPickVideo),
     pickVideoDir: () => call(CH.dialogPickVideoDir)
+  },
+  showcase: {
+    // 搜索页展示位（空态轮播图）：把选中的图片收进应用数据目录（白名单内）后返回新路径
+    importImages: (paths) => call(CH.showcaseImportImages, paths)
   },
   rulesRepo: {
     index: () => call(CH.rulesRepoIndex),
@@ -219,7 +227,13 @@ const api: SakanaApi = {
     onEvent: (cb) => subscribe(CH.evGal, cb)
   },
   stat: {
-    exportImage: (listId) => call(CH.statExportImage, listId)
+    get: () => call(CH.statGet),
+    apply: (action) => call(CH.statApply, action),
+    onChanged: (cb) => subscribe(CH.evStat, cb),
+    exportImage: (listId, opts) => call(CH.statExportImage, listId, opts),
+    shots: (entry) => call(CH.statShots, entry),
+    shotsOpenDir: (entry) => call(CH.statShotsOpenDir, entry),
+    watchProgress: (entry) => call(CH.statWatchProgress, entry)
   },
   app: {
     dataPath: () => call(CH.appDataPath),

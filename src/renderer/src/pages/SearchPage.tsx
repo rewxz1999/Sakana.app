@@ -21,7 +21,7 @@ import type { MarkItem, MarkList, SearchResultItem } from '@shared/types'
 import { api } from '@/lib/api'
 import { yearOf } from '@/lib/format'
 import { HISTORY_LIMIT, defaultListName, useMarks } from '@/stores/marks'
-import { toast } from '@/stores/app'
+import { toast, useSettings } from '@/stores/app'
 import {
   Badge,
   Button,
@@ -197,6 +197,12 @@ function clearSnapshot(): void {
 
 export function SearchPage() {
   const navigate = useNavigate()
+  /**
+   * 空态轮播图的切换间隔（秒）：存在 settings 里（searchCarouselSec），随设置一起持久化，
+   * 老设置文件没有这个键时由 ImageCarousel 按默认 6 秒兜底。
+   */
+  const carouselSec = useSettings((s) => s.settings.searchCarouselSec)
+  const saveSettings = useSettings((s) => s.save)
   const {
     lists,
     items,
@@ -632,8 +638,19 @@ export function SearchPage() {
       return
     }
     if (r.data.length === 0) return // 用户取消，不打扰
+    /*
+     * 白名单坑（必须过主进程复制一份）：
+     * 图片都走 `sakana-img://local/<base64url>` 加载，而这个协议只读 media.ts
+     * registerDefaultRoots() 注册过的目录。用户从「图片」文件夹挑的图不在白名单里，
+     * 协议直接 403 —— 界面上就是一片空白（galgame 封面曾因同一个原因整批不显示）。
+     * 主进程把图收进 <userData>/search-showcase 后返回新路径，存的就是白名单内的路径，
+     * 重启后仍然能显示。
+     */
+    const imp = await api.showcase.importImages(r.data)
+    if (!imp.ok) toast.warn(`图片未能收进应用目录（${imp.error}），可能显示不出来`)
+    const paths = imp.ok ? imp.data : r.data
     // 去重交给 store：同一张图重复加入只会让轮播停在同图上
-    const added = addShowcase(r.data)
+    const added = addShowcase(paths)
     if (added === 0) toast.info('所选图片已在展示列表中')
     else toast.success(`已添加 ${added} 张展示图片`)
   }
@@ -642,6 +659,39 @@ export function SearchPage() {
 
   // 主区域是否有需要避让底部展示位的内容
   const hasListContent = view === 'bookmark' ? currentCount > 0 : results.length > 0
+
+  /**
+   * 「空态」判定：搜索视图 + 没有任何结果 + 不在搜索中。
+   * 只有这种时候整片区域是空的，才把轮播图当**主内容**铺上去（用户的诉求就是「空荡」时填空）。
+   * 有结果时它退回到原来那个右下角悬浮小窗，绝不挤占列表（`hasListContent` 时的 pb-40 也是原逻辑）。
+   */
+  const emptyShowcaseOpen = view === 'search' && !hasListContent && !searching
+
+  /**
+   * 空态轮播展示位：文案下面撑满剩余高度的一块大轮播图。
+   * 外层 `flex-1`（父容器是 `flex min-h-full flex-col`，见下面的空态分支）让它吃掉文案之外的空白，
+   * `min-h-[200px]` 保证窗口再矮也有一块像样的图，不够高时跟着滚动区正常滚动。
+   */
+  const emptyShowcase = (
+    <div className="mt-4 min-h-[200px] flex-1">
+      <ImageCarousel
+        images={showcase}
+        onUpload={() => void uploadShowcase()}
+        onDeleteCurrent={(path) => {
+          removeShowcase(path)
+          toast.info('已删除当前展示图片')
+        }}
+        onClearAll={() => {
+          clearShowcase()
+          toast.info('已清空展示图片')
+        }}
+        intervalSec={carouselSec}
+        onIntervalChange={(sec) => saveSettings({ searchCarouselSec: sec })}
+        showcase
+        className="h-full w-full"
+      />
+    </div>
+  )
 
   /** 书签条列表里实际铺出的行（超过上限的部分折进「+N」） */
   const stripLists = showAllMarks ? lists : lists.slice(0, STRIP_ROWS)
@@ -666,18 +716,24 @@ export function SearchPage() {
               {/*
                 搜索历史下拉触发器（v0.2.12）：放在搜索框左侧内部，不再单独占一整行。
                 面板里分「搜索历史 / 书签」两个标签页，点任一条都是重跑搜索。
+
+                v0.3.0 修（用户反馈「搜索图标会遮住下拉表，点历史标签无响应」）：
+                真因是 outside-click 的那只 ref 挂在了**这个触发按钮**上，
+                于是点击面板内部（历史标签本身）会被判定成「点了外部」→ 先关面板再派发点击 →
+                标签看起来完全没反应。现在 ref 挂在**包住触发按钮与面板的容器**上，
+                并把面板的层级提高到 z-50，保证它在搜索图标之上。
               */}
-              <button
-                ref={historyPanelRef as unknown as React.RefObject<HTMLButtonElement>}
-                title="搜索历史与书签"
-                onClick={() => setHistoryOpen((v) => !v)}
-                className={`absolute left-1.5 top-1/2 flex h-7 -translate-y-1/2 items-center gap-0.5 rounded-lg px-1.5 text-faint transition-colors hover:bg-elev2 hover:text-text ${
-                  historyOpen ? 'bg-accent-soft text-accent' : ''
-                }`}
-              >
-                <History size={14} />
-                <ChevronDown size={12} className={`transition-transform ${historyOpen ? 'rotate-180' : ''}`} />
-              </button>
+              <div ref={historyPanelRef} className="contents">
+                <button
+                  title="搜索历史与书签"
+                  onClick={() => setHistoryOpen((v) => !v)}
+                  className={`absolute left-1.5 top-1/2 z-20 flex h-7 -translate-y-1/2 items-center gap-0.5 rounded-lg px-1.5 text-faint transition-colors hover:bg-elev2 hover:text-text ${
+                    historyOpen ? 'bg-accent-soft text-accent' : ''
+                  }`}
+                >
+                  <History size={14} />
+                  <ChevronDown size={12} className={`transition-transform ${historyOpen ? 'rotate-180' : ''}`} />
+                </button>
               <div className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
                 {query ? (
                   <button
@@ -802,6 +858,7 @@ export function SearchPage() {
                   </div>
                 </div>
               ) : null}
+              </div>
             </div>
           </div>
           <Button icon={BookmarkPlus} className="shrink-0" onClick={openCreate}>
@@ -977,43 +1034,60 @@ export function SearchPage() {
                 })}
               </div>
             </div>
-          ) : searched ? (
-            <EmptyState
-              icon={Search}
-              title="没有搜索到结果"
-              desc={
-                searchError
-                  ? `${searchError}\n可点下方按钮检查/切换数据源`
-                  : '换个关键词试试；若一直失败，可到设置里检查数据源是否可用'
-              }
-            />
           ) : (
-            <EmptyState
-              icon={Search}
-              title="搜索番剧"
-              desc="输入关键词后回车开始搜索，结果可直接拖到右侧书签条；点书签条上的书签可查看详情、重新搜索或管理条目"
-            />
+            /*
+              空态（初次进入 / 没搜到结果）：原来只有一段居中的文案，整页看着很空。
+              现在下面接一块轮播展示位（用户可自定义图片与切换间隔），把空白填满。
+              文案区不缩小、滚动/拖拽等行为都不变 —— 展示位只是补在文案下方。
+            */
+            <div className="flex min-h-full flex-col">
+              {searched ? (
+                <EmptyState
+                  icon={Search}
+                  title="没有搜索到结果"
+                  desc={
+                    searchError
+                      ? `${searchError}\n可点下方按钮检查/切换数据源`
+                      : '换个关键词试试；若一直失败，可到设置里检查数据源是否可用'
+                  }
+                />
+              ) : (
+                <EmptyState
+                  icon={Search}
+                  title="搜索番剧"
+                  desc="输入关键词后回车开始搜索，结果可直接拖到右侧书签条；点书签条上的书签可查看详情、重新搜索或管理条目"
+                />
+              )}
+              {emptyShowcase}
+            </div>
           )}
         </div>
 
-        {/* 底部展示位：自制小广告窗，定时轮播 + 右键菜单管理（小窗口下缩一档，别把结果列表挤没） */}
-        <ImageCarousel
-          images={showcase}
-          onUpload={() => void uploadShowcase()}
-          onDeleteCurrent={(path) => {
-            removeShowcase(path)
-            toast.info('已删除当前展示图片')
-          }}
-          onClearAll={() => {
-            clearShowcase()
-            toast.info('已清空展示图片')
-          }}
-          className={
-            SMALL
-              ? `absolute bottom-3 h-[96px] w-[200px] ${stripDocked ? CAROUSEL_RIGHT_OPEN : CAROUSEL_RIGHT}`
-              : `absolute bottom-4 h-[110px] w-[240px] sm:h-[124px] sm:w-[320px] ${stripDocked ? CAROUSEL_RIGHT_OPEN : CAROUSEL_RIGHT}`
-          }
-        />
+        {/*
+          底部展示位：自制小广告窗，定时轮播 + 右键菜单管理（小窗口下缩一档，别把结果列表挤没）。
+          空态时改由上面的「emptyShowcase」以主内容形态呈现（同一份图片列表、同一份间隔设置），
+          这里就不再渲染，避免同屏出现两个轮播。
+        */}
+        {emptyShowcaseOpen ? null : (
+          <ImageCarousel
+            images={showcase}
+            onUpload={() => void uploadShowcase()}
+            onDeleteCurrent={(path) => {
+              removeShowcase(path)
+              toast.info('已删除当前展示图片')
+            }}
+            onClearAll={() => {
+              clearShowcase()
+              toast.info('已清空展示图片')
+            }}
+            intervalSec={carouselSec}
+            className={
+              SMALL
+                ? `absolute bottom-3 h-[96px] w-[200px] ${stripDocked ? CAROUSEL_RIGHT_OPEN : CAROUSEL_RIGHT}`
+                : `absolute bottom-4 h-[110px] w-[240px] sm:h-[124px] sm:w-[320px] ${stripDocked ? CAROUSEL_RIGHT_OPEN : CAROUSEL_RIGHT}`
+            }
+          />
+        )}
 
         {/*
           书签条：贴在结果区右侧的悬浮长条卡片。

@@ -8,6 +8,9 @@ import type {
   GalRecentShot,
   GalToolsConfig,
   LocalTargetInput,
+  StatAction,
+  StatEntry,
+  StatExportOptions,
   SubHistoryItem,
   SubscribeAndDownloadInput,
   Subscription
@@ -31,7 +34,7 @@ import {
   stopRuleProbe
 } from './services/ruleProbe'
 import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
-import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending } from './services/mpv'
+import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar } from './services/mpv'
 import { buildStreamInfo } from './services/playerInfo'
 import {
   checkUpdate,
@@ -44,6 +47,8 @@ import {
   updateInstallState
 } from './services/updater'
 import { fetchDanmaku, loadDanmaku, matchDanmaku, prefetchDanmaku, writeDanmakuXml } from './services/danmaku'
+// v0.3.0：Jikan（MAL）作为角色立绘的备用数据源（带 3 次/秒、60 次/分钟节流）
+import { jikanCharactersByTitle } from './services/jikan'
 import { saveDirsInfo, setSaveDirs } from './services/saveDirs'
 import { ffmpegExe, inspectMedia, startLive, startLiveUrl, stopLive } from './services/transcode'
 import {
@@ -99,9 +104,11 @@ import {
 } from './services/galgameTools'
 import { galSearchSites } from './services/galgameSearch'
 import { statExportImage } from './services/statExport'
+import { applyStatAction, readStatData, statWatchProgressFor } from './services/statStore'
+import { listStatShots, statShotsDirToOpen } from './services/statShots'
 import { maybeShowSaveHint } from './services/onboarding'
 import { ensureSaveDirs } from './services/saveDirs'
-import { clearCache, clearJunk, getCacheBytes, pickDirectory, pickNavBgImage, setCacheDir } from './services/settingsExt'
+import { clearCache, clearJunk, getCacheBytes, importShowcaseImages, pickDirectory, pickNavBgImage, setCacheDir } from './services/settingsExt'
 
 function focused(): BrowserWindow | undefined {
   // focusedOrMain 会排除离屏取数窗口：否则对话框可能被挂到一个不可见的窗口上
@@ -184,6 +191,30 @@ export function registerIpc(): void {
   ipcMain.handle(CH.bgmTestMirrors, () => bangumi.testMirrors())
   // 「最XX的角色 9宫格」：角色列表（v0 优先 + 老接口兜底）与导出用的图片 data URL
   ipcMain.handle(CH.bgmCharacters, (_e, id: number) => bangumi.characters(Number(id)))
+  /*
+   * v0.3.0：按**标题**用 Jikan（MAL）取角色 —— 「最XX的角色 9宫格」可以切换到这个数据源，
+   * 目的是拿到更清晰的立绘（Bangumi 的角色图不少只有 250x300）。
+   *
+   * 为什么按标题而不是 id：我们的条目 id 是 Bangumi 的，Jikan 认 MAL id，两套 id 体系不通，
+   * 标题是唯一可靠的桥。Jikan 限制 3 次/秒、60 次/分钟，节流统一在 services/jikan.ts 里做。
+   */
+  ipcMain.handle(CH.bgmCharactersJikan, async (_e, title: string) => {
+    const r = await jikanCharactersByTitle(String(title ?? ''))
+    return {
+      title: String(title ?? ''),
+      /** 复用 Bangumi 的角色结构，渲染层不用分支处理 */
+      items: r.characters.map((c) => ({
+        id: c.id,
+        name: c.name,
+        name_cn: c.nameCn,
+        relation: c.relation,
+        images: c.images
+      })),
+      source: 'jikan' as const,
+      animeTitle: r.anime?.title ?? '',
+      malId: r.anime?.malId ?? 0
+    }
+  })
   /*
    * 图片 → data URL。必须走主进程：渲染层直接用 sakana-img:// 画 canvas 会污染画布，
    * toBlob() 会抛 SecurityError（导出整条链路断在这里），data URL 则永不污染。
@@ -520,6 +551,14 @@ export function registerIpc(): void {
     mpvPushDanmakuDelay(offsetMs)
     return true
   })
+  /*
+   * v0.2.18：uosc 控制栏的状态下行。
+   * 播放页把「选集/线路/字幕/倍速/比例/弹幕设置」推过来，主进程按内容去重后
+   * 交给 mpv 侧的 sakana-uosc-ctrl.lua —— 它据此刷新按钮与菜单。
+   * 反向的动作（点按钮 / 菜单项 / input.conf 快捷键）走 user-data/sakana-ctrl 轮询，
+   * 在主进程里直接派发成 OverlayAction（见 mpv.ts 的 pollUoscCtrl），不经过本文件。
+   */
+  ipcMain.handle(CH.playerUoscBar, (_e, payload: unknown) => mpvPushUoscBar(payload))
   // ---------- 全屏控制栏悬浮窗 ----------
   /*
    * v0.2.8 附加 修「控制栏按钮点了没反应」：
@@ -610,6 +649,14 @@ export function registerIpc(): void {
     })
     return r.canceled ? [] : r.filePaths
   })
+  /*
+   * 搜索页展示位（空态轮播图）：把 pickImages 返回的图片复制到应用数据目录后回传新路径。
+   * 不直接改 dialogPickImages：那个通道还被「统计工具 → 剧照」用来挑系统目录里的原图，
+   * 给它加上「偷偷复制一份」的副作用会打乱那边的语义（同一张图会有两个路径）。
+   */
+  ipcMain.handle(CH.showcaseImportImages, (_e, paths: string[]) =>
+    importShowcaseImages(Array.isArray(paths) ? paths.map((p) => String(p)) : [])
+  )
   ipcMain.handle(CH.dialogPickSubtitle, async () => {
     const w = focused()
     if (!w) return null
@@ -687,8 +734,22 @@ export function registerIpc(): void {
   ipcMain.handle(CH.galListShots, (_e, gameName: string) => galListShots(String(gameName ?? '')))
   // 站点搜索统计：并行查 7 个资源站，只回「数量 + 跳转链接」，绝不回传站点内容
   ipcMain.handle(CH.galSearchSites, (_e, keyword: string) => galSearchSites(String(keyword ?? '')))
-  // 统计工具：导出列表为图片（自选保存位置）
-  ipcMain.handle(CH.statExportImage, (_e, listId: string) => statExportImage(listId))
+  // 统计工具：导出列表为图片（自选保存位置 + 勾选要导出的字段）
+  ipcMain.handle(CH.statExportImage, (_e, listId: string, opts?: StatExportOptions) =>
+    statExportImage(String(listId ?? ''), opts)
+  )
+  // 统计工具：主进程为唯一写入方（读全量 / 发一个写动作，改完广播 ev:stat）
+  ipcMain.handle(CH.statGet, () => readStatData())
+  ipcMain.handle(CH.statApply, (_e, action: StatAction) => applyStatAction(action))
+  // 详情窗口：剧照图库（读番剧截图目录，不复制文件）
+  ipcMain.handle(CH.statShots, (_e, entry: StatEntry) => listStatShots(entry))
+  ipcMain.handle(CH.statShotsOpenDir, async (_e, entry: StatEntry) => {
+    const dir = statShotsDirToOpen(entry)
+    const err = await shell.openPath(dir)
+    // openPath 失败时返回错误字符串（空串 = 成功），原样回给渲染层显示
+    return { dir, error: err || '' }
+  })
+  ipcMain.handle(CH.statWatchProgress, (_e, entry: StatEntry) => statWatchProgressFor(entry))
 
   // ---------- 设置页扩展：日志文件 / 数据目录 / 缓存 / 保存目录 / 导航背景 ----------
   ipcMain.handle(CH.logRead, () => {

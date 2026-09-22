@@ -120,6 +120,27 @@ export function DashboardPage() {
    *    保证「继续观看」不会出现空白，行为与 v0.2.3 的本地续播一致。
    */
   const continueList = useMemo<ContinueEntry[]>(() => {
+    /*
+     * 封面兜底（v0.3.0，用户反馈「继续观看列表上不显示番剧封面」）。
+     *
+     * 原因：观看进度记录里的 `cover` 是后加的字段，**旧记录没有它**（写入时还没这个字段），
+     * 而界面上原本只读 `p.cover`，于是老用户看到的全是渐变占位块。
+     * 这里按「进度自带封面 → 收藏里的同一条目封面 → 本地观看历史里的封面」逐级兜底，
+     * 不用迁移数据也能把封面补回来。
+     * 观看历史那条分支原本压根没传 cover，一并补上。
+     */
+    const coverFor = (subjectId?: number, title?: string): string | undefined => {
+      if (subjectId != null) {
+        const fav = favorites.find((f) => f.subjectId === subjectId)
+        if (fav?.cover) return fav.cover
+      }
+      /*
+       * 观看历史（WatchHistoryItem）本身没有封面字段，只用来「确认这部看过」；
+       * 封面只可能来自收藏或进度记录本身，所以这里不再从历史里取。
+       */
+      void title
+      return undefined
+    }
     if (progressItems.length > 0) {
       return [...progressItems]
         .sort((a, b) => b.updatedAt - a.updatedAt)
@@ -127,7 +148,7 @@ export function DashboardPage() {
         .map((p) => ({
           key: p.id,
           title: p.title,
-          cover: p.cover,
+          cover: p.cover || coverFor(p.subjectId, p.title),
           episodeNo: p.episodeIndex + 1,
           percent: p.durationSec > 0 ? Math.min(100, Math.round((p.positionSec / p.durationSec) * 100)) : null,
           source: p.source,
@@ -140,6 +161,8 @@ export function DashboardPage() {
     return watchHistory.slice(0, CONTINUE_LIMIT).map((h) => ({
       key: h.id,
       title: h.title,
+      // 观看历史本身没有封面字段，统一从收藏/进度里按 subjectId 兜底（见上面 coverFor）
+      cover: coverFor(h.subjectId, h.title),
       episodeNo: h.episode,
       percent: null,
       source: h.source,
@@ -147,7 +170,7 @@ export function DashboardPage() {
       progress: null,
       subjectId: h.subjectId
     }))
-  }, [progressItems, watchHistory])
+  }, [progressItems, watchHistory, favorites])
 
   /**
    * 在线续播（source === 'online'）。

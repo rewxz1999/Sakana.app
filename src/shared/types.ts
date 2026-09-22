@@ -1108,6 +1108,25 @@ export interface AppSettings {
    * 渲染层由 `resolveScheduleFilters()` 补默认值。
    */
   scheduleFilters?: Partial<ScheduleDisplayFilters>
+  /**
+   * 播放器控制栏是否交给 uosc（v0.2.18）。
+   *
+   * - 缺省 / true：用 mpv 内置的 uosc 画控制栏（布局在 resources/mpv-config/script-opts/uosc.conf，
+   *   快捷键在 resources/mpv-config/input.conf，按钮/菜单由 resources/mpv-scripts/sakana-uosc-ctrl.lua 驱动）；
+   * - false：回落到应用自己的悬浮窗控制栏（代码原样保留，见 services/playerOverlay.ts），
+   *   遇到 uosc 出问题时可随时切回来。
+   *
+   * 内置 uosc 缺失（安装目录不完整）时也会自动回落，不需要用户去改这个开关。
+   */
+  uoscControlBar?: boolean
+  /**
+   * 搜索页空态轮播图（展示位）的自动切换间隔，单位秒（v0.3.0 附加）。
+   *
+   * 可选字段：老设置文件里没有这个键，渲染层按 6 秒兜底（见 ImageCarousel 的 DEFAULT_INTERVAL_SEC）。
+   * 轮播图片列表不在这里：它是一串绝对路径、条数不定，历史上就存在同一个 store 的
+   * `searchShowcase` 键里（stores/marks.ts），换键会让老用户已选的图片全部丢失，故保持不动。
+   */
+  searchCarouselSec?: number
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -1153,7 +1172,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   bangumiCustomApi: 'https://sankana-bangumi.de5.net/api',
   bangumiCustomImg: 'https://sankana-bangumi.de5.net/img',
   // 番剧表「显示范围」筛选默认全关 = 全部显示
-  scheduleFilters: { hideWatched: false, hideDropped: false, onlyWatching: false }
+  scheduleFilters: { hideWatched: false, hideDropped: false, onlyWatching: false },
+  // 搜索页空态轮播图默认 6 秒/张（与 ImageCarousel 里的 DEFAULT_INTERVAL_SEC 一致）
+  searchCarouselSec: 6
 }
 
 // ---------------- 工具数据导出 ----------------
@@ -1207,8 +1228,17 @@ export interface LiveStartResult {
   mode: 'vcopy' | 'vtranscode'
 }
 
-// ---------------- 内置统计工具 v0.1 ----------------
+// ---------------- 内置统计工具 v0.2（条目详情大改） ----------------
 
+/**
+ * 统计条目（v0.2）。
+ *
+ * 字段分三类，改动时别混：
+ * 1. **自动带出**（添加时从收藏/番剧表写入，详情窗口只读）：name/nameCn/cover/airDate/genres/bgmRating。
+ *    其中 `bgmRating` 允许在条目上手工校正（旧数据没有该值时用户仍可填），但详情窗口不给输入框。
+ * 2. **用户录入**（详情窗口可改）：watchedAt、四档评分、三段评价、overallReview、historyTier、photos、remark。
+ * 3. **兼容字段**：`reviews` 是 v0.1 的两段评价数组，迁移后保留原值不再读取（删掉会让老数据无法回滚）。
+ */
 export interface StatEntry {
   id: string
   listId: string
@@ -1218,25 +1248,177 @@ export interface StatEntry {
   nameCn: string
   cover: string
   airDate: string | null // 放送时间
-  watchedAt: string | null // 看完时间（YYYY-MM-DD，可手动输入）
-  personalRating: number | null // 个人评分
-  bgmRating: number | null // bangumi 评分
-  photos: string[] // 剧照 1-3（本地图片绝对路径）
+  /** v0.2：番剧类型/标签（添加时从收藏 genres 带出，详情窗口只读） */
+  genres: string[]
+  watchedAt: string | null // 看完时间（YYYY-MM-DDTHH:mm，本地时间，无时区）
+  initialRating: number | null // 初始评分 0–10
+  midRating: number | null // 中期评分 0–10
+  endRating: number | null // 结束评分 0–10
+  personalRating: number | null // 个人评分 0–10
+  bgmRating: number | null // bangumi 评分（自动带出）
+  initialReview: string // 初期评价
+  midReview: string // 中期评价
+  endReview: string // 结束评价
+  overallReview: string // 总体评价
+  /** 历史级：自由文本（如「历史级 9」，空串 = 未评级） */
+  historyTier: string
+  photos: string[] // 剧照（本地图片绝对路径，最多 STAT_MAX_PHOTOS 张）
+  remark: string // 备注
   reviews: string[] // 旧评价字段（兼容迁移用）
-  initialReview: string // 初始评价
-  finalReview: string // 完结评价
+  finalReview: string // v0.1 的「完结评价」——迁移时并入 endReview，保留原值
   order: number
+  /** 最近一次修改时间（详情窗口底部显示） */
+  updatedAt?: number
 }
+
+/** 剧照上限（渲染层与导出图片共用同一个数字） */
+export const STAT_MAX_PHOTOS = 5
 
 export interface StatList {
   id: string
   name: string
   createdAt: number
+  /** 置顶：置顶列表排在列表栏最前，排序持久化（undefined = 未置顶） */
+  pinned?: boolean
 }
 
 export interface StatToolData {
   lists: StatList[]
   entries: StatEntry[]
+  /**
+   * 数据修订号：主进程每次写入 +1。
+   *
+   * 渲染层「乐观更新 → 等广播确认」靠它收敛：只认 `revision >= 自己发出的那次`
+   * 的广播，避免两次快速编辑（比如连按两次置顶）被乱序广播打回旧状态。
+   */
+  revision?: number
+}
+
+/** 渲染层可改的条目字段（白名单，主进程会再过滤一次） */
+export type StatEntryPatch = Partial<
+  Pick<
+    StatEntry,
+    | 'watchedAt'
+    | 'initialRating'
+    | 'midRating'
+    | 'endRating'
+    | 'personalRating'
+    | 'initialReview'
+    | 'midReview'
+    | 'endReview'
+    | 'overallReview'
+    | 'historyTier'
+    | 'photos'
+    | 'remark'
+    | 'bgmRating'
+    | 'seq'
+    | 'order'
+  >
+>
+
+/**
+ * 统计工具的全部写操作（渲染层 → 主进程）。
+ *
+ * 为什么不是「渲染层把整个数组写回 store」：多窗口/多次快速编辑会互相覆盖。
+ * 主进程是唯一写入方，读-改-写在主进程内存里串行完成，改完广播给所有窗口。
+ */
+export type StatAction =
+  | { kind: 'createList'; name: string; makeCurrent?: boolean }
+  | { kind: 'renameList'; listId: string; name: string }
+  | { kind: 'deleteList'; listId: string }
+  | { kind: 'setPinned'; listId: string; pinned: boolean }
+  /** 重新排序：整表重排（按年份 + 顺序）或按给出的条目 id 顺序重排 */
+  | { kind: 'resort'; listId: string; entryIds?: string[] }
+  | { kind: 'addEntries'; listId: string; items: StatAddItem[] }
+  | { kind: 'updateEntry'; entryId: string; patch: StatEntryPatch }
+  | { kind: 'removeEntry'; entryId: string }
+
+/**
+ * 「添加番剧」的输入项（收藏 / 季度列表 / 搜索结果共用一种形态）。
+ * subjectId 为 0 表示没有 bangumi 条目（本地番剧），此时按 name 去重。
+ */
+export interface StatAddItem {
+  subjectId: number
+  name: string
+  nameCn: string
+  cover: string
+  airDate: string | null
+  rating: number | null
+  genres?: string[]
+  watchedAt?: string | null
+}
+
+/** 可以放进「添加番剧」弹窗的来源 */
+export type StatAddSource = 'favorites' | 'season' | 'search'
+
+/**
+ * 详情窗口里的观看进度（由主进程按 subjectId / 标题聚合 watchProgress + watchHistory 得出）。
+ * 「被标记看完的就是已看完」：`[FLAG]` 标记来自收藏条目上的手动 watchedAt。
+ */
+export interface StatWatchProgress {
+  /** 已观看集数 */
+  watchedEpisodes: number
+  /** 总集数（未知为 null） */
+  totalEpisodes: number | null
+  /** 是否已看完（手动标记 / 集数覆盖 / 统计条目自己填了看完时间） */
+  completed: boolean
+  /** 最后观看时间（毫秒时间戳） */
+  lastWatchedAt: number | null
+  /** 进度文案，界面上直接显示 */
+  text: string
+}
+
+/** 剧照候选：截图目录里的一个图片文件 */
+export interface StatShotFile {
+  path: string
+  name: string
+  mtime: number
+  size: number
+}
+
+/** 番剧截图目录信息（详情窗口的「打开截图目录」与图库标题用） */
+export interface StatShotDirInfo {
+  /** 该番剧的截图子目录（<截图目录>/<番剧名>图片） */
+  dir: string
+  /** 截图根目录 */
+  root: string
+  /** 子目录是否存在（不存在时图库只列根目录里的图） */
+  dirExists: boolean
+  /** 一次返回的最大张数 */
+  limit: number
+  files: StatShotFile[]
+}
+
+/** 导出图片时可勾选的内容 */
+export type StatExportField =
+  | 'seq'
+  | 'cover'
+  | 'name'
+  | 'airDate'
+  | 'watchedAt'
+  | 'genres'
+  | 'initialRating'
+  | 'midRating'
+  | 'endRating'
+  | 'personalRating'
+  | 'bgmRating'
+  | 'deviation'
+  | 'initialReview'
+  | 'midReview'
+  | 'endReview'
+  | 'overallReview'
+  | 'historyTier'
+  | 'photos'
+  | 'progress'
+  | 'remark'
+
+/** 导出选项：勾选字段 + 条目宽度 + 剧照尺寸 */
+export interface StatExportOptions {
+  fields: StatExportField[]
+  /** 条目宽度倍数（1 = 默认 800px 画布；内容多时渲染层自动加宽，用户也能手动再加宽） */
+  widthScale?: number
+  /** 剧照图上尺寸倍数（1 = 默认 92×56） */
+  photoScale?: number
 }
 
 // ---------------- 订阅+下载组合操作 ----------------

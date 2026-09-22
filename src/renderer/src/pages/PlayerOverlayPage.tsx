@@ -297,6 +297,19 @@ export default function PlayerOverlay(): React.ReactElement {
 
   // 打开详情浮层时拉一次番剧详情（悬浮窗有完整的 api 能力）
   const showInfoPanel = state?.showInfo === true
+  /**
+   * v0.2.18：控制栏是否已交给 uosc（mpv 侧绘制，见 PlayerPage 的 uoscBarMode）。
+   *
+   * 为 true 时这个悬浮窗**不再画任何控件**：
+   * - 底栏（进度条 + 全部按钮 + 弹幕设置面板）整条隐藏 —— 它们由 uosc 提供；
+   * - 顶栏只留「标题 + 状态药丸」（纯展示），✕ / 番剧详情 / 截图 三个按钮撤掉（uosc 里有）。
+   *
+   * 保留下来的部分都是 uosc **给不了**的：
+   * ① 弹幕画布（canvas 渲染方式时，弹幕必须由网页画在视频之上）；
+   * ② 番剧详情浮层、选集抽屉（应用自己的富面板）；
+   * ③ 断点续播提示、错误条、流详情弹窗、捕捉视频流中的提示。
+   */
+  const uoscBar = state?.uoscBar === true
   useEffect(() => {
     if (!showInfoPanel) return
     const id = state?.subjectId
@@ -654,19 +667,21 @@ export default function PlayerOverlay(): React.ReactElement {
         </div>
       ) : null}
 
-      {/* 顶部：退出 / 标题 / 状态 / 详情 / 截图 */}
+      {/* 顶部：退出 / 标题 / 状态 / 详情 / 截图（v0.2.18：uosc 接管控制栏后只留标题与状态） */}
       <div
         className={`absolute inset-x-0 top-0 z-30 flex h-14 items-center justify-between bg-gradient-to-b from-black/70 via-black/25 to-transparent px-2 transition-opacity duration-300 ${
           visible ? 'opacity-100' : 'pointer-events-none opacity-0'
         }`}
       >
         {/* 小窗口时「✕」表示退出播放（没有全屏可退），全屏时先退全屏 */}
-        <IconBtn
-          title={state?.fullscreen ? '退出全屏' : '退出播放'}
-          onClick={() => send({ type: state?.fullscreen ? 'exitFullscreen' : 'exitPlayer' })}
-        >
-          <X size={22} />
-        </IconBtn>
+        {uoscBar ? null : (
+          <IconBtn
+            title={state?.fullscreen ? '退出全屏' : '退出播放'}
+            onClick={() => send({ type: state?.fullscreen ? 'exitFullscreen' : 'exitPlayer' })}
+          >
+            <X size={22} />
+          </IconBtn>
+        )}
         <div className="pointer-events-none min-w-0 flex-1 px-2">
           <div className="truncate text-sm font-medium text-white drop-shadow">
             {state?.title ?? ''}
@@ -698,12 +713,16 @@ export default function PlayerOverlay(): React.ReactElement {
           {state?.status.text ?? '加载中'}
         </button>
         <div className="flex items-center gap-1">
-          <IconBtn title="番剧详情" onClick={() => send({ type: 'toggleInfo' })}>
-            <Info size={20} />
-          </IconBtn>
-          <IconBtn title="截图" onClick={() => send({ type: 'snapshot' })}>
-            <Camera size={20} />
-          </IconBtn>
+          {uoscBar ? null : (
+            <>
+              <IconBtn title="番剧详情" onClick={() => send({ type: 'toggleInfo' })}>
+                <Info size={20} />
+              </IconBtn>
+              <IconBtn title="截图" onClick={() => send({ type: 'snapshot' })}>
+                <Camera size={20} />
+              </IconBtn>
+            </>
+          )}
         </div>
       </div>
 
@@ -711,10 +730,13 @@ export default function PlayerOverlay(): React.ReactElement {
         底部：进度条 + 控制按钮
         v0.2.8：弹幕开关与弹幕设置放在**控制栏上方**（同一容器里、进度条之前），
         跟着控制栏一起显隐，不额外占用画面。
+        v0.2.18：控制栏交给 uosc 后，这整条（含弹幕设置面板）不再显示 ——
+        进度条/播放控制/倍速/字幕/比例/弹幕菜单全部由 uosc 画在视频画面上。
+        这里只关显隐、不删代码：设置里把「播放器控制栏」切回旧版即可原样恢复。
       */}
       <div
         className={`absolute inset-x-0 bottom-0 z-30 flex flex-col gap-1 bg-gradient-to-t from-black/75 via-black/30 to-transparent px-3 pb-2 pt-6 transition-opacity duration-300 ${
-          visible ? 'opacity-100' : 'pointer-events-none opacity-0'
+          visible && !uoscBar ? 'opacity-100' : 'pointer-events-none opacity-0'
         }`}
       >
         {/* 弹幕设置面板（覆盖区域 / 弹幕数量 / 时间轴 / 别名检测 + 更多设置） */}

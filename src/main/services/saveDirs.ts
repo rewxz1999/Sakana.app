@@ -46,6 +46,18 @@ export function ensureSaveDirs(): SaveDirsInfo {
   mkdirSync(downloadDir, { recursive: true })
   mkdirSync(screenshotDir, { recursive: true })
 
+  /*
+   * 把两个目录显式加进自定义协议白名单（统计工具详情窗口的「剧照图库」要直接读截图目录，
+   * 走 sakana-img://local 显示）。
+   *
+   * 正常情况下它们已被 media.ts 的 registerDefaultRoots 用 settings/downloads/screenshots
+   * 注册过，但白名单是全局可变状态：用户把截图目录改到别处、或某条路径没走到
+   * allowMediaRoot 的分支时，缩略图会静默 403（界面上就是一片空白）。这里每次启动补一次，
+   * 代价只是两次 Set.add。
+   */
+  allowMediaRoot(downloadDir)
+  allowMediaRoot(screenshotDir)
+
   const gal = galToolsGet()
   const galDir = gal.dir || p.galgameShots
   if (!gal.dir) galToolsSet({ dir: galDir })

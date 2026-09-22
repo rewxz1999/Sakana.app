@@ -35,6 +35,7 @@ import { AboutPage } from '@/pages/AboutPage'
 import { SaveDirsPage } from '@/pages/SaveDirsPage'
 import { NavBgPage } from '@/pages/NavBgPage'
 import { api } from '@/lib/api'
+import { useShell } from '@/stores/shell'
 
 /** 小窗口自定义标题栏上的路由标题 */
 const SMALL_WINDOW_TITLES: Record<string, string> = {
@@ -166,6 +167,12 @@ export default function App() {
 
 function AppFrame() {
   const location = useLocation()
+  /*
+   * 沉浸模式开关（galgame 页写入，见 stores/shell.ts）：为 true 时**不渲染左侧导航栏**，
+   * 于是 main（flex-1）自动占满整宽 —— 沉浸页的 absolute inset-0 壁纸就铺满了原来导航栏那一列。
+   * 这里必须放在函数最前面（早于下面几个 early return）：Hook 不能被条件分支跳过。
+   */
+  const immersive = useShell((s) => s.immersive)
   // 全屏控制栏悬浮窗：整窗透明，只有控制栏可见
   if (api.overlay.isOverlay || location.pathname.startsWith('/overlay')) {
     return (
@@ -219,7 +226,8 @@ function AppFrame() {
     <div className="flex h-full flex-col overflow-hidden">
       <TitleBar />
       <div className="flex min-h-0 flex-1">
-        <SideNav />
+        {/* 沉浸模式隐藏导航栏：整窗只剩壁纸（TitleBar 保留，否则窗口就没法拖动/关闭了） */}
+        {immersive ? null : <SideNav />}
         <main className="relative min-w-0 flex-1 overflow-hidden bg-bg">
           <ErrorBoundary>
             <AnimatedRoutes />

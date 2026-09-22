@@ -4,6 +4,7 @@ import type {
   AspectMode,
   CalendarResult,
   CharactersResult,
+  CharacterItem,
   DanmakuComment,
   DanmakuLoadResult,
   DanmakuMatch,
@@ -35,6 +36,12 @@ import type {
   SearchResult,
   SeasonResult,
   StreamInfo,
+  StatAction,
+  StatEntry,
+  StatExportOptions,
+  StatShotDirInfo,
+  StatToolData,
+  StatWatchProgress,
   SubUpdateCheck,
   SubjectResult,
   SubscribeAndDownloadInput,
@@ -90,6 +97,60 @@ export interface OverlayState {
    * 弹幕要精确地盖在画面之上、且不压到上下控制栏，所以由播放页把 `#player-host` 的矩形推过来。
    */
   videoRect?: { x: number; y: number; width: number; height: number }
+  /**
+   * v0.2.18：控制栏是否已交给 uosc（mpv 侧绘制）。
+   *
+   * 为 true 时悬浮窗**不再绘制**自己的控制栏（顶部按钮与整条底栏），
+   * 只保留弹幕画布（canvas 渲染方式）、番剧详情浮层、断点续播提示、错误条等
+   * 「uosc 给不了」的部分；控件本身全部由 uosc 画在视频画面上。
+   */
+  uoscBar?: boolean
+}
+
+/**
+ * v0.2.18：推给 uosc 控制栏的状态（播放页 → mpv 侧 sakana-uosc-ctrl.lua）。
+ *
+ * 这份数据决定三件事：
+ *   ① 每个按钮的图标/激活态/角标/是否可点；
+ *   ② 选集、线路、字幕、倍速、画面比例、弹幕设置这几个菜单里有什么、哪一项是当前值；
+ *   ③ 弹幕开关按钮显示「打开/关闭」与条数。
+ *
+ * 刻意**不含播放进度**（每秒都在变），只在「换集 / 改设置 / 状态变化」时推一次。
+ */
+export interface UoscBarState {
+  /** 番剧名（仅用于日志与菜单标题） */
+  title: string
+  /** 副标题：线路 + 集名 */
+  subtitle: string
+  playing: boolean
+  /** 当前倍速（按钮角标显示它） */
+  speed: number
+  aspect: AspectMode
+  fullscreen: boolean
+  canPrev: boolean
+  canNext: boolean
+  /** 选集数据：规则播放时是「线路 × 集」，本地播放时是单条线路的文件列表 */
+  lines: { name: string; episodes: string[] }[]
+  currentLine: number
+  currentEp: number
+  /** mpv 的字幕轨（id = sid，-1 表示关闭） */
+  subs: { id: number; label: string }[]
+  subId: number
+  danmaku: {
+    enabled: boolean
+    /** 当前这一集拿到的弹幕条数（按钮角标用） */
+    count: number
+    area: number
+    maxCount: number
+    offsetMs: number
+    showScroll: boolean
+    showTop: boolean
+    showBottom: boolean
+    /** 弹幕是否由 uosc_danmaku 插件渲染（决定菜单里要不要露出插件入口） */
+    pluginActive: boolean
+    source: string
+  }
+  status: { kind: PlayStatus; text: string }
 }
 
 /** 选集数据（低频变化，单独走一个通道；避免把大数组塞进每秒多次的状态推送） */
@@ -146,6 +207,11 @@ export type OverlayAction =
   | { type: 'toggleFullscreen' }
   | { type: 'exitFullscreen' }
   | { type: 'exitPlayer' }
+  /**
+   * v0.2.18：Esc 语义（uosc 控制栏 / mpv 侧快捷键发来）。
+   * 与键盘 Esc 完全一致：依次关闭 选集 → 详情 → 退出全屏 → 退出播放。
+   */
+  | { type: 'escape' }
   /** 选集浮层里点了某一集 */
   | { type: 'selectEpisode'; line: number; ep: number }
   /** v0.2.8 弹幕：开关 / 改单项设置 / 打开详细设置 / 重新检测 / 别名检测 */
@@ -200,6 +266,22 @@ export interface SakanaApi {
      * 老接口的**角色数可能比 v0 少**，结果里的 `source` 会如实标出来源，界面照实提示。
      */
     characters(subjectId: number): Promise<ApiResult<CharactersResult>>
+    /**
+     * v0.3.0：按**标题**从 Jikan（MyAnimeList）取角色 —— 9宫格工具可切换的数据源。
+     *
+     * 为什么按标题：我们的条目 id 是 Bangumi 的，Jikan 认 MAL id，两套体系不通，标题是唯一的桥。
+     * MAL 的角色图是原图（不像 Bangumi 分 s/g/m/l 四档），对「立绘太模糊」的角色更清晰。
+     * 主进程侧统一节流（Jikan 限制 3 次/秒、60 次/分钟）。
+     */
+    charactersJikan(title: string): Promise<
+      ApiResult<{
+        title: string
+        items: { id: number; name: string; name_cn: string; relation: string; images: CharacterItem['images'] }[]
+        source: 'jikan'
+        animeTitle: string
+        malId: number
+      }>
+    >
     /**
      * 把一张远程图片取回来转成 data URL（导出 PNG 时画进 canvas 用）。
      *
@@ -322,6 +404,8 @@ export interface SakanaApi {
         playing?: boolean
         message?: string
         index?: number
+        /** v0.2.18：音量（uosc 的滑杆直接改 mpv 属性，这里把变化同步回渲染层） */
+        volume?: number
       }) => void
     ): () => void
     /** 截图（v0.2.9：目录/文件名规则统一由主进程处理，见 snapshotPath） */
@@ -379,6 +463,17 @@ export interface SakanaApi {
     /** 选择本地视频文件夹（批量加入播放列表） */
     pickVideoDir(): Promise<ApiResult<string | null>>
   }
+  showcase: {
+    /**
+     * 搜索页展示位（空态轮播图）图片：把用户挑选的本地图片复制进应用数据目录，
+     * 返回**白名单内**的新绝对路径供持久化。
+     *
+     * 为什么不能直接存用户选的路径：`sakana-img://local` 只读 media.ts 白名单里的目录
+     * （安装目录/缓存/截图/下载/userData…），从「图片」文件夹随手选的图不在白名单里，
+     * 图片协议会 403 —— 表现就是轮播图一片空白（galgame 封面曾因同一个原因整批不显示）。
+     */
+    importImages(paths: string[]): Promise<ApiResult<string[]>>
+  }
   rulesRepo: {
     index(): Promise<ApiResult<{ name: string; version: string; author: string; lastUpdate: number }[]>>
     import(names: string[]): Promise<ApiResult<{ imported: number; failed: string[] }>>
@@ -429,7 +524,20 @@ export interface SakanaApi {
     onEvent(cb: (ev: GalEvent) => void): () => void
   }
   stat: {
-    exportImage(listId: string): Promise<ApiResult<string>> // 空字符串 = 用户取消
+    /** 拉全量统计数据（主进程为准） */
+    get(): Promise<ApiResult<StatToolData>>
+    /** 发一个写动作（主进程读-改-写 + 广播），返回写入后的全量数据 */
+    apply(action: StatAction): Promise<ApiResult<StatToolData>>
+    /** 订阅统计数据变更（主进程是唯一写入方，改完推给所有窗口） */
+    onChanged(cb: (data: StatToolData) => void): () => void
+    /** 导出列表为图片：fields 决定图片上出现哪些详情字段（空/省略 = 默认一组） */
+    exportImage(listId: string, opts?: StatExportOptions): Promise<ApiResult<string>> // 空字符串 = 用户取消
+    /** 剧照图库：读番剧截图目录（<截图目录>/<番剧名>图片）里的截图，不复制文件 */
+    shots(entry: StatEntry): Promise<ApiResult<StatShotDirInfo>>
+    /** 在系统文件管理器里打开番剧截图目录 */
+    shotsOpenDir(entry: StatEntry): Promise<ApiResult<{ dir: string; error: string }>>
+    /** 详情窗口的观看进度（watchProgress + watchHistory + 收藏手动标记 聚合） */
+    watchProgress(entry: StatEntry): Promise<ApiResult<StatWatchProgress>>
   }
   app: {
     dataPath(): Promise<ApiResult<string>>
@@ -497,6 +605,11 @@ export interface SakanaApi {
     clear(): Promise<ApiResult<boolean>>
     /** 弹幕时间轴微调（毫秒） */
     delay(offsetMs: number): Promise<ApiResult<boolean>>
+    /**
+     * v0.2.18：控制栏状态下行 → mpv 侧的 sakana-uosc-ctrl.lua。
+     * 主进程按内容去重（同一份状态不会重复下发），所以调用方「变了就推」即可。
+     */
+    bar(payload: UoscBarState): Promise<ApiResult<boolean>>
   }
   cache: {
     info(): Promise<ApiResult<CacheInfo>>

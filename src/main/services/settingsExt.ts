@@ -1,10 +1,12 @@
-﻿import { app, BrowserWindow, dialog, nativeImage } from 'electron'
+import { app, BrowserWindow, dialog, nativeImage } from 'electron'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
-import { extname, join } from 'node:path'
+import { createHash } from 'node:crypto'
+import { extname, join, resolve, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { CacheInfo } from '@shared/api'
 import { store } from '../store'
 import { dataPaths } from './paths'
+import { allowMediaRoot } from './media'
 
 // ---------------- 目录字节数 / 文件数 ----------------
 
@@ -144,6 +146,77 @@ export function clearJunk(): number {
     }
   }
   return count
+}
+
+// ---------------- 搜索页展示位（空态轮播图）图片 ----------------
+
+/** 允许收进展示位的图片扩展名（与 sakana-img 协议能正确给 Content-Type 的格式一致） */
+const SHOWCASE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'])
+
+/**
+ * 展示位图片的落地目录：`<安装目录>/data/userData/search-showcase`。
+ *
+ * 为什么必须复制一份，而不是直接用用户选的路径：
+ * `sakana-img://local` 只放行 media.ts 里 `registerDefaultRoots()` 注册过的目录
+ * （安装目录 / 缓存 / 截图 / 下载 / userData / temp…）。用户从「图片」「下载」之类
+ * 任意位置挑的图**不在白名单里**，协议直接 403，界面上就是一块空白 ——
+ * galgame 封面曾经因为同一个原因整批不显示（media.ts 里那段注释记着这次事故）。
+ * 放进 userData 还有两个好处：
+ * 1. 它同时被 `p.root` 和 `p.userData` 两条白名单覆盖，将来数据根再变也不会漏；
+ * 2. 它**不在** clearCache 清理的三个目录（img / bangumi / galgame-covers）里，
+ *    用户精心挑的图不会被一次「清除缓存」清掉。
+ */
+function showcaseDir(): string {
+  const dir = join(dataPaths().userData, 'search-showcase')
+  mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+/**
+ * 把用户挑选的图片收进应用目录，返回可以安全持久化的绝对路径。
+ *
+ * - 命名用「源路径 hash + 原扩展名」：同一张图反复添加只会有一个副本，不会越堆越多
+ *   （列表去重仍由渲染层 store 负责）；
+ * - 已经在展示位目录里的路径原样返回，所以「每次启动都迁移一次历史数据」也不会重复复制；
+ * - 源文件不存在 / 扩展名不支持 / 复制失败时**保留原路径**返回：宁可让轮播显示
+ *   「图片无法加载」的提示，也不静默把用户配置过的图从列表里删掉。
+ */
+export function importShowcaseImages(paths: string[]): string[] {
+  const dir = showcaseDir()
+  const dirPrefix = resolve(dir).toLowerCase() + sep
+  const out: string[] = []
+  for (const src of paths) {
+    if (typeof src !== 'string' || !src) continue
+    let abs = ''
+    try {
+      abs = resolve(src).toLowerCase()
+    } catch {
+      /* 路径非法，下面按失败处理 */
+    }
+    if (abs && abs.startsWith(dirPrefix)) {
+      out.push(src)
+      continue
+    }
+    const ext = extname(src).toLowerCase()
+    let ok = false
+    if (SHOWCASE_EXTS.has(ext)) {
+      try {
+        if (existsSync(src) && statSync(src).isFile()) {
+          const key = createHash('sha1').update(abs || src).digest('hex').slice(0, 12)
+          const dst = join(dir, `carousel-${key}${ext}`)
+          if (!existsSync(dst)) copyFileSync(src, dst)
+          out.push(dst)
+          ok = true
+        }
+      } catch {
+        /* 单张失败不影响其余图片 */
+      }
+    }
+    if (!ok) out.push(src)
+  }
+  // 双保险：目录本身也注册进图片协议白名单（正常情况下 media.ts 已经覆盖了 userData）
+  allowMediaRoot(dir)
+  return out
 }
 
 // ---------------- 目录选择 ----------------

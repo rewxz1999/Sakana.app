@@ -185,8 +185,9 @@ export async function checkUpdate(manual = false): Promise<UpdateInfo> {
   if (release?.tag_name) {
     const latest = String(release.tag_name).replace(/^v/i, '')
     const asset = pickInstaller(release)
-    // v0.2.10：优先用增量补丁（只下变化的文件），没有补丁才用完整安装包
-    const patch = pickPatch(release, current, latest)
+    // v0.3.0：补丁链路停用（用户要求「每次更新后把增量融合进安装包、重新安装」），
+    // 所以界面上也不再显示「增量更新（x MB）」，一律按完整安装包展示与下载。
+    const patch = USE_INCREMENTAL_PATCH ? pickPatch(release, current, latest) : null
     const info: UpdateInfo = {
       current,
       latest,
@@ -265,6 +266,17 @@ export async function checkUpdate(manual = false): Promise<UpdateInfo> {
 }
 
 /* ------------------------------- 一键更新 ------------------------------- */
+
+/**
+ * 是否使用增量补丁更新（v0.3.0 起**关闭**）。
+ *
+ * 用户决定：「增量更新一直失败，那么我们该换思路，每次更新后，将增量融合进安装包，
+ * 重新安装即可」。所以这一版把补丁链路整体停用，更新一律走完整安装包 ——
+ * 少一层可能失败的东西，换「点了就能装上」的确定性。
+ * 补丁相关代码（生成脚本、校验、增量还原、覆盖脚本）保留但不再被选中；
+ * 以后若要恢复，把这里改回 true，并在发布时同时上传 patch 资产即可。
+ */
+const USE_INCREMENTAL_PATCH = false
 
 /** 「更新进行中」标记文件名：辅助进程成功后删除，留着说明上次没走完 */
 const PENDING_MARKER = '.pending-update'
@@ -377,12 +389,13 @@ export async function downloadUpdate(): Promise<{ ok: boolean; file?: string; me
   const release = await fetchLatestRelease()
   if (!release) return { ok: false, message: '无法获取更新地址（GitHub API 不可达）' }
   // v0.2.17：这台机器上补丁方式起不来过 → 直接走完整安装包，别再撞同一堵墙
-  const patchBlocked = store.get<boolean>(PATCH_BLOCKED_KEY, false)
-  const patch = patchBlocked ? null : pickPatch(release, info.current, info.latest)
+  // v0.3.0：补丁链路整体停用（见 USE_INCREMENTAL_PATCH 注释），一律用完整安装包
+  const patch = USE_INCREMENTAL_PATCH
+    ? store.get<boolean>(PATCH_BLOCKED_KEY, false)
+      ? null
+      : pickPatch(release, info.current, info.latest)
+    : null
   const installer = pickInstaller(release)
-  if (patchBlocked && pickPatch(release, info.current, info.latest)) {
-    log.append('info', 'update', '此前补丁方式在本机启动失败过，本次改用完整安装包')
-  }
   const asset = patch ?? installer
   if (!asset) return { ok: false, message: '无法获取更新地址（release 里没有安装包或补丁）' }
 
