@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   ArrowLeft,
   ArrowLeftRight,
+  Crop,
   Download,
   Eraser,
   ImageOff,
@@ -97,6 +98,37 @@ function resolvedLabel(kind: ResolvedKind): string {
   return 'Bangumi v0 接口'
 }
 
+/**
+ * 单个角色的「取景框」（v0.3.4）。
+ *
+ * 归一化到**原图比例**（0~1）：`x/y` 是源矩形左上角、`w/h` 是源矩形的宽高比例。
+ * 之所以存源矩形而不是存缩放/位移：预览（CSS 百分比定位）与导出（canvas 九参数 drawImage）
+ * 都能由它**精确**还原同一块区域，两边不会漂。缺省 = 完整显示（见 drawImageFit）。
+ */
+interface CropRect {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+/**
+ * 兜住非法/老数据：宽高必须 >0，且必须落在 0~1 内（越界就整体平移回来而不是丢弃，
+ * 因为轻微越界（浮点误差）比「整张裁切设置消失」更该被容忍）。
+ */
+function normalizeCrop(raw: unknown): CropRect | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const o = raw as Record<string, unknown>
+  const w = Number(o.w)
+  const h = Number(o.h)
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0.001 || h <= 0.001) return undefined
+  const cw = Math.min(1, w)
+  const ch = Math.min(1, h)
+  const x = clamp(Number(o.x) || 0, 0, 1 - cw)
+  const y = clamp(Number(o.y) || 0, 0, 1 - ch)
+  return { x, y, w: cw, h: ch }
+}
+
 /** 格子里的角色：只保留可序列化的字段，直接进 localStorage */
 interface CellChar {
   id: number
@@ -106,6 +138,8 @@ interface CellChar {
   images: Partial<CoverImages> | null
   /** 角色所属作品名（导出图副标题汇总用） */
   subject: string
+  /** 取景框（v0.3.4）：没有就是完整显示 */
+  crop?: CropRect
 }
 
 interface Cell {
@@ -205,7 +239,9 @@ function normalizeChar(raw: unknown): CellChar | null {
     name_cn: nameCn,
     relation: String(o.relation ?? ''),
     images: (o.images as Partial<CoverImages> | null) ?? null,
-    subject: String(o.subject ?? '')
+    subject: String(o.subject ?? ''),
+    // 老缓存没有 crop → undefined（= 完整显示），不会因为缺字段崩掉或显示空白
+    crop: normalizeCrop(o.crop)
   }
 }
 
@@ -502,8 +538,9 @@ function drawBackdrop(
 
 /**
  * 按当前的填充方式画一张立绘。**导出与预览共用同一套语义**（预览是 CSS 侧的等价写法）：
- * - `cover` → 只画一层 cover（旧行为，一字未改）；
- * - `contain` → 先画模糊压暗背景层，再把整张立绘等比画在框内。
+ * - 有取景框（`crop`）→ 只画框选的那块源区域（v0.3.4 新增，九参数 drawImage，与预览的百分比定位一一对应）；
+ * - 无 crop 且 `fit==='cover'` → 只画一层 cover（旧行为，一字未改）；
+ * - 无 crop 且 `contain` → 先画模糊压暗背景层，再把整张立绘等比画在框内。
  */
 function drawImageFit(
   ctx: CanvasRenderingContext2D,
@@ -513,8 +550,29 @@ function drawImageFit(
   dw: number,
   dh: number,
   fit: FitMode,
-  canvasScale = EX.S
+  canvasScale = EX.S,
+  crop?: CropRect
 ): boolean {
+  const nw = img.naturalWidth || img.width
+  const nh = img.naturalHeight || img.height
+  if (crop && nw > 0 && nh > 0) {
+    try {
+      ctx.drawImage(
+        img,
+        crop.x * nw,
+        crop.y * nh,
+        crop.w * nw,
+        crop.h * nh,
+        dx,
+        dy,
+        dw,
+        dh
+      )
+      return true
+    } catch {
+      /* 落到下面的默认画法 */
+    }
+  }
   if (fit === 'cover') return drawCover(ctx, img, dx, dy, dw, dh, EX.BIAS, canvasScale)
   drawBackdrop(ctx, img, dx, dy, dw, dh)
   return drawContain(ctx, img, dx, dy, dw, dh)
@@ -789,11 +847,11 @@ async function exportPng(
             rrect(ctx, g.rect.x, g.rect.y, g.rect.w, g.rect.h, EX.IMG_R)
             ctx.clip()
             /*
-             * 立绘画法由 state.fit 决定（默认「完整显示」）。
-             * 这里**必须**和界面预览用同一套语义：预览是 CSS 侧（object-contain! / object-cover + 背景层），
+             * 立绘画法：有取景框（crop）就只画框选的那块源区域，否则按 state.fit（默认「完整显示」）。
+             * 这里**必须**和界面预览用同一套语义：预览是 CSS 侧的等价写法（百分比定位 / object-contain + 背景层），
              * 画布是这一行 —— 两边一旦分叉，用户就会遇到「预览看得到全身、导出却被裁掉」。
              */
-            drawImageFit(ctx, img, g.rect.x, g.rect.y, g.rect.w, g.rect.h, state.fit)
+            drawImageFit(ctx, img, g.rect.x, g.rect.y, g.rect.w, g.rect.h, state.fit, EX.S, g.char?.crop)
             ctx.restore()
             return
           } catch {
@@ -810,25 +868,262 @@ async function exportPng(
   return { blob, missing, width: canvas.width, height: canvas.height }
 }
 
+// ---------------- 取景框（v0.3.4） ----------------
+
+/**
+ * 单张立绘的「框选」弹窗。
+ *
+ * 用户要求：把过去那个全局的「铺满裁剪」档，换成**每个格子单独选图区**——
+ * 从角色列表/格子上点开立绘 → 出现一个与格子图片区**同比例**的框选区 → 可放大缩小、拖动 →
+ * 确认后卡片里就显示框选的那块。
+ *
+ * 设计要点（都是为了「所见即所得」）：
+ * - **视口本身就是最终裁切区**：视口比例 = 格子图片区比例，所以框里看到什么，卡片上就是什么；
+ * - 视口内只有**一层**图片（绝对定位 + 像素尺寸），缩放就是改尺寸、平移就是改 left/top，
+ *   与导出侧的 `drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh)` 是同一个源矩形，
+ *   不存在「预览好看、导出不一样」的问题；
+ * - 缩放范围：最小 = 铺满视口（再缩就会露白边），最大 = 4 倍；
+ * - 平移被钳在「图片始终盖满视口」的范围内，拖不出白边；
+ * - 打开时若这一格已有取景框，会**精确还原**成当时的缩放/平移（不重置用户的调整）。
+ */
+function CropDialog({
+  char,
+  aspect,
+  onCancel,
+  onConfirm
+}: {
+  char: CellChar
+  /** 格子图片区的宽高比（宽/高） */
+  aspect: number
+  onCancel: () => void
+  onConfirm: (crop: CropRect | undefined) => void
+}) {
+  const url = pickImage(char.images, 'large')
+  const VW = 320
+  const VH = Math.max(120, Math.round(VW / Math.max(0.2, aspect)))
+  const [nat, setNat] = useState<{ w: number; h: number } | null>(null)
+  /** 相对「铺满视口」的倍数（1 = 刚好铺满） */
+  const [zoom, setZoom] = useState(1)
+  /** 图片左上角相对视口的像素偏移（<= 0） */
+  const [off, setOff] = useState({ x: 0, y: 0 })
+  const dragRef = useRef<{ px: number; py: number; ox: number; oy: number } | null>(null)
+
+  /** 铺满视口所需的最小缩放（图片像素 → 视口像素） */
+  const baseScale = nat ? Math.max(VW / nat.w, VH / nat.h) : 1
+  const scale = baseScale * zoom
+  const clampOff = useCallback(
+    (x: number, y: number, sc: number): { x: number; y: number } => ({
+      x: Math.min(0, Math.max(VW - (nat?.w ?? 0) * sc, x)),
+      y: Math.min(0, Math.max(VH - (nat?.h ?? 0) * sc, y))
+    }),
+    [nat, VH]
+  )
+
+  /** 图片解码完才知道原始尺寸 → 这时才能按已有 crop 还原（或居中铺满） */
+  const onImgLoad = (e: React.SyntheticEvent<HTMLImageElement>): void => {
+    const img = e.currentTarget
+    const w = img.naturalWidth
+    const h = img.naturalHeight
+    if (!w || !h) return
+    setNat({ w, h })
+    const c = char.crop
+    if (c && c.w > 0 && c.h > 0) {
+      // 已有取景框：由「源矩形」反推缩放与偏移，保证与导出完全一致
+      const sw = c.w * w
+      const sc = VW / sw
+      const z = sc / Math.max(VW / w, VH / h)
+      const x = -c.x * w * sc
+      const y = -c.y * h * sc
+      setZoom(Math.min(4, Math.max(1, z)))
+      setOff({ x: Math.min(0, x), y: Math.min(0, y) })
+    } else {
+      // 没有取景框：居中铺满（等价于旧「铺满裁剪」的默认取景，但这次由用户确认）
+      const sc = Math.max(VW / w, VH / h)
+      setZoom(1)
+      setOff({ x: (VW - w * sc) / 2, y: (VH - h * sc) / 2 })
+    }
+  }
+
+  const applyZoom = (next: number): void => {
+    const z = Math.min(4, Math.max(1, next))
+    if (!nat) {
+      setZoom(z)
+      return
+    }
+    const sc = baseScale * z
+    // 以视口中心为锚点缩放：先把当前中心对应的图片点算出来，再让它缩放后仍落在中心
+    const cx = (VW / 2 - off.x) / scale
+    const cy = (VH / 2 - off.y) / scale
+    setZoom(z)
+    setOff(clampOff(VW / 2 - cx * sc, VH / 2 - cy * sc, sc))
+  }
+
+  const currentCrop = (): CropRect | undefined => {
+    if (!nat) return undefined
+    const sw = VW / scale
+    const sh = VH / scale
+    return normalizeCrop({ x: -off.x / scale / nat.w, y: -off.y / scale / nat.h, w: sw / nat.w, h: sh / nat.h })
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onCancel}>
+      <div
+        className="w-[380px] max-w-full rounded-2xl border border-border bg-elev1 p-4 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-2 flex items-center gap-2">
+          <span className="text-sm font-semibold text-text">框选立绘</span>
+          <span className="truncate text-xs text-faint">{charName(char)}</span>
+        </div>
+        <p className="mb-2 text-[11px] leading-relaxed text-faint">
+          框里就是卡片上会显示的区域（与格子图片区同比例）。拖动图片平移，滚轮或 +/− 缩放，确认后写入这一格。
+        </p>
+        <div
+          className="relative mx-auto overflow-hidden rounded-lg border border-border bg-elev2"
+          style={{ width: VW, height: VH, cursor: dragRef.current ? 'grabbing' : 'grab', touchAction: 'none' }}
+          onPointerDown={(e) => {
+            if (!nat) return
+            e.currentTarget.setPointerCapture(e.pointerId)
+            dragRef.current = { px: e.clientX, py: e.clientY, ox: off.x, oy: off.y }
+          }}
+          onPointerMove={(e) => {
+            const d = dragRef.current
+            if (!d) return
+            setOff(clampOff(d.ox + (e.clientX - d.px), d.oy + (e.clientY - d.py), scale))
+          }}
+          onPointerUp={(e) => {
+            dragRef.current = null
+            try {
+              e.currentTarget.releasePointerCapture(e.pointerId)
+            } catch {
+              /* ignore */
+            }
+          }}
+          onWheel={(e) => {
+            e.preventDefault()
+            applyZoom(zoom * (e.deltaY < 0 ? 1.12 : 1 / 1.12))
+          }}
+        >
+          {/* 只放一层图片：尺寸 = 原图 × 缩放，位置 = 偏移。与导出用的是同一个源矩形 */}
+          <img
+            src={imgUrl(url)}
+            alt=""
+            draggable={false}
+            onLoad={onImgLoad}
+            className="absolute max-w-none select-none"
+            style={
+              nat
+                ? { width: nat.w * scale, height: nat.h * scale, left: off.x, top: off.y }
+                : { width: VW, height: VH, left: 0, top: 0, opacity: 0 }
+            }
+          />
+          {!nat ? (
+            <div className="absolute inset-0 flex items-center justify-center text-xs text-faint">立绘加载中…</div>
+          ) : null}
+        </div>
+        <div className="mt-3 flex items-center gap-2">
+          <Button size="sm" variant="outline" onClick={() => applyZoom(zoom / 1.25)}>
+            −
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => applyZoom(zoom * 1.25)}>
+            ＋
+          </Button>
+          <span className="text-[11px] text-faint">{Math.round(zoom * 100)}%</span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              if (!nat) return
+              const sc = Math.max(VW / nat.w, VH / nat.h)
+              setZoom(1)
+              setOff({ x: (VW - nat.w * sc) / 2, y: (VH - nat.h * sc) / 2 })
+            }}
+          >
+            重置取景
+          </Button>
+          <span className="ml-auto flex gap-2">
+            <Button size="sm" variant="outline" onClick={onCancel}>
+              取消
+            </Button>
+            <Button size="sm" onClick={() => onConfirm(currentCrop())} disabled={!nat}>
+              确认
+            </Button>
+          </span>
+        </div>
+        <div className="mt-2 flex justify-between text-[11px]">
+          <button className="text-faint hover:text-text" onClick={() => onConfirm(undefined)}>
+            恢复「完整显示」（不裁切）
+          </button>
+          <span className="text-faint">取景框比例 {aspect.toFixed(2)} : 1</span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ---------------- 页面 ----------------
 
 export function CharacterGridPage() {
   const navigate = useNavigate()
   const [state, setState] = useState<GridState>(() => loadState())
   const { cols, rows, cells } = state
+  /*
+   * `state.fit` 仍然保留（老缓存里可能存着 'cover'），但界面上不再有全局开关：
+   * v0.3.4 起「铺满裁剪」由**每格的取景框**（CellChar.crop）代替，
+   * 用户没框选过的格子一律按「完整显示」画。保留字段是为了「老盘面 refresh 后仍然是它当初的样子」，
+   * 同时也让 exportPng 里的 drawImageFit 仍能接受它。
+   */
   const fit = state.fit
 
   /**
-   * 切换立绘填充方式（完整显示 / 铺满裁剪）。
+   * 取景框编辑（v0.3.4）。
    *
-   * 为什么要做一个开关而不是直接改掉：用户报的是「立绘展示不完全」，
-   * 所以**默认**必须改成「完整显示」；但 cover（铺满裁剪）本身不是 bug ——
-   * 它让格子更满、更像一张海报，有人就是喜欢那种。删掉它等于用一个新毛病换掉旧毛病，
-   * 所以做成两档可切，并且预览与导出都读 state.fit 这一份值（切换后两边同时变）。
+   * 用户要求：「将剪裁铺面改为单独选择展示图片的那个区域 —— 从角色列表中打开立绘图片，
+   * 出现一个对应格子封面区域大小的框选区，确认后展示在卡片上，框选时可缩小/放大图片」。
+   * 所以：把原来的全局「铺满裁剪」档换成**每个格子单独取景**：
+   * 打开时视口比例 = 该盘面下格子图片区的比例（所见即所得），确认后写进这一格角色的 `crop`。
    */
-  const setFit = useCallback((v: FitMode): void => {
-    setState((s) => (s.fit === v ? s : { ...s, fit: v }))
+  const [cropPos, setCropPos] = useState<Pos | null>(null)
+  const cropChar = cropPos ? (cells[cropPos.r]?.[cropPos.c]?.char ?? null) : null
+  /** 打开某一格的取景框弹窗（框选立绘） */
+  const onCrop = useCallback((r: number, c: number): void => {
+    setCropPos({ r, c })
   }, [])
+  const applyCrop = useCallback(
+    (r: number, c: number, crop: CropRect | undefined): void => {
+      setState((s) => {
+        const rows2 = s.cells.map((row, ri) =>
+          row.map((cell, ci) => {
+            if (ri !== r || ci !== c || !cell.char) return cell
+            const next: CellChar = { ...cell.char }
+            if (crop) next.crop = crop
+            else delete next.crop
+            return { ...cell, char: next }
+          })
+        )
+        return { ...s, cells: rows2 }
+      })
+    },
+    []
+  )
+  /** 该角色在盘面上的第一个位置（角色列表里的「框选」按钮据此定位；不在盘上就返回 null） */
+  const findCharCell = useCallback(
+    (id: number): Pos | null => {
+      for (let r = 0; r < cells.length; r++) {
+        for (let c = 0; c < (cells[r]?.length ?? 0); c++) {
+          if (cells[r][c]?.char?.id === id) return { r, c }
+        }
+      }
+      return null
+    },
+    [cells]
+  )
+
+  /** 当前盘面的格子图片区比例（取景框与它同比例 → 框里看到的就是卡片上的） */
+  const imgAspect = useMemo(() => {
+    const m = gridMetrics(cols, rows)
+    return m.imgW / m.imgH
+  }, [cols, rows])
 
   // 作品搜索
   const [keyword, setKeyword] = useState('')
@@ -1403,18 +1698,49 @@ export function CharacterGridPage() {
           {chars.length > 0 ? (
             <div className="max-h-[420px] overflow-y-auto">
               <div className="grid grid-cols-3 gap-2">
-                {chars.map((ch) => (
-                  <button
-                    key={ch.id}
-                    title={ch.name}
-                    onClick={() => placeCharacter(ch)}
-                    className="flex flex-col items-center gap-1 rounded-lg border border-border bg-elev1 p-1.5 transition-colors hover:border-accent"
-                  >
-                    <CoverImage src={pickImage(ch.images, 'medium')} className="h-20 w-full" rounded="rounded-md" />
-                    <span className="w-full truncate text-[11px]">{charName(ch)}</span>
-                    <span className="w-full truncate text-[10px] text-faint">{ch.relation || '—'}</span>
-                  </button>
-                ))}
+                {chars.map((ch) => {
+                  /*
+                   * 角色列表里的「框选」入口（v0.3.4）。
+                   * 用户的用法就是「从角色列表里打开立绘 → 框选 → 卡片上展示」，
+                   * 所以：已经在盘面上的角色 → 直接打开它所在那一格的取景框；
+                   * 还没上盘面的 → 先装进当前选中的格子，再立刻打开取景框（一步到位，不用先点一次再去找按钮）。
+                   */
+                  const onBoard = findCharCell(ch.id)
+                  return (
+                    <div
+                      key={ch.id}
+                      className="relative rounded-lg border border-border bg-elev1 transition-colors hover:border-accent"
+                    >
+                      <button
+                        title={ch.name}
+                        onClick={() => placeCharacter(ch)}
+                        className="flex w-full flex-col items-center gap-1 p-1.5"
+                      >
+                        <CoverImage src={pickImage(ch.images, 'medium')} className="h-20 w-full" rounded="rounded-md" />
+                        <span className="w-full truncate text-[11px]">{charName(ch)}</span>
+                        <span className="w-full truncate text-[10px] text-faint">{ch.relation || '—'}</span>
+                      </button>
+                      <button
+                        title={
+                          onBoard
+                            ? '框选这张立绘（放大 / 缩小 / 拖动，确认后这一格按框内显示）'
+                            : '装进当前选中的格子并框选立绘'
+                        }
+                        onClick={() => {
+                          if (onBoard) {
+                            onCrop(onBoard.r, onBoard.c)
+                            return
+                          }
+                          placeCharacter(ch)
+                          onCrop(target.r, target.c)
+                        }}
+                        className="absolute right-1 top-1 rounded bg-black/55 p-0.5 text-white transition-colors hover:bg-black/80"
+                      >
+                        <Crop size={12} />
+                      </button>
+                    </div>
+                  )
+                })}
               </div>
             </div>
           ) : (
@@ -1471,37 +1797,15 @@ export function CharacterGridPage() {
             </span>
 
             {/*
-              立绘填充方式（v0.3.4 新增，默认「完整显示」）。
-              默认值的理由就是用户的诉求本身：图区 138×134 近正方形、立绘 2434×3466 竖长，
-              cover 只能保住 68% 的高度，上下被裁掉三分之一 —— 用户看到的「展示不完全」正是它。
-              「铺满裁剪」作为旧行为保留（有人就想要铺满的观感），切换后预览与导出同时生效。
+              立绘取景（v0.3.4）。
+              原先这里是一个全局的「完整显示 / 铺满裁剪」两档开关；用户要求把它换成
+              **每张立绘单独框选**：点格子里的「框选」按钮（或角色列表里的同名按钮）打开框选弹窗，
+              框的比例就是格子图片区的比例，可以放大/缩小/拖动，确认后这一格就按框内显示。
+              取景框跟着格子一起存进 localStorage（`CellChar.crop`）。
             */}
             <span className="flex items-center gap-1 text-[11px] text-dim">
-              立绘
-              <span className="flex rounded-lg border border-border bg-elev1 p-0.5">
-                {(
-                  [
-                    [
-                      'contain',
-                      '完整显示',
-                      '整张立绘等比缩进图区、不裁切；两侧空白用同一张立绘的模糊压暗版填满（默认）'
-                    ],
-                    ['cover', '铺满裁剪', '按短边铺满图区再裁掉超出部分（旧行为）：格子更满，但竖长立绘会被切掉上下']
-                  ] as const
-                ).map(([v, label, hint]) => (
-                  <button
-                    key={v}
-                    type="button"
-                    title={hint}
-                    onClick={() => setFit(v)}
-                    className={`rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors ${
-                      fit === v ? 'bg-accent text-white' : 'text-dim hover:text-text'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </span>
+              立绘默认「完整显示」（不裁切，空白用模糊同图填充）
+              <span className="text-faint">· 需要更满的构图就用格子右下角的「框选」按钮单独调</span>
             </span>
 
             <span className="ml-auto flex items-center gap-2">
@@ -1595,15 +1899,33 @@ export function CharacterGridPage() {
                     )}
 
                     <div className="relative min-h-0 flex-1 overflow-hidden rounded-md bg-elev2">
-                      {cell.char ? (
+                      {cell.char && cell.char.crop && art ? (
+                        /*
+                          有取景框：直接按「源矩形 → 容器」精确映射画一层图（v0.3.4）。
+                          百分比定位与导出侧 drawImage(img, sx, sy, sw, sh, …) 是同一个源区域：
+                          宽度放大 1/w、高度放大 1/h，左上角偏移 -x/w、-y/h（都相对容器尺寸取百分比），
+                          所以预览看到的与导出图**逐像素对应**，不需要 object-fit 参与。
+                        */
+                        <img
+                          src={imgUrl(art)}
+                          alt={charName(cell.char)}
+                          draggable={false}
+                          className="absolute max-w-none select-none"
+                          style={{
+                            left: `${(-cell.char.crop.x / cell.char.crop.w) * 100}%`,
+                            top: `${(-cell.char.crop.y / cell.char.crop.h) * 100}%`,
+                            width: `${(1 / cell.char.crop.w) * 100}%`,
+                            height: `${(1 / cell.char.crop.h) * 100}%`
+                          }}
+                        />
+                      ) : cell.char ? (
                         <>
                           {/*
                             完整显示时的底：**同一张**立绘 cover 铺满 + 模糊压暗，把 contain 让出来的空白填掉。
                             参数（EX.BACKDROP_FILTER / BACKDROP_PAD）与导出画布里的 drawBackdrop 是同一份，
                             连「向外扩一圈再模糊」这个细节都一样：不扩，模糊的羽化边会在四边泛出一圈亮边。
-                            切到「铺满裁剪」时这一层不画 —— 那时立绘自己就把图区填满了。
                           */}
-                          {fit === 'contain' && art ? (
+                          {art ? (
                             <div
                               aria-hidden
                               className="absolute"
@@ -1628,7 +1950,7 @@ export function CharacterGridPage() {
                             src={art}
                             alt={charName(cell.char)}
                             rounded="rounded-md"
-                            className={`relative h-full w-full ${fit === 'contain' ? 'object-contain!' : ''}`}
+                            className="relative h-full w-full object-contain!"
                           />
                         </>
                       ) : (
@@ -1642,6 +1964,21 @@ export function CharacterGridPage() {
                       ) : null}
                       {isSwapFrom ? (
                         <span className="absolute bottom-1 left-1 rounded bg-warn px-1 text-[9px] text-white">起点</span>
+                      ) : null}
+                      {cell.char ? (
+                        <button
+                          title="框选这一格的立绘（放大/缩小/拖动，确认后按框内显示）"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            onCrop(r, c)
+                          }}
+                          /* 与「清空」并排：选中格常显、其余悬停出现 */
+                          className={`absolute bottom-1 right-7 rounded bg-black/55 p-0.5 text-white transition-opacity ${
+                            isTarget && !swapFrom ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                          }`}
+                        >
+                          <Crop size={12} />
+                        </button>
                       ) : null}
                       {cell.char ? (
                         <button
@@ -1682,14 +2019,30 @@ export function CharacterGridPage() {
             导出为 2 倍图 PNG，单格画「标签 + 立绘 + 名字」，右上角写制作人，页脚写实际用到的数据源；
             立绘由主进程取回并转成 data URL 后再画进画布（避免自定义协议污染画布导致导出失败）。
             立绘默认按**完整显示**画：整张等比缩进图区不裁切（竖长立绘按高度贴合、两侧空白用同一张立绘的
-            模糊压暗版填满），想看铺满的效果可以切「立绘：铺满裁剪」，两档都由预览与导出共用同一套几何与绘制函数。
+            模糊压暗版填满）；想换成「铺满构图」就用格子右下角（或角色列表右上角）的
+            <span className="text-dim">「框选」</span>按钮单独取景 —— 框选里放大/缩小/拖动，
+            确认后只影响这一格，预览与导出共用同一个源矩形，不会两边不一致。
             画布开着高质量重采样，并且**源图比目标框小时按 1:1 设备像素居中绘制、不放大**
-            （放大只会更糊；注意这一条只作用于「铺满裁剪」，完整显示必须和 CSS 的 object-fit: contain 一致）。
+            （放大只会更糊；这一条作用于「完整显示」的取景）。
             9 宫格的单格也特意收紧，格子越小立绘被放大的倍数越小，越清晰。
-            盘面与标签、制作人、数据源、立绘填充方式都会存到本地，刷新不丢。
+            盘面与标签、制作人、数据源、每格的取景框都会存到本地，刷新不丢。
           </p>
         </section>
       </div>
+
+      {/* 取景框弹窗（v0.3.4）：比例跟着当前盘面的格子图片区走 */}
+      {cropPos && cropChar ? (
+        <CropDialog
+          char={cropChar}
+          aspect={imgAspect}
+          onCancel={() => setCropPos(null)}
+          onConfirm={(crop) => {
+            applyCrop(cropPos.r, cropPos.c, crop)
+            setCropPos(null)
+            toast.success(crop ? '已按框选取景' : '已恢复完整显示')
+          }}
+        />
+      ) : null}
     </div>
   )
 }
