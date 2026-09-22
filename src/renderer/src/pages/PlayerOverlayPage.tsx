@@ -275,10 +275,36 @@ export default function PlayerOverlay(): React.ReactElement {
     api.overlay.action(action)
   }, [])
 
+  /**
+   * v0.3.2：uosc 接管控制栏后，这个悬浮窗**必须一直是点击穿透的**。
+   *
+   * 原因（实测，不是推测）：这个悬浮窗是覆盖整个播放器窗口的独立顶层窗口。
+   * 只要它一旦变成「接收点击」（`setIgnoreMouseEvents(false)`），
+   * `WindowFromPoint` 在视频区域命中的就是它（`Chrome_RenderWidgetHostHWND`），
+   * 而**不是** mpv 的原生子窗口 —— 于是 mpv 收不到任何鼠标移动，
+   * uosc 永远等不到「鼠标动了」这个唤出条件。用户看到的现象就是：
+   * 「旧控制栏还在、新的 uosc 控制栏呼不出来、点哪儿都没反应」。
+   *
+   * 所以 uosc 模式下只有「真的需要点的东西」（应用自己的详情/选集/弹幕菜单浮层）
+   * 才临时打开交互，其余时间一律穿透，把鼠标让给 mpv。
+   * `poke` 的依赖数组是空的，所以这里用 ref 读取最新的 uosc 状态，避免闭包拿到旧值。
+   */
+  const uoscBarRef = useRef(false)
+  useEffect(() => {
+    uoscBarRef.current = state?.uoscBar === true
+    /*
+     * 刚进播放器时，悬浮窗会在「窗口显示」事件里先 poke 一次（那时还不知道已经交给 uosc），
+     * 于是短暂申请过交互。这里一旦确认 uosc 接管、且没有浮层要点，就**立刻把鼠标还给 mpv**，
+     * 不让用户等那 5 秒的自动隐藏计时。
+     */
+    if (state?.uoscBar === true && !holdRef.current) void api.overlay.setInteractive(false)
+  }, [state?.uoscBar])
+
   /** 唤出控制栏：显示 + 接收鼠标事件；空闲 5 秒后隐藏 + 恢复点击穿透 */
   const poke = useCallback(() => {
     setVisible(true)
-    void api.overlay.setInteractive(true)
+    // uosc 模式下不申请交互：控制栏由 mpv 画，鼠标必须留给它
+    if (!uoscBarRef.current) void api.overlay.setInteractive(true)
     window.clearTimeout(hideTimer.current)
     hideTimer.current = window.setTimeout(() => {
       if (holdRef.current) return
@@ -332,11 +358,18 @@ export default function PlayerOverlay(): React.ReactElement {
       showInfo || subMenu || aspectMenu || danmakuMenu || showInfoPanel || state?.showEpisodes === true
     if (holdRef.current) {
       setVisible(true)
+      // 浮层是需要点的东西 → 临时接收鼠标（uosc 的控制栏此刻被浮层挡着，不影响）
       void api.overlay.setInteractive(true)
     } else {
       poke()
     }
-  }, [showInfo, subMenu, aspectMenu, poke])
+    /*
+     * v0.3.2：依赖数组补全。以前只盯着「应用自己的三个本地菜单」，漏了
+     * `danmakuMenu`、`showInfoPanel`（番剧详情）与 `state.showEpisodes`（选集）——
+     * 后三个是从 uosc 菜单/桥接脚本回传过来的，依赖不全时这个 effect 不会重跑，
+     * 于是浮层弹出来了却**没有申请交互**，点上去毫无反应（用户报的「点了没反应」）。
+     */
+  }, [showInfo, subMenu, aspectMenu, danmakuMenu, showInfoPanel, state?.showEpisodes, poke])
 
   useEffect(() => api.overlay.onState(setState), [])
   // 透明窗口：给根元素打标记，让全局样式把底色设为透明（否则会盖住整屏画面）
@@ -360,9 +393,12 @@ export default function PlayerOverlay(): React.ReactElement {
    * 回到前台后如果用户**不移动鼠标直接点**，就收不到 mousemove、交互状态也不会恢复 ——
    * 表现为控制栏看得见、点不动。这里在控制栏可见期间每 1.5 秒幂等地重申一次
    * 「我在接收点击」，保证窗口的系统级状态始终与界面状态一致。
+   *
+   * v0.3.2：uosc 接管时不心跳 —— 那时控制栏由 mpv 画，悬浮窗每 1.5 秒申请一次交互
+   * 会把它变成「接收点击」的窗口，从而抢走 mpv 的鼠标（见 poke 上方的长注释）。
    */
   useEffect(() => {
-    if (!visible) return
+    if (!visible || uoscBar) return
     const t = window.setInterval(() => {
       void api.overlay.setInteractive(true)
     }, 1500)
@@ -371,7 +407,7 @@ export default function PlayerOverlay(): React.ReactElement {
       // 控制栏收起时归还点击穿透，避免透明窗口挡住画面上的其它操作
       void api.overlay.setInteractive(false)
     }
-  }, [visible])
+  }, [visible, uoscBar])
   useEffect(() => {
     // 点击穿透时 mousemove 依然会转发到本窗口，因此可以自行感知鼠标移动
     const onMove = (): void => poke()

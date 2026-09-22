@@ -19,11 +19,33 @@ import type {
   SubjectDetail,
   SubjectResult
 } from '@shared/types'
-import { monthsOfSeason, seasonIndexOfMonth } from '@shared/season'
+import { monthsOfSeason, seasonIndexOfMonth, seasonOfDate } from '@shared/season'
 import { log } from '../log'
 import { BROWSER_UA, buildProxyAgents, getSettings } from '../net'
 import { store } from '../store'
 import { parseCalendar, parseRatingOnly, parseSearchPage, parseSubjectPage } from './bangumiHtml'
+import {
+  anilistSearchAnime,
+  anilistSeasonAnime,
+  jikanAnimeById,
+  jikanAnimeSearch,
+  jikanBackoffRemainMs,
+  jikanSeason,
+  jikanSeasonNow,
+  jikanTopAiring,
+  mergeJikanAnime,
+  type JikanAnime
+} from './jikan'
+import {
+  isAiringNow,
+  jikanToCalendarDays,
+  jikanToSearchItem,
+  jikanToSeasonItem,
+  jikanToSubjectDetail,
+  malIdFromFallbackId,
+  withJikanFallback,
+  type JikanFallbackMeta
+} from './jikanMap'
 import { offscreenGet } from './offscreenFetch'
 
 const TTL_CALENDAR = 30 * 60 * 1000
@@ -72,6 +94,48 @@ const REQUEST_TIMEOUT = 12000
 const MAX_PROXY_CONCURRENCY = 2
 let proxyInFlight = 0
 const proxyQueue: (() => void)[] = []
+
+/**
+ * Jikan 兜底的缓存（v0.3.2 新增）。
+ *
+ * ⚠️ **兜底数据绝不写进上面那些 bangumi 缓存键**（`calendar` / `search-*` / `season-*` / `subject*`）。
+ *
+ * 为什么必须分开：主缓存是「反代恢复后照旧可用」的那一份。如果把 Jikan 的数据写进 `calendar`，
+ * 反代恢复之后进程读到的仍是 MAL 的番剧表（30 分钟 TTL 内都翻不了身），
+ * 界面上还会以为这是 Bangumi 的数据 —— 表现为「反代明明好了，番剧表还是不对」。
+ * 所以兜底走**独立的 `jikan-*` 键**，而且只有「主数据源全挂」时才会被读到：
+ * 主数据源一恢复，正常路径就把自己的键覆盖回 Bangumi 数据，`jikan-*` 只是自然过期。
+ *
+ * TTL 的取法：番剧表/季度列表/搜索都取「短」——
+ * 反代挂了是**临时状态**，用户多半几分钟内就会修好（换镜像、开代理），
+ * 兜底数据只用来撑过这段时间，没必要长期留着（也避免它被误当成正式数据）。
+ */
+const TTL_JIKAN_CALENDAR = 15 * 60 * 1000
+const TTL_JIKAN_SEASON = 6 * 3600 * 1000
+const TTL_JIKAN_SEARCH = 10 * 60 * 1000
+const TTL_JIKAN_SUBJECT = 30 * 24 * 3600 * 1000
+
+/** 兜底搜索给 AniList 命中的**前几条**补一次 MAL 详情（见 jikanSearchFallback 的说明） */
+const JIKAN_SEARCH_ENRICH_MAX = 3
+
+/** 兜底取数的返回：`meta.reason` 在失败时说明「为什么没兜到」，成功时为空串 */
+interface FallbackOutcome<T> {
+  value: T
+  meta: JikanFallbackMeta
+}
+
+/**
+ * 兜底也失败时，把原因**并进原来的错误信息**。
+ *
+ * 为什么要并：用户拿到的是界面上的那句错误（以及日志）。如果只写「所有 bangumi 镜像均不可访问」，
+ * 他无从判断「兜底到底试没试、为什么没兜到」——而这两件事决定了下一步该做什么
+ * （是去换镜像，还是等 Jikan 上游恢复）。所以把兜底用过的端点与最终原因直接附在后面。
+ */
+function appendFallbackFailure(error: SourceError, meta: JikanFallbackMeta): void {
+  if (!meta.reason) return
+  error.message = `${error.message}；Jikan 兜底也失败：${meta.reason}`
+  if (meta.endpoints?.length) error.tried = [...error.tried, ...meta.endpoints]
+}
 
 interface CacheEntry<T> {
   fetchedAt: number
@@ -636,6 +700,254 @@ class BangumiService {
     })
   }
 
+  // ---------------- Jikan 兜底（v0.3.2） ----------------
+
+  /**
+   * 兜底搜索：主数据源（自建反代 / 全部镜像）**全部失败**后才调用。
+   *
+   * 尝试顺序（每一步失败都记进 reason，最终写进日志与 `dataSource.reason`）：
+   *   ① Jikan `/anime?q=`：它就是 MAL 自己的搜索，中文标题命中率最好；
+   *      但实测当前大面积 504（Jikan 连不上 MAL 上游），所以必须有下一条；
+   *   ② AniList GraphQL 搜索（带 `idMal`）：兜底的主力；
+   *   ③ 用 Jikan `/anime/{id}/full` 给**前 3 条**补细节（拿 MAL 的中文标题）。
+   *
+   * 为什么只给前 3 条补：`/anime/{id}` 每调用一次就占 60 次/分钟里的一格，
+   * 24 条全补会把一次兜底搜索的配额吃光（后面的翻页/别的兜底就没配额了）。
+   * 而 AniList 自己的响应里已经有名称/封面/评分/放送日/简介，**列表本身不缺字段**，
+   * 补细节的唯一价值是 MAL 偶尔带的中文标题，所以只对最可能被点开的前几条做。
+   *
+   * ⚠️ 兜底结果**不写主缓存键**（`search-*`），只写 `jikan-search-*`（见文件上方 TTL 注释）。
+   */
+  private async jikanSearchFallback(keyword: string): Promise<FallbackOutcome<SearchResultItem[]>> {
+    const t0 = Date.now()
+    const endpoints: string[] = []
+    const reasons: string[] = []
+    const kw = String(keyword ?? '').trim()
+    const cacheKey = `jikan-search-${createHash('md5').update(kw).digest('hex')}`
+    const cached = this.readCache<SearchResultItem[]>(cacheKey)
+    if (cached && Date.now() - cached.fetchedAt < TTL_JIKAN_SEARCH) {
+      log.append('info', 'bangumi', `搜索兜底：命中 Jikan 兜底缓存（${cached.data.length} 条，键 ${cacheKey}）`)
+      return { value: cached.data, meta: { source: 'jikan', endpoints: [`cache:${cacheKey}`], ms: 0 } }
+    }
+
+    // ① Jikan /anime?q=
+    if (jikanBackoffRemainMs() > 2000) {
+      /*
+       * Jikan 正在 429 退避：**跳过这一档**，直接去 AniList。
+       * 为什么要跳过而不是等：退避是全局的（最长 15 秒），
+       * 而兜底本身就是为了「界面还能用」——让用户盯着转圈等十几秒再去问 AniList 是本末倒置。
+       * 服务端已经明确说了「别来」，我们不发请求也是遵守限流的一部分。
+       */
+      const secs = Math.round(jikanBackoffRemainMs() / 1000)
+      reasons.push(`Jikan 正在限流退避（剩余约 ${secs}s），本次跳过 Jikan 搜索`)
+      log.append('warn', 'bangumi', `搜索兜底：Jikan 正在限流退避（剩余约 ${secs}s），跳过 Jikan 直接用 AniList（关键词「${kw}」）`)
+    } else {
+      const viaJikan = await jikanAnimeSearch(kw, 24)
+      endpoints.push(viaJikan.endpoint)
+      if (viaJikan.items.length > 0) {
+        const items = viaJikan.items.map((a) => jikanToSearchItem(a))
+        this.writeCache(cacheKey, items)
+        const ms = Date.now() - t0
+        log.append(
+          'info',
+          'bangumi',
+          `搜索兜底成功：Jikan ${viaJikan.endpoint} → ${items.length} 条，耗时 ${ms}ms（关键词「${kw}」）`
+        )
+        return { value: items, meta: { source: 'jikan', endpoints, ms } }
+      }
+      reasons.push(`Jikan ${viaJikan.endpoint} → ${viaJikan.reason || '没有匹配结果'}`)
+    }
+
+    // ② AniList 搜索
+    const viaAniList = await anilistSearchAnime(kw, 24)
+    endpoints.push(`anilist:Page.media(search=${kw})`)
+    if (viaAniList.items.length === 0) {
+      reasons.push(`anilist:Page.media(search=${kw}) → ${viaAniList.reason || '没有匹配结果'}`)
+      const ms = Date.now() - t0
+      const reason = reasons.join('；')
+      log.append('warn', 'bangumi', `搜索兜底失败：${reason}（耗时 ${ms}ms）`)
+      return { value: [], meta: { source: 'jikan', endpoints, ms, reason } }
+    }
+    // ③ 前几条用 Jikan /full 补一次细节（拿 MAL 的中文标题）；失败不影响列表
+    const enriched: JikanAnime[] = [...viaAniList.items]
+    if (jikanBackoffRemainMs() <= 2000) {
+      for (let i = 0; i < Math.min(JIKAN_SEARCH_ENRICH_MAX, enriched.length); i++) {
+        const detail = await jikanAnimeById(enriched[i].malId)
+        if (detail.item) enriched[i] = mergeJikanAnime(enriched[i], detail.item)
+      }
+    }
+    const items = enriched.map((a) => jikanToSearchItem(a))
+    this.writeCache(cacheKey, items)
+    const ms = Date.now() - t0
+    log.append(
+      'info',
+      'bangumi',
+      `搜索兜底成功：anilist → ${items.length} 条（前 ${Math.min(JIKAN_SEARCH_ENRICH_MAX, enriched.length)} 条尝试用 Jikan 补过细节），耗时 ${ms}ms（关键词「${kw}」）`
+    )
+    return { value: items, meta: { source: 'jikan', endpoints, ms } }
+  }
+
+  /**
+   * 兜底番剧表（每周放送）：主数据源全部失败后才调用。
+   *
+   * 端点顺序：Jikan `/seasons/now` → Jikan `/top/anime?filter=airing` → AniList 当季。
+   *
+   * 为什么最后要挂 AniList：用户要的是「反代挂了也能看到番剧表」，
+   * 而 Jikan 的两个季节/榜单端点实测**都是 504**，只挂 Jikan 等于这个功能不存在。
+   * AniList 的季节检索实测 200，且带 `nextAiringEpisode.airingAt` ——
+   * 把这条时间戳换算成 JST 星期，正好补上「Jikan 不给星期几」这个最大缺口
+   * （见 jikanMap.jikanToCalendarDays 的三级取舍）。
+   */
+  private async jikanCalendarFallback(): Promise<FallbackOutcome<CalendarDay[]>> {
+    const t0 = Date.now()
+    const endpoints: string[] = []
+    const reasons: string[] = []
+    const cached = this.readCache<CalendarDay[]>('jikan-calendar')
+    if (cached && Date.now() - cached.fetchedAt < TTL_JIKAN_CALENDAR) {
+      const count = cached.data.reduce((n, d) => n + d.items.length, 0)
+      log.append('info', 'bangumi', `番剧表兜底：命中 Jikan 兜底缓存（${count} 条，键 jikan-calendar）`)
+      return { value: cached.data, meta: { source: 'jikan', endpoints: ['cache:jikan-calendar'], ms: 0 } }
+    }
+
+    let items: JikanAnime[] = []
+    // Jikan 正在 429 退避时跳过两个 Jikan 端点（理由同 jikanSearchFallback 里的说明）
+    const skipJikan = jikanBackoffRemainMs() > 2000
+    if (skipJikan) {
+      const secs = Math.round(jikanBackoffRemainMs() / 1000)
+      reasons.push(`Jikan 正在限流退避（剩余约 ${secs}s），本次跳过 Jikan 的季节/榜单端点`)
+      log.append('warn', 'bangumi', `番剧表兜底：Jikan 正在限流退避（剩余约 ${secs}s），直接走 AniList`)
+    } else {
+      const seasonsNow = await jikanSeasonNow(25)
+      endpoints.push(seasonsNow.endpoint)
+      items = seasonsNow.items.filter((a) => isAiringNow(a))
+      if (items.length === 0) reasons.push(`Jikan ${seasonsNow.endpoint} → ${seasonsNow.reason || '没有在播条目'}`)
+    }
+
+    if (items.length === 0 && !skipJikan) {
+      const top = await jikanTopAiring(25)
+      endpoints.push(top.endpoint)
+      items = top.items.filter((a) => isAiringNow(a))
+      if (items.length === 0) reasons.push(`Jikan ${top.endpoint} → ${top.reason || '没有在播条目'}`)
+    }
+
+    if (items.length === 0) {
+      const { year, season } = seasonOfDate()
+      const alt = await anilistSeasonAnime(year, season, 25)
+      endpoints.push(alt.endpoint)
+      items = alt.items.filter((a) => isAiringNow(a))
+      if (items.length === 0) reasons.push(`${alt.endpoint} → ${alt.reason || '没有在播条目'}`)
+    }
+
+    if (items.length === 0) {
+      const ms = Date.now() - t0
+      const reason = reasons.join('；') || '兜底数据源没有可用端点'
+      log.append('warn', 'bangumi', `番剧表兜底失败：${reason}（耗时 ${ms}ms）`)
+      return { value: [], meta: { source: 'jikan', endpoints, ms, reason } }
+    }
+
+    const days = jikanToCalendarDays(items)
+    this.writeCache('jikan-calendar', days)
+    const count = days.reduce((n, d) => n + d.items.length, 0)
+    const ms = Date.now() - t0
+    log.append(
+      'info',
+      'bangumi',
+      `番剧表兜底成功：${endpoints[endpoints.length - 1]} → ${count} 条（按星期分组，耗时 ${ms}ms；端点链 ${endpoints.join(' → ')}）`
+    )
+    return { value: days, meta: { source: 'jikan', endpoints, ms } }
+  }
+
+  /**
+   * 兜底季度列表：主数据源全部失败后才调用。
+   * 端点顺序：Jikan `/seasons/{year}/{season}` → AniList `season + seasonYear`。
+   *
+   * 同样绝不写主缓存键 `season-<年>-<季度>`（否则反代恢复后仍显示 MAL 的条目）。
+   */
+  private async jikanSeasonFallback(year: number, season: number): Promise<FallbackOutcome<SeasonItem[]>> {
+    const t0 = Date.now()
+    const endpoints: string[] = []
+    const reasons: string[] = []
+    const cacheKey = `jikan-season-${year}-${season}`
+    const cached = this.readCache<SeasonItem[]>(cacheKey)
+    if (cached && Date.now() - cached.fetchedAt < TTL_JIKAN_SEASON) {
+      log.append('info', 'bangumi', `季度兜底：命中 Jikan 兜底缓存（${cached.data.length} 条，键 ${cacheKey}）`)
+      return { value: cached.data, meta: { source: 'jikan', endpoints: [`cache:${cacheKey}`], ms: 0 } }
+    }
+
+    let items: JikanAnime[] = []
+    // Jikan 正在 429 退避时跳过这一档（理由见 jikanSearchFallback 里的说明）
+    if (jikanBackoffRemainMs() > 2000) {
+      const secs = Math.round(jikanBackoffRemainMs() / 1000)
+      reasons.push(`Jikan 正在限流退避（剩余约 ${secs}s），本次跳过 /seasons/{year}/{season}`)
+      log.append('warn', 'bangumi', `季度兜底（${year}-Q${season}）：Jikan 正在限流退避（剩余约 ${secs}s），直接走 AniList`)
+    } else {
+      const viaJikan = await jikanSeason(year, season, 50)
+      endpoints.push(viaJikan.endpoint)
+      items = viaJikan.items
+      if (items.length === 0) reasons.push(`Jikan ${viaJikan.endpoint} → ${viaJikan.reason || '返回为空'}`)
+    }
+
+    if (items.length === 0) {
+      const alt = await anilistSeasonAnime(year, season, 25)
+      endpoints.push(alt.endpoint)
+      items = alt.items
+      if (items.length === 0) reasons.push(`${alt.endpoint} → ${alt.reason || '返回为空'}`)
+    }
+
+    if (items.length === 0) {
+      const ms = Date.now() - t0
+      const reason = reasons.join('；') || '兜底数据源没有可用端点'
+      log.append('warn', 'bangumi', `季度兜底失败（${year}-Q${season}）：${reason}（耗时 ${ms}ms）`)
+      return { value: [], meta: { source: 'jikan', endpoints, ms, reason } }
+    }
+
+    const mapped = items.map((a) => jikanToSeasonItem(a))
+    this.writeCache(cacheKey, mapped)
+    const ms = Date.now() - t0
+    log.append(
+      'info',
+      'bangumi',
+      `季度兜底成功（${year}-Q${season}）：${endpoints[endpoints.length - 1]} → ${mapped.length} 条，耗时 ${ms}ms`
+    )
+    return { value: mapped, meta: { source: 'jikan', endpoints, ms } }
+  }
+
+  /**
+   * 兜底条目详情：**只在 id 为负数（即 MAL 兜底 id）时才会走到**，见 jikanMap.jikanFallbackId。
+   *
+   * 为什么值得做：兜底番剧表/搜索/季度列表里的卡片带的是 `-MAL id`，
+   * 用户点进去如果不处理就只会看到一个「条目不存在」的错误页 —— 那兜底就等于半残。
+   * 这里用 `/anime/{id}/full` 把 MAL 详情映射成同一套 `SubjectDetail`，
+   * 页面能正常渲染（标题/封面/评分/简介/类型标签/详细信息）。
+   * 正常条目（正数 id）完全不走这条路，主数据源的行为一行没变。
+   */
+  private async subjectByMalId(malId: number): Promise<SubjectResult> {
+    const key = `jikan-subject-${malId}`
+    const cache = this.readCache<SubjectDetail>(key)
+    if (cache && Date.now() - cache.fetchedAt < TTL_JIKAN_SUBJECT) {
+      return withJikanFallback(
+        { fromCache: true, data: cache.data },
+        { source: 'jikan', endpoints: [`cache:${key}`], ms: 0 }
+      )
+    }
+    const t0 = Date.now()
+    const r = await jikanAnimeById(malId)
+    const ms = Date.now() - t0
+    if (!r.item) {
+      const reason = r.reason || 'Jikan 详情接口不可用'
+      log.append('warn', 'bangumi', `详情兜底失败（MAL #${malId}）：${r.endpoint} → ${reason}（耗时 ${ms}ms）`)
+      return {
+        fromCache: false,
+        data: null,
+        error: makeSourceError('ALL_DOWN', `Jikan 兜底详情不可用（${reason}）`, [`${r.endpoint}: ${reason}`])
+      }
+    }
+    const data = jikanToSubjectDetail(r.item)
+    this.writeCache(key, data)
+    log.append('info', 'bangumi', `详情兜底成功：Jikan ${r.endpoint} → 《${data.name_cn || data.name}》（MAL #${malId}，耗时 ${ms}ms）`)
+    return withJikanFallback({ fromCache: false, data }, { source: 'jikan', endpoints: [r.endpoint], ms })
+  }
+
   async calendar(force = false): Promise<CalendarResult> {
     const cache = this.readCache<CalendarDay[]>('calendar')
     // 会话内只请求一次：应用打开后首次加载联网更新，之后一律直接使用本地数据（除非用户手动刷新）
@@ -670,6 +982,23 @@ class BangumiService {
           ? (err as SourceError)
           : makeSourceError('NETWORK', String(err), [])
       log.append('error', 'bangumi', `获取番剧表失败: ${error.message}${error.tried.length ? `（${error.tried.join('; ')}）` : ''}`)
+      /*
+       * v0.3.2：主数据源全挂 → Jikan 兜底番剧表（带独立的 `jikan-calendar` 缓存，绝不写 `calendar` 键）。
+       * 兜底也给不出数据时，才按原来的行为退回过期缓存（带 stale 标记）/ 返回错误。
+       */
+      const fb = await this.jikanCalendarFallback()
+      if (fb.value.length > 0) {
+        /*
+         * ⚠️ 这里**故意不设置 `calendarSessionFresh`**：
+         * 那个标记是「本会话已经联网更新过、之后不再自动请求」的闸门。
+         * 兜底成功不等于主数据源恢复 —— 如果在这里置位，用户这一整个会话都不会再去试反代，
+         * 反代修好了（换镜像/开代理）也得重启应用才生效。
+         * 不置位 + `jikan-calendar` 15 分钟缓存 = 「反代一恢复就能自动切回真实数据」，
+         * 同时兜底本身也不会被反复请求（缓存兜着）。
+         */
+        return withJikanFallback({ fromCache: false, fetchedAt: Date.now(), days: fb.value }, fb.meta)
+      }
+      appendFallbackFailure(error, fb.meta)
       if (cache) {
         return { fromCache: true, stale: true, fetchedAt: cache.fetchedAt, days: cache.data, error }
       }
@@ -711,7 +1040,15 @@ class BangumiService {
           ? (err as SourceError)
           : makeSourceError('NETWORK', String(err), [])
       log.append('warn', 'bangumi', `获取季度番剧失败 (${y}-Q${season}): ${error.message}`)
-      // 过期缓存照样可用：季度条目几乎不变，宁可给旧数据也不要空弹窗
+      /*
+       * v0.3.2：主数据源全挂 → Jikan 兜底季度列表（独立键 `jikan-season-<年>-<季度>`）。
+       * 兜底失败才退回过期缓存（季度条目几乎不变，宁可给旧数据也不要空弹窗）。
+       */
+      const fb = await this.jikanSeasonFallback(y, season)
+      if (fb.value.length > 0) {
+        return withJikanFallback({ year: y, season, fromCache: false, fetchedAt: Date.now(), items: fb.value }, fb.meta)
+      }
+      appendFallbackFailure(error, fb.meta)
       if (cache) {
         return { year: y, season, fromCache: true, stale: true, fetchedAt: cache.fetchedAt, items: cache.data, error }
       }
@@ -781,6 +1118,15 @@ class BangumiService {
   }
 
   async subject(id: number): Promise<SubjectResult> {
+    /*
+     * v0.3.2：**负数 id = Jikan 兜底条目**（`-MAL id`，见 jikanMap.jikanFallbackId）。
+     *
+     * 兜底番剧表/搜索/季度列表里的卡片带的都是这种 id，点进详情页时从这里分流到 MAL 详情，
+     * 于是「反代挂了 → 兜底列表 → 点开某一部」这条链是通的（而不是一个「条目不存在」的错误页）。
+     * 正数 id（正常的 Bangumi 条目）完全不走这条路，主链路行为一行没变。
+     */
+    const fallbackMalId = malIdFromFallbackId(id)
+    if (fallbackMalId) return await this.subjectByMalId(fallbackMalId)
     /*
      * v0.2.7：缓存键加版本后缀 —— 详情映射补了 date/platform/total_episodes，
      * 沿用旧键会让用户一直看到「缺上映日期」的历史缓存。
@@ -861,15 +1207,28 @@ class BangumiService {
       const items = await this.searchRace(keyword)
       this.writeCache(key, items)
       return { items }
-    } catch (err) {
-      const error: SourceError =
-        err && typeof err === 'object' && 'kind' in err
-          ? (err as SourceError)
-          : makeSourceError('NETWORK', String(err), [])
-      log.append('warn', 'bangumi', `搜索失败 (${keyword}): ${error.message}`)
-      if (cache) return { items: cache.data }
-      return { items: [], error }
-    }
+      } catch (err) {
+        const error: SourceError =
+          err && typeof err === 'object' && 'kind' in err
+            ? (err as SourceError)
+            : makeSourceError('NETWORK', String(err), [])
+        log.append('warn', 'bangumi', `搜索失败 (${keyword}): ${error.message}`)
+        /*
+         * v0.3.2：主数据源全挂 → **Jikan 兜底**（用户的明确要求：反代失效时优先用它）。
+         *
+         * 顺序：先兜底取数，再退回过期缓存 ——
+         * 反代挂掉时缓存里的旧搜索结果最多是 30 分钟前的，而兜底能给出「现在搜得到的东西」；
+         * 两者都拿不到才把错误抛给界面（维持原来的行为）。
+         * 兜底结果**不写 `search-*` 主缓存**（见文件上方的 TTL 注释）。
+         */
+        const fb = await this.jikanSearchFallback(keyword)
+        if (fb.value.length > 0) {
+          return withJikanFallback({ items: fb.value }, fb.meta)
+        }
+        appendFallbackFailure(error, fb.meta)
+        if (cache) return { items: cache.data }
+        return { items: [], error }
+      }
   }
 
   /** 补全番剧评分（日历页不含评分，从详情页提取，7 天缓存，并发 4） */
@@ -877,6 +1236,13 @@ class BangumiService {
     const out: Record<number, { score: number | null; total: number }> = {}
     const missing: number[] = []
     for (const id of [...new Set(ids)]) {
+      /*
+       * v0.3.2：**跳过 Jikan 兜底条目**（负数 id）。
+       * 它们的评分兜底时就已经从 MAL/AniList 带回来了（见 jikanMap.toRating），
+       * 而拿负数 id 去问 bangumi 反代必然是 404 —— 白打一次请求，还可能把 404 结果写进 `rating-*` 缓存。
+       * 返回里不给这一项，渲染层会自动退回 `item.rating.score`（`ratings[id]?.score ?? item.rating?.score`）。
+       */
+      if (id <= 0) continue
       const cache = this.readCache<{ score: number | null; total: number }>(`rating-${id}`)
       if (cache && Date.now() - cache.fetchedAt < TTL_RATING) {
         out[id] = cache.data

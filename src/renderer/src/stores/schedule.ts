@@ -9,6 +9,14 @@ interface ScheduleState {
   fetchedAt: number | null
   fromCache: boolean
   stale: boolean
+  /**
+   * v0.3.2：本次番剧表是不是**备用数据源（Jikan/AniList）兜底**来的。
+   *
+   * 兜底只在主数据源（反代 + 镜像）全挂时触发，且覆盖面比主源小
+   * （AniList 的季度模型只给「当季在播」）—— 所以界面上要如实标出来，
+   * 否则用户会以为「番剧莫名其妙变少了」。
+   */
+  fallbackSource: 'jikan' | null
   selectedDay: number // 1-7
   weekOffset: number
   ratings: Record<number, { score: number | null; total: number }>
@@ -25,6 +33,7 @@ export const useSchedule = create<ScheduleState>((set, get) => ({
   fetchedAt: null,
   fromCache: false,
   stale: false,
+  fallbackSource: null,
   ratings: {},
   selectedDay: (() => {
     const d = new Date().getDay()
@@ -42,6 +51,8 @@ export const useSchedule = create<ScheduleState>((set, get) => ({
         fetchedAt: r.data.fetchedAt,
         fromCache: r.data.fromCache,
         stale: !!r.data.stale,
+        // 主进程只在「走了兜底」时才挂 dataSource，缺失即代表主数据源数据
+        fallbackSource: r.data.dataSource?.source === 'jikan' ? 'jikan' : null,
         loading: false
       })
       /*

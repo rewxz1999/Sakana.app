@@ -87,6 +87,27 @@ export interface CalendarResult {
   fetchedAt: number | null
   days: CalendarDay[]
   error?: SourceError
+  /**
+   * v0.3.2：这份数据是不是**备用数据源（Jikan/AniList）兜底**来的。
+   *
+   * 语义：字段**缺失 = 主数据源（自建反代 / 镜像）**；`source === 'jikan'` = 本次走了兜底。
+   * 兜底数据的覆盖面比主源小（AniList 的季度模型只给「当季在播」），
+   * 所以界面必须能显示出来，否则用户会以为「番剧变少了」。
+   */
+  dataSource?: JikanFallbackMeta
+}
+
+/**
+ * 备用数据源（Jikan / AniList）兜底元信息（v0.3.2）。
+ *
+ * `endpoints` 记录本次实际用到的端点链（AniList 的写成 `anilist:Page.media(...)`），
+ * `reason` 是**兜底也失败**时的原因（主源与兜底各一段），方便用户与日志一眼看出问题在哪。
+ */
+export interface JikanFallbackMeta {
+  source: 'bangumi' | 'jikan'
+  endpoints?: string[]
+  ms?: number
+  reason?: string
 }
 
 /**
@@ -118,6 +139,8 @@ export interface SeasonResult {
   fetchedAt: number | null
   items: SeasonItem[]
   error?: SourceError
+  /** v0.3.2：季度列表是否来自备用数据源兜底（见 JikanFallbackMeta） */
+  dataSource?: JikanFallbackMeta
 }
 
 export interface SubjectDetail {
@@ -143,6 +166,8 @@ export interface SubjectResult {
   /** v0.2.7 附加：命中的是**已过期**的缓存（界面可照常渲染，后台正在静默刷新） */
   stale?: boolean
   error?: SourceError
+  /** v0.3.2：详情是否来自备用数据源兜底（兜底时 `data.id` 是**负数 = -MAL id**） */
+  dataSource?: JikanFallbackMeta
 }
 
 export interface SearchResultItem {
@@ -158,6 +183,8 @@ export interface SearchResultItem {
 export interface SearchResult {
   items: SearchResultItem[]
   error?: SourceError
+  /** v0.3.2：搜索结果是否来自备用数据源兜底（见 JikanFallbackMeta） */
+  dataSource?: JikanFallbackMeta
 }
 
 /**

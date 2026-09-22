@@ -678,6 +678,199 @@ if (!gotLock) {
       }, 2500)
     }
 
+    /*
+     * 控制栏 / uosc 自检（SAKANA_UOSC_TEST=视频文件，v0.3.2）。
+     *
+     * 用户报的「老控制栏没删掉、新控制栏（uosc）呼不出来、点不了」是**窗口层级 + 鼠标命中**
+     * 的问题，光看代码看不出来，必须实测两件事：
+     *   ① 悬浮窗（旧控制栏那个透明窗）在鼠标移动后是否变成了「接收点击」——
+     *      它一旦接收点击，就整窗盖住视频，mpv/uosc 再也收不到鼠标移动，uosc 永远不出现；
+     *   ② 视频区域中心的 `WindowFromPoint` 命中的是**我们的 mpv 子窗口**还是那个悬浮窗
+     *      （native 的 hitTest 就是干这个的，返回 hitClass / isOurChild）。
+     * 自检会打印 `[uosc-test]` 行，修复前后各跑一次即可对比。
+     */
+    if (process.env.SAKANA_UOSC_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const file = process.env.SAKANA_UOSC_TEST!
+          const { overlayWindow, showOverlay, pushOverlayState, pokeOverlay, isOverlayInteractive, syncBounds } =
+            await import('./services/playerOverlay')
+          const mpv = await import('./services/mpv')
+          const { store } = await import('./store')
+
+          // uosc 接管控制栏（默认），Anime4K 关掉以免干扰
+          const cur = store.get<Record<string, unknown>>('settings', {})
+          store.set('settings', { ...cur, uoscControlBar: true, anime4k: { enabled: false } })
+
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
+          if (!win) {
+            console.log('[uosc-test] 无主窗口')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const att = mpv.mpvAttach(win, { x: 0, y: 100, width: 960, height: 480 })
+          console.log(`[uosc-test] 嵌入=${JSON.stringify(att)}`)
+          console.log(
+            `[uosc-test] 请求 uosc 控制栏=${mpv.uoscControlBarRequested()} 实际生效=${mpv.uoscControlBarActive()}` +
+              ` 桥接脚本=${mpv.uoscCtrlActive()} 插件目录=${mpv.bundledMpvConfigDir() ? '有' : '没有'}`
+          )
+          mpv.mpvPlay(file)
+          for (let i = 0; i < 6; i++) {
+            await new Promise((r) => setTimeout(r, 1000))
+            const st = mpv.mpvGetState()
+            if (st?.ready && st.length > 0 && st.time > 0) break
+          }
+
+          // 复刻播放页的行为：显示悬浮窗 + 持续推送「uosc 接管」状态
+          // （播放页每秒都会推状态；只推一次的话悬浮窗刚加载完还没订阅好，会漏掉）
+          const gen = showOverlay(win)
+          const pushState = (): void =>
+            pushOverlayState({ uoscBar: true, playing: true, title: 'uosc 自检', time: 1000, length: 8000 })
+          for (let i = 0; i < 6; i++) {
+            pushState()
+            await new Promise((r) => setTimeout(r, 500))
+          }
+          syncBounds()
+
+          const ov = overlayWindow()
+          const ovHwnd = ov && !ov.isDestroyed() ? ov.getNativeWindowHandle().readUInt32LE(0) : 0
+          const before = isOverlayInteractive()
+          console.log(`[uosc-test] 悬浮窗 gen=${gen} 可见=${ov?.isVisible()} 初始可交互=${before}`)
+          console.log(
+            `[uosc-test] 所有窗口: ${JSON.stringify(
+              BrowserWindow.getAllWindows().map((w) => ({
+                title: w.getTitle(),
+                bounds: w.getBounds(),
+                visible: w.isVisible(),
+                isOverlay: w === ov
+              }))
+            )}`
+          )
+
+          /*
+           * 模拟「鼠标在播放器上移动」：悬浮窗渲染层收到 poke 就会唤出控制栏，
+           * 这正是旧控制栏的唤出路径（也是抢走 mpv 鼠标输入的元凶）。
+           */
+          pokeOverlay()
+          await new Promise((r) => setTimeout(r, 800))
+          const after = isOverlayInteractive()
+          console.log(`[uosc-test] 模拟鼠标移动后 悬浮窗可交互=${after}（uosc 模式下**必须仍是 false**，否则 mpv 收不到鼠标）`)
+
+          // 视频区域中心点做命中测试：应当是 mpv 子窗口，而不是悬浮窗。
+          // 注意坐标单位：Electron 的 getBounds 是 DIP，WindowFromPoint 要**物理像素**，所以要乘缩放比。
+          const b = win.getBounds()
+          const sf = screen.getDisplayNearestPoint({ x: b.x + b.width / 2, y: b.y + b.height / 2 }).scaleFactor
+          const videoDip = { x: b.x + 480, y: b.y + 340 } // 传入 mpvAttach 的是 {x:0,y:100,960x480}（客户端 DIP）
+          const physX = Math.round(videoDip.x * sf)
+          const physY = Math.round(videoDip.y * sf)
+          const native = mpv.mpvDumpWindows()
+          console.log(`[uosc-test] 窗口树=${JSON.stringify(native)}`)
+          console.log(
+            `[uosc-test] 窗口句柄: ${JSON.stringify(
+              BrowserWindow.getAllWindows().map((w) => ({
+                title: w.getTitle(),
+                isOverlay: w === ov,
+                hwnd: w.getNativeWindowHandle().readUInt32LE(0)
+              }))
+            )} 缩放=${sf} 命中点(物理)=(${physX},${physY})`
+          )
+          const hit = mpv.mpvHitTest(physX, physY)
+          console.log(`[uosc-test] 屏幕点(${physX},${physY}) WindowFromPoint → ${JSON.stringify(hit)}`)
+          console.log(
+            `[uosc-test] 结论：${after ? '✗ 悬浮窗抢走了鼠标（uosc 永远呼不出来）' : '✓ 悬浮窗保持点击穿透，鼠标可到 mpv'}` +
+              `；命中 ${hit?.isOurChild ? '✓ 我们的 mpv 子窗口' : `✗ 不是 mpv 子窗口（命中 ${hit?.hitClass}）`}`
+          )
+
+          /*
+           * 进一步定位：命中到别人的渲染窗口说明有个顶层窗口压在视频上面。
+           * 用「销毁悬浮窗 → 再测 → 重建悬浮窗 → 再测」来判定命中的到底是不是悬浮窗，
+           * 这比猜 HWND 归属可靠。
+           */
+          console.log(`[uosc-test] 销毁悬浮窗前: 命中=${hit?.hitClass}(isOurChild=${hit?.isOurChild})`)
+          const { destroyOverlay } = await import('./services/playerOverlay')
+          destroyOverlay(gen)
+          await new Promise((r) => setTimeout(r, 700))
+          const hit2 = mpv.mpvHitTest(physX, physY)
+          console.log(
+            `[uosc-test] 悬浮窗已销毁: 存在=${overlayWindow() !== null} 命中=${hit2?.hitClass}` +
+              `(isOurChild=${hit2?.isOurChild}, root=${hit2?.hitChain?.[hit2.hitChain.length - 1] ?? '-'})`
+          )
+          showOverlay(win)
+          for (let i = 0; i < 3; i++) {
+            pushState()
+            await new Promise((r) => setTimeout(r, 400))
+          }
+          syncBounds()
+          const hit3 = mpv.mpvHitTest(physX, physY)
+          console.log(
+            `[uosc-test] 悬浮窗重建后: 可交互=${isOverlayInteractive()} 命中=${hit3?.hitClass}` +
+              `(isOurChild=${hit3?.isOurChild})`
+          )
+          console.log(
+            `[uosc-test] 归属判定：${
+              hit?.hitClass !== hit2?.hitClass
+                ? '命中随悬浮窗消失而改变 → 压在视频上的是**悬浮窗**'
+                : '销毁悬浮窗后命中不变 → 压在视频上的是**别的窗口**（不是悬浮窗）'
+            }`
+          )
+          /*
+           * 把窗口/视频区域的几何落盘，便于在主进程之外（PowerShell）核对
+           * 「这个屏幕点上最上层的窗口到底属于哪个进程」——判断命中到的到底是本应用的窗口
+           * 还是别的程序（探针环境里可能有别的窗口压在上面，那结论就不能算在应用头上）。
+           */
+          {
+            const { writeFileSync } = await import('node:fs')
+            const { join: pjoin } = await import('node:path')
+            writeFileSync(
+              pjoin(process.cwd(), '.e2e', 'uosc-point.json'),
+              JSON.stringify(
+                {
+                  win: b,
+                  sf,
+                  videoDip,
+                  phys: { x: physX, y: physY },
+                  overlayHwnd: ovHwnd,
+                  mainHwnd: win.getNativeWindowHandle().readUInt32LE(0),
+                  /* mpv 子窗口在**客户端坐标**里的矩形（物理像素）：外部探针用它做
+                     ChildWindowFromPointEx，判断同一窗口内部到底是 mpv 还是 Chromium 渲染窗口在上面 */
+                  childRects: mpv.mpvDumpWindows(),
+                  hit: hit ?? null
+                },
+                null,
+                2
+              ),
+              'utf8'
+            )
+            console.log('[uosc-test] 几何已写入 .e2e/uosc-point.json')
+          }
+          const hold = Number(process.env.SAKANA_UOSC_HOLD) > 0 ? Number(process.env.SAKANA_UOSC_HOLD) : 0
+          if (hold > 0) {
+            /*
+             * 自检窗口可能被别的程序盖住（实测本机自检环境里，那个屏幕点上是 msedge 的窗口）——
+             * 盖住时鼠标当然到不了 mpv，会把「应用的问题」和「环境的问题」混在一起。
+             * 所以这段只在自检里把窗口临时提到最前，让外部光标实验测的是应用本身。
+             */
+            win.setAlwaysOnTop(true)
+            win.focus()
+            // 这行是给外部光标实验的同步信号（ASCII 标记：PS 脚本按 ANSI 读无 BOM 文件，
+            // 用中文匹配会因编码问题匹配不到）。外部看到它之后再把光标移进视频区，
+            // 否则光标可能落在别的程序窗口上（实测自检环境里那个点是 msedge 的窗口）
+            console.log('[uosc-test] RAISED_FOR_CURSOR_TEST 已把自检窗口临时置顶（仅自检），开始每秒读 mpv 鼠标状态')
+            for (let i = 0; i < hold; i++) {
+              await new Promise((r) => setTimeout(r, 1000))
+              const m = mpv.mpvProbeProperties(['user-data/sakana-mouse'])
+              console.log(`[uosc-test] t=${i + 1}s mpv 鼠标状态 → ${JSON.stringify(m['user-data/sakana-mouse'])}`)
+            }
+          }
+          mpv.mpvDestroy()
+          console.log('[uosc-test] done')
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
+    }
+
     // 中转流自检（SAKANA_LIVE_TEST=视频文件）：
     // FFmpeg 中转 → 本机 HTTP 地址 → 当前内核播放（验证中转回退方案可用）
     if (process.env.SAKANA_LIVE_TEST) {
@@ -1992,6 +2185,66 @@ if (!gotLock) {
           app.quit()
         })()
       }, 3000)
+    }
+
+    /*
+     * 通用 DOM 自检（SAKANA_DOM_TEST='/route|js 表达式或语句'，v0.3.2）。
+     *
+     * 为什么需要它：小窗自检只看得到「页面渲染出来了没有」，而用户报的很多问题是
+     * **交互层**的（下拉被图标盖住点不动、右键菜单点了没反应、卡片上的按钮失效）——
+     * 这类问题必须真的在页面里查 DOM 才能定位。
+     *
+     * 用法：`SAKANA_DOM_TEST='/search|<js>'`，可写多条用 `;;` 分隔。
+     * 注入的代码在页面里执行，返回值（或最后一句表达式的值）会被 JSON 打印出来；
+     * 约定：把结论放进 `window.__domTest` 里返回最方便，例如
+     *   `window.__domTest = { at: document.elementFromPoint(100,100)?.className }`
+     * 每次执行都会等 `SAKANA_DOM_DELAY`（默认 2500ms）让页面把数据拉完。
+     */
+    if (process.env.SAKANA_DOM_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const { openSmallWindow } = await import('./window')
+          const delay = Number(process.env.SAKANA_DOM_DELAY) > 0 ? Number(process.env.SAKANA_DOM_DELAY) : 2500
+          const specs = String(process.env.SAKANA_DOM_TEST)
+            .split(';;')
+            .map((s) => s.trim())
+            .filter(Boolean)
+          for (const spec of specs) {
+            const sep = spec.indexOf('|')
+            const hash = sep >= 0 ? spec.slice(0, sep) : '/'
+            const script = sep >= 0 ? spec.slice(sep + 1) : spec
+            const w = openSmallWindow(hash, { width: 900, height: 640, title: `DOM 自检 ${hash}` })
+            const logs: string[] = []
+            w.webContents.on('console-message', (...args: unknown[]) => {
+              const d =
+                typeof args[1] === 'object' && args[1] !== null
+                  ? (args[1] as { level?: string; message?: string })
+                  : { level: String(args[1]), message: String(args[2]) }
+              logs.push(`${d.level}: ${String(d.message).slice(0, 300)}`)
+            })
+            await new Promise<void>((resolve) => {
+              w.webContents.once('did-finish-load', () => resolve())
+              setTimeout(resolve, 6000)
+            })
+            await new Promise((r) => setTimeout(r, delay))
+            try {
+              const out = await w.webContents.executeJavaScript(
+                `(async function(){ ${script} })()`,
+                true
+              )
+              console.log(`[dom-test] ${hash} → ${typeof out === 'string' ? out : JSON.stringify(out)}`)
+            } catch (err) {
+              console.log(`[dom-test] ${hash} 执行失败: ${String((err as Error)?.message ?? err).slice(0, 300)}`)
+            }
+            const errs = logs.filter((l) => /error|Error|did-fail/.test(l))
+            if (errs.length) console.log(`[dom-test] ${hash} 页面报错: ${errs.slice(0, 4).join(' || ')}`)
+            w.destroy()
+          }
+          console.log('[dom-test] done')
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
     }
 
     // 小窗口自检（SAKANA_SMALLWIN_TEST=1）：逐个打开副窗口并输出渲染层错误/内容长度

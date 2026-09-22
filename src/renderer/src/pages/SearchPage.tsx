@@ -7,6 +7,7 @@ import {
   Check,
   ChevronDown,
   ChevronLeft,
+  CloudOff,
   GripVertical,
   History,
   Pencil,
@@ -230,6 +231,12 @@ export function SearchPage() {
   const [results, setResults] = useState<SearchResultItem[]>(restored?.results ?? [])
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState(restored?.searchError ?? '')
+  /**
+   * v0.3.2：本次结果是否来自备用数据源（Jikan/AniList）兜底。
+   * 单独一个 state 而不是塞进 searchError：兜底是**成功**的结果，
+   * 塞进错误文案会让「空态/错误态」的渲染分支误判成搜索失败。
+   */
+  const [fallbackNote, setFallbackNote] = useState('')
   const [searched, setSearched] = useState(restored?.searched ?? false)
 
   /** 主区域当前展示什么：搜索结果，还是某个书签的条目 */
@@ -375,9 +382,20 @@ export function SearchPage() {
       // 数据源返回了「全部不可达」之类的说明（例如自建反代挂了）时，
       // 把原因留在页面上，方便用户照着文案去「数据源配置」里切换（v0.2.7）
       setSearchError(r.data.error ? r.data.error.message : '')
+      /*
+       * v0.3.2：主数据源全挂时结果来自 Jikan/AniList 兜底，必须标出来。
+       * 兜底搜索的条数明显少于反代（AniList 对中文关键词命中少），
+       * 不说明的话用户会以为「搜索坏了」。
+       */
+      setFallbackNote(
+        r.data.dataSource?.source === 'jikan'
+          ? `数据源不可用，本次结果来自 Jikan / AniList 备用源（${r.data.items.length} 条，可能少于平时）`
+          : ''
+      )
     } else {
       setResults([])
       setSearchError(r.error)
+      setFallbackNote('')
       toast.error(r.error)
     }
   }
@@ -698,8 +716,25 @@ export function SearchPage() {
 
   return (
     <div className="flex h-full flex-col">
-      {/* 顶部搜索框（回车或点击右侧按钮触发）+ 右上角「添加书签」 */}
-      <div className="border-b border-border bg-elev1/70 px-4 py-3 backdrop-blur sm:px-5">
+      {/*
+        顶部搜索框（回车或点击右侧按钮触发）+ 右上角「添加书签」。
+
+        v0.3.2 修「搜索图标盖住搜索历史下拉表、点历史标签没反应」——真因是**绘制/命中顺序**，
+        不是事件顺序：这条 header 带 backdrop-blur（= backdrop-filter），而 backdrop-filter
+        会生成一个**层叠上下文**；header 本身又是 static 的普通流块，于是它整棵子树
+        （含搜索框里的下拉面板）按普通流排在「定位元素」之前绘制。
+        紧跟在后面的结果区是 `relative`（z-auto，定位元素），按 CSS 2.1 附录 E 排在定位层，
+        于是**整片结果区压在下拉面板之上**：空态那个大搜索图标正好落在下拉区域正中间，
+        看起来就是「搜索图标盖住下拉」；命中测试命中的也是结果区里的元素，
+        所以点历史标签、点历史条目都落不到面板上（mousedown 打在结果区上，还会被
+        「点面板外面就收起」的监听判成点了外面、当场把面板收起），表现就是「点了没反应」。
+
+        为什么要给 header 加层级而不是继续抬面板：z-index 只在**最近的层叠上下文内**排序，
+        面板的 z-30 被 header 自己的上下文锁住，加多少都提不出 header 之外。
+        这里给 header 一个明确层级（40 高于结果区 z-auto，也高于书签条 z-30，
+        同时低于应用里各浮层：通用弹窗 80 / 公告 95 / Toast 99），整棵子树才排到结果区之上。
+      */}
+      <div className="relative z-40 border-b border-border bg-elev1/70 px-4 py-3 backdrop-blur sm:px-5">
         <div className="flex items-center gap-3">
           <div className="relative min-w-0 flex-1">
             <div className="relative mx-auto max-w-xl">
@@ -717,11 +752,17 @@ export function SearchPage() {
                 搜索历史下拉触发器（v0.2.12）：放在搜索框左侧内部，不再单独占一整行。
                 面板里分「搜索历史 / 书签」两个标签页，点任一条都是重跑搜索。
 
-                v0.3.0 修（用户反馈「搜索图标会遮住下拉表，点历史标签无响应」）：
-                真因是 outside-click 的那只 ref 挂在了**这个触发按钮**上，
-                于是点击面板内部（历史标签本身）会被判定成「点了外部」→ 先关面板再派发点击 →
-                标签看起来完全没反应。现在 ref 挂在**包住触发按钮与面板的容器**上，
-                并把面板的层级提高到 z-50，保证它在搜索图标之上。
+                面板与触发按钮同属 header 这棵子树，「下拉能不能盖住结果区」由 header 的层级决定
+                （见上方 header 上的 relative z-40 与根因说明）；面板自己的 z-30 只要压住
+                触发器（z-20）与右侧的清空/搜索按钮（z-auto）就够了。
+
+                v0.3.0 那次「把 outside-click 的 ref 从触发按钮挪到外层容器」改的不是这个 bug：
+                面板上的 mousedown 在 React 层就 stopPropagation 了，document 上的监听收不到，
+                「先关面板再派发 click」这条路径根本不会发生；真凶是上面的层叠上下文。
+
+                ref 挂在「触发器 + 面板」的共同祖先上是对的：点触发器时它必须被判成「内部」，
+                否则 mousedown 先收起、click 又把它翻回来（表现为点不开或闪一下）。
+                contents 只是让这个 ref 挂点不参与布局。
               */}
               <div ref={historyPanelRef} className="contents">
                 <button
@@ -734,12 +775,17 @@ export function SearchPage() {
                   <History size={14} />
                   <ChevronDown size={12} className={`transition-transform ${historyOpen ? 'rotate-180' : ''}`} />
                 </button>
+              {/* 清空/搜索按钮在 ref 容器内（它们就在搜索框里），但语义上属于「面板外部」：
+                  点它们顺手收起面板，免得下拉一直盖着刚搜出来的结果（v0.3.0 挪 ref 时丢掉了这个行为） */}
               <div className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
                 {query ? (
                   <button
                     className="flex h-8 w-8 items-center justify-center rounded-lg text-faint hover:text-text"
                     title="清空"
-                    onClick={handleClear}
+                    onClick={() => {
+                      setHistoryOpen(false)
+                      handleClear()
+                    }}
                   >
                     <X size={14} />
                   </button>
@@ -747,7 +793,10 @@ export function SearchPage() {
                 <button
                   className="flex h-8 w-12 items-center justify-center rounded-lg bg-accent-soft text-accent hover:bg-accent/20 whitespace-nowrap"
                   title="搜索"
-                  onClick={() => void doSearch(query)}
+                  onClick={() => {
+                    setHistoryOpen(false)
+                    void doSearch(query)
+                  }}
                 >
                   {searching ? <Spinner size={14} /> : <Search size={14} />}
                 </button>
@@ -968,6 +1017,13 @@ export function SearchPage() {
                 <span className="text-sm font-semibold">搜索结果</span>
                 <span className="text-xs text-faint">{results.length} 部</span>
               </div>
+              {/* v0.3.2：兜底结果要标出来（条数通常比反代少，不说明会让人以为搜索坏了） */}
+              {fallbackNote ? (
+                <div className="mb-3 flex items-start gap-2 rounded-lg border border-border bg-elev2/60 px-3 py-2 text-[11px] leading-relaxed text-dim">
+                  <CloudOff size={13} className="mt-0.5 shrink-0 text-warn" />
+                  <span>{fallbackNote}</span>
+                </div>
+              ) : null}
               <div className="flex flex-col gap-2">
                 {results.map((item) => {
                   const subject = toDragSubject(item)

@@ -68,3 +68,6 @@ Thumbs.db
 # 仓库里只有变量名、没有名字本身；删掉这个文件也能正常构建（关于页只是不显示作者）。
 sakana.local.json
 
+
+/logs.json
+/.tmp-*/

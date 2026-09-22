@@ -5,6 +5,7 @@ import type {
   WatchHistoryItem
 } from '@shared/types'
 import { api } from '@/lib/api'
+import { toast } from '@/stores/app'
 
 export type FavoriteSubjectInput = {
   id: number
@@ -124,6 +125,15 @@ export const useLibrary = create<LibraryState>((set, get) => ({
   },
   toggleFavorite: (subject) => {
     const { favorites } = get()
+    /*
+     * v0.3.2：备用数据源（Jikan/AniList 兜底）的条目 id 是**负数**（= -MAL id）。
+     * 收藏它只会存下一条反代恢复后对不上的记录（id 正负两套体系），
+     * 所以这里直接拦住并说清原因，而不是让用户攒下一堆莫名其妙的收藏。
+     */
+    if (subject.id < 0) {
+      toast.warn('这条来自备用数据源（Jikan / AniList 兜底），等数据源恢复后再收藏')
+      return
+    }
     const exists = isFavorite(favorites, subject.id)
     let next: FavoriteItem[]
     if (exists) {

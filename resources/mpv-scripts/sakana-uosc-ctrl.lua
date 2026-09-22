@@ -515,4 +515,26 @@ mp.add_periodic_timer(2, function()
   update_buttons(not uosc_seen)
 end)
 
+-- ─────────────────────── 鼠标命中诊断（仅自检，v0.3.2） ───────────────────────
+--
+-- 排查「uosc 控制栏呼不出来」时，最关键的问题是：**mpv 窗口到底收不收得到鼠标事件**。
+-- 光看窗口类名和 z 序只能推测，这里让 mpv 自己说话：`mouse-pos` 是 mpv 对每个鼠标事件的
+-- 记录，把它写成可读属性（`user-data/sakana-mouse`），Electron 侧读一下就知道有没有。
+--
+-- 只在环境变量 SAKANA_UOSC_TEST 存在时启用 → 正常播放时这个定时器根本不会创建，
+-- 不产生任何开销、也不污染 mpv 的属性空间。
+if os.getenv('SAKANA_UOSC_TEST') then
+  mp.add_periodic_timer(0.5, function()
+    local pos = mp.get_property_native('mouse-pos')
+    if type(pos) ~= 'table' then
+      mp.set_property('user-data/sakana-mouse', 'hover=0 x=- y=-')
+      return
+    end
+    local hover = pos.hover and 1 or 0
+    mp.set_property('user-data/sakana-mouse',
+      string.format('hover=%d x=%d y=%d', hover, math.floor(pos.x or -1), math.floor(pos.y or -1)))
+  end)
+  msg.info('鼠标命中诊断已启用（user-data/sakana-mouse）')
+end
+
 msg.info('sakana-uosc-ctrl 已加载（控制栏按钮 + 菜单 + 动作回传）')

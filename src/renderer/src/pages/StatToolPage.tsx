@@ -15,7 +15,7 @@ import {
 import { useNavigate } from 'react-router-dom'
 import type { StatEntry, StatExportField, StatList } from '@shared/types'
 import { api } from '@/lib/api'
-import { orderedListsOf, useStatTool } from '@/stores/statTool'
+import { orderedListsOf, useStatTool, warmSeasonAddItems } from '@/stores/statTool'
 import { toast } from '@/stores/app'
 import { CoverImage } from '@/components/CoverImage'
 import { Button, ConfirmModal, EmptyState, Input, Modal, Spinner } from '@/components/ui'
@@ -262,6 +262,16 @@ export function StatToolPage() {
 
   useEffect(() => {
     void load()
+    /*
+     * 预热「当季番剧」候选（v0.3.2）。
+     *
+     * 用户要求「添加番剧时从本地缓存的当季数据添加，这样加载更快」：
+     * 进页面就把当前季度放进渲染层的记忆（见 stores/statTool.ts），
+     * 这样点「添加番剧 → 当季番剧」是同步出数据的，连一帧转圈都没有。
+     * 记忆够新鲜时这个调用什么都不做（0 请求）；否则那一次 IPC 绝大多数情况命中
+     * 主进程的 7 天季度磁盘缓存（只是读盘），所以预热几乎不产生联网。
+     */
+    warmSeasonAddItems()
   }, [load])
 
   // 置顶优先（排序规则在 store 里与主进程保持一致），useMemo 避免每次渲染新建数组

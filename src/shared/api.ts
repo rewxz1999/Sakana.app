@@ -280,6 +280,18 @@ export interface SakanaApi {
         source: 'jikan'
         animeTitle: string
         malId: number
+        /**
+         * v0.3.2：这次数据**实际**是谁给的。
+         *
+         * `jikan` = Jikan 可用（含用它补的详情）；`anilist` = Jikan 端点挂了、改走 AniList；
+         * `none` = 两条路都没拿到。界面徽章与导出图页脚必须照这个字段写来源，
+         * 不能再一律写「Jikan / MAL」——实测 Jikan 的角色端点会整片 504，那时数据其实来自 AniList。
+         */
+        via?: 'jikan' | 'anilist' | 'none'
+        /** 立绘实际来自哪个图床（决定徽章与页脚文案） */
+        imageSource?: 'myanimelist' | 'anilist' | null
+        /** 取不到时的具体原因（主源与兜底各一段）；界面要常驻显示 */
+        reason?: string
       }>
     >
     /**

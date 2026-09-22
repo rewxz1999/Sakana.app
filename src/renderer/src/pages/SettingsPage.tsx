@@ -378,7 +378,13 @@ export function SettingsPage() {
             <OpenRow
               icon={MonitorPlay}
               title="播放器设置"
-              desc="播放内核（libmpv）、FFmpeg 路径与播放器快捷键"
+              /*
+               * v0.3.2：这一行的说明必须点名「超分 / 画质」。
+               * 用户反馈「超分辨率设置不知所踪」——功能其实就在播放器设置页里（Anime4K 卡片），
+               * 但原来这里只写「播放内核、FFmpeg、快捷键」，用户在设置总览里看不到「画质」二字，
+               * 自然找不到入口。总览是唯一的入口清单，说明文字要点名关键功能。
+               */
+              desc="播放内核（libmpv）、Anime4K 超分与画质（饱和度/对比度/HDR）、FFmpeg 路径与快捷键"
               onOpen={() => openSmall('/player-settings', 700, 620, '播放器设置')}
             />
             <RowDivider />

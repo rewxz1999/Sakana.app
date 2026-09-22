@@ -39,7 +39,7 @@ function SkeletonCard() {
 
 export function SchedulePage() {
   const navigate = useNavigate()
-  const { days, loading, error, fetchedAt, fromCache, stale, selectedDay, weekOffset, ratings, load, loadRatings, selectDay } = useSchedule()
+  const { days, loading, error, fetchedAt, fromCache, stale, fallbackSource, selectedDay, weekOffset, ratings, load, loadRatings, selectDay } = useSchedule()
   const favorites = useLibrary((s) => s.favorites)
   const watchHistory = useLibrary((s) => s.watchHistory)
   const toggleFavorite = useLibrary((s) => s.toggleFavorite)
@@ -253,7 +253,17 @@ export function SchedulePage() {
       <div className="flex items-center justify-between border-t border-border bg-elev1/70 px-5 py-1.5 text-[11px] text-faint">
         <span>
           {/* v0.2.7 附加：走反代时统一显示「Bangumi」，不再把反代/镜像地址摊在界面上 */}
-          数据来源：{settings.bangumiCustomApi ? 'Bangumi' : settings.bangumiBase || 'Bangumi'}
+          {/*
+            v0.3.2：主数据源全挂、本次番剧表是 Jikan/AniList 兜底来的，必须如实标出来。
+            兜底数据的覆盖面比主源小（AniList 的季度模型只给「当季在播」），
+            不标的话用户会以为「番剧变少了」。
+          */}
+          数据来源：
+          {fallbackSource === 'jikan'
+            ? 'Jikan / AniList 备用源（主数据源不可用）'
+            : settings.bangumiCustomApi
+              ? 'Bangumi'
+              : settings.bangumiBase || 'Bangumi'}
           {` · 本周 ${weekRange}`}
           {fetchedAt ? ` · 缓存于 ${fmtDateTime(fetchedAt)}${fromCache ? '（本地缓存）' : ''}` : ''}
         </span>

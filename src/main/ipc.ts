@@ -219,7 +219,17 @@ export function registerIpc(): void {
       })),
       source: 'jikan' as const,
       animeTitle: r.anime?.title ?? '',
-      malId: r.anime?.malId ?? 0
+      malId: r.anime?.malId ?? 0,
+      /*
+       * v0.3.2：把「到底是谁给的」如实透出。
+       * Jikan 的搜索/角色端点目前会整片 504（它自己连不上 MAL 上游），
+       * 这时会改走 AniList；界面徽章与导出图页脚必须按实际来源写，
+       * 否则用户看到的仍是「来源：Jikan/MAL」——等于骗人（上一版就是这么错的）。
+       */
+      via: r.via,
+      imageSource: r.imageSource,
+      /** 两条路都失败时的具体原因：界面要常驻显示，不能只弹一个会消失的 toast */
+      reason: r.reason ?? ''
     }
   })
   /*

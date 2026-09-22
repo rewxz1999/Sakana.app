@@ -3,7 +3,14 @@ import { ChevronLeft, ChevronRight, Layers, Loader2, Plus, Search } from 'lucide
 import type { StatAddItem, StatAddSource } from '@shared/types'
 import { absoluteSeasonIndex, fromAbsoluteSeasonIndex, seasonLabel, seasonOfDate, shiftAbsoluteSeasonIndex } from '@shared/season'
 import { api } from '@/lib/api'
-import { favoriteToAddItem, useStatTool } from '@/stores/statTool'
+import {
+  bgmItemToAddItem,
+  favoriteToAddItem,
+  fetchSeasonAddItems,
+  peekSeasonAddItems,
+  seasonSnapshotIsFresh,
+  useStatTool
+} from '@/stores/statTool'
 import { useLibrary } from '@/stores/library'
 import { toast } from '@/stores/app'
 import { Badge, Button, EmptyState, Modal } from '@/components/ui'
@@ -20,6 +27,15 @@ import { CoverImage } from '@/components/CoverImage'
  * - `picked`（key → StatAddItem）跨来源保留，切换 tab 不会清空；
  * - 「加入列表」把 picked 的值一次性发给主进程（addEntries 一次调用 = 一次读-改-写 + 一次广播），
  *   重复条目由主进程忽略，这里按返回值提示「新增 N 部，M 部已在列表中」。
+ *
+ * 当季数据的取数（v0.3.2 改，用户要求「从本地缓存的当季番剧数据添加，加载更快」）：
+ * 主进程本来就有 7 天磁盘缓存（`main/services/bangumi.ts` 的 season()），
+ * 但渲染层过去每次切到当季页签都要**发一次 IPC 并先显示转圈**。
+ * 现在渲染层自己也留一份记忆（见 stores/statTool.ts 的 peekSeasonAddItems）：
+ * - 命中记忆 → 同步出候选，**一次请求都不发**（`seasonLoading` 连一帧都不会亮）；
+ * - 记忆过期（默认 6 小时）→ 先用记忆里的数据渲染，再后台静默刷新，
+ *   该不该联网由主进程自己的 TTL 决定，所以「静默刷新」通常也只是读它自己的磁盘缓存；
+ * - 完全没记忆（本次会话第一次、或切到没看过的季度）→ 才进入加载态并等这一次请求。
  */
 export function BatchAddDialog({
   open,
@@ -46,6 +62,8 @@ export function BatchAddDialog({
   })
   const [seasonItems, setSeasonItems] = useState<StatAddItem[]>([])
   const [seasonLoading, setSeasonLoading] = useState(false)
+  /** 这批候选是不是主进程磁盘缓存给的（界面上标一下，用户能看出"确实走的本地缓存"） */
+  const [seasonFromCache, setSeasonFromCache] = useState(false)
 
   const [searchItems, setSearchItems] = useState<StatAddItem[]>([])
   const [searching, setSearching] = useState(false)
@@ -60,31 +78,42 @@ export function BatchAddDialog({
     }
   }, [open])
 
-  // 只在切到「当季」时拉数据（打开弹窗默认收藏 tab，不会白拉一次季度接口）
+  // 切到「当季」时取数据：先看渲染层记忆（命中就同步渲染、不发请求），没命中才进加载态
   useEffect(() => {
     if (!open || source !== 'season') return
     let alive = true
+
+    const memo = peekSeasonAddItems(year, season)
+    if (memo) {
+      setSeasonLoading(false)
+      setSeasonItems(memo.items)
+      setSeasonFromCache(memo.fromMainCache)
+      if (!seasonSnapshotIsFresh(memo)) {
+        // 记忆过期：界面照旧用记忆里的数据，后台悄悄刷新（主进程缓存还新鲜时这次也不会联网）
+        void fetchSeasonAddItems(year, season).then((snap) => {
+          if (!alive || snap.ipcError || snap.items.length === 0) return
+          setSeasonItems(snap.items)
+          setSeasonFromCache(snap.fromMainCache)
+        })
+      }
+      return () => {
+        alive = false
+      }
+    }
+
     setSeasonLoading(true)
-    void api.bangumi.season(year, season * 3).then((r) => {
+    void fetchSeasonAddItems(year, season).then((snap) => {
       if (!alive) return
       setSeasonLoading(false)
-      if (!r.ok) {
-        toast.error(r.error)
+      if (snap.ipcError) {
+        toast.error(snap.ipcError)
         return
       }
-      if (r.data.error) {
-        toast.warn(`季度数据源异常：${r.data.error.message}（显示的可能是不完整结果）`)
+      if (snap.sourceError) {
+        toast.warn(`季度数据源异常：${snap.sourceError}（显示的可能是不完整结果）`)
       }
-      setSeasonItems(
-        r.data.items.map((it) => ({
-          subjectId: it.id,
-          name: it.name,
-          nameCn: it.name_cn || it.name,
-          cover: it.images?.large ?? it.images?.common ?? '',
-          airDate: it.air_date,
-          rating: it.rating?.score ?? null
-        }))
-      )
+      setSeasonItems(snap.items)
+      setSeasonFromCache(snap.fromMainCache)
     })
     return () => {
       alive = false
@@ -121,16 +150,7 @@ export function BatchAddDialog({
       return
     }
     if (r.data.error) toast.warn(`搜索异常：${r.data.error.message}`)
-    setSearchItems(
-      r.data.items.map((it) => ({
-        subjectId: it.id,
-        name: it.name,
-        nameCn: it.name_cn || it.name,
-        cover: it.images?.large ?? it.images?.common ?? '',
-        airDate: it.air_date,
-        rating: it.rating?.score ?? null
-      }))
-    )
+    setSearchItems(r.data.items.map(bgmItemToAddItem))
   }
 
   const pickedList = Object.values(picked)
@@ -205,6 +225,11 @@ export function BatchAddDialog({
               <ChevronLeft size={14} />
             </button>
             <span className="min-w-[112px] text-center text-xs text-dim">{seasonLabel(year, season)}</span>
+            {seasonFromCache ? (
+              <span className="rounded bg-elev2 px-1.5 py-0.5 text-[10px] text-faint" title="数据来自本地季度缓存（主进程磁盘缓存，无需联网）">
+                本地缓存
+              </span>
+            ) : null}
             <button
               type="button"
               title="下一季"

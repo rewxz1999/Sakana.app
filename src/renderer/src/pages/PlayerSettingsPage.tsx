@@ -150,65 +150,6 @@ export function PlayerSettingsPage() {
         </div>
       </Card>
 
-      {/* 播放器控制栏（v0.2.18：uosc 接管 / 旧悬浮窗） */}
-      <Card
-        title="播放器控制栏"
-        desc="控制栏由 mpv 内置的 uosc 绘制，还是用应用自己的悬浮窗控制栏"
-      >
-        <div className="flex flex-col gap-2.5">
-          <label className="flex items-center gap-2 text-xs text-text">
-            <input
-              type="checkbox"
-              checked={settings.uoscControlBar !== false}
-              onChange={(e) => save({ uoscControlBar: e.target.checked })}
-              className="h-3.5 w-3.5 accent-accent"
-            />
-            用 uosc 接管控制栏（推荐）
-          </label>
-          <p className="text-[11px] leading-relaxed text-faint">
-            控制栏画在**视频画面上**（mpv 自己绘制），因此不再受「透明悬浮窗 + 原生视频子窗口」
-            的层叠与点击穿透问题影响。布局与时间显示在
-            <code className="mx-1 font-mono">resources/mpv-config/script-opts/uosc.conf</code>
-            ，快捷键在
-            <code className="mx-1 font-mono">resources/mpv-config/input.conf</code>
-            ，按钮与菜单由
-            <code className="mx-1 font-mono">resources/mpv-scripts/sakana-uosc-ctrl.lua</code>
-            驱动。
-            <span className="text-dim">
-              {' '}
-              取消勾选即回落到应用自己的悬浮窗控制栏（弹幕画布、番剧详情浮层等不受影响），
-              遇到渲染异常时可以随时切回来。切换在**下次进入播放器**时生效。
-            </span>
-          </p>
-        </div>
-      </Card>
-
-      {/* 画面比例 */}
-      <Card title="画面比例" desc="视频与屏幕比例不一致时的填充方式（播放器控制栏右下角也可随时切换）">
-        <div className="flex gap-2">
-          {(
-            [
-              { mode: 'fit' as const, label: '适应', desc: '保持原比例，必要时留黑边（默认）' },
-              { mode: 'cover' as const, label: '裁剪铺满', desc: '放大裁掉多余部分，铺满画面不变形' },
-              { mode: 'stretch' as const, label: '拉伸铺满', desc: '强行拉满整屏，画面会变形' }
-            ] as const
-          ).map((o) => (
-            <button
-              key={o.mode}
-              onClick={() => save({ aspectMode: o.mode })}
-              className={`flex-1 rounded-xl border px-3 py-2.5 text-left transition-colors ${
-                (settings.aspectMode ?? 'fit') === o.mode
-                  ? 'border-accent bg-accent-soft'
-                  : 'border-border hover:border-accent/50'
-              }`}
-            >
-              <div className="text-xs font-semibold text-text">{o.label}</div>
-              <div className="mt-0.5 text-[10px] leading-snug text-faint">{o.desc}</div>
-            </button>
-          ))}
-        </div>
-      </Card>
-
       {/* Anime4K 超分辨率 + 画面微调（v0.3.1） */}
       <Card
         title="Anime4K 超分辨率"
@@ -427,6 +368,71 @@ export function PlayerSettingsPage() {
             若显卡跟不上（24fps 需要单帧 ≤41ms），把档位换成「流畅优先」或改用模式 C。
             按 <code className="font-mono">Shift+I</code> 再按 <code className="font-mono">2</code> 可看 mpv 自己的渲染耗时统计。
           </p>
+        </div>
+      </Card>
+
+      {/* 播放器控制栏（v0.2.18：uosc 接管 / 旧悬浮窗） */}
+      <Card
+        title="播放器控制栏"
+        desc="控制栏由 mpv 内置的 uosc 绘制，还是用应用自己的悬浮窗控制栏"
+      >
+        <div className="flex flex-col gap-2.5">
+          <label className="flex items-center gap-2 text-xs text-text">
+            <input
+              type="checkbox"
+              checked={settings.uoscControlBar !== false}
+              onChange={(e) => save({ uoscControlBar: e.target.checked })}
+              className="h-3.5 w-3.5 accent-accent"
+            />
+            用 uosc 接管控制栏（推荐）
+          </label>
+          <p className="text-[11px] leading-relaxed text-faint">
+            控制栏画在**视频画面上**（mpv 自己绘制），因此不再受「透明悬浮窗 + 原生视频子窗口」
+            的层叠与点击穿透问题影响。布局与时间显示在
+            <code className="mx-1 font-mono">resources/mpv-config/script-opts/uosc.conf</code>
+            ，快捷键在
+            <code className="mx-1 font-mono">resources/mpv-config/input.conf</code>
+            ，按钮与菜单由
+            <code className="mx-1 font-mono">resources/mpv-scripts/sakana-uosc-ctrl.lua</code>
+            驱动。
+            <span className="text-dim">
+              {' '}
+              取消勾选即回落到应用自己的悬浮窗控制栏（弹幕画布、番剧详情浮层等不受影响），
+              遇到渲染异常时可以随时切回来。切换在**下次进入播放器**时生效。
+            </span>
+          </p>
+          <p className="text-[11px] leading-relaxed text-faint">
+            <span className="font-semibold text-text">怎么唤出：</span>
+            鼠标移到画面下方，控制栏就会滑出来（暂停期间会一直显示）。
+            <span className="text-dim">键盘兜底：</span>按 <code className="font-mono">Tab</code>{' '}
+            可显隐整条控制栏 —— 万一鼠标在画面上不起作用，用键盘也照样能操作。
+          </p>
+        </div>
+      </Card>
+
+      {/* 画面比例 */}
+      <Card title="画面比例" desc="视频与屏幕比例不一致时的填充方式（播放器控制栏右下角也可随时切换）">
+        <div className="flex gap-2">
+          {(
+            [
+              { mode: 'fit' as const, label: '适应', desc: '保持原比例，必要时留黑边（默认）' },
+              { mode: 'cover' as const, label: '裁剪铺满', desc: '放大裁掉多余部分，铺满画面不变形' },
+              { mode: 'stretch' as const, label: '拉伸铺满', desc: '强行拉满整屏，画面会变形' }
+            ] as const
+          ).map((o) => (
+            <button
+              key={o.mode}
+              onClick={() => save({ aspectMode: o.mode })}
+              className={`flex-1 rounded-xl border px-3 py-2.5 text-left transition-colors ${
+                (settings.aspectMode ?? 'fit') === o.mode
+                  ? 'border-accent bg-accent-soft'
+                  : 'border-border hover:border-accent/50'
+              }`}
+            >
+              <div className="text-xs font-semibold text-text">{o.label}</div>
+              <div className="mt-0.5 text-[10px] leading-snug text-faint">{o.desc}</div>
+            </button>
+          ))}
         </div>
       </Card>
 

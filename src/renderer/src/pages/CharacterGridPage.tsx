@@ -51,6 +51,50 @@ const DEFAULT_TITLE = '最XX的角色 9宫格'
 const STORE_KEY = 'sakana-character-grid'
 /** 当前选中的作品也单独存一份：刷新回来还能直接看到角色表（不用重新搜） */
 const SUBJECT_KEY = 'sakana-character-grid-subject'
+/**
+ * 当前选中的**数据源**（v0.3.2 抽出常量）。
+ *
+ * 过去这个 key 是直接写在 useState 初始化里的字符串字面量：读一处、写一处，
+ * 拼错任何一处都会静默退回默认值，而「切换不生效」正是这次要修的问题之一，
+ * 所以收敛成一个常量，读写都只能用它。
+ */
+const SOURCE_KEY = 'sakana-character-grid-source'
+
+/**
+ * 可选的两个角色数据源。
+ * - `jikan`：MyAnimeList（经 Jikan）—— 立绘是 MAL 原图，画质优先，默认；
+ * - `bangumi`：原来的 Bangumi（v0 优先 + 老接口兜底）—— 中文名更准，图偏小。
+ */
+type CharSrc = 'jikan' | 'bangumi'
+
+/**
+ * 实际**拿到数据**的来源：Jikan 取不到会回落 Bangumi，界面必须如实说明是哪一个。
+ *
+ * v0.3.2：`jikan` 这一档再细分「谁给的」—— 实测 Jikan 的搜索/角色端点会整片 504
+ * （它自己连不上 MAL 上游），此时主进程会改走 AniList。数据来源必须按**实际**写，
+ * 否则用户看到的「来源：Jikan/MAL」是假的（上一版就是这么错的）。
+ */
+type ResolvedKind = 'jikan' | 'jikan-anilist' | 'v0' | 'legacy'
+
+interface ResolvedSource {
+  kind: ResolvedKind
+  /** 命中的是过期缓存（数据可用，后台在刷新） */
+  stale?: boolean
+  /** 走 Jikan 时命中的 MAL 条目（回落 Bangumi 后仍保留，用来解释为什么回落） */
+  jikan?: { malId: number; animeTitle: string; asked: string }
+  /** 回落原因：只在 Jikan 没取到时出现，界面上**常驻**提示（不能只发一个会消失的 toast） */
+  fallback?: string
+  /** 本次拿到的角色数 */
+  count: number
+}
+
+/** 来源的中文名：徽章、导出图页脚、说明文字统一用它，避免一处说 Jikan 一处说 Bangumi */
+function resolvedLabel(kind: ResolvedKind): string {
+  if (kind === 'jikan') return 'Jikan（MyAnimeList）'
+  if (kind === 'jikan-anilist') return 'AniList（Jikan 端点不可用时的备用源）'
+  if (kind === 'legacy') return 'Bangumi 老接口兜底'
+  return 'Bangumi v0 接口'
+}
 
 /** 格子里的角色：只保留可序列化的字段，直接进 localStorage */
 interface CellChar {
@@ -174,15 +218,42 @@ function loadState(): GridState {
 // ---------------- 导出：canvas 布局与绘制工具 ----------------
 
 /*
- * 布局参数与编辑区单格比例（230:276 / aspect-[230/276]）保持一致，做到「所见即所得」。
- * S=2 是 2 倍图：文字与立绘在高 DPI 屏上不糊。
+ * 布局参数。S=2 是 2 倍图：文字在高 DPI 屏上不糊。
+ *
+ * v0.3.2（用户反馈「9 格的时候适当减小格子大小」+「立绘还是不够清晰」）：
+ * 9 宫格单格改成**明显小一圈**（230×276 → 156×224），原因有两个，缺一个都不成立：
+ *   ① 3×3 只有 9 格，用 4 列那套尺寸整张图会大而无当、四周一堆空白；
+ *   ② 导出格子越小，立绘被**放大**的倍数就越小 —— 实测 MAL 立绘多为 225×350，
+ *      2 倍图下旧格子要给立绘 360 设备像素宽（放大 1.6 倍 → 糊），新格子只要 276（放大 1.22 倍）。
+ *      「减小格子」和「更清晰」在这里是同一件事，不是两个互相抵消的目标。
+ * 其它行列组合（列 4 / 行 > 3）仍用原尺寸，保证 4×10 时每格的字还看得清。
  */
 const EX = {
   S: 2,
+  /**
+   * 常规单格（列数 4 或行数 > 3 时使用）。
+   *
+   * 已知遗留（本次**故意不动**，写在这里免得下次又摸不着头脑）：
+   * 按 MAL 立绘 225×350、2 倍图算，这个尺寸下立绘要被放大到 420 设备像素宽 ≈ **1.87 倍**，
+   * 比 9 宫格还糊。之所以先不动：4 列最多 40 格（4×10），格子再小字就看不清了，
+   * 而且用户这次只对 9 格提了要求。真要一起优化，把这里降到 158×190 左右即可
+   * （算出 1.23 倍上下），代价是 4 列的导出宽度从 2028 掉到约 1400。
+   */
   CELL_W: 230,
   CELL_H: 276,
+  /** 9 宫格单格：比常规小一圈（面积约为原来的 55%），立绘放大倍数同时降下来 */
+  NINE_W: 156,
+  NINE_H: 224,
+  /** 9 宫格更紧凑的内边距/标签高/名字块高（格子小了，这几项也必须跟着收，否则立绘框被挤没） */
+  NINE_PAD: 9,
+  NINE_LABEL_H: 22,
+  NINE_NAME_H: 34,
   PAD: 10,
   LABEL_H: 26,
+  /** 名字区高度（角色名 + 关系两行） */
+  NAME_H: 46,
+  /** 标签行与立绘框之间、立绘框与名字区之间的留白 */
+  IMG_GAP: 8,
   GAP: 14,
   OUTER: 26,
   HEAD_H: 96,
@@ -191,6 +262,47 @@ const EX = {
   CARD_R: 10,
   /** 立绘纵向裁切基准，与 CSS object-position: center 20% 对应 */
   BIAS: 0.2
+}
+
+/** 一套布局的全部尺寸（导出画布与编辑区预览共用，保证「所见即所得」） */
+interface GridMetrics {
+  cols: number
+  rows: number
+  /** 是否 9 宫格（3×3）—— 9 宫格走收紧后的单格尺寸 */
+  nine: boolean
+  cellW: number
+  cellH: number
+  pad: number
+  labelH: number
+  nameH: number
+  /** 画布逻辑尺寸（乘 EX.S 才是导出像素） */
+  w: number
+  h: number
+  /** 立绘框逻辑尺寸（单格扣掉内边距、标签行、名字区之后剩下的矩形） */
+  imgW: number
+  imgH: number
+}
+
+/**
+ * 由行列数算出这一套布局的所有尺寸。
+ *
+ * 为什么抽成函数：过去是在 drawPoster 里**改写模块级 EX**（`EX.CELL_W = nine ? …`），
+ * 于是「界面上的格子多大」和「导出图的格子多大」是两套各写一份的数字，
+ * 单格比例在 JSX 里还硬编码着 230/276 —— 改了导出、界面纹丝不动，
+ * 用户自然会觉得「改了没生效」。现在界面与导出都从这里取值。
+ */
+function gridMetrics(cols: number, rows: number): GridMetrics {
+  const nine = cols === 3 && rows === 3
+  const cellW = nine ? EX.NINE_W : EX.CELL_W
+  const cellH = nine ? EX.NINE_H : EX.CELL_H
+  const pad = nine ? EX.NINE_PAD : EX.PAD
+  const labelH = nine ? EX.NINE_LABEL_H : EX.LABEL_H
+  const nameH = nine ? EX.NINE_NAME_H : EX.NAME_H
+  const w = EX.OUTER * 2 + cols * cellW + (cols - 1) * EX.GAP
+  const h = EX.HEAD_H + EX.OUTER + rows * cellH + (rows - 1) * EX.GAP + EX.OUTER + EX.FOOT_H
+  const imgW = cellW - pad * 2
+  const imgH = cellH - (pad + labelH + EX.IMG_GAP) - EX.IMG_GAP - nameH - pad
+  return { cols, rows, nine, cellW, cellH, pad, labelH, nameH, w, h, imgW, imgH }
 }
 const FONT =
   '"Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Source Han Sans SC", "Noto Sans CJK SC", sans-serif'
@@ -226,22 +338,34 @@ function drawCover(
   dy: number,
   dw: number,
   dh: number,
-  bias = EX.BIAS
+  bias = EX.BIAS,
+  /** 当前画布的缩放倍数（drawPoster 里做过 ctx.scale(EX.S, EX.S)） */
+  canvasScale = EX.S
 ): boolean {
   const iw = img.naturalWidth || img.width
   const ih = img.naturalHeight || img.height
   if (!iw || !ih) return false
   /*
-   * v0.2.17（用户反馈「立绘还是不清晰」）：**小图不放大**。
+   * 「小图不放大」的判定**必须换算到设备像素**。
    *
-   * 实测 Bangumi 角色立绘尺寸差异极大：常见 800x2767（很清晰），但也有不少角色
-   * 官方最大档只有 250x300；而导出格子是 230x276 逻辑像素、2 倍图后 460x552 ——
-   * 把 250px 宽的图 cover 拉到 460px 等于放大 1.84 倍，插值再好也是糊的。
-   * 所以源图比目标框小时改成「原始像素、居中、不放大」（宁可留白）；够大时仍然 cover 裁剪。
+   * v0.2.17 加这条守卫时的意图是对的（源图比目标框小就别拉大，宁可留白），
+   * 但拿的是逻辑像素：`Math.min(dw / iw, dh / ih)`。而画布已经 `ctx.scale(2, 2)`，
+   * 传进来的 dw/dh 是逻辑像素，真实目标是 **dw*S × dh*S 设备像素**。
+   *
+   * 于是出现两个错：
+   *   ① 该拦的没拦住 —— 实测 MAL 立绘 225×350、9 宫格立绘框 180×132（逻辑）时，
+   *      算出 min(0.8, 0.377)=0.377 不满足 >1，直接走 cover：设备像素要 360 宽，
+   *      等于把 225px 的图放大 1.6 倍，插值再好也是糊的（用户报的「不清晰」）；
+   *   ② 真拦下来时更糟 —— 分支里按 `iw/dh`（逻辑）画，2 倍图上仍是放大 2 倍。
+   * 现在统一在设备像素上判断，分支里再把「源图设备像素」换算回逻辑单位（/S）画，
+   * 这样 1:1 就是真的 1:1。
    */
-  const containScale = Math.min(dw / iw, dh / ih)
-  if (containScale > 1) {
-    ctx.drawImage(img, dx + (dw - iw) / 2, dy + (dh - ih) / 2, iw, ih)
+  const fit = Math.min((dw * canvasScale) / iw, (dh * canvasScale) / ih)
+  if (fit > 1) {
+    // 源图连目标框都填不满：按设备像素 1:1 居中画（宁可留白，也不放大糊掉）
+    const lw = iw / canvasScale
+    const lh = ih / canvasScale
+    ctx.drawImage(img, dx + (dw - lw) / 2, dy + (dh - lh) / 2, lw, lh)
     return true
   }
   const scale = Math.max(dw / iw, dh / ih)
@@ -300,19 +424,16 @@ interface CellGeo {
 }
 
 /** 画底稿（背景/标题/制作人/标签/名字/占位块），返回各格立绘的目标矩形 */
-function drawPoster(state: GridState, producer: string): { canvas: HTMLCanvasElement; geo: CellGeo[] } {
-  const { cols, rows } = state
-  /*
-   * v0.3.0（用户要求「9格的时候适当减小格子大小」）：3×3 时把格子缩到 200x240，
-   * 画面更紧凑、不至于一张九宫格里大片空白；格子多了（4 列 / 更多行）仍用原尺寸保证可读。
-   * 这里直接改 EX 上的两个尺寸（EX 只在本文件用、每次导出都会重算），
-   * 这样下面所有按 EX.CELL_W/CELL_H 布局的代码不用逐个改 —— 改一处、全图生效。
-   */
-  const nine = cols === 3 && rows === 3
-  EX.CELL_W = nine ? 200 : 230
-  EX.CELL_H = nine ? 240 : 276
-  const W = EX.OUTER * 2 + cols * EX.CELL_W + (cols - 1) * EX.GAP
-  const H = EX.HEAD_H + EX.OUTER + rows * EX.CELL_H + (rows - 1) * EX.GAP + EX.OUTER + EX.FOOT_H
+function drawPoster(
+  state: GridState,
+  producer: string,
+  /** 实际拿到数据的数据源：写在导出图页脚（用 Jikan 时不能还写着「来自 Bangumi」） */
+  sourceKind: ResolvedKind
+): { canvas: HTMLCanvasElement; geo: CellGeo[] } {
+  const m = gridMetrics(state.cols, state.rows)
+  const { cols, rows } = m
+  const W = m.w
+  const H = m.h
 
   const canvas = document.createElement('canvas')
   canvas.width = Math.round(W * EX.S)
@@ -325,6 +446,8 @@ function drawPoster(state: GridState, producer: string): { canvas: HTMLCanvasEle
    * 图像重采样质量（v0.2.14，用户反馈「立绘太模糊」）：
    * canvas 默认 'low' 是速度优先的近似实现，立绘缩到格子尺寸（少数小图还要放大）时边缘发虚。
    * 设为 'high' 用更好的插值核，同分辨率下观感明显更锐；导出只多几十毫秒。
+   * 注意：它只影响**缩放时的插值**，救不了「本来就不够大的源图被硬放大」——
+   * 那件事由 drawCover 的 1:1 判定与收紧后的 9 宫格尺寸负责。
    */
   ctx.imageSmoothingEnabled = true
   ctx.imageSmoothingQuality = 'high'
@@ -372,77 +495,77 @@ function drawPoster(state: GridState, producer: string): { canvas: HTMLCanvasEle
   const geo: CellGeo[] = []
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
-      const x = EX.OUTER + c * (EX.CELL_W + EX.GAP)
-      const y = EX.HEAD_H + EX.OUTER + r * (EX.CELL_H + EX.GAP)
+      const x = EX.OUTER + c * (m.cellW + EX.GAP)
+      const y = EX.HEAD_H + EX.OUTER + r * (m.cellH + EX.GAP)
       const cell = state.cells[r][c]
-      const pad = EX.PAD
+      const pad = m.pad
 
       ctx.save()
       ctx.shadowColor = 'rgba(24,30,55,.07)'
       ctx.shadowBlur = 8
       ctx.shadowOffsetY = 2
       ctx.fillStyle = '#ffffff'
-      rrect(ctx, x, y, EX.CELL_W, EX.CELL_H, EX.CARD_R)
+      rrect(ctx, x, y, m.cellW, m.cellH, EX.CARD_R)
       ctx.fill()
       ctx.restore()
       ctx.strokeStyle = '#e6e8f0'
       ctx.lineWidth = 1
-      rrect(ctx, x + 0.5, y + 0.5, EX.CELL_W - 1, EX.CELL_H - 1, EX.CARD_R)
+      rrect(ctx, x + 0.5, y + 0.5, m.cellW - 1, m.cellH - 1, EX.CARD_R)
       ctx.stroke()
 
       // 标签胶囊（空标签也照实写出来，提醒用户这格还没写标签）
       const label = cell.label || '（未命名）'
-      ctx.font = `600 13px ${FONT}`
-      const labelText = fitText(ctx, label, EX.CELL_W - pad * 2 - 16)
-      const lw = Math.min(EX.CELL_W - pad * 2, ctx.measureText(labelText).width + 16)
+      // 9 宫格的字号也跟着收一点，否则小格子里标签会把立绘框挤没
+      const labelFont = m.nine ? 12 : 13
+      ctx.font = `600 ${labelFont}px ${FONT}`
+      const labelText = fitText(ctx, label, m.cellW - pad * 2 - 16)
+      const lw = Math.min(m.cellW - pad * 2, ctx.measureText(labelText).width + 16)
       ctx.fillStyle = cell.label ? '#eef0fe' : '#f1f2f6'
-      rrect(ctx, x + pad, y + pad, lw, EX.LABEL_H, 6)
+      rrect(ctx, x + pad, y + pad, lw, m.labelH, 6)
       ctx.fill()
       ctx.save()
-      rrect(ctx, x + pad, y + pad, lw, EX.LABEL_H, 6)
+      rrect(ctx, x + pad, y + pad, lw, m.labelH, 6)
       ctx.clip()
       ctx.fillStyle = cell.label ? '#4756c4' : '#a6abb8'
       ctx.textAlign = 'left'
-      ctx.fillText(labelText, x + pad + 8, y + pad + 18)
+      ctx.fillText(labelText, x + pad + 8, y + pad + (m.nine ? 15 : 18))
       ctx.restore()
 
-      // 立绘占位块（有图时盖在上面）
-      const imgY = y + pad + EX.LABEL_H + 8
-      const imgW = EX.CELL_W - pad * 2
-      const nameBlock = 46
-      const imgH = EX.CELL_H - (pad + EX.LABEL_H + 8) - 8 - nameBlock - pad
-      const rect = { x: x + pad, y: imgY, w: imgW, h: imgH }
+      // 立绘占位块（有图时盖在上面）。矩形尺寸统一由 gridMetrics 给出，
+      // 与编辑区预览用的是同一套数字（过去这里另写一份 nameBlock=46，改了一处另一处不会跟着变）
+      const imgY = y + pad + m.labelH + EX.IMG_GAP
+      const rect = { x: x + pad, y: imgY, w: m.imgW, h: m.imgH }
       ctx.fillStyle = '#f3f4f8'
       rrect(ctx, rect.x, rect.y, rect.w, rect.h, EX.IMG_R)
       ctx.fill()
       if (cell.char) geo.push({ char: cell.char, rect })
 
       // 角色名 + 关系
-      const cx = x + EX.CELL_W / 2
-      const nameTop = imgY + imgH + 8
+      const cx = x + m.cellW / 2
+      const nameTop = imgY + m.imgH + EX.IMG_GAP
       ctx.textAlign = 'center'
       if (cell.char) {
         const n1 = charName(cell.char)
         const n2 = cell.char.name && cell.char.name_cn && cell.char.name_cn !== cell.char.name ? cell.char.name : ''
         ctx.fillStyle = '#23262e'
-        ctx.font = `600 15px ${FONT}`
-        ctx.fillText(fitText(ctx, n1, imgW), cx, nameTop + 18)
+        ctx.font = `600 ${m.nine ? 14 : 15}px ${FONT}`
+        ctx.fillText(fitText(ctx, n1, m.imgW), cx, nameTop + (m.nine ? 15 : 18))
         if (n2) {
           ctx.fillStyle = '#9aa1b1'
-          ctx.font = `12px ${FONT}`
-          ctx.fillText(fitText(ctx, n2, imgW), cx, nameTop + 36)
+          ctx.font = `${m.nine ? 11 : 12}px ${FONT}`
+          ctx.fillText(fitText(ctx, n2, m.imgW), cx, nameTop + (m.nine ? 30 : 36))
         }
       } else {
         ctx.fillStyle = '#c3c8d6'
-        ctx.font = `13px ${FONT}`
-        ctx.fillText('（空）', cx, nameTop + 18)
+        ctx.font = `${m.nine ? 12 : 13}px ${FONT}`
+        ctx.fillText('（空）', cx, nameTop + (m.nine ? 15 : 18))
       }
 
       // 右下角序号，方便对着屏幕找格子
       ctx.textAlign = 'right'
       ctx.fillStyle = '#dfe2ec'
       ctx.font = `10px ${FONT}`
-      ctx.fillText(String(r * cols + c + 1), x + EX.CELL_W - 7, y + EX.CELL_H - 6)
+      ctx.fillText(String(r * cols + c + 1), x + m.cellW - 7, y + m.cellH - 6)
     }
   }
 
@@ -450,7 +573,18 @@ function drawPoster(state: GridState, producer: string): { canvas: HTMLCanvasEle
   ctx.textAlign = 'left'
   ctx.fillStyle = '#9aa1b1'
   ctx.font = `12px ${FONT}`
-  ctx.fillText('角色立绘与资料来自 Bangumi（bgm.tv）', EX.OUTER, H - 24)
+  /*
+   * 页脚必须写**实际用到的**数据源：v0.3.2 之前这里硬编码「来自 Bangumi（bgm.tv）」，
+   * 换成 Jikan 之后导出图上仍然写着 Bangumi —— 图上写错来源比不写还糟。
+   * 回落时（Jikan 没取到，实际用 Bangumi）也照实写 Bangumi。
+   */
+  const footer =
+    sourceKind === 'jikan'
+      ? '角色立绘与资料来自 Jikan / MyAnimeList（cdn.myanimelist.net）'
+      : sourceKind === 'jikan-anilist'
+        ? '角色立绘与资料来自 AniList（s4.anilist.co）· Jikan 端点不可用时的备用源'
+        : `角色立绘与资料来自 Bangumi（bgm.tv）· ${resolvedLabel(sourceKind)}`
+  ctx.fillText(footer, EX.OUTER, H - 24)
   const d = new Date()
   ctx.textAlign = 'right'
   ctx.fillText(`导出时间 ${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`, W - EX.OUTER, H - 24)
@@ -483,8 +617,12 @@ function imageCandidates(images: Partial<CoverImages> | null | undefined): strin
  * 所有立绘 `await` 画完之后才 `toBlob()`，避免「导出图缺图」。
  * 分批（每批 4 张）是为了不让几十张大图同时驻留内存（4×10 最多 40 格）。
  */
-async function exportPng(state: GridState, producer: string): Promise<{ blob: Blob; missing: number; width: number; height: number }> {
-  const { canvas, geo } = drawPoster(state, producer)
+async function exportPng(
+  state: GridState,
+  producer: string,
+  sourceKind: ResolvedKind
+): Promise<{ blob: Blob; missing: number; width: number; height: number }> {
+  const { canvas, geo } = drawPoster(state, producer, sourceKind)
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('无法创建画布上下文')
 
@@ -540,7 +678,20 @@ export function CharacterGridPage() {
   // 角色
   const [chars, setChars] = useState<CharacterItem[]>([])
   const [loadingChars, setLoadingChars] = useState(false)
-  const [charSource, setCharSource] = useState<{ source: 'v0' | 'legacy'; stale?: boolean } | null>(null)
+  /**
+   * 当前选中的**数据源**（用户选择的那个，不是实际拿到的那个）。
+   * v0.3.0 就有这个 state 了，但界面上**一个控件都没有**：pickSource 是死代码，
+   * 用户既看不到当前用的是什么、也切不过去 —— 这是「切换数据源没生效」的第一层原因。
+   */
+  const [charSrc, setCharSrc] = useState<CharSrc>(() => {
+    try {
+      return localStorage.getItem(SOURCE_KEY) === 'bangumi' ? 'bangumi' : 'jikan'
+    } catch {
+      return 'jikan'
+    }
+  })
+  /** 实际拿到数据的来源 + 回落原因（界面常驻显示，不靠会消失的 toast） */
+  const [resolved, setResolved] = useState<ResolvedSource | null>(null)
 
   // 编辑态
   const [target, setTarget] = useState<Pos>({ r: 0, c: 0 })
@@ -550,6 +701,8 @@ export function CharacterGridPage() {
   const [producerError, setProducerError] = useState(false)
   const [exporting, setExporting] = useState(false)
   const producerRef = useRef<HTMLInputElement>(null)
+  /** 上次选中的作品只恢复一次（见下面的 useEffect：selectSubject 的引用会随数据源变，不能进依赖数组） */
+  const restoredRef = useRef(false)
 
   /** 每次改动都落 localStorage：刷新不丢（尺寸自检在 loadState 里做） */
   useEffect(() => {
@@ -645,45 +798,97 @@ export function CharacterGridPage() {
   }, [keyword])
 
   /**
-   * 角色数据源（v0.3.0，用户要求「切换角色数据来源，使用 Jikan API，主要是为了角色立绘清晰度」）。
+   * 按当前数据源取角色（v0.3.0 引入数据源，v0.3.2 重写）。
    *
-   * - `jikan`：MyAnimeList 的角色图（**原图**，实测常见 350x500 上下）—— 默认，立绘更清晰；
-   * - `bangumi`：原来的 Bangumi（v0 优先、老接口兜底），中文名更准，但图偏小（不少只有 250x300）。
+   * - `jikan`：MyAnimeList（经 Jikan）的角色图。实测**原图常见 225×350**（少量 434×675）；
+   * - `bangumi`：原来的 v0 角色接口（老接口兜底），中文名更准，但图偏小（不少只有 250×300）。
    *
    * 为什么 Jikan 按标题查：我们手里是 Bangumi 的条目 id，Jikan 认 MAL id，两边不通，标题是桥。
-   * 选了 jikan 但没取到角色时**自动回落到 Bangumi**，不会让用户空手而归。
+   *
+   * v0.3.2 三处修正（都是「用户以为 Jikan 没生效」的直接原因）：
+   *   ① 标题只试一个（name_cn || name）。中文名在 MAL 上常常搜不到，
+   *      而 MAL 条目名多半是日文原名 —— 现在两种标题都会试一次，命中率明显提高；
+   *   ② 成功后把来源标成 `v0`（Bangumi 的接口名），界面徽章于是写「来源：v0 角色接口」——
+   *      用了 Jikan 却显示 v0，等于给用户一个「果然没生效」的假证据，现在如实标 `jikan`；
+   *   ③ 回落只发一个几秒就消失的 toast，不留痕。现在回落原因写进 `resolved.fallback`，
+   *      界面上常驻显示，并且可以直接点「重试 Jikan」。
    */
-  const [charSrc, setCharSrc] = useState<'jikan' | 'bangumi'>(() => {
-    try {
-      return localStorage.getItem('sakana-character-grid-source') === 'bangumi' ? 'bangumi' : 'jikan'
-    } catch {
-      return 'jikan'
-    }
-  })
-  const pickSource = (v: 'jikan' | 'bangumi'): void => {
-    setCharSrc(v)
-    try {
-      localStorage.setItem('sakana-character-grid-source', v)
-    } catch {
-      /* 存储不可用时忽略 */
-    }
-    // 换源后立刻按新源重新拉一次当前作品，用户能马上看到差别
-    if (subject) void loadChars(subject, v)
-  }
-
-  const loadChars = useCallback(async (item: SearchResultItem, src: 'jikan' | 'bangumi') => {
+  const loadChars = useCallback(async (item: SearchResultItem, src: CharSrc) => {
     setLoadingChars(true)
     if (src === 'jikan') {
-      const r = await api.bangumi.charactersJikan(item.name_cn || item.name)
-      if (r.ok && r.data.items.length > 0) {
+      /*
+       * 两种标题各试一次（相同就只试一次）：中文名优先，因为用户是在中文界面里选的条目，
+       * 但 MAL 上多数条目只有日文原名，所以中文名没结果时必须再拿原名试一次。
+       */
+      const titles = [item.name_cn, item.name].map((s) => String(s ?? '').trim()).filter(Boolean)
+      const tries = [...new Set(titles)].slice(0, 2)
+      /*
+       * 回落原因用**局部变量**累积，不要放进 state 再读回来：
+       * setState 是异步的，同一次调用里读到的还是上一次的值（第一次失败时读到空串），
+       * 那样提示就成了没信息量的「Jikan 没取到角色」。这个局部变量同时喂给
+       * 「回落横幅的说明」和界面上的常驻提示。
+       */
+      let note = ''
+      for (const title of tries) {
+        const r = await api.bangumi.charactersJikan(title)
+        if (!r.ok) {
+          note = `Jikan 接口调用失败：${r.error}`
+          continue
+        }
+        if (r.data.items.length === 0) {
+          // malId=0 说明连 MAL 条目都没匹配上；reason 是主进程给的具体原因（Jikan 504 / AniList 无匹配…）
+          note =
+            r.data.reason ||
+            (r.data.malId > 0
+              ? `匹配到《${r.data.animeTitle}》(MAL #${r.data.malId})，但没有返回角色`
+              : `没匹配到「${title}」对应的 MAL 条目（搜索接口不可用或标题对不上）`)
+          continue
+        }
+        const items: CharacterItem[] = r.data.items.map((c) => ({
+          id: c.id,
+          name: c.name,
+          name_cn: c.name_cn,
+          relation: c.relation,
+          // 只给一张原图，四个档位都指向它（pickImage 取哪一档都是原图）
+          images: c.images as CoverImages | null
+        }))
+        // 立绘到底来自 MAL 还是 AniList，按主进程如实回报的字段决定（不能一律写 Jikan）
+        const fromAniList = r.data.imageSource === 'anilist' || r.data.via === 'anilist'
         setLoadingChars(false)
-        setChars(r.data.items as never)
-        setCharSource({ source: 'v0', stale: undefined })
-        toast.success(`已从 Jikan 取到 ${r.data.items.length} 位角色（立绘为 MAL 原图）`)
+        setChars(items)
+        setResolved({
+          kind: fromAniList ? 'jikan-anilist' : 'jikan',
+          jikan: { malId: r.data.malId, animeTitle: r.data.animeTitle, asked: title },
+          count: items.length
+        })
+        toast.success(
+          fromAniList
+            ? `已取到 ${items.length} 位角色（Jikan 端点不可用，改走 AniList 取图）`
+            : `已用 Jikan 取到 ${items.length} 位角色（MAL #${r.data.malId}，立绘为原图）`
+        )
         return
       }
-      // Jikan 没取到（网络/限流/对不上标题）→ 回落 Bangumi，并说明原因
-      toast.warn(r.ok ? 'Jikan 没取到角色，已回落到 Bangumi' : `Jikan 不可用（${r.error}），已回落到 Bangumi`)
+      // Jikan 这一路没拿到：回落 Bangumi，并把原因留在界面上
+      toast.warn('Jikan 没取到角色，已回落到 Bangumi')
+      const r = await api.bangumi.characters(item.id)
+      setLoadingChars(false)
+      if (!r.ok) {
+        toast.error(r.error)
+        return
+      }
+      setChars(r.data.items)
+      setResolved({
+        kind: r.data.source,
+        stale: r.data.stale,
+        count: r.data.items.length,
+        fallback: note || `Jikan 没取到「${item.name_cn || item.name}」的角色`
+      })
+      if (r.data.items.length === 0) {
+        if (r.data.error) toast.error(r.data.error.message)
+        else toast.info('这部作品没有取到角色数据')
+      }
+      if (r.data.source === 'legacy') toast.info('角色来自老接口兜底，数量可能少于完整角色表')
+      return
     }
     const r = await api.bangumi.characters(item.id)
     setLoadingChars(false)
@@ -692,7 +897,8 @@ export function CharacterGridPage() {
       return
     }
     setChars(r.data.items)
-    setCharSource({ source: r.data.source, stale: r.data.stale })
+    // 用户自己选的 Bangumi：不该出现「回落」提示（fallback 留空）
+    setResolved({ kind: r.data.source, stale: r.data.stale, count: r.data.items.length })
     if (r.data.items.length === 0) {
       if (r.data.error) toast.error(r.data.error.message)
       else toast.info('这部作品没有取到角色数据')
@@ -704,7 +910,7 @@ export function CharacterGridPage() {
     async (item: SearchResultItem) => {
       setSubject(item)
       setChars([])
-      setCharSource(null)
+      setResolved(null)
       try {
         localStorage.setItem(SUBJECT_KEY, JSON.stringify(item))
       } catch {
@@ -715,8 +921,33 @@ export function CharacterGridPage() {
     [charSrc, loadChars]
   )
 
-  /** 恢复上次选中的作品（selectSubject 是稳定引用，这里只跑一次） */
+  /** 切换数据源：立刻落盘 + 立刻按新源重拉当前作品（用户要能马上就看出差别） */
+  const pickSource = useCallback(
+    (v: CharSrc): void => {
+      if (v === charSrc) return
+      setCharSrc(v)
+      try {
+        localStorage.setItem(SOURCE_KEY, v)
+      } catch {
+        /* 存储不可用时忽略 */
+      }
+      toast.info(v === 'jikan' ? '数据源已切到 Jikan（立绘画质优先）' : '数据源已切到 Bangumi（中文名优先）')
+      if (subject) void loadChars(subject, v)
+    },
+    [charSrc, subject, loadChars]
+  )
+
+  /*
+   * 恢复上次选中的作品。
+   *
+   * 注意依赖数组里**不能**放 selectSubject：它的引用随 charSrc 变化，
+   * 换数据源时会重新触发这个 effect → 又按 SUBJECT_KEY 重选一次作品 →
+   * 加上 pickSource 自己那次重拉，同一次切换会打两遍 Jikan（白吃配额、还会弹两次 toast）。
+   * 所以用 ref 保证「只在挂载时恢复一次」；换源的重拉由 pickSource 负责。
+   */
   useEffect(() => {
+    if (restoredRef.current) return
+    restoredRef.current = true
     try {
       const raw = localStorage.getItem(SUBJECT_KEY)
       if (!raw) return
@@ -725,7 +956,8 @@ export function CharacterGridPage() {
     } catch {
       /* 缓存损坏就当作没有选中作品 */
     }
-  }, [selectSubject])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const placeCharacter = useCallback(
     (ch: CharacterItem) => {
@@ -775,12 +1007,18 @@ export function CharacterGridPage() {
     setProducerError(false)
     setExporting(true)
     try {
-      const { blob, missing, width, height } = await exportPng(state, who)
+      // 页脚要写实际用到的数据源：把当前来源传进去（没取到过就按用户选的标）
+      const kind: ResolvedKind = resolved?.kind ?? (charSrc === 'jikan' ? 'jikan' : 'v0')
+      const { blob, missing, width, height } = await exportPng(state, who, kind)
       downloadBlob(blob, exportFilename(state, who, subjectLabel))
+      /*
+       * 导出成功的提示里带上**实际来源与画布尺寸**：
+       * 用户这次的两个诉求（数据源 / 9 格尺寸）都能在这一行里被直接确认，
+       * 不必再去猜「到底生效了没有」。
+       */
       toast.success(
-        missing > 0
-          ? `已导出 PNG（${width}×${height}）；有 ${missing} 张立绘取不到，已用占位色块代替`
-          : `已导出 PNG（${width}×${height}），制作人已写在图上`
+        `已导出 PNG（${width}×${height}，来源：${resolvedLabel(kind)}）` +
+          (missing > 0 ? `；有 ${missing} 张立绘取不到，已用占位色块代替` : '')
       )
     } catch (err) {
       const msg = String((err as Error)?.message ?? err)
@@ -788,12 +1026,21 @@ export function CharacterGridPage() {
     } finally {
       setExporting(false)
     }
-  }, [state, subjectLabel])
+  }, [state, subjectLabel, resolved, charSrc])
 
   const untagged = useMemo(
     () => cells.flat().filter((cell) => !cell.label).length,
     [cells]
   )
+
+  /*
+   * 导出尺寸与单格立绘框尺寸（界面上的「导出 1096×1788」提示用它）。
+   * 数字全部来自 gridMetrics —— 和真正画图时用的是同一个函数，
+   * 所以界面上写的尺寸就是导出图的尺寸，不会出现「写着 200 实际画 230」。
+   */
+  const metrics = useMemo(() => gridMetrics(cols, rows), [cols, rows])
+  /** 编辑区预览的单格宽度：给个上限，否则 3×3 在宽窗口里每格能有 300px，立绘被拉糊 */
+  const previewW = metrics.nine ? 152 : 120
 
   return (
     <div className="relative h-full overflow-y-auto px-4 py-3">
@@ -813,7 +1060,8 @@ export function CharacterGridPage() {
             <Badge tone="accent">工具</Badge>
           </div>
           <p className="mt-0.5 text-xs text-faint">
-            搜作品 → 点角色装进选中的格子 → 填「制作人」后导出 PNG（数据来自 Bangumi）
+            搜作品 → 点角色装进选中的格子 → 填「制作人」后导出 PNG（角色数据源可在左侧切换：
+            Jikan / Bangumi）
           </p>
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-2">
@@ -881,6 +1129,44 @@ export function CharacterGridPage() {
             </div>
           ) : null}
 
+          {/*
+            ===== 角色数据源 =====
+            v0.3.2：**这是本次补上的可见控件**。v0.3.0 只有 charSrc 这个 state 和一个
+            （从未被任何控件调用的）pickSource 函数 —— 用户既看不到当前用的是什么，
+            也没有任何办法切过去，「切换数据源」自然「没生效」。
+            现在：选中态高亮、写在控件上、下面一行常驻说明当前用的是哪一个。
+          */}
+          <div className="rounded-lg border border-border bg-elev2/50 p-2">
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] font-semibold text-dim">角色数据源</span>
+              <div className="ml-auto flex rounded-lg border border-border bg-elev1 p-0.5">
+                {(
+                  [
+                    ['jikan', 'Jikan', 'MyAnimeList 原图，立绘更清晰（默认）'],
+                    ['bangumi', 'Bangumi', '中文名更准，但立绘偏小']
+                  ] as const
+                ).map(([v, label, hint]) => (
+                  <button
+                    key={v}
+                    type="button"
+                    title={hint}
+                    onClick={() => pickSource(v)}
+                    className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
+                      charSrc === v ? 'bg-accent text-white' : 'text-dim hover:text-text'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <p className="mt-1 text-[10px] leading-relaxed text-faint">
+              {charSrc === 'jikan'
+                ? '当前：Jikan —— 立绘取 MAL 原图（实测常见 225×350），画质优先；取不到角色时自动回落 Bangumi，并在下面写明原因。'
+                : '当前：Bangumi —— 中文名与关系更准，但角色图偏小（不少只有 250×300），导出时会被放大。'}
+            </p>
+          </div>
+
           {/* 角色列表 */}
           <div className="flex items-center gap-2">
             <span className="truncate text-xs font-semibold text-dim">
@@ -888,17 +1174,46 @@ export function CharacterGridPage() {
             </span>
             {loadingChars ? <Spinner size={14} /> : null}
             <span className="ml-auto flex shrink-0 items-center gap-1">
-              {charSource ? (
+              {resolved ? (
                 <>
-                  <Badge tone={charSource.source === 'v0' ? 'accent' : 'warn'}>
-                    {charSource.source === 'v0' ? '来源：v0 角色接口' : '来源：老接口兜底'}
+                  {/* 徽章写的是**实际取到数据的那一个**（用 Jikan 成功时不再显示成 v0） */}
+                  <Badge tone={resolved.kind === 'jikan' ? 'accent' : resolved.kind === 'v0' ? 'neutral' : 'warn'}>
+                    {resolvedLabel(resolved.kind)}
                   </Badge>
-                  {charSource.stale ? <Badge tone="neutral">缓存</Badge> : null}
+                  {resolved.stale ? <Badge tone="neutral">缓存</Badge> : null}
                 </>
+              ) : loadingChars ? (
+                <Badge tone="neutral">取角色中…</Badge>
               ) : null}
             </span>
           </div>
-          {charSource?.source === 'legacy' ? (
+
+          {/* 走 Jikan 成功时：把命中的 MAL 条目写出来，用户能确认「确实是 Jikan 给的」 */}
+          {resolved?.kind === 'jikan' && resolved.jikan ? (
+            <p className="text-[10px] leading-relaxed text-accent">
+              已命中 MAL《{resolved.jikan.animeTitle}》(#{resolved.jikan.malId})，共 {resolved.count} 位角色，
+              立绘为 MAL 原图。
+            </p>
+          ) : null}
+
+          {/* 回落提示：**常驻**在这里，不靠几秒就消失的 toast —— 不写清楚，用户只会以为「Jikan 没生效」 */}
+          {resolved?.fallback ? (
+            <div className="rounded-lg border border-warn/40 bg-warn/10 px-2 py-1.5">
+              <p className="text-[10px] leading-relaxed text-warn">
+                Jikan 没取到角色，本次列表用的是「{resolvedLabel(resolved.kind)}」。原因：{resolved.fallback}
+              </p>
+              {subject ? (
+                <button
+                  type="button"
+                  onClick={() => void loadChars(subject, 'jikan')}
+                  className="mt-1 text-[10px] font-semibold text-accent hover:underline"
+                >
+                  重试 Jikan
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          {resolved?.kind === 'legacy' ? (
             <p className="text-[10px] leading-relaxed text-warn">
               这部作品的角色走的是老接口兜底，角色数可能少于完整角色表（v0 接口当前不可用）。
             </p>
@@ -923,7 +1238,11 @@ export function CharacterGridPage() {
             </div>
           ) : (
             <div className="rounded-lg border border-dashed border-border px-3 py-6 text-center text-[11px] text-faint">
-              {loadingChars ? '正在取角色…' : '选中作品后这里会列出角色，点角色即可装进当前选中的格子'}
+              {loadingChars
+                ? `正在从 ${charSrc === 'jikan' ? 'Jikan（MyAnimeList）' : 'Bangumi'} 取角色…`
+                : subject
+                  ? '这部作品暂时没有取到角色，可以换一部作品或切换数据源试试'
+                  : '选中作品后这里会列出角色，点角色即可装进当前选中的格子'}
             </div>
           )}
         </section>
@@ -960,6 +1279,15 @@ export function CharacterGridPage() {
               </IconButton>
             </span>
             <span className="text-[10px] text-faint">共 {cols * rows} 格（上限 4×10 = 40 格）</span>
+            {/*
+              导出尺寸写在这里：9 格会收紧单格，用户过去完全看不到这件事 ——
+              改的只是导出画布，界面纹丝不动，于是「改了没生效」。
+              数字由 gridMetrics 直接算出，与真正画图用的是同一份尺寸。
+            */}
+            <span className="text-[10px] text-faint">
+              · 导出 {metrics.w * EX.S}×{metrics.h * EX.S}
+              {metrics.nine ? `（9 格单格 ${metrics.cellW}×${metrics.cellH}，已收紧）` : `（单格 ${metrics.cellW}×${metrics.cellH}）`}
+            </span>
 
             <span className="ml-auto flex items-center gap-2">
               <Button
@@ -991,10 +1319,19 @@ export function CharacterGridPage() {
             {swapFrom ? <span className="text-accent">· 交换模式已开启</span> : null}
           </div>
 
-          {/* 格子盘面：列数用内联样式（Tailwind 无法动态生成 grid-cols-N） */}
+          {/*
+            格子盘面。
+            列宽不再用 1fr：宽窗口里 3 列会各自撑到 300px 上下，而 MAL 立绘只有 225px 宽 ——
+            预览里立绘被硬拉大 2 倍多，用户看到的就是「立绘不清晰」。
+            现在按行列给一个单格宽度上限（9 宫格更小），并把单格比例换成**导出用的真实比例**，
+            预览和导出终于对得上（过去这里硬编码 230/276，9 宫格导出改成 200/240 后两者就不一致了）。
+          */}
           <div
             className="mt-3 grid gap-2"
-            style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}
+            style={{
+              gridTemplateColumns: `repeat(${cols}, ${previewW}px)`,
+              justifyContent: 'center'
+            }}
           >
             {cells.map((row, r) =>
               row.map((cell, c) => {
@@ -1009,7 +1346,7 @@ export function CharacterGridPage() {
                     className={`group relative flex cursor-pointer flex-col gap-1.5 rounded-xl border bg-elev1 p-1.5 transition-colors ${
                       isSwapFrom ? 'border-warn' : isTarget ? 'border-accent' : 'border-border hover:border-accent/60'
                     }`}
-                    style={{ aspectRatio: '230 / 276' }}
+                    style={{ aspectRatio: `${metrics.cellW} / ${metrics.cellH}` }}
                   >
                     {isEditing ? (
                       <input
@@ -1096,9 +1433,11 @@ export function CharacterGridPage() {
           </div>
 
           <p className="mt-3 text-[10px] leading-relaxed text-faint">
-            导出为 2 倍图 PNG，单格画「标签 + 立绘（cover 裁切）+ 名字」，右上角写制作人；
+            导出为 2 倍图 PNG，单格画「标签 + 立绘 + 名字」，右上角写制作人，页脚写实际用到的数据源；
             立绘由主进程取回并转成 data URL 后再画进画布（避免自定义协议污染画布导致导出失败）。
-            盘面与标签、制作人会存到本地，刷新不丢。
+            画布开着高质量重采样，并且**源图比目标框小时按 1:1 设备像素居中绘制、不放大**
+            （放大只会更糊）；9 宫格的单格也特意收紧，格子越小立绘被放大的倍数越小，越清晰。
+            盘面与标签、制作人、数据源都会存到本地，刷新不丢。
           </p>
         </section>
       </div>
