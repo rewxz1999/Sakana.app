@@ -1134,6 +1134,16 @@ function tuneValue(v: unknown): number | null {
 }
 
 /**
+ * 上一次真正应用过的画质设置指纹（v0.3.1）。
+ *
+ * 为什么需要：设置页每次改动都会写一遍 `settings`，而主进程在 store 写入钩子里
+ * 顺手重应用画质项（见 ipc.ts）——如果每次都无脑 `glsl-shaders clr + append`，
+ * 播放中随便改个**别的**设置（哪怕只是拖一下弹幕透明度）都会让着色器链重建、
+ * 掉一帧。指纹相同就什么都不做。
+ */
+let lastEnhanceKey = ''
+
+/**
  * 把 Anime4K 与画面微调**当场**应用到正在播放的实例（v0.3.1）。
  *
  * 三个调用点：① mpvAttach 建好实例之后；② 用户在设置页改动画质选项（主进程在
@@ -1144,12 +1154,25 @@ function tuneValue(v: unknown): number | null {
  * 逗号/分号两种写法（Anime4K 官方配置用分号），走 change-list 一条一条 append
  * 就不必赌分隔符，路径里带空格/中文也不会被拆开。
  *
+ * 与上次完全相同的设置会直接返回（见 lastEnhanceKey）；重建实例后由 mpvAttach 复位指纹，
+ * 保证新实例一定会被设置一次。
+ *
  * @returns 实际挂上的着色器绝对路径（空数组 = 已清空或没有可用着色器）
  */
 export function mpvApplyVideoEnhance(): string[] {
   if (!ready || !native) return []
   const s = getSettings().anime4k ?? {}
   const paths = anime4kChainPaths()
+  const key = JSON.stringify({
+    paths,
+    saturation: tuneValue(s.saturation),
+    contrast: tuneValue(s.contrast),
+    brightness: tuneValue(s.brightness),
+    gamma: tuneValue(s.gamma),
+    hdr: s.hdr ?? {}
+  })
+  if (key === lastEnhanceKey) return paths
+  lastEnhanceKey = key
 
   // ① 着色器链：先整体清空再按顺序 append（顺序 = 执行顺序，见 @shared/anime4k）
   try {
@@ -1342,7 +1365,9 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
    * Anime4K 着色器（v0.3.1）：实例就绪后按设置的链挂上。
    * 放在这里而不是 options 里，是因为列表选项的分隔符在 mpv 里有讲究，
    * 用 change-list 逐条 append 更稳（见 mpvApplyVideoEnhance 的注释）。
+   * 先复位指纹：新实例（或重进播放页）必须重新设置一次，不能被「和上次一样」挡掉。
    */
+  lastEnhanceKey = ''
   mpvApplyVideoEnhance()
   attachedWin = win
   lastPlaying = false
@@ -1715,6 +1740,8 @@ export function mpvDestroy(): void {
   uoscDanmakuLoaded = false
   uoscCtrlLoaded = false
   lastUoscBarJson = ''
+  // 画质设置的指纹也要复位：实例没了，新实例必须被重新设置一次（哪怕设置值没变）
+  lastEnhanceKey = ''
   lastVolume = -1
   latestPluginDanmakuFile = ''
   injectedForPath = ''

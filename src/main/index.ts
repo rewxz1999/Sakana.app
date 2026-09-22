@@ -654,6 +654,22 @@ if (!gotLock) {
             `[a4k-test] 旧链残留 ${stale.length} 个${stale.length === 0 ? '（已整体替换）' : `：${stale.join(', ')}`}` +
               `；切换后仍在播放: ${(st2?.time ?? 0) > 0 ? `✓ time=${Number(st2?.time ?? 0).toFixed(0)}ms` : '✗'}`
           )
+          /*
+           * ⑤ 幂等性：设置没变时重复应用应该**什么都不做**（否则播放中改任何别的设置
+           * 都会重建着色器链、掉一帧）。用 mpv 日志里那条「已挂载 N 个着色器」的条数来判定。
+           */
+          const { log: logSvc } = await import('./log')
+          const a4kLogCount = (): number =>
+            logSvc.list().filter((e) => String(e.message ?? '').includes('Anime4K 已挂载')).length
+          const before3 = a4kLogCount()
+          mpv.mpvApplyVideoEnhance()
+          mpv.mpvApplyVideoEnhance()
+          const after3 = a4kLogCount()
+          console.log(
+            `[a4k-test] 幂等性：设置未变时重复调用两次 → 日志新增 ${after3 - before3} 条` +
+              `（期望 0，即被指纹挡掉）→ ${after3 - before3 === 0 ? '✓' : '✗ 重复应用了'}`
+          )
+
           mpv.mpvDestroy()
           console.log('[a4k-test] done')
           markQuitting()
