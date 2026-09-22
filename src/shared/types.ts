@@ -2,6 +2,42 @@
 // Sakana 共享领域类型（主进程 / 渲染层共用）
 // ============================================================
 
+import type { Anime4kMode, Anime4kTier } from './anime4k'
+
+/**
+ * Anime4K 超分辨率与画面微调（v0.3.1）。
+ *
+ * 分三块：① 着色器链（模式 + 显卡档位，或自定义）；② 画面微调（mpv 的
+ * saturation/contrast/brightness/gamma，范围 -100~100，0 = 不动）；
+ * ③ HDR（直通显示器 / 色调映射算法 / 目标峰值亮度）。
+ */
+export interface Anime4kSettings {
+  /** 总开关；缺省 = 关 */
+  enabled?: boolean
+  /** 内置模式（A/B/C/A+A/B+B/C+A）或自定义；缺省 'A' */
+  mode?: Anime4kMode
+  /** 显卡档位；缺省 'fast'（官方 Low-end 模板，低端显卡也跑得动） */
+  tier?: Anime4kTier
+  /** 自定义模式的着色器文件名列表（顺序即执行顺序），仅 mode='custom' 时使用 */
+  custom?: string[]
+  /** 饱和度 -100~100（0 = 原始） */
+  saturation?: number
+  /** 对比度 -100~100（0 = 原始） */
+  contrast?: number
+  /** 亮度 -100~100（0 = 原始） */
+  brightness?: number
+  /** 伽马 -100~100（0 = 原始） */
+  gamma?: number
+  /** HDR 相关（`passthrough` = 把 HDR 原样交给显示器，需要显示器支持） */
+  hdr?: {
+    passthrough?: boolean
+    /** `--tone-mapping` 的算法名，见 ANIME4K_TONE_MAPPINGS；缺省 'auto' */
+    toneMapping?: string
+    /** 目标峰值亮度（nits），0/未填 = auto */
+    targetPeak?: number
+  }
+}
+
 export interface Rating {
   score: number | null
   total: number
@@ -1127,6 +1163,19 @@ export interface AppSettings {
    * `searchShowcase` 键里（stores/marks.ts），换键会让老用户已选的图片全部丢失，故保持不动。
    */
   searchCarouselSec?: number
+  /**
+   * Anime4K 超分辨率与画面微调（v0.3.1）。
+   *
+   * 着色器是随包内置的 39 个 `.glsl`（`resources/shaders`，由 extraResources 复制到
+   * 安装目录 `resources/shaders`，不进 asar），模式 → 着色器链的对照表在
+   * `@shared/anime4k`，链本身照抄 Anime4K v4.0.1 官方 mpv 模板。
+   *
+   * 主进程在 libmpv 初始化之后用运行时的
+   * `change-list glsl-shaders clr "" / append <path>` 挂载，所以改设置**当场生效**，
+   * 不需要重进播放器（见 mpv.ts 的 mpvApplyVideoEnhance）。
+   * 老设置文件里没有这个键时按「关闭」处理。
+   */
+  anime4k?: Anime4kSettings
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {

@@ -65,9 +65,6 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
   const [shotsOpen, setShotsOpen] = useState(false)
   const [shotsGame, setShotsGame] = useState<GalGame | null>(null)
   const [bgFailed, setBgFailed] = useState(false)
-  // 空态背景：复用「导航栏背景」里用户自己设置的图片（未设置时为空串）
-  const [navBgPath, setNavBgPath] = useState('')
-  const [navBgFailed, setNavBgFailed] = useState(false)
   /** 左下角小按钮的弹出层：沉浸模式下被隐藏的那三个按钮都收在这里 */
   const [overflowOpen, setOverflowOpen] = useState(false)
   /**
@@ -102,24 +99,12 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // 进页面读一次自定义导航栏背景图，供「没有导入 galgame」的空态当背景用
-  useEffect(() => {
-    let alive = true
-    void api.navBg.get().then((r) => {
-      if (alive && r.ok) setNavBgPath(r.data.path)
-    })
-    return () => {
-      alive = false
-    }
-  }, [])
-
   useEffect(() => {
     setBgFailed(false)
   }, [bgUrl])
 
-  // 空态背景图同样走 sakana-img 协议（主进程白名单 + 磁盘缓存），失败则回落纯色渐变
-  const navBgUrl = navBgPath ? localImgUrl(navBgPath) : ''
-  const emptyBg = navBgUrl || galgameDefaultBg
+  /** 空态背景图：只用内置默认背景（`galgameDefaultBg`），想换图直接替换 resources 里的默认图 */
+  const emptyBg = galgameDefaultBg
 
   // 底部封面条：竖向滚轮 → 横向滚动（原生非 passive 监听才能 preventDefault）
   useEffect(() => {
@@ -381,19 +366,19 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
         {/* 中部：选中游戏信息 / 空状态 */}
         <div className="flex min-h-0 flex-1 items-end px-6 pb-4">
           {games.length === 0 ? (
-            /* 空态：用用户自定义的导航栏背景图铺满整块区域代替纯色背景
+            /* 空态：用内置默认背景图铺满整块区域代替纯色背景
                （父容器 items-end，用 self-stretch 让这块区域撑满中部空间，背景图才真的铺满） */
             <div className="relative flex w-full flex-1 self-stretch items-center justify-center overflow-hidden rounded-2xl">
-              {emptyBg && !navBgFailed ? (
+              {emptyBg && !bgFailed ? (
                 <img
                   src={emptyBg}
                   alt=""
                   aria-hidden
                   className="absolute inset-0 h-full w-full object-cover"
-                  onError={() => setNavBgFailed(true)}
+                  onError={() => setBgFailed(true)}
                 />
               ) : (
-                /* 未设置背景图 / 图片加载失败：回落到原有纯色渐变，不报错、不白屏 */
+                /* 默认背景图缺失 / 图片加载失败：回落到原有纯色渐变，不报错、不白屏 */
                 <div className="absolute inset-0 bg-gradient-to-br from-[#1b2233] via-[#16121f] to-[#0d0a12]" />
               )}
               {/*

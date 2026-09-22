@@ -1,9 +1,10 @@
 import { app, BrowserWindow, screen } from 'electron'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { CH } from '@shared/channels'
 import type { OverlayAction } from '@shared/api'
 import type { DanmakuSettings } from '@shared/types'
+import { anime4kChain } from '@shared/anime4k'
 import { BROWSER_UA, getSettings } from '../net'
 import { danmakuApiBase } from './danmaku'
 import { log } from '../log'
@@ -1072,6 +1073,167 @@ export function mpvUoscDanmakuLoaded(): boolean {
   }
 }
 
+/* ─────────────── Anime4K 超分 + 画面微调（v0.3.1） ─────────────── */
+
+/**
+ * 内置着色器目录（39 个 Anime4K v4.0.1 的 `.glsl`）。
+ *
+ * 与 mpv-config 一样走 extraResources：打包后在 `<安装目录>/resources/shaders`，
+ * 开发态在仓库的 `resources/shaders`。判定存在的哨兵文件用
+ * `Anime4K_Clamp_Highlights.glsl` —— 它是所有内置模式的第一颗着色器，
+ * 少了它整条链都是错的，拿它当探针最贴切。
+ */
+export function bundledShaderDir(): string {
+  const candidates = [
+    join(process.resourcesPath ?? '', 'shaders'),
+    join(app.getAppPath(), '..', 'shaders'),
+    join(app.getAppPath(), 'resources', 'shaders')
+  ]
+  for (const p of candidates) {
+    try {
+      if (p && existsSync(join(p, 'Anime4K_Clamp_Highlights.glsl'))) return p
+    } catch {
+      /* ignore */
+    }
+  }
+  return ''
+}
+
+/**
+ * 目录里真实存在的着色器文件名（升序）。
+ *
+ * 给设置页的「自定义模式」用：只列真的躺在磁盘上的文件，
+ * 免得用户勾了半天、播放时 mpv 报找不到文件。
+ */
+export function anime4kShaderFiles(): string[] {
+  const dir = bundledShaderDir()
+  if (!dir) return []
+  try {
+    return readdirSync(dir)
+      .filter((f) => f.toLowerCase().endsWith('.glsl'))
+      .sort()
+  } catch {
+    return []
+  }
+}
+
+/** 当前设置解析出的着色器绝对路径（关闭 / 目录缺失时返回空数组） */
+export function anime4kChainPaths(): string[] {
+  const s = getSettings().anime4k
+  if (!s?.enabled) return []
+  const dir = bundledShaderDir()
+  if (!dir) return []
+  const names = anime4kChain(s.mode ?? 'A', s.tier ?? 'fast', s.custom)
+  return names.map((n) => join(dir, n)).filter((p) => existsSync(p))
+}
+
+/** 把 -100~100 的微调值夹到 mpv 能接受的范围；非数字返回 null（= 不动这个属性） */
+function tuneValue(v: unknown): number | null {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return null
+  return Math.max(-100, Math.min(100, Math.round(v)))
+}
+
+/**
+ * 把 Anime4K 与画面微调**当场**应用到正在播放的实例（v0.3.1）。
+ *
+ * 三个调用点：① mpvAttach 建好实例之后；② 用户在设置页改动画质选项（主进程在
+ * 通用 store 写入钩子里调，见 ipc.ts 的 storeSet）；③ 播放中新开一集时沿用同一实例，
+ * 无需重设 —— 着色器列表是 mpv 的全局属性，不随文件切换而清空。
+ *
+ * glsl-shaders 用 `change-list` 而不是 `--glsl-shaders`：列表分隔符在 mpv 里有
+ * 逗号/分号两种写法（Anime4K 官方配置用分号），走 change-list 一条一条 append
+ * 就不必赌分隔符，路径里带空格/中文也不会被拆开。
+ *
+ * @returns 实际挂上的着色器绝对路径（空数组 = 已清空或没有可用着色器）
+ */
+export function mpvApplyVideoEnhance(): string[] {
+  if (!ready || !native) return []
+  const s = getSettings().anime4k ?? {}
+  const paths = anime4kChainPaths()
+
+  // ① 着色器链：先整体清空再按顺序 append（顺序 = 执行顺序，见 @shared/anime4k）
+  try {
+    native.command(['change-list', 'glsl-shaders', 'clr', ''])
+    for (const p of paths) native.command(['change-list', 'glsl-shaders', 'append', slashPath(p)])
+    log.append('info', 'mpv', paths.length ? `Anime4K 已挂载 ${paths.length} 个着色器` : 'Anime4K 着色器已清空')
+  } catch (err) {
+    log.append('warn', 'mpv', `Anime4K 着色器设置失败: ${String((err as Error)?.message ?? err)}`)
+  }
+
+  /*
+   * ② 画面微调：这四个都是 mpv 的属性，运行时可改。
+   * 值为空/非数字时写回 0（= 原始），用户把滑杆拨回中间就等于恢复原样。
+   */
+  const props: [string, number][] = [
+    ['saturation', tuneValue(s.saturation) ?? 0],
+    ['contrast', tuneValue(s.contrast) ?? 0],
+    ['brightness', tuneValue(s.brightness) ?? 0],
+    ['gamma', tuneValue(s.gamma) ?? 0]
+  ]
+  for (const [name, value] of props) {
+    try {
+      native.setProperty(name, value)
+    } catch {
+      /* 老版本 mpv 没有某个属性就跳过 */
+    }
+  }
+
+  // ③ HDR：直通 / 色调映射 / 目标峰值
+  const hdr = s.hdr ?? {}
+  const hdrProps: [string, string | number | boolean][] = [
+    ['target-colorspace-hint', hdr.passthrough === true],
+    ['tone-mapping', hdr.toneMapping || 'auto'],
+    ['target-peak', typeof hdr.targetPeak === 'number' && hdr.targetPeak > 0 ? hdr.targetPeak : 'auto']
+  ]
+  for (const [name, value] of hdrProps) {
+    try {
+      native.setProperty(name, value)
+    } catch {
+      /* 同上 */
+    }
+  }
+  return paths
+}
+
+/** 内置着色器是否就位（设置页据此提示「安装目录不完整」） */
+export function anime4kAvailable(): boolean {
+  return bundledShaderDir() !== ''
+}
+
+/**
+ * 只读探测若干 mpv 属性（**仅供自检**：SAKANA_ANIME4K_TEST 用它证明
+ * 「着色器链真的进了 mpv」而不是只在我们这边拼好了字符串）。
+ */
+export function mpvProbeProperties(names: string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  if (!ready || !native) return out
+  for (const n of names) {
+    try {
+      out[n] = native.getProperty(n)
+    } catch (err) {
+      out[n] = `<读取失败: ${String((err as Error)?.message ?? err)}>`
+    }
+  }
+  return out
+}
+
+/**
+ * 把当前画面存成 PNG（**仅供自检**：SAKANA_ANIME4K_TEST 用它对比
+ * 「开着色器 / 关着色器」两帧是否真的不同）。
+ *
+ * `video` 模式 = 不含 OSD，避免弹幕/控制栏混进对比结果。
+ */
+export function mpvScreenshotToFile(file: string): boolean {
+  if (!ready || !native) return false
+  try {
+    return native.command(['screenshot-to-file', file, 'video'])
+  } catch {
+    return false
+  }
+}
+
+/* ─────────────────── 嵌入 ─────────────────── */
+
 /** 嵌入 libmpv（在播放器视频区域创建输出子窗口） */
 export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean; message: string } {
   const mod = loadNative()
@@ -1094,6 +1256,22 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
    * 之后再改就来不及了）。
    */
   const scriptOptsParts = [bili.options['script-opts'], wantUoscDanmaku ? uoscScriptOpts() : ''].filter(Boolean)
+  /*
+   * Anime4K / 画面微调（v0.3.1）：能当选项给的就直接在建实例时给上
+   * （第一帧就带上，不会出现「先原画闪一下再变清晰」）；
+   * 着色器链必须在实例就绪后用 change-list 追加，见下面的 mpvApplyVideoEnhance()。
+   */
+  const a4k = getSettings().anime4k ?? {}
+  const a4kHdr = a4k.hdr ?? {}
+  const a4kOpts: Record<string, string> = {
+    ...(tuneValue(a4k.saturation) !== null ? { saturation: String(tuneValue(a4k.saturation)) } : {}),
+    ...(tuneValue(a4k.contrast) !== null ? { contrast: String(tuneValue(a4k.contrast)) } : {}),
+    ...(tuneValue(a4k.brightness) !== null ? { brightness: String(tuneValue(a4k.brightness)) } : {}),
+    ...(tuneValue(a4k.gamma) !== null ? { gamma: String(tuneValue(a4k.gamma)) } : {}),
+    ...(a4kHdr.passthrough === true ? { 'target-colorspace-hint': 'yes' } : {}),
+    ...(a4kHdr.toneMapping ? { 'tone-mapping': a4kHdr.toneMapping } : {}),
+    ...(typeof a4kHdr.targetPeak === 'number' && a4kHdr.targetPeak > 0 ? { 'target-peak': String(a4kHdr.targetPeak) } : {})
+  }
   const ok = mod.create({
     x: currentBounds.x,
     y: currentBounds.y,
@@ -1103,6 +1281,7 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
     options: {
       ...(process.env.SAKANA_MPV_VERBOSE ? { terminal: 'yes', 'msg-level': 'all=v' } : {}),
       ...bili.options,
+      ...a4kOpts,
       /*
        * ── v0.2.18「uosc 接管控制栏」新增的启动参数，四条都必要 ──
        *
@@ -1159,6 +1338,12 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
   if (cfgDir && !uoscBarLoaded) {
     loadUoscPlugins(mod, cfgDir, wantUoscDanmaku, wantUoscBar)
   }
+  /*
+   * Anime4K 着色器（v0.3.1）：实例就绪后按设置的链挂上。
+   * 放在这里而不是 options 里，是因为列表选项的分隔符在 mpv 里有讲究，
+   * 用 change-list 逐条 append 更稳（见 mpvApplyVideoEnhance 的注释）。
+   */
+  mpvApplyVideoEnhance()
   attachedWin = win
   lastPlaying = false
   lastLength = 0

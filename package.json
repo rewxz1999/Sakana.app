@@ -1,6 +1,6 @@
 {
   "name": "sakana",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Sakana - 番剧管理及播放桌面客户端",
   "main": "./out/main/index.js",
   "author": "Sakana Team",
@@ -63,6 +63,10 @@
       {
         "from": "resources/mpv-config",
         "to": "mpv-config"
+      },
+      {
+        "from": "resources/shaders",
+        "to": "shaders"
       }
     ],
     "win": {

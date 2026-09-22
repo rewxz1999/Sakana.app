@@ -623,11 +623,6 @@ export interface SakanaApi {
     /** 设置自定义缓存目录（''=恢复默认 userData/cache），主进程会 mkdir -p */
     setDir(dir: string): Promise<ApiResult<{ dir: string }>>
   }
-  navBg: {
-    get(): Promise<ApiResult<{ path: string }>>
-    set(path: string): Promise<ApiResult<boolean>>
-    pick(): Promise<ApiResult<{ ok: boolean; error?: string; path?: string }>>
-  }
   saveDirs: {
     info(): Promise<ApiResult<SaveDirsInfo>>
     /** 修改保存目录并**立即生效**（主进程同步给下载器/截图服务，并返回最新配置） */
@@ -649,6 +644,10 @@ export interface PlayerAssets {
   aria2: boolean
   /** libmpv 运行时（libmpv-2.dll）是否就绪 */
   mpv: boolean
+  /** v0.3.1：Anime4K 着色器是否随包内置（安装目录不完整时为 false） */
+  anime4k?: boolean
+  /** v0.3.1：安装目录里实际存在的着色器文件名（升序），供「自定义模式」勾选 */
+  shaders?: string[]
 }
 
 /** 缓存占用信息（cache:info）：dir 为当前生效的缓存根目录 */

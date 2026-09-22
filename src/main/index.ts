@@ -472,6 +472,196 @@ if (!gotLock) {
       }, 2500)
     }
 
+    /*
+     * Anime4K 超分自检（SAKANA_ANIME4K_TEST=视频文件，v0.3.1）。
+     *
+     * 要证的不是「我们拼出了路径」，而是**mpv 真的接受了这条链**：
+     * ① 把设置里的 anime4k 写成指定模式 → ② 嵌入并播放真实视频 →
+     * ③ 读回 mpv 的 `glsl-shaders` 属性，逐个比对文件名 →
+     * ④ 顺带读回 saturation/tone-mapping 等微调属性与播放进度。
+     * 可选 SAKANA_ANIME4K_MODE=A|B|C|AA|BB|CA|custom、SAKANA_ANIME4K_TIER=fast|quality。
+     */
+    if (process.env.SAKANA_ANIME4K_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const file = process.env.SAKANA_ANIME4K_TEST!
+          const mode = (process.env.SAKANA_ANIME4K_MODE ?? 'A') as string
+          const tier = (process.env.SAKANA_ANIME4K_TIER ?? 'fast') as string
+          const mpv = await import('./services/mpv')
+          const { store } = await import('./store')
+          const { anime4kChain } = await import('@shared/anime4k')
+
+          // ① 先关掉着色器建实例：这次截图当基准
+          const cur = store.get<Record<string, unknown>>('settings', {})
+          store.set('settings', {
+            ...cur,
+            anime4k: {
+              enabled: false,
+              mode,
+              tier,
+              custom: mode === 'custom' ? String(process.env.SAKANA_ANIME4K_CUSTOM ?? '').split(',').filter(Boolean) : [],
+              saturation: 0,
+              contrast: 0,
+              brightness: 0,
+              gamma: 0,
+              hdr: { passthrough: false, toneMapping: 'bt.2390', targetPeak: 200 }
+            }
+          })
+
+          console.log(`[a4k-test] 着色器目录=${mpv.bundledShaderDir() || '(未找到)'}`)
+          console.log(`[a4k-test] 目录内着色器 ${mpv.anime4kShaderFiles().length} 个`)
+          const expect = anime4kChain(mode as never, tier as never, [])
+          console.log(`[a4k-test] 模式 ${mode} / 档位 ${tier} → 预期链 ${expect.length} 个: ${expect.join(' → ')}`)
+
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
+          if (!win) {
+            console.log('[a4k-test] 无主窗口')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const att = mpv.mpvAttach(win, { x: 0, y: 60, width: 960, height: 480 })
+          console.log(`[a4k-test] 嵌入: ${JSON.stringify(att)}`)
+          if (!att.ok) {
+            markQuitting()
+            app.quit()
+            return
+          }
+          console.log(`[a4k-test] 关闭状态下 glsl-shaders=${JSON.stringify(mpv.mpvProbeProperties(['glsl-shaders'])['glsl-shaders'])}`)
+          mpv.mpvPlay(file)
+
+          // 等基准画面稳定再截图（静态测试片源，三次截图内容只差「颜色微调」与「着色器」）
+          for (let i = 0; i < 6; i++) {
+            await new Promise((r) => setTimeout(r, 1000))
+            const st = mpv.mpvGetState()
+            if (st?.ready && st.length > 0 && st.time > 0) break
+          }
+          const shotOff = join(app.getPath('temp'), 'sakana-a4k-off.png')
+          const shotColor = join(app.getPath('temp'), 'sakana-a4k-color.png')
+          const shotOn = join(app.getPath('temp'), 'sakana-a4k-on.png')
+          mpv.mpvScreenshotToFile(shotOff)
+          await new Promise((r) => setTimeout(r, 1200))
+
+          /*
+           * ②-a 只调颜色（着色器仍关）：验证 saturation/contrast/brightness 生效
+           */
+          const curColor = store.get<Record<string, unknown>>('settings', {})
+          store.set('settings', {
+            ...curColor,
+            anime4k: {
+              ...((curColor.anime4k ?? {}) as Record<string, unknown>),
+              enabled: false,
+              saturation: 20,
+              contrast: -10,
+              brightness: 5
+            }
+          })
+          mpv.mpvApplyVideoEnhance()
+          await new Promise((r) => setTimeout(r, 1500))
+          mpv.mpvScreenshotToFile(shotColor)
+          await new Promise((r) => setTimeout(r, 1200))
+
+          // ②-b 再打开着色器（颜色不变）：这一次的差异只可能来自着色器
+          const curOn = store.get<Record<string, unknown>>('settings', {})
+          store.set('settings', {
+            ...curOn,
+            anime4k: { ...((curOn.anime4k ?? {}) as Record<string, unknown>), enabled: true }
+          })
+          const applied = mpv.mpvApplyVideoEnhance()
+          console.log(`[a4k-test] 应用后返回 ${applied.length} 条路径: ${JSON.stringify(applied)}`)
+          await new Promise((r) => setTimeout(r, 1500))
+          mpv.mpvScreenshotToFile(shotOn)
+          await new Promise((r) => setTimeout(r, 1200))
+
+          // ③ 读回 mpv 侧的属性
+          const probe = mpv.mpvProbeProperties([
+            'glsl-shaders',
+            'saturation',
+            'contrast',
+            'brightness',
+            'gamma',
+            'tone-mapping',
+            'target-peak',
+            'target-colorspace-hint'
+          ])
+          console.log(`[a4k-test] mpv 属性回读: ${JSON.stringify(probe)}`)
+          const back = String(probe['glsl-shaders'] ?? '')
+          const missing = expect.filter((f) => !back.includes(f.replace(/\.glsl$/, '')))
+          console.log(
+            `[a4k-test] glsl-shaders 回读含 ${expect.length - missing.length}/${expect.length} 个着色器` +
+              (missing.length ? `，缺: ${missing.join(', ')}` : ' → ✓ 与预期链一致')
+          )
+          console.log(
+            `[a4k-test] 微调属性: saturation=${probe['saturation']} contrast=${probe['contrast']} ` +
+              `brightness=${probe['brightness']} tone-mapping=${probe['tone-mapping']} target-peak=${probe['target-peak']}`
+          )
+
+          // ③.5 三张截图的哈希对比：分别隔离「颜色微调」与「着色器」两种效果
+          const { createHash } = await import('node:crypto')
+          const { readFileSync: rf, statSync: ss } = await import('node:fs')
+          const hashOf = (p: string): string => {
+            try {
+              return createHash('sha256').update(rf(p)).digest('hex').slice(0, 16)
+            } catch {
+              return '(读不到)'
+            }
+          }
+          const sizeOf = (p: string): number => {
+            try {
+              return ss(p).size
+            } catch {
+              return 0
+            }
+          }
+          const hOff = hashOf(shotOff)
+          const hColor = hashOf(shotColor)
+          const hOn = hashOf(shotOn)
+          const gauge = (a: string, b: string): string =>
+            a !== b && a !== '(读不到)' && b !== '(读不到)' ? '✓ 有差异' : '✗ 完全相同'
+          console.log(
+            `[a4k-test] 截图①原画=${hOff}(${(sizeOf(shotOff) / 1024).toFixed(0)}KB) ` +
+              `②仅调色=${hColor}(${(sizeOf(shotColor) / 1024).toFixed(0)}KB) ${gauge(hOff, hColor)} ` +
+              `③开着色器=${hOn}(${(sizeOf(shotOn) / 1024).toFixed(0)}KB) ${gauge(hColor, hOn)}`
+          )
+          console.log(
+            `[a4k-test] 结论: 颜色微调${gauge(hOff, hColor).startsWith('✓') ? '生效' : '无效'}；` +
+              `着色器${gauge(hColor, hOn).startsWith('✓') ? '生效（画面已改变，且颜色项前后一致）' : '无效'}` +
+              ` [${shotOff} / ${shotColor} / ${shotOn}]`
+          )
+
+          /*
+           * ④ 播放中换模式（模拟用户在设置页改选项）：
+           * 设置写回 store 后再应用一次 —— 这正是 ipc.ts 里 storeSet 钩子做的事，
+           * 用它证明「不用重进播放器就能换链」。
+           */
+          const nextMode = mode === 'C' ? 'B' : 'C'
+          const nextTier = tier === 'quality' ? 'fast' : 'quality'
+          const nextSettings = store.get<Record<string, unknown>>('settings', {})
+          const prevA4k = (nextSettings.anime4k ?? {}) as Record<string, unknown>
+          store.set('settings', { ...nextSettings, anime4k: { ...prevA4k, mode: nextMode, tier: nextTier } })
+          const applied2 = mpv.mpvApplyVideoEnhance()
+          const probe2 = mpv.mpvProbeProperties(['glsl-shaders'])
+          const back2 = String(probe2['glsl-shaders'] ?? '')
+          const expect2 = anime4kChain(nextMode as never, nextTier as never, [])
+          const missing2 = expect2.filter((f) => !back2.includes(f.replace(/\.glsl$/, '')))
+          const stale = expect.filter((f) => !expect2.includes(f) && back2.includes(f.replace(/\.glsl$/, '')))
+          const st2 = mpv.mpvGetState()
+          console.log(
+            `[a4k-test] 播放中切到 ${nextMode}/${nextTier}：应用 ${applied2.length} 条，回读含 ${expect2.length - missing2.length}/${expect2.length}` +
+              (missing2.length ? `，缺: ${missing2.join(', ')}` : ' ✓')
+          )
+          console.log(
+            `[a4k-test] 旧链残留 ${stale.length} 个${stale.length === 0 ? '（已整体替换）' : `：${stale.join(', ')}`}` +
+              `；切换后仍在播放: ${(st2?.time ?? 0) > 0 ? `✓ time=${Number(st2?.time ?? 0).toFixed(0)}ms` : '✗'}`
+          )
+          mpv.mpvDestroy()
+          console.log('[a4k-test] done')
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
+    }
+
     // 中转流自检（SAKANA_LIVE_TEST=视频文件）：
     // FFmpeg 中转 → 本机 HTTP 地址 → 当前内核播放（验证中转回退方案可用）
     if (process.env.SAKANA_LIVE_TEST) {
@@ -1793,7 +1983,22 @@ if (!gotLock) {
       setTimeout(() => {
         void (async () => {
           const { openSmallWindow } = await import('./window')
-          const hashes = [
+          /*
+           * 两个可选的调试旋钮（v0.3.1 加的，都是**只影响自检**的读法）：
+           * - `SAKANA_SMALLWIN_ROUTES='/player-settings'`：只查指定路由（默认全量 22 条），
+           *   用来单独核对某个长页面的下半部分，不必把 22 个窗口都开一遍；
+           * - `SAKANA_SMALLWIN_TEXT=4000`：把下面 JSON 里 `text` 字段的截断长度从 600 放宽，
+           *   长页面（比如播放器设置）末尾的内容才看得到。
+           */
+          const textLimit = Math.max(
+            200,
+            Math.min(20000, Number(process.env.SAKANA_SMALLWIN_TEXT) > 0 ? Math.floor(Number(process.env.SAKANA_SMALLWIN_TEXT)) : 600)
+          )
+          const routeOverride = String(process.env.SAKANA_SMALLWIN_ROUTES ?? '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+          const hashes = routeOverride.length > 0 ? routeOverride : [
             '/stattool',
             // v0.2.4：新增搜索页（收藏页的搜索框已迁到这里），纳入小窗口自检以免路由级错误漏网
             '/search',
@@ -1815,7 +2020,6 @@ if (!gotLock) {
             '/logs',
             '/about',
             '/save-dirs',
-            '/nav-bg',
             '/downloader-config',
             '/galgame/tools',
             // v0.2.8 附加：galgame 页（空态默认背景图）纳入
@@ -1938,7 +2142,7 @@ if (!gotLock) {
                         return JSON.stringify(out.slice(0,12))
                       })(),
                       // 详情页核对用：把正文前 600 字带出来，能直接看到上映日期/导演/製作等是否渲染
-                      text:(b?(b.innerText||'').replace(/\\s+/g,' ').slice(0,600):'')
+                      text:(b?(b.innerText||'').replace(/\\s+/g,' ').slice(0,${textLimit}):'')
                     })})()`
                 )
               )

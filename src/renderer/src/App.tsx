@@ -33,7 +33,6 @@ import { UpdatePage } from '@/pages/UpdatePage'
 import { LogsPage } from '@/pages/LogsPage'
 import { AboutPage } from '@/pages/AboutPage'
 import { SaveDirsPage } from '@/pages/SaveDirsPage'
-import { NavBgPage } from '@/pages/NavBgPage'
 import { api } from '@/lib/api'
 import { useShell } from '@/stores/shell'
 
@@ -46,7 +45,6 @@ const SMALL_WINDOW_TITLES: Record<string, string> = {
   '/logs': '运行日志',
   '/about': '关于 Sakana',
   '/save-dirs': '文件保存配置',
-  '/nav-bg': '导航栏背景',
   '/downloader-config': '下载器配置',
   '/player-settings': '播放器设置',
   '/cache-settings': '缓存设置',
@@ -103,7 +101,6 @@ function AnimatedRoutes() {
         <Route path="/logs" element={<PageTransition><LogsPage /></PageTransition>} />
         <Route path="/about" element={<PageTransition><AboutPage /></PageTransition>} />
         <Route path="/save-dirs" element={<PageTransition><SaveDirsPage /></PageTransition>} />
-        <Route path="/nav-bg" element={<PageTransition><NavBgPage /></PageTransition>} />
         <Route path="/galgame" element={<PageTransition><GalgamePage /></PageTransition>} />
         <Route path="/galgame/tools" element={<PageTransition><GalgameToolsPage /></PageTransition>} />
         <Route path="/downloads-win" element={<DownloadDetailPage />} />

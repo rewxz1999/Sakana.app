@@ -13,7 +13,6 @@ import {
 } from 'lucide-react'
 import { NavLink, useLocation } from 'react-router-dom'
 import { api } from '@/lib/api'
-import { localImgUrl } from '@/lib/format'
 import sidebarArt from '@/assets/sidebar-art.png'
 
 interface NavItem {
@@ -40,14 +39,10 @@ const SIDEBAR_ART = sidebarArt
 /** 侧面导航栏（方案 2：6 个标签，交互动画），支持自定义背景图片 */
 export function SideNav() {
   const location = useLocation()
-  const [bgPath, setBgPath] = useState('')
   /** 应用版本号（v0.2.8 附加：底部标签改为读真实版本，不再写死） */
   const [appVersion, setAppVersion] = useState('0.2.8')
 
   useEffect(() => {
-    void api.navBg.get().then((r) => {
-      if (r.ok) setBgPath(r.data.path)
-    })
     void api.app
       .version()
       .then((r) => {
@@ -61,7 +56,8 @@ export function SideNav() {
       item.to === '/' ? location.pathname === '/' : location.pathname.startsWith(item.to)
     ) ?? NAV_ITEMS[0]
 
-  const bgUrl = bgPath ? localImgUrl(bgPath) : ''
+  // v0.3.1：导航栏背景功能已按用户要求整体删除（设置项、页面、IPC、主进程实现一并移除）
+  const bgUrl = ''
 
   return (
     <nav className="relative flex w-48 shrink-0 flex-col overflow-hidden border-r border-border bg-elev1">

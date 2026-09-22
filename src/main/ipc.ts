@@ -34,7 +34,7 @@ import {
   stopRuleProbe
 } from './services/ruleProbe'
 import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
-import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested } from './services/mpv'
+import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested, mpvApplyVideoEnhance, anime4kAvailable, anime4kShaderFiles } from './services/mpv'
 import { buildStreamInfo } from './services/playerInfo'
 import {
   checkUpdate,
@@ -108,7 +108,7 @@ import { applyStatAction, readStatData, statWatchProgressFor } from './services/
 import { listStatShots, statShotsDirToOpen } from './services/statShots'
 import { maybeShowSaveHint } from './services/onboarding'
 import { ensureSaveDirs } from './services/saveDirs'
-import { clearCache, clearJunk, getCacheBytes, importShowcaseImages, pickDirectory, pickNavBgImage, setCacheDir } from './services/settingsExt'
+import { clearCache, clearJunk, getCacheBytes, importShowcaseImages, pickDirectory, setCacheDir } from './services/settingsExt'
 
 function focused(): BrowserWindow | undefined {
   // focusedOrMain 会排除离屏取数窗口：否则对话框可能被挂到一个不可见的窗口上
@@ -177,6 +177,13 @@ export function registerIpc(): void {
   ipcMain.handle(CH.storeGet, (_e, ns: string) => store.get(ns, null))
   ipcMain.handle(CH.storeSet, (_e, ns: string, data: unknown) => {
     store.set(ns, data)
+    /*
+     * v0.3.1：设置里带播放画质项（Anime4K 模式/着色器链、饱和度对比度、HDR…），
+     * 而这些项对 mpv 都是**运行时属性**，所以在这里顺手重应用一次 ——
+     * 用户改完设置立刻能看到画面变化，不必退出播放页再进来。
+     * 只在播放器实例存在时才有实际动作（mpvApplyVideoEnhance 自己会判 ready）。
+     */
+    if (ns === 'settings') mpvApplyVideoEnhance()
     return true
   })
 
@@ -608,7 +615,10 @@ export function registerIpc(): void {
   ipcMain.handle(CH.playerAssets, async () => ({
     ffmpeg: ffmpegExe() !== null,
     aria2: (await aria2.findBinary()) !== null,
-    mpv: mpvRuntimeAvailable()
+    mpv: mpvRuntimeAvailable(),
+    // v0.3.1：Anime4K 着色器是否随包内置（设置页据此显示/隐藏画质卡片与自定义列表）
+    anime4k: anime4kAvailable(),
+    shaders: anime4kShaderFiles()
   }))
 
   // ---------- 工具 ----------
@@ -773,12 +783,6 @@ export function registerIpc(): void {
   ipcMain.handle(CH.junkClear, () => clearJunk())
   // 自定义缓存目录：保存并 mkdir -p（'' = 恢复默认 userData/cache）
   ipcMain.handle(CH.cacheSetDir, (_e, dir: string) => setCacheDir(dir))
-  ipcMain.handle(CH.navBgGet, () => store.get<{ path: string }>('navBg', { path: '' }))
-  ipcMain.handle(CH.navBgSet, (_e, path: string) => {
-    store.set('navBg', { path })
-    return true
-  })
-  ipcMain.handle(CH.navBgPick, () => pickNavBgImage())
   ipcMain.handle(CH.galDirsGet, () => ({ dir: galToolsGet().dir }))
   ipcMain.handle(CH.galDirsSet, (_e, dir: string) => {
     galToolsSet({ dir })

@@ -267,11 +267,6 @@ const api: SakanaApi = {
     junkClear: () => call(CH.junkClear),
     setDir: (dir) => call(CH.cacheSetDir, dir)
   },
-  navBg: {
-    get: () => call(CH.navBgGet),
-    set: (path) => call(CH.navBgSet, path),
-    pick: () => call(CH.navBgPick)
-  },
   saveDirs: {
     info: () => call(CH.saveDirsInfo),
     set: (patch) => call(CH.saveDirsSet, patch)

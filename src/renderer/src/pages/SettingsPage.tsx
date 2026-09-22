@@ -333,13 +333,7 @@ export function SettingsPage() {
                 ))}
               </div>
             </div>
-            <RowDivider />
-            <OpenRow
-              icon={Image}
-              title="导航栏背景"
-              desc="为左侧导航栏设置自定义背景图片（PNG/JPG/GIF/WEBP，≤ 8MB）"
-              onOpen={() => openSmall('/nav-bg', 640, 560, '导航栏背景')}
-            />
+            {/* v0.3.1：按用户要求删除「导航栏背景」设置项（连同页面、IPC 与主进程实现一并移除） */}
           </div>
         </Section>
 
