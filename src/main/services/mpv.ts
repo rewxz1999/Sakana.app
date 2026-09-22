@@ -661,8 +661,9 @@ function clamp01(n: number): number {
  *   ③ uosc（控制栏本身：按钮、进度条、音量、菜单）
  *
  * @param wantDanmaku 是否加载 uosc_danmaku（弹幕渲染方式 = uosc 时才加载）
+ * @param wantBar 控制栏是否交给 uosc（设置项 uoscControlBar，默认 true）
  */
-function loadUoscPlugins(mod: MpvNative, cfgDir: string, wantDanmaku: boolean): boolean {
+function loadUoscPlugins(mod: MpvNative, cfgDir: string, wantDanmaku: boolean, wantBar: boolean): boolean {
   const uoscDir = slashPath(join(cfgDir, 'scripts', 'uosc'))
   const danmakuDir = slashPath(join(cfgDir, 'scripts', 'uosc_danmaku'))
 
@@ -724,11 +725,31 @@ function loadUoscPlugins(mod: MpvNative, cfgDir: string, wantDanmaku: boolean): 
     /* ignore */
   }
   /*
-   * v0.2.18：这里**删掉**了旧版那句 `disable-elements timeline,controls,volume,top_bar,window_border`。
-   * 以前应用的控制栏在 Electron 悬浮窗里，uosc 自带的那套必须关掉免得两套打架；
-   * 现在反过来 —— 控制栏就是 uosc 的，那些元素正要用（布局/按钮/时间显示全在
-   * resources/mpv-config/script-opts/uosc.conf 里配）。
+   * 用户在设置里把控制栏切回「应用自己的悬浮窗」时（wantBar=false），
+   * uosc 仍可能因为**弹幕插件**而必须加载（插件的搜索/样式/延迟菜单要用 uosc 渲染）。
+   * 那种情况下必须把它自己的控制栏关掉，否则画面上下会各挂一条控制栏。
+   * 这里的逗号列表只能走 script-message（`--script-opts` 的逗号解析救不了，见 uosc.conf 头注释）。
    */
+  if (!wantBar) {
+    try {
+      mod.command([
+        'script-message-to',
+        'uosc',
+        'disable-elements',
+        'sakana',
+        'timeline,controls,volume,top_bar,window_border'
+      ])
+      log.append('info', 'mpv', '已关闭 uosc 自带的控制栏（用户在设置里选择了应用自己的控制栏）')
+    } catch {
+      /* ignore */
+    }
+  } else {
+    /*
+     * wantBar=true：那些元素正是我们要的（布局/按钮/时间显示全在
+     * resources/mpv-config/script-opts/uosc.conf 里配），
+     * 所以旧版那句无条件的 disable-elements 已经删掉。
+     */
+  }
   return true
 }
 
@@ -1136,7 +1157,7 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
    * 重复 load-script 会出现两套控制栏 / 两份弹幕插件）。
    */
   if (cfgDir && !uoscBarLoaded) {
-    loadUoscPlugins(mod, cfgDir, wantUoscDanmaku)
+    loadUoscPlugins(mod, cfgDir, wantUoscDanmaku, wantUoscBar)
   }
   attachedWin = win
   lastPlaying = false

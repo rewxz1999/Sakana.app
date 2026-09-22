@@ -34,7 +34,7 @@ import {
   stopRuleProbe
 } from './services/ruleProbe'
 import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
-import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar } from './services/mpv'
+import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested } from './services/mpv'
 import { buildStreamInfo } from './services/playerInfo'
 import {
   checkUpdate,
@@ -537,7 +537,9 @@ export function registerIpc(): void {
     // v2.1.0 没有「条数」属性，只有 has-danmaku 布尔值：够用来判断插件到底有没有把弹幕挂上
     loaded: mpvUoscDanmakuLoaded(),
     // 有弹幕在排队等 mpv 载入文件：渲染层此时应当「再等等」而不是回落到画布
-    pending: mpvPluginDanmakuPending()
+    pending: mpvPluginDanmakuPending(),
+    // v0.2.18：uosc 本体（控制栏）是否挂上了 —— 渲染层据此决定要不要回落到旧控制栏
+    bar: uoscControlBarRequested() && uoscControlBarActive()
   }))
   ipcMain.handle(CH.playerUoscMenu, (_e, which: 'search' | 'total' | 'style' | 'delay' | 'add') =>
     mpvOpenDanmakuMenu(which)

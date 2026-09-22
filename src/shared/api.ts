@@ -595,8 +595,13 @@ export interface SakanaApi {
    * 插件自身的渲染、布局、样式菜单完全由上游实现，替换资源目录即可升级。
    */
   uosc: {
-    /** 插件当前状态：用户是否选了插件渲染 / 插件是否真的挂上了 / 是否已显示弹幕 / 是否有弹幕在等文件就绪 */
-    status(): Promise<ApiResult<{ requested: boolean; active: boolean; loaded: boolean; pending: boolean }>>
+    /**
+     * 插件当前状态：用户是否选了插件渲染 / 插件是否真的挂上了 / 是否已显示弹幕 / 是否有弹幕在等文件就绪。
+     * `bar`（v0.2.18）= uosc 本体是否挂上（控制栏画不画得出来）；为 false 时渲染层要回落到旧控制栏。
+     */
+    status(): Promise<
+      ApiResult<{ requested: boolean; active: boolean; loaded: boolean; pending: boolean; bar: boolean }>
+    >
     /** 打开插件的菜单（uosc 渲染）：搜索弹幕 / 总菜单 / 弹幕样式 / 源延迟 / 从源添加 */
     menu(which: 'search' | 'total' | 'style' | 'delay' | 'add'): Promise<ApiResult<boolean>>
     /** 显式设置插件的弹幕开关（与内置开关联动；插件把开关状态存在自己的记录文件里） */

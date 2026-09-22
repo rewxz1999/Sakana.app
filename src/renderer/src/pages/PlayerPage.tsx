@@ -1373,12 +1373,13 @@ export function PlayerPage() {
    * 三重条件：
    *   ① 设置开关没被关掉（`uoscControlBar !== false`，默认开）；
    *   ② 内核确实是 libmpv（HTML5 回退路径里没有 mpv，也就没有 uosc）；
-   *   ③ 内置 uosc 目录存在（安装不完整时主进程会回落，这里跟着一起回落）。
+   *   ③ uosc 本体没有明确报告「没挂上」（`uoscBarReady === false` 时回落到旧控制栏）。
+   *      未知（null，刚进播放器还没查过）时先按接管处理，避免旧控制栏闪一下再消失。
    * 为 true 时悬浮窗只画弹幕与「uosc 给不了的浮层」，不再画控件。
    */
-  const uoscBarMode = appSettings?.uoscControlBar !== false && engineState === 'active'
-  const uoscBarRef = useRef(false)
-  uoscBarRef.current = uoscBarMode
+  const [uoscBarReady, setUoscBarReady] = useState<boolean | null>(null)
+  const uoscBarMode =
+    appSettings?.uoscControlBar !== false && engineState === 'active' && uoscBarReady !== false
   /** 最近一次 show 拿到的悬浮窗代号（hide 时带回去，防止迟到的 hide 关掉新窗口） */
   const overlayGenRef = useRef<number | null>(null)
   useEffect(() => {
@@ -2100,6 +2101,8 @@ export function PlayerPage() {
       const r = await api.uosc.status()
       if (!alive || !r.ok) return
       setUoscActive(r.data.active)
+      // v0.2.18：uosc 本体（控制栏）有没有挂上 —— 没挂上就回落到旧控制栏，不能让人没有控制栏可用
+      setUoscBarReady(r.data.bar)
       if (r.data.active) {
         console.log(`[player] 弹幕由 uosc_danmaku 插件渲染（已显示=${r.data.loaded}）`)
         void api.uosc.delay(danmakuSettingsRef.current.offsetMs)

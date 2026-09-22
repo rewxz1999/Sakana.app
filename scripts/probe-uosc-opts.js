@@ -232,6 +232,19 @@ setTimeout(() => {
       await wait(500)
       console.log('[probe] 状态下行后 user-data/sakana-ctrl =', JSON.stringify(ctrlProp()), '（期望空：状态不该产生动作）')
 
+      /*
+       * 2.5) 逐个打开全部菜单：这一步验证六个菜单构造器里的 JSON 生成
+       *      （嵌套子菜单、表格形式的 value、activate 标记…）不报 Lua 错误。
+       *      有错的话 mpv 会把 `Lua error: ...` 打到 stderr，日志里能直接看到。
+       */
+      for (const menu of ['episodes', 'lines', 'subtitle', 'speed', 'aspect', 'danmaku']) {
+        napi.command(['script-message', 'sakana-menu', menu])
+        await wait(180)
+      }
+      console.log('[probe] 六个菜单已依次打开（请检查上面 stderr 有无 Lua error）')
+      napi.command(['script-message-to', 'uosc', 'close-menu', 'sakana-danmaku'])
+      await wait(200)
+
       // 3) 菜单动作必须被脚本自己吃掉（弹 uosc 菜单），不能回传给应用
       napi.command(['script-message', 'sakana-ctrl', 'menu', 'speed'])
       await wait(500)
