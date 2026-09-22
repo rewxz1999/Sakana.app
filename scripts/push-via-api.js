@@ -76,14 +76,24 @@ async function main() {
   }
   const localFiles = git(['ls-files']).split(/\r?\n/).filter(Boolean)
   const changed = []
+  /*
+   * 二进制判定：**看内容，不看扩展名**。
+   *
+   * 这里踩过一次坑：以前用扩展名白名单（png|jpg|…|ttf 之类）判断，
+   * 漏了 `.otf`（uosc 的图标字体 `resources/mpv-config/fonts/uosc_icons.otf`），
+   * 于是那个字体被当成文本做了 CRLF→LF 归一化后上传 —— 远端那份字体文件从此是坏的，
+   * 谁从仓库 clone 出来自己构建，uosc 的图标就会出问题（本地打包不受影响，因为用的是本地那份）。
+   * 现在改成「前 8KB 里出现 NUL 字节即二进制」，字体/图片/压缩包都逃不掉。
+   */
+  const looksBinary = (raw) => raw.subarray(0, 8192).includes(0)
   for (const path of localFiles) {
     const rel = path.replace(/\\/g, '/')
     const raw = readFileSync(path)
-    const isBinary = /\.(png|jpe?g|webp|gif|ico|zip|7z|exe|dll|node|woff2?|ttf|mp4|mp3)$/i.test(path)
+    const isBinary = looksBinary(raw)
     const content = isBinary ? raw : Buffer.from(raw.toString('utf8').replace(/\r\n/g, '\n'), 'utf8')
     const sha = gitBlobSha(content)
     if (remoteBlobs.get(rel) !== sha) {
-      changed.push({ status: remoteBlobs.has(rel) ? 'M' : 'A', path, content })
+      changed.push({ status: remoteBlobs.has(rel) ? 'M' : 'A', path, content, binary: isBinary })
     }
     remoteBlobs.delete(rel)
   }
