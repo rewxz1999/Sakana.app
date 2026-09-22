@@ -18,6 +18,7 @@ import {
   SkipBack,
   SkipForward,
   SlidersHorizontal,
+  Sparkles,
   Subtitles,
   Volume1,
   Volume2,
@@ -25,7 +26,8 @@ import {
   X
 } from 'lucide-react'
 import type { OverlayAction, OverlayDanmaku, OverlayEpisodes, OverlayState } from '@shared/api'
-import type { AspectMode, SubjectDetail } from '@shared/types'
+import type { Anime4kSettings, AspectMode, SubjectDetail } from '@shared/types'
+import { ANIME4K_MODES, ANIME4K_TIERS } from '@shared/anime4k'
 import { api } from '@/lib/api'
 import { StreamInfoModal } from '@/components/StreamInfoModal'
 import { CoverImage } from '@/components/CoverImage'
@@ -45,6 +47,13 @@ const ASPECT_LABEL: Record<AspectMode, string> = {
   cover: '裁剪铺满',
   stretch: '拉伸铺满'
 }
+
+/**
+ * 画质按钮角标用的模式短名（v0.3.3）。
+ * 直接从 `@shared/anime4k` 的模式表里取 `short`，与设置页、mpv 桥接脚本三处口径一致 ——
+ * 不再手写一遍，免得以后加模式时漏改。
+ */
+const A4K_SHORT: Record<string, string> = Object.fromEntries(ANIME4K_MODES.map((m) => [m.id, m.short]))
 
 function fmt(sec: number): string {
   if (!Number.isFinite(sec) || sec < 0) sec = 0
@@ -259,6 +268,15 @@ export default function PlayerOverlay(): React.ReactElement {
   const [aspectMenu, setAspectMenu] = useState(false)
   // v0.2.9 最后更新：倍速菜单
   const [speedMenu, setSpeedMenu] = useState(false)
+  /**
+   * 画质（Anime4K）菜单与当前设置（v0.3.3）。
+   *
+   * 为什么悬浮窗要自己读一遍 settings：超分设置存在主进程，而这里要显示角标
+   * （开着时显示当前模式 A/B/C…）。挂载时读一次，打开菜单时再读一次保证是最新的；
+   * 改动写回 settings 后主进程的 store 钩子会立刻重挂着色器链 —— 播放中即时生效。
+   */
+  const [qualityMenu, setQualityMenu] = useState(false)
+  const [a4k, setA4k] = useState<Anime4kSettings>({})
   const [showInfo, setShowInfo] = useState(false)
   /** 选集浮层里正在查看的线路（悬浮窗本地状态，切换线路不打断播放） */
   const [browseLine, setBrowseLine] = useState(0)
@@ -303,6 +321,14 @@ export default function PlayerOverlay(): React.ReactElement {
   /** 唤出控制栏：显示 + 接收鼠标事件；空闲 5 秒后隐藏 + 恢复点击穿透 */
   const poke = useCallback(() => {
     setVisible(true)
+    /*
+     * v0.3.3：uosc 模式下**主动让 mpv 把控制栏显示出来**。
+     *
+     * uosc 的设计是「鼠标靠近底部（默认 40px）才显示控制栏」，在画面中间移动鼠标它按设计不出现；
+     * 而用户期望的正是「鼠标一动就出来」。这里每次鼠标移动（poke 由 mousemove 触发）
+     * 就让主进程执行 uosc 自带的 flash-ui（强制显示 1 秒），节流在主进程里做（900ms）。
+     */
+    if (uoscBarRef.current) void api.uosc.reveal()
     // uosc 模式下不申请交互：控制栏由 mpv 画，鼠标必须留给它
     if (!uoscBarRef.current) void api.overlay.setInteractive(true)
     window.clearTimeout(hideTimer.current)
@@ -311,6 +337,8 @@ export default function PlayerOverlay(): React.ReactElement {
       setSubMenu(false)
       setAspectMenu(false)
       setDanmakuMenu(false)
+      // v0.3.3：画质菜单也要一起收起来，否则控制栏藏了、菜单还挂在屏幕上点不到
+      setQualityMenu(false)
       setVisible(false)
       void api.overlay.setInteractive(false)
     }, 5000)
@@ -355,7 +383,15 @@ export default function PlayerOverlay(): React.ReactElement {
   // 浮层/菜单打开时保持可交互，关闭后恢复正常 5 秒自动隐藏
   useEffect(() => {
     holdRef.current =
-      showInfo || subMenu || aspectMenu || danmakuMenu || showInfoPanel || state?.showEpisodes === true
+      showInfo ||
+      subMenu ||
+      aspectMenu ||
+      danmakuMenu ||
+      // v0.3.3：画质菜单同理 —— 不把它算进来，菜单开着的时候控制栏会按 5 秒计时收走、
+      // 悬浮窗还会归还点击穿透，用户点菜单就是在点一个「已经不接收点击」的窗口。
+      qualityMenu ||
+      showInfoPanel ||
+      state?.showEpisodes === true
     if (holdRef.current) {
       setVisible(true)
       // 浮层是需要点的东西 → 临时接收鼠标（uosc 的控制栏此刻被浮层挡着，不影响）
@@ -369,9 +405,41 @@ export default function PlayerOverlay(): React.ReactElement {
      * 后三个是从 uosc 菜单/桥接脚本回传过来的，依赖不全时这个 effect 不会重跑，
      * 于是浮层弹出来了却**没有申请交互**，点上去毫无反应（用户报的「点了没反应」）。
      */
-  }, [showInfo, subMenu, aspectMenu, danmakuMenu, showInfoPanel, state?.showEpisodes, poke])
+  }, [showInfo, subMenu, aspectMenu, danmakuMenu, qualityMenu, showInfoPanel, state?.showEpisodes, poke])
 
   useEffect(() => api.overlay.onState(setState), [])
+
+  /*
+   * 画质设置：挂载时读一次（给按钮角标用），打开菜单时再读一次（保证是最新值）。
+   * 写回走的也是同一个 settings，主进程的 store 钩子会立刻重挂着色器链。
+   */
+  const loadA4k = useCallback(async (): Promise<void> => {
+    const r = await api.store.get('settings')
+    if (!r.ok || !r.data || typeof r.data !== 'object') return
+    const s = (r.data as Record<string, unknown>).anime4k
+    setA4k(s && typeof s === 'object' ? (s as Anime4kSettings) : {})
+  }, [])
+  useEffect(() => {
+    void loadA4k()
+  }, [loadA4k])
+  useEffect(() => {
+    if (qualityMenu) void loadA4k()
+  }, [qualityMenu, loadA4k])
+  /** 改一项画质设置：先更新本地（角标立刻跟手），再整份写回 settings */
+  const patchA4k = useCallback((patch: Partial<Anime4kSettings>): void => {
+    setA4k((prev) => {
+      const next = { ...prev, ...patch }
+      void api.store.get('settings').then((r) => {
+        const cur = (r.ok && r.data && typeof r.data === 'object' ? r.data : {}) as Record<string, unknown>
+        void api.store.set('settings', { ...cur, anime4k: next })
+      })
+      return next
+    })
+  }, [])
+  const a4kEnabled = a4k.enabled === true
+  const a4kMode = a4k.mode ?? 'A'
+  const a4kTier = a4k.tier ?? 'fast'
+  const a4kShort = A4K_SHORT[a4kMode] ?? a4kMode
   // 透明窗口：给根元素打标记，让全局样式把底色设为透明（否则会盖住整屏画面）
   useEffect(() => {
     document.documentElement.classList.add('sakana-overlay')
@@ -1117,6 +1185,91 @@ export default function PlayerOverlay(): React.ReactElement {
                       {ASPECT_LABEL[m]}
                     </button>
                   ))}
+                </div>
+              )}
+            </div>
+
+            {/*
+              画质（Anime4K 超分，v0.3.3）。
+              用户要求「控制栏里要有超分辨率按钮」——以前只能进设置页改，播放中没法切。
+              数据来源是主进程的 settings（走 api.store 读写），主进程在 store 写入钩子里
+              会立刻重挂着色器链，所以这里是**播放中即时生效**；按钮角标显示当前模式。
+            */}
+            <div className="relative">
+              <IconBtn
+                title={`画质（Anime4K 超分）：${a4kEnabled ? `模式 ${a4kShort}` : '已关闭'}`}
+                active={qualityMenu || a4kEnabled}
+                onClick={() => {
+                  setQualityMenu(!qualityMenu)
+                  setSubMenu(false)
+                  setAspectMenu(false)
+                }}
+              >
+                <span className="flex items-center gap-0.5">
+                  <Sparkles size={18} />
+                  <span className="min-w-[14px] text-[10px] font-semibold tabular-nums">
+                    {a4kEnabled ? a4kShort : '关'}
+                  </span>
+                </span>
+              </IconBtn>
+              {qualityMenu && (
+                <div className="absolute bottom-12 right-0 z-40 w-60 rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur">
+                  <div className="px-2 py-1 text-[10px] text-white/50">
+                    Anime4K 超分（改完立刻生效）
+                  </div>
+                  <button
+                    className={`block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 ${
+                      a4kEnabled ? '' : 'text-accent'
+                    }`}
+                    onClick={() => {
+                      patchA4k({ enabled: false })
+                      setQualityMenu(false)
+                    }}
+                  >
+                    关闭超分
+                  </button>
+                  {ANIME4K_MODES.filter((m) => m.id !== 'custom').map((m) => (
+                    <button
+                      key={m.id}
+                      className={`block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 ${
+                        a4kEnabled && a4kMode === m.id ? 'text-accent' : ''
+                      }`}
+                      onClick={() => {
+                        patchA4k({ enabled: true, mode: m.id })
+                        setQualityMenu(false)
+                      }}
+                    >
+                      <span className="font-medium">{m.short}</span>
+                      <span className="ml-2 text-[10px] text-white/50">{m.desc}</span>
+                    </button>
+                  ))}
+                  <div className="my-1 border-t border-white/10" />
+                  <div className="px-2 py-1 text-[10px] text-white/50">显卡档位</div>
+                  {ANIME4K_TIERS.map((t) => (
+                    <button
+                      key={t.id}
+                      className={`block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 ${
+                        a4kTier === t.id ? 'text-accent' : ''
+                      }`}
+                      onClick={() => {
+                        patchA4k({ tier: t.id })
+                        setQualityMenu(false)
+                      }}
+                    >
+                      <span className="font-medium">{t.label}</span>
+                      <span className="ml-2 text-[10px] text-white/50">{t.desc}</span>
+                    </button>
+                  ))}
+                  <div className="my-1 border-t border-white/10" />
+                  <button
+                    className="block w-full rounded px-2 py-1.5 text-left hover:bg-white/10"
+                    onClick={() => {
+                      setQualityMenu(false)
+                      send({ type: 'openQualitySettings' })
+                    }}
+                  >
+                    完整画质设置…
+                  </button>
                 </div>
               )}
             </div>

@@ -134,6 +134,14 @@ export const CH = {
    * （选集/线路/字幕表/倍速/比例/弹幕设置…），桥接脚本据此刷新按钮与菜单。
    */
   playerUoscBar: 'player:uosc-bar',
+  /**
+   * v0.3.3：让 uosc 立刻把控制栏显示出来。
+   *
+   * 为什么需要：uosc 按设计只在鼠标靠近底部时显示控制栏，画面中间移动鼠标它不出来；
+   * 而且鼠标事件能否到 mpv 还受窗口层级影响。所以改由**应用侧主动唤出**：
+   * 播放页每次看到鼠标移动就调它，主进程执行 uosc 自带的 `script-binding uosc/flash-ui`。
+   */
+  playerUoscReveal: 'player:uosc-reveal',
 
   // 订阅（主进程为唯一写入方：变更后广播，渲染层只读 + 触发操作）
   subsList: 'subs:list',

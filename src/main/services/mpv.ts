@@ -8,6 +8,7 @@ import { anime4kChain } from '@shared/anime4k'
 import { BROWSER_UA, getSettings } from '../net'
 import { danmakuApiBase } from './danmaku'
 import { log } from '../log'
+import { store } from '../store'
 
 /**
  * libmpv 播放内核（可选，与 libVLC 并列）
@@ -550,9 +551,21 @@ export function uoscDanmakuRequested(): boolean {
  * 那时应用回落到自己那套悬浮窗控制栏（代码原样保留，见 playerOverlay.ts）。
  * 内置 uosc 缺失（安装目录不完整）时也回落到旧控制栏 —— 不能让人没有控制栏可用。
  */
+/**
+ * uosc 控制栏是否接管（v0.2.18 引入，**v0.3.3 起默认关闭**）。
+ *
+ * 为什么默认关掉：用户明确要求「撤销 uosc，就用我们原来自建的控制栏」。
+ * 现在回头看，当初迁到 uosc 是为了绕开「控制栏按钮失灵」，而那个毛病的真因后来查清了
+ * （① 悬浮窗在鼠标移动时抢走交互、② uosc 的动作字符串被 mpv 加了引号导致全部匹配不上），
+ * 两个都修好之后应用自己的悬浮窗控制栏是完全可用的，而且它的按钮、菜单、超分入口
+ * 都在我们自己的 React 里，调试和扩展都比改 mpv 脚本直接。
+ *
+ * 仍保留 uosc 这条路（设置里可手动打开）：弹幕插件 uosc_danmaku 的菜单要用 uosc 渲染，
+ * 所以 uosc 本身还会被加载，只是**不再让它画控制栏**（见 loadUoscPlugins 里的 disable-elements）。
+ */
 export function uoscControlBarRequested(): boolean {
   const s = getSettings() as unknown as { uoscControlBar?: boolean }
-  return s.uoscControlBar !== false && uoscPluginAvailable()
+  return s.uoscControlBar === true && uoscPluginAvailable()
 }
 
 /** uosc 本体（控制栏/进度条/菜单）是否真的挂上了 */
@@ -751,6 +764,40 @@ function loadUoscPlugins(mod: MpvNative, cfgDir: string, wantDanmaku: boolean, w
      * 所以旧版那句无条件的 disable-elements 已经删掉。
      */
   }
+
+  /*
+   * v0.3.3：**桥接脚本存活检查**。
+   *
+   * 为什么需要：`load-script` 只表示「文件被接受了」，脚本在运行时报错（例如我们在 Lua 里
+   * 误写了一个 JSDoc 风格的 `/** *​/` 注释）会立刻退出，而 load-script 依然返回成功 ——
+   * 那时控制栏会**一个按钮都没有**、菜单全打不开，用户还以为「控制栏坏了」。
+   * 脚本加载成功后会在自己末尾写 `user-data/sakana-ctrl-ready`；这里等一会儿去读，
+   * 读不到就判定脚本没活下来，把 uosc 控制栏标记为不可用（渲染层会回落到应用自己的悬浮窗控制栏，
+   * 至少保证用户有控制栏可用），并把原因写进日志与错误日志页。
+   */
+  if (uoscCtrlLoaded) {
+    setTimeout(() => {
+      if (!ready || !native) return
+      let alive = ''
+      try {
+        const v = native.getProperty('user-data/sakana-ctrl-ready')
+        alive = typeof v === 'string' ? v : ''
+      } catch {
+        alive = ''
+      }
+      if (alive) {
+        log.append('info', 'mpv', `控制栏桥接脚本已就绪（版本 ${alive}）`)
+        return
+      }
+      uoscCtrlLoaded = false
+      log.append(
+        'error',
+        'mpv',
+        '控制栏桥接脚本没有就绪（多半是 Lua 语法/运行错误，见日志里的 Lua error）——' +
+          '已回落到应用自己的控制栏，请检查 resources/mpv-scripts/sakana-uosc-ctrl.lua'
+      )
+    }, 1200)
+  }
   return true
 }
 
@@ -873,7 +920,7 @@ function pollUoscCtrl(win: BrowserWindow): void {
   let raw = ''
   try {
     const v = native.getProperty(UOSC_CTRL_PROP)
-    raw = typeof v === 'string' ? v.trim() : ''
+    raw = typeof v === 'string' ? normalizeCtrlProp(v) : ''
   } catch {
     return
   }
@@ -886,10 +933,24 @@ function pollUoscCtrl(win: BrowserWindow): void {
     /* ignore */
   }
   const action = uoscActionToOverlay(raw)
+  /*
+   * v0.3.3：Anime4K 的动作**直接在主进程处理**，不绕渲染层。
+   *
+   * 理由：设置存在主进程的 store 里，处理完马上就要 change-list 重挂着色器链、
+   * 再把新状态推回控制栏（角标/勾选态）。绕一圈渲染层只是多一次 IPC 往返，
+   * 中间还可能出现「菜单已经关了但按钮还是旧状态」的空窗。
+   */
+  if (handleAnime4kUoscAction(raw)) {
+    lastDispatchedAction = `${raw}（主进程直接处理）`
+    dispatchedCount += 1
+    return
+  }
   if (!action) {
     log.append('warn', 'mpv', `uosc 控制栏动作无法识别，已忽略: ${raw.slice(0, 80)}`)
     return
   }
+  lastDispatchedAction = raw
+  dispatchedCount += 1
   try {
     if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
       win.webContents.send(CH.overlayAction, action)
@@ -897,6 +958,37 @@ function pollUoscCtrl(win: BrowserWindow): void {
   } catch (err) {
     log.append('warn', 'mpv', `uosc 控制栏动作派发失败: ${String((err as Error)?.message ?? err)}`)
   }
+}
+
+/**
+ * 归一化 `user-data/sakana-ctrl` 读到的值（v0.3.3 关键修复）。
+ *
+ * `user-data/*` 是**节点（node）类型**的属性，mpv 把它转成字符串时对字符串节点会输出
+ * JSON 风格字面量：脚本写进去的 `toggle-danmaku`，我们读回来是 `"toggle-danmaku"`（带引号）。
+ * 而 `uoscActionToOverlay()` 按裸字符串匹配 → **每个动作都匹配不上**，
+ * 用户看到的就是「控制栏按钮点了没反应」（他从 0.3.0 起一直反馈的问题）。
+ *
+ * 还有两个必须处理的形态：
+ *  - 我们用 `setProperty(name, '')` 清空后，读回来是 `""`（两个引号字符，不是空串）——
+ *    以前会被当成一个「无法识别的动作」，每 250ms 往日志页刷一条告警；
+ *  - 将来若写成 JSON 对象/数组，也能原样还原成文本。
+ */
+function normalizeCtrlProp(value: string): string {
+  const t = value.trim()
+  if (t.length < 2 || !t.startsWith('"') || !t.endsWith('"')) return t
+  try {
+    const parsed = JSON.parse(t) as unknown
+    return typeof parsed === 'string' ? parsed : t
+  } catch {
+    return t.slice(1, -1)
+  }
+}
+
+/** 自检用：最近一次被成功派发的控制栏动作 + 累计条数（证明动作链路真的通了） */
+let lastDispatchedAction = ''
+let dispatchedCount = 0
+export function uoscActionStats(): { last: string; count: number } {
+  return { last: lastDispatchedAction, count: dispatchedCount }
 }
 
 /** 上一次推给桥接脚本的状态（内容没变就不重发；控制栏状态是低频变化） */
@@ -910,9 +1002,29 @@ let lastUoscBarJson = ''
  */
 export function mpvPushUoscBar(payload: unknown): boolean {
   if (!ready || !native || !uoscCtrlLoaded) return false
+  /*
+   * v0.3.3：把**当前画质设置**并进这份状态。
+   *
+   * 为什么由主进程来并：Anime4K 的设置存在主进程的 store 里（uosc 菜单改的也是它），
+   * 渲染层那份 payload 里没有这个字段；而控制栏的「画质」按钮要靠它显示角标与勾选态。
+   * 合并放在去重比较**之前** —— 这样菜单里改了模式之后重推同一份 payload 也能生效。
+   */
+  const a4kSettings = getSettings().anime4k ?? {}
+  let merged: Record<string, unknown> | null = null
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    merged = {
+      ...(payload as Record<string, unknown>),
+      anime4k: {
+        enabled: a4kSettings.enabled === true,
+        mode: a4kSettings.mode ?? 'A',
+        tier: a4kSettings.tier ?? 'fast'
+      }
+    }
+    lastUoscPayload = merged
+  }
   let json = ''
   try {
-    json = JSON.stringify(payload ?? null)
+    json = JSON.stringify(merged ?? payload ?? null)
   } catch {
     return false
   }
@@ -1223,6 +1335,168 @@ export function anime4kAvailable(): boolean {
   return bundledShaderDir() !== ''
 }
 
+/** 上一次渲染层推下来的原始状态：Anime4K 在 uosc 菜单里改完之后要拿它重推一次（合并新设置） */
+let lastUoscPayload: Record<string, unknown> | null = null
+/** 记录最近一次由 uosc 菜单改的画质设置，供自检核对 */
+let lastA4kActionLog = ''
+
+/** 把画质设置写回 store（与 ipc.ts 的 storeSet 同一条路，只是不经过渲染层） */
+function saveAnime4kSettings(patch: Record<string, unknown>): void {
+  const cur = store.get<Record<string, unknown>>('settings', {})
+  const prev = (cur.anime4k ?? {}) as Record<string, unknown>
+  store.set('settings', { ...cur, anime4k: { ...prev, ...patch } })
+}
+
+/**
+ * 处理来自 uosc「画质」菜单的动作（v0.3.3）。
+ *
+ * 支持：`a4k-set <off|A|B|C|AA|BB|CA>`、`a4k-tier <fast|quality>`、`a4k-toggle`、
+ * `open-quality-settings`。改完立刻重挂着色器链（播放中即时生效），并把新状态推回控制栏，
+ * 让按钮角标与菜单勾选态马上跟手。
+ *
+ * @returns 是否消费了这个动作（消费了就不再往渲染层派发）
+ */
+function handleAnime4kUoscAction(raw: string): boolean {
+  const [head, arg] = raw.trim().split(/\s+/)
+  if (head === 'open-quality-settings') {
+    dispatchOverlayAction({ type: 'openQualitySettings' })
+    return true
+  }
+  if (head !== 'a4k-set' && head !== 'a4k-tier' && head !== 'a4k-toggle') return false
+
+  const a4k = getSettings().anime4k ?? {}
+  if (head === 'a4k-set') {
+    if (arg === 'off') {
+      saveAnime4kSettings({ enabled: false })
+    } else if (anime4kChain(arg === 'custom' ? 'custom' : (arg as never), a4k.tier ?? 'fast', a4k.custom).length > 0) {
+      saveAnime4kSettings({ enabled: true, mode: arg })
+    } else {
+      log.append('warn', 'mpv', `画质模式无法识别，已忽略: ${arg}`)
+      return true
+    }
+  } else if (head === 'a4k-tier') {
+    if (arg !== 'fast' && arg !== 'quality') return true
+    saveAnime4kSettings({ tier: arg })
+  } else {
+    saveAnime4kSettings({ enabled: a4k.enabled !== true })
+  }
+
+  const applied = mpvApplyVideoEnhance()
+  const now = getSettings().anime4k ?? {}
+  lastA4kActionLog = `${raw} → enabled=${now.enabled === true} mode=${now.mode ?? 'A'} tier=${now.tier ?? 'fast'} 链长=${applied.length}`
+  log.append('info', 'mpv', `控制栏画质菜单：${lastA4kActionLog}`)
+  // 状态回推：控制栏按钮角标 / 菜单勾选态立刻跟着变
+  if (lastUoscPayload) mpvPushUoscBar(lastUoscPayload)
+  return true
+}
+
+/** 自检用：最近一次 uosc 画质菜单动作的处理结果 */
+export function anime4kLastUoscAction(): string {
+  return lastA4kActionLog
+}
+
+/** 把 OverlayAction 发给播放页（供主进程内部直接派发用，例如 uosc 菜单里的「完整画质设置」） */
+function dispatchOverlayAction(action: Record<string, unknown>): void {
+  try {
+    const win = attachedWin
+    if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send(CH.overlayAction, action)
+    }
+  } catch (err) {
+    log.append('warn', 'mpv', `动作派发失败: ${String((err as Error)?.message ?? err)}`)
+  }
+}
+
+/**
+ * 让 uosc 把控制栏**立刻显示出来**（v0.3.3）。
+ *
+ * 用户反馈「在播放器内移动鼠标时无法呼出控制栏」。实测 uosc 的设计是
+ * **只有鼠标靠近底部（proximity_in 像素内）才显示**控制栏（见 Element.lua 的 get_visibility），
+ * 在画面中间移动鼠标它按设计就不出来；再加上「鼠标事件能不能到 mpv」本身还受窗口层级影响，
+ * 光靠 mpv 自己的鼠标处理不可靠。
+ *
+ * 所以这里由**应用侧主动唤出**：播放页/悬浮窗每次看到鼠标移动就调一次这个方法，
+ * 它执行 uosc 自带的 `script-binding uosc/flash-ui`（强制显示 1 秒，见 uosc main.lua）。
+ * flash 持续 1 秒，这里按 900ms 节流，避免鼠标一动就狂发命令。
+ */
+export function mpvRevealUoscUi(): boolean {
+  if (!ready || !native || !uoscBarLoaded) return false
+  const now = Date.now()
+  if (now - lastRevealAt < 900) return true
+  lastRevealAt = now
+  let ok = false
+  try {
+    /*
+     * 两条路都发，互为保险（uosc 两个入口都是它自己注册的，不是我们编的）：
+     *  ① `script-binding uosc/flash-ui`：uosc main.lua 里 bind_command('flash-ui', …) 注册的命名键位，
+     *     效果同它自己的快捷键（强制显示 timeline/controls/volume/top_bar 各 1 秒）；
+     *  ② `script-message-to uosc flash-elements …`：uosc 专门为**外部脚本**注册的消息入口
+     *     （main.lua: `mp.register_script_message('flash-elements', …)`），语义相同。
+     * 两条都失败也不报错到界面 —— 用户还有 Tab 键与「靠近底部自动浮现」两条路。
+     */
+    const a = native.command(['script-binding', 'uosc/flash-ui'])
+    const b = native.command([
+      'script-message-to',
+      'uosc',
+      'flash-elements',
+      'timeline,controls,volume,top_bar'
+    ])
+    ok = a || b
+    if (!ok) log.append('warn', 'mpv', '唤出 uosc 控制栏被拒（flash-ui 与 flash-elements 都没成功）')
+    return ok
+  } catch (err) {
+    log.append('warn', 'mpv', `唤出 uosc 控制栏异常: ${String((err as Error)?.message ?? err)}`)
+    return false
+  }
+}
+
+/** 自检用：绕过节流强制唤出一次（验证「应用侧唤出」这条路真的能让 uosc 画出控制栏） */
+export function mpvRevealUoscUiForTest(): boolean {
+  lastRevealAt = 0
+  return mpvRevealUoscUi()
+}
+
+/**
+ * 自检用：给 mpv 脚本发一条 script-message（例如让桥接脚本打开「画质」菜单）。
+ * 业务代码不要用它 —— 正常路径都是通过属性/状态推下来的。
+ */
+export function mpvSendScriptMessage(args: string[]): boolean {
+  if (!ready || !native) return false
+  try {
+    return native.command(['script-message', ...args])
+  } catch {
+    return false
+  }
+}
+
+/** 自检用：画一条 OSD 文字（用来验证「subtitles 档截图到底拍不拍得到 OSD 层」） */
+export function mpvShowTextForTest(text: string): boolean {
+  if (!ready || !native) return false
+  try {
+    return native.command(['show-text', text, '4000'])
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 自检用：直接写一条「控制栏动作」（等价于用户点了 uosc 菜单项 / 按钮）。
+ *
+ * 真实路径是：桥接脚本把动作写进 `user-data/sakana-ctrl`，主进程的 250ms 轮询读走并派发。
+ * 这里就是替脚本写一次 —— 走的完全是同一条消费路径。
+ */
+export function mpvSetCtrlPropForTest(raw: string): boolean {
+  if (!ready || !native) return false
+  try {
+    return native.setProperty(UOSC_CTRL_PROP, raw)
+  } catch {
+    return false
+  }
+}
+
+/** 上一次主动唤出控制栏的时间（节流用） */
+let lastRevealAt = 0
+
 /**
  * 只读探测若干 mpv 属性（**仅供自检**：SAKANA_ANIME4K_TEST 用它证明
  * 「着色器链真的进了 mpv」而不是只在我们这边拼好了字符串）。
@@ -1241,15 +1515,16 @@ export function mpvProbeProperties(names: string[]): Record<string, unknown> {
 }
 
 /**
- * 把当前画面存成 PNG（**仅供自检**：SAKANA_ANIME4K_TEST 用它对比
- * 「开着色器 / 关着色器」两帧是否真的不同）。
+ * 把当前画面存成 PNG（**仅供自检**：SAKANA_ANIME4K_TEST / SAKANA_UOSC_TEST 用它对比
+ * 「开着色器 / 关着色器」或「控制栏显示 / 未显示」两块画面是否真的不同）。
  *
- * `video` 模式 = 不含 OSD，避免弹幕/控制栏混进对比结果。
+ * @param mode `video` = 不含 OSD（对比画质用）；`subtitles` = **包含 OSD**，
+ *             uosc 的控制栏与菜单都画在 OSD 层上，所以验证控制栏必须用这一档。
  */
-export function mpvScreenshotToFile(file: string): boolean {
+export function mpvScreenshotToFile(file: string, mode: 'video' | 'subtitles' = 'video'): boolean {
   if (!ready || !native) return false
   try {
-    return native.command(['screenshot-to-file', file, 'video'])
+    return native.command(['screenshot-to-file', file, mode])
   } catch {
     return false
   }

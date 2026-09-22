@@ -34,7 +34,7 @@ import {
   stopRuleProbe
 } from './services/ruleProbe'
 import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
-import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested, mpvApplyVideoEnhance, anime4kAvailable, anime4kShaderFiles } from './services/mpv'
+import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested, mpvApplyVideoEnhance, anime4kAvailable, anime4kShaderFiles, mpvRevealUoscUi } from './services/mpv'
 import { buildStreamInfo } from './services/playerInfo'
 import {
   checkUpdate,
@@ -578,6 +578,8 @@ export function registerIpc(): void {
    * 在主进程里直接派发成 OverlayAction（见 mpv.ts 的 pollUoscCtrl），不经过本文件。
    */
   ipcMain.handle(CH.playerUoscBar, (_e, payload: unknown) => mpvPushUoscBar(payload))
+  // v0.3.3：播放页/悬浮窗看到鼠标移动时调它 → uosc 立刻把控制栏显示出来（flash-ui，节流在 mpv.ts 里）
+  ipcMain.handle(CH.playerUoscReveal, () => mpvRevealUoscUi())
   // ---------- 全屏控制栏悬浮窗 ----------
   /*
    * v0.2.8 附加 修「控制栏按钮点了没反应」：

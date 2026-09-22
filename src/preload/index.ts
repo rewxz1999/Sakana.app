@@ -136,7 +136,9 @@ const api: SakanaApi = {
     clear: () => call(CH.playerUoscClear),
     delay: (offsetMs) => call(CH.playerUoscDelay, offsetMs),
     // v0.2.18：控制栏状态下行（uosc 按钮的图标/激活态/角标、各菜单的内容）
-    bar: (payload) => call(CH.playerUoscBar, payload)
+    bar: (payload) => call(CH.playerUoscBar, payload),
+    // v0.3.3：让 uosc 立刻显示控制栏（播放页看到鼠标移动时调）
+    reveal: () => call(CH.playerUoscReveal)
   },
   overlay: {
     isOverlay: process.argv.includes('--sakana-overlay'),

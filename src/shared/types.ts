@@ -272,6 +272,22 @@ export interface Subscription {
   folder: string | null // 本地播放文件夹
   mikanKeyword: string
   createdAt: number
+  /**
+   * 蜜柑「按番剧 + 字幕组」官方订阅 RSS 的解析结果缓存（v0.3.3）。
+   *
+   * 为什么要有这三个字段：蜜柑的订阅地址是
+   * `RSS/Bangumi?bangumiId=…&subgroupid=…`，`bangumiId` 要从搜索页 HTML 里解析、
+   * `subgroupId` 要从番剧页 HTML 里解析 —— 一次解析要 2 个请求。缓存下来后
+   * 后续每次检测都是 **0 个解析请求**（直接用缓存拼 feed 地址），否则「每次检测都重解析」
+   * 既慢又平白多打蜜柑两下。
+   *
+   * 三个字段都可选：老订阅记录里没有，第一次检测时解析并回写。
+   * `cachedGroupName` 是缓存**有效性的键** —— 用户在界面上换了字幕组时
+   * （`group` 变了而 id 还是旧的），必须重新解析，否则会一直拉旧字幕组的 feed。
+   */
+  mikanBangumiId?: number
+  mikanSubgroupId?: number
+  cachedGroupName?: string | null
 }
 
 export interface MikanItem {
@@ -1172,13 +1188,16 @@ export interface AppSettings {
    */
   scheduleFilters?: Partial<ScheduleDisplayFilters>
   /**
-   * 播放器控制栏是否交给 uosc（v0.2.18）。
+   * 播放器控制栏是否交给 uosc（v0.2.18 引入；**v0.3.3 起默认关闭**）。
    *
-   * - 缺省 / true：用 mpv 内置的 uosc 画控制栏（布局在 resources/mpv-config/script-opts/uosc.conf，
-   *   快捷键在 resources/mpv-config/input.conf，按钮/菜单由 resources/mpv-scripts/sakana-uosc-ctrl.lua 驱动）；
-   * - false：回落到应用自己的悬浮窗控制栏（代码原样保留，见 services/playerOverlay.ts），
-   *   遇到 uosc 出问题时可随时切回来。
+   * - 缺省 / false：用**应用自己的悬浮窗控制栏**（v0.3.3 起这是默认）——
+   *   进度条、播放控制、选集、字幕、倍速、画面比例、弹幕、画质（Anime4K 超分）、全屏与退出
+   *   都在里面，按钮/菜单是应用自己的界面（见 renderer 的 PlayerOverlayPage）；
+   * - true：改由 mpv 的 uosc 画控制栏（布局在 resources/mpv-config/script-opts/uosc.conf，
+   *   快捷键在 resources/mpv-config/input.conf，按钮/菜单由 resources/mpv-scripts/sakana-uosc-ctrl.lua 驱动）。
    *
+   * ⚠️ 主进程与渲染层两处判定必须一致（mpv.ts 的 `uoscControlBarRequested()` 与
+   * PlayerPage 的 `uoscBarMode`），否则会出现「uosc 不画 + 自建控制栏也不画」= 完全没有控制栏。
    * 内置 uosc 缺失（安装目录不完整）时也会自动回落，不需要用户去改这个开关。
    */
   uoscControlBar?: boolean

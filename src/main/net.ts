@@ -11,6 +11,24 @@ export const UA = 'Sakana/0.1.0 (anime desktop client; +https://github.com/sakan
 export const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 
+/**
+ * 蜜柑计划的基础域名（v0.3.3 从 mikan.ts 挪到这里，供 mikan.ts 与 mikanFeed.ts 共用一份）。
+ *
+ * 为什么要挪：官方订阅 RSS（`RSS/Bangumi?bangumiId=…&subgroupid=…`）的解析在 mikanFeed.ts、
+ * 搜索 RSS 在 mikan.ts，两边各写一份域名常量迟早漂移（蜜柑主站 mikanani.me 直连不通，
+ * 真要换镜像站时漏改一处就会整个订阅链路失效）。这里做成**实时读**的 getter：
+ * 模块初始化时由 mikan.ts 调用一次 setFeedBase 对齐，之后所有 URL 都取当前值。
+ */
+let feedBase = 'https://mikanani.kas.pub'
+
+export function setFeedBase(base: string): void {
+  if (base) feedBase = String(base).replace(/\/+$/, '')
+}
+
+export function getFeedBase(): string {
+  return feedBase
+}
+
 /** 读取设置（带默认值深度合并，防止旧版本设置缺字段） */
 export function getSettings(): AppSettings {
   const s = store.get<Partial<AppSettings>>('settings', {})

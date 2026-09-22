@@ -849,18 +849,78 @@ if (!gotLock) {
             /*
              * 自检窗口可能被别的程序盖住（实测本机自检环境里，那个屏幕点上是 msedge 的窗口）——
              * 盖住时鼠标当然到不了 mpv，会把「应用的问题」和「环境的问题」混在一起。
-             * 所以这段只在自检里把窗口临时提到最前，让外部光标实验测的是应用本身。
+             * 所以这段只在自检里把窗口**全屏 + 置顶**，让外部光标实验测的是应用本身。
              */
             win.setAlwaysOnTop(true)
+            win.setFullScreen(true)
             win.focus()
+            await new Promise((r) => setTimeout(r, 1200))
             // 这行是给外部光标实验的同步信号（ASCII 标记：PS 脚本按 ANSI 读无 BOM 文件，
             // 用中文匹配会因编码问题匹配不到）。外部看到它之后再把光标移进视频区，
             // 否则光标可能落在别的程序窗口上（实测自检环境里那个点是 msedge 的窗口）
-            console.log('[uosc-test] RAISED_FOR_CURSOR_TEST 已把自检窗口临时置顶（仅自检），开始每秒读 mpv 鼠标状态')
+            console.log('[uosc-test] RAISED_FOR_CURSOR_TEST 已把自检窗口全屏置顶（仅自检），开始每秒读 mpv 鼠标状态')
             for (let i = 0; i < hold; i++) {
               await new Promise((r) => setTimeout(r, 1000))
               const m = mpv.mpvProbeProperties(['user-data/sakana-mouse'])
               console.log(`[uosc-test] t=${i + 1}s mpv 鼠标状态 → ${JSON.stringify(m['user-data/sakana-mouse'])}`)
+              // 第 6 秒做「控制栏能不能真的显示出来」的实验（此时外部应已把光标移进画面）
+              if (i === 5) {
+                /*
+                 * 判据说明：mpv 的截图**拍不到 OSD 层**（实测：连 `show-text` 画的文字都拍不出来，
+                 * 四张截图逐字节相同），所以不能用截图判断控制栏有没有画出来。
+                 * 改用 uosc 自己暴露的可观测状态：`user-data/osc/margins` ——
+                 * 它在控制栏可见时底部边距会变成非 0（见 uosc main.lua 的 update_margins：
+                 * `causes_margin(controls)` 成立才给 bottom 赋值）。
+                 */
+                const readMargins = (): string => {
+                  const m = mpv.mpvProbeProperties(['user-data/osc/margins'])['user-data/osc/margins']
+                  return typeof m === 'string' ? m.replace(/\s+/g, '') : JSON.stringify(m)
+                }
+                // ① 先等控制栏自然隐藏（鼠标不在底部，且上一次 flash 已过期）
+                await new Promise((r) => setTimeout(r, 1800))
+                const hidden = readMargins()
+                // ② 应用侧主动唤出（这就是鼠标移动时用户会得到的行为）
+                const revealed = mpv.mpvRevealUoscUiForTest()
+                await new Promise((r) => setTimeout(r, 350))
+                const shown = readMargins()
+                // ③ 等 flash 过期，应当自动隐藏
+                await new Promise((r) => setTimeout(r, 1500))
+                const after = readMargins()
+                console.log(`[uosc-test] 控制栏显隐实验：隐藏时 margins=${hidden} → 唤出后=${shown}（命令返回 ${revealed}）→ 1.5s 后=${after}`)
+                console.log(
+                  `[uosc-test] 结论：${
+                    hidden !== shown ? '✓ 唤出确实改变了控制栏的可见状态（margins 变化）' : '✗ 唤出没有改变可见状态'
+                  }；${after === hidden ? '✓ flash 过期后自动隐藏' : '（1.5s 后仍未回到隐藏态，可能因为暂停/持久化设置）'}`
+                )
+                // ④ 打开「画质」菜单：靠桥接脚本自己的日志确认菜单被构造出来（含最新状态）
+                try {
+                  mpv.mpvSendScriptMessage(['sakana-menu', 'quality'])
+                } catch (err) {
+                  console.log(`[uosc-test] 打开画质菜单失败: ${String(err)}`)
+                }
+                await new Promise((r) => setTimeout(r, 600))
+                /*
+                 * ⑤ 动作回传链路：先让**桥接脚本自己**发一条动作（与用户点按钮完全同一条路：
+                 *    脚本写 user-data/sakana-ctrl → 主进程 250ms 轮询读走并派发），
+                 *    再验证「画质菜单里的动作」能被识别并真的应用。
+                 */
+                mpv.mpvSendScriptMessage(['sakana-ctrl', 'toggle-danmaku'])
+                await new Promise((r) => setTimeout(r, 800))
+                const stats1 = mpv.uoscActionStats()
+                console.log(
+                  `[uosc-test] 桥接脚本动作链路：最近=${stats1.last || '(无)'} 累计=${stats1.count}` +
+                    `（期望最近=toggle-danmaku，说明「脚本写属性 → 主进程识别 → 派发渲染层」通了）`
+                )
+                const before = mpv.mpvProbeProperties(['glsl-shaders'])['glsl-shaders']
+                mpv.mpvSetCtrlPropForTest('a4k-set B')
+                await new Promise((r) => setTimeout(r, 900))
+                const after2 = mpv.mpvProbeProperties(['glsl-shaders'])['glsl-shaders']
+                const chainLen = typeof after2 === 'string' ? after2.split(';').filter(Boolean).length : 0
+                console.log(
+                  `[uosc-test] 画质菜单动作实验：动作前 glsl-shaders=${JSON.stringify(String(before ?? '')).slice(0, 60)}…` +
+                    ` → 动作后 ${chainLen} 个着色器；处理结果=${mpv.anime4kLastUoscAction() || '(无)'}`
+                )
+              }
             }
           }
           mpv.mpvDestroy()
@@ -1125,6 +1185,41 @@ if (!gotLock) {
           console.log(
             `[playerui] 窗口状态 可见=${win.isVisible()} 最小化=${win.isMinimized()} 边界=${JSON.stringify(win.getBounds())}`
           )
+          /*
+           * v0.3.3：**控制栏归属自检**（真实播放页 + 真实播放中）。
+           *
+           * 用户要求「撤销 uosc，用我们自建的控制栏，并且要有超分按钮」。
+           * 这里在播放中直接问悬浮窗渲染层：控制栏可见吗、有几个按钮、有没有「画质」按钮；
+           * 同时报出主进程侧的 uosc 判定 —— 两边必须一致，否则会出现「谁都不画控制栏」。
+           */
+          {
+            const mpvSvc = await import('./services/mpv')
+            const { overlayWindow: ovWin } = await import('./services/playerOverlay')
+            console.log(
+              `[playerui] uosc 判定：requested=${mpvSvc.uoscControlBarRequested()} active=${mpvSvc.uoscControlBarActive()}` +
+                `（false 表示 uosc 不画控制栏 → 由自建控制栏接管）`
+            )
+            const ov = ovWin()
+            if (!ov || ov.isDestroyed()) {
+              console.log('[playerui] 悬浮窗不存在（自建控制栏没起来）')
+            } else {
+              try {
+                const info = String(
+                  await ov.webContents.executeJavaScript(
+                    `(function(){var bs=Array.prototype.slice.call(document.querySelectorAll('button'));
+                      var titles=bs.map(function(b){return String(b.getAttribute('title')||b.textContent||'').trim()});
+                      return JSON.stringify({overlayVisible:window.__sakanaOverlayVisible===true,
+                        buttons:bs.length, hasQuality:titles.some(function(t){return /画质/.test(t)}),
+                        qualityTitle:(titles.filter(function(t){return /画质/.test(t)})[0]||''),
+                        barOpacity:(function(){var el=document.querySelector('.pointer-events-auto.absolute.bottom-0')||document.querySelector('div[class*="bottom-0"]');return el?getComputedStyle(el).opacity:'(未找到)'})()})})()`
+                  )
+                )
+                console.log(`[playerui] 自建控制栏=${info}`)
+              } catch (err) {
+                console.log(`[playerui] 读取悬浮窗失败: ${String((err as Error)?.message ?? err)}`)
+              }
+            }
+          }
           // 全屏自检：对比「窗口 / DOM 视频区 / mpv 子窗口」三者矩形，定位画面不铺满的原因
           if (process.env.SAKANA_PLAYERUI_FULLSCREEN) {
             const hostRect = async (): Promise<unknown> =>

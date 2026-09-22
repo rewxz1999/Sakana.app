@@ -1371,15 +1371,21 @@ export function PlayerPage() {
    * v0.2.18：控制栏是否由 uosc（mpv 侧绘制）接管。
    *
    * 三重条件：
-   *   ① 设置开关没被关掉（`uoscControlBar !== false`，默认开）；
+   *   ① 设置里显式勾选了「改用 mpv 的 uosc 控制栏」（`uoscControlBar === true`，**默认不勾**）；
    *   ② 内核确实是 libmpv（HTML5 回退路径里没有 mpv，也就没有 uosc）；
-   *   ③ uosc 本体没有明确报告「没挂上」（`uoscBarReady === false` 时回落到旧控制栏）。
-   *      未知（null，刚进播放器还没查过）时先按接管处理，避免旧控制栏闪一下再消失。
+   *   ③ uosc 本体没有明确报告「没挂上」（`uoscBarReady === false` 时回落到自建控制栏）。
    * 为 true 时悬浮窗只画弹幕与「uosc 给不了的浮层」，不再画控件。
    */
   const [uoscBarReady, setUoscBarReady] = useState<boolean | null>(null)
+  /*
+   * v0.3.3：默认改成「用应用自己的控制栏」，所以这里的判定从 `!== false` 变成 `=== true`。
+   *
+   * ⚠️ 两处默认值必须一致：主进程 `uoscControlBarRequested()`（mpv.ts）决定 uosc 到底画不画控制栏，
+   * 这里决定悬浮窗里的自建控制栏画不画。以前主进程是 `!== false`、渲染层也是 `!== false`，
+   * 只要改一边就会出现「两边都不画」——用户看到的就是**根本没有控制栏**。
+   */
   const uoscBarMode =
-    appSettings?.uoscControlBar !== false && engineState === 'active' && uoscBarReady !== false
+    appSettings?.uoscControlBar === true && engineState === 'active' && uoscBarReady !== false
   /** 最近一次 show 拿到的悬浮窗代号（hide 时带回去，防止迟到的 hide 关掉新窗口） */
   const overlayGenRef = useRef<number | null>(null)
   useEffect(() => {
@@ -1575,6 +1581,10 @@ export function PlayerPage() {
           break
         case 'openDanmakuSettings':
           void api.window.openSmall('/danmaku-settings', { width: 620, height: 560, title: '弹幕设置' })
+          break
+        case 'openQualitySettings':
+          // v0.3.3：uosc 的「画质」菜单里点了「完整画质设置…」→ 打开播放器设置页（Anime4K 卡片在最前面）
+          void api.window.openSmall('/player-settings', { width: 700, height: 620, title: '播放器设置' })
           break
         case 'uoscMenu':
           // v0.2.9：打开插件自己的菜单（uosc 渲染）：搜索弹幕 / 总菜单 / 弹幕样式 / 源延迟

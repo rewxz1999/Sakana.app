@@ -207,6 +207,8 @@ export type OverlayAction =
   | { type: 'toggleFullscreen' }
   | { type: 'exitFullscreen' }
   | { type: 'exitPlayer' }
+  /** v0.3.3：从 uosc 的「画质」菜单打开完整画质设置（播放器设置页的 Anime4K 卡片） */
+  | { type: 'openQualitySettings' }
   /**
    * v0.2.18：Esc 语义（uosc 控制栏 / mpv 侧快捷键发来）。
    * 与键盘 Esc 完全一致：依次关闭 选集 → 详情 → 退出全屏 → 退出播放。
@@ -627,6 +629,8 @@ export interface SakanaApi {
      * 主进程按内容去重（同一份状态不会重复下发），所以调用方「变了就推」即可。
      */
     bar(payload: UoscBarState): Promise<ApiResult<boolean>>
+    /** v0.3.3：让 uosc 立刻把控制栏显示出来（uosc 默认只在靠近底部时才显示，见 mpv.ts 的注释） */
+    reveal(): Promise<ApiResult<boolean>>
   }
   cache: {
     info(): Promise<ApiResult<CacheInfo>>

@@ -371,24 +371,30 @@ export function PlayerSettingsPage() {
         </div>
       </Card>
 
-      {/* 播放器控制栏（v0.2.18：uosc 接管 / 旧悬浮窗） */}
+      {/* 播放器控制栏（v0.2.18 引入 uosc；**v0.3.3 起默认改回应用自己的控制栏**） */}
       <Card
         title="播放器控制栏"
-        desc="控制栏由 mpv 内置的 uosc 绘制，还是用应用自己的悬浮窗控制栏"
+        desc="默认使用应用自己的悬浮窗控制栏（含超分/画质按钮）；也可切换成 mpv 的 uosc 控制栏"
       >
         <div className="flex flex-col gap-2.5">
           <label className="flex items-center gap-2 text-xs text-text">
             <input
               type="checkbox"
-              checked={settings.uoscControlBar !== false}
+              checked={settings.uoscControlBar === true}
               onChange={(e) => save({ uoscControlBar: e.target.checked })}
               className="h-3.5 w-3.5 accent-accent"
             />
-            用 uosc 接管控制栏（推荐）
+            改用 mpv 的 uosc 控制栏（实验性）
           </label>
           <p className="text-[11px] leading-relaxed text-faint">
-            控制栏画在**视频画面上**（mpv 自己绘制），因此不再受「透明悬浮窗 + 原生视频子窗口」
-            的层叠与点击穿透问题影响。布局与时间显示在
+            <span className="font-semibold text-text">默认（不勾选）：</span>
+            用应用自己的悬浮窗控制栏 —— 进度条、播放控制、选集、字幕、倍速、画面比例、弹幕、
+            <span className="text-dim">画质（Anime4K 超分）</span>、全屏与退出都在里面，
+            按钮与菜单都是应用自己的界面，改起来、查起来都最直接。
+          </p>
+          <p className="text-[11px] leading-relaxed text-faint">
+            <span className="font-semibold text-text">勾选后：</span>
+            控制栏改由 mpv 的 uosc 绘制（画在视频画面上）。布局与时间显示在
             <code className="mx-1 font-mono">resources/mpv-config/script-opts/uosc.conf</code>
             ，快捷键在
             <code className="mx-1 font-mono">resources/mpv-config/input.conf</code>
@@ -397,15 +403,13 @@ export function PlayerSettingsPage() {
             驱动。
             <span className="text-dim">
               {' '}
-              取消勾选即回落到应用自己的悬浮窗控制栏（弹幕画布、番剧详情浮层等不受影响），
-              遇到渲染异常时可以随时切回来。切换在**下次进入播放器**时生效。
+              切换在**下次进入播放器**时生效；无论用哪一个，弹幕画布、番剧详情浮层、选集抽屉都不受影响。
             </span>
           </p>
           <p className="text-[11px] leading-relaxed text-faint">
-            <span className="font-semibold text-text">怎么唤出：</span>
-            鼠标移到画面下方，控制栏就会滑出来（暂停期间会一直显示）。
-            <span className="text-dim">键盘兜底：</span>按 <code className="font-mono">Tab</code>{' '}
-            可显隐整条控制栏 —— 万一鼠标在画面上不起作用，用键盘也照样能操作。
+            <span className="font-semibold text-text">uosc 模式怎么唤出：</span>
+            鼠标移到画面下方（或任意位置移动，应用会主动唤出），控制栏就会浮现；
+            <span className="text-dim">键盘兜底：</span>按 <code className="font-mono">Tab</code> 可显隐整条控制栏。
           </p>
         </div>
       </Card>

@@ -1,44 +1,45 @@
 import axios from 'axios'
-import { XMLParser } from 'fast-xml-parser'
 import type { DownloadTask, MikanItem, MikanSearchResult, SubUpdateCheck, Subscription } from '@shared/types'
 import { parseEpisode, parseGroup, parseResolution, humanSize } from '../lib/parse'
 import { log } from '../log'
 import { BROWSER_UA, buildProxyAgents, getSettings } from '../net'
 import { store } from '../store'
+import {
+  buildBangumiRssUrl,
+  fetchOfficialFeed,
+  newFeedTrace,
+  parseFeed,
+  resolveSubFeed,
+  setFeedBase,
+  type FeedItem,
+  type FeedTrace
+} from './mikanFeed'
 
 /** 蜜柑计划（方案 4.1：订阅数据源，RSS） */
 export const MIKAN_BASE = 'https://mikanani.kas.pub'
+// 官方订阅 RSS 的解析（services/mikanFeed.ts）用同一个基础域名，避免两处各写一份而漂移
+setFeedBase(MIKAN_BASE)
 
-interface RssRawItem {
-  /**
-   * RSS 的 <guid isPermaLink="false">xxx</guid>。
-   *
-   * 坑：本文件的 XMLParser 配了 `ignoreAttributes: false`，fast-xml-parser 会把**带属性的节点**
-   * 解析成对象 `{ '#text': 'xxx', '@_isPermaLink': 'false' }`，
-   * 于是 `String(raw.guid)` 得到的是 `"[object Object]"` —— 整份 RSS 里每一条都一模一样。
-   * 这个字符串同时是「确认下载」列表的 React key 与勾选集合的键，
-   * 撞车后表现为「勾一条全被勾上」以及「下载所选 1 项」却下载了全部，所以必须取 #text。
-   */
-  guid?: unknown
-  title?: string
-  link?: unknown
-  pubDate?: string
-  /** 蜜柑的发布日期挂在 <torrent><pubDate> 上（顶层没有 pubDate） */
-  torrent?: { pubDate?: unknown }
-  enclosure?: { '@_url'?: string; '@_length'?: string | number }
-}
-
-/** 取 XML 节点文本：兼容 fast-xml-parser 把带属性节点解析成对象的情况 */
-function nodeText(v: unknown): string {
-  if (v == null) return ''
-  if (typeof v === 'string') return v.trim()
-  if (typeof v === 'number') return String(v)
-  if (typeof v === 'object') {
-    const t = (v as Record<string, unknown>)['#text']
-    if (typeof t === 'string') return t.trim()
-    if (typeof t === 'number') return String(t)
+/**
+ * mikanFeed 解析出来的 feed 条目 → 应用内部使用的 MikanItem。
+ *
+ * 两份 feed（搜索 RSS 与官方订阅 RSS）结构一致，差异只有这里补的两个字段：
+ *   · `magnet`：蜜柑 RSS 里没有磁力链接，只有 .torrent 的 enclosure，置空；
+ *   · `isNew`：由调用方在「这条算本次更新」时再打上，这里不预设。
+ */
+function toMikanItem(it: FeedItem): MikanItem {
+  return {
+    guid: it.guid,
+    title: it.title,
+    link: it.link,
+    torrentUrl: it.torrentUrl,
+    magnet: null,
+    size: it.size,
+    pubDate: it.pubDate,
+    group: it.group,
+    episode: it.episode,
+    resolution: it.resolution
   }
-  return ''
 }
 
 /**
@@ -66,6 +67,8 @@ interface PassResult {
   rejected: number
   /** 发布日期取不到/解析不出、被 isNewerThanLast 放过的条数 */
   undated: number
+  /** 被判为「不是这部番」且**不属于该字幕组**的条数（只在回落链路的日志里用） */
+  offGroup: number
 }
 
 /** 日志里附带的「被判为不是这部番」的候选标题条数上限 */
@@ -208,6 +211,37 @@ function isNewerThanLast(item: MikanItem, lastPubDate?: string | null): boolean 
   return itemTime > lastTime
 }
 
+/**
+ * 把解析出来的官方订阅入口写回订阅记录（`store` 的 `subscriptions`）。
+ *
+ * 为什么要落盘：`bangumiId` 要从搜索页 HTML 解析、`subgroupId` 要从番剧页 HTML 解析，
+ * 首次要 2 个请求；缓存后每次检测是 **0 个解析请求**（用户要求验证的就是这一条）。
+ *
+ * 为什么直接改 store 而不是走 subsStore / IPC：`checkSub` 的入参是订阅对象的副本，
+ * 返回值结构（SubUpdateCheck）又被 IPC 与界面依赖，不能改。这里只更新三个**新增的可选字段**，
+ * 不碰任何已有字段；subsStore.mutateSubscriptions 读写的是同一份 store 数据，互不冲突。
+ * 值没变化时不写盘，避免每次检测都触发一次无意义的落盘。
+ */
+function persistSubFeedCache(
+  subId: string,
+  bangumiId: number | null,
+  subgroupId: number | null,
+  groupName: string | null | undefined
+): void {
+  if (bangumiId == null) return
+  const subs = store.get<Subscription[]>('subscriptions', [])
+  let changed = false
+  const next = subs.map((s) => {
+    if (s.id !== subId) return s
+    if (s.mikanBangumiId === bangumiId && s.mikanSubgroupId === subgroupId && s.cachedGroupName === (groupName ?? null)) {
+      return s
+    }
+    changed = true
+    return { ...s, mikanBangumiId: bangumiId, mikanSubgroupId: subgroupId, cachedGroupName: groupName ?? null }
+  })
+  if (changed) store.set('subscriptions', next)
+}
+
 class MikanService {
   async search(keyword: string): Promise<MikanSearchResult> {
     try {
@@ -218,38 +252,9 @@ class MikanService {
         headers: { 'User-Agent': BROWSER_UA },
         ...buildProxyAgents(getSettings().proxy)
       })
-      const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' })
-      const doc = parser.parse(res.data as string) as {
-        rss?: { channel?: { item?: RssRawItem[] | RssRawItem } }
-      }
-      const rawItems = doc?.rss?.channel?.item ?? []
-      const list: RssRawItem[] = Array.isArray(rawItems) ? rawItems : [rawItems]
-      const seen = new Set<string>()
-      const items: MikanItem[] = []
-      for (const raw of list) {
-        const title = String(raw.title ?? '')
-        if (!title) continue
-        const base = nodeText(raw.guid) || nodeText(raw.link) || title
-        // guid 必须全局唯一：它既是列表行标识也是勾选键，重复就会出现「勾一条全勾上」
-        let guid = base
-        for (let n = 2; seen.has(guid); n++) guid = `${base}#${n}`
-        seen.add(guid)
-        items.push({
-          guid,
-          title,
-          link: nodeText(raw.link),
-          torrentUrl: raw.enclosure?.['@_url'] ? String(raw.enclosure['@_url']) : null,
-          magnet: null,
-          size: humanSize(Number(raw.enclosure?.['@_length'] ?? 0)),
-          // 发布日期在 <torrent><pubDate> 里；过去只读顶层 raw.pubDate 拿到的一直是空串，
-          // 于是「本集发布日期」永远空白、按日期判断新资源的过滤也形同虚设
-          pubDate: nodeText(raw.pubDate) || nodeText(raw.torrent?.pubDate),
-          group: parseGroup(title),
-          episode: parseEpisode(title),
-          resolution: parseResolution(title)
-        })
-      }
-      return { items }
+      // RSS 解析统一走 mikanFeed.parseFeed：官方订阅 feed 与搜索 feed 的字段语义完全一致，
+      // 两处各写一份解析必然漂移（历史上 guid 的 `[object Object]` 坑就出在这里）
+      return { items: parseFeed(res.data as string).map(toMikanItem) }
     } catch (err) {
       const e = err as { message?: string }
       const msg = e?.message ?? String(err)
@@ -261,7 +266,18 @@ class MikanService {
   /**
    * 检测单个订阅的新资源（方案 4.2：仅检测，需用户确认后下载；已存在下载任务的资源不再提示）
    *
-   * 匹配规则（本版收敛为**两道硬门槛**，与 v0.2.10 的差别只有第二条）：
+   * ============ v0.3.3：优先走蜜柑自己的「按番剧 + 字幕组」订阅 RSS ============
+   * 用户要求「直接抄蜜柑的 RSS 订阅规则，现在的订阅规则老是失误」。蜜柑番剧页每个字幕组旁边
+   * 就有 RSS 图标，地址是 `RSS/Bangumi?bangumiId=<番剧ID>&subgroupid=<字幕组ID>` ——
+   * 它由**蜜柑在服务端**按番剧与字幕组筛好，本地不再需要用标题判据去猜「这是不是这部番」。
+   * 判定顺序（详细说明与实测数据见下方「路径选择」那一段的注释）：
+   *   ① 订阅记录里有缓存的 bangumiId/subgroupId → 0 个解析请求，直接拼 feed 地址；
+   *   ② 没有缓存 → 搜索页 HTML 取 bangumiId、番剧页 HTML 取 subgroupid，再拼地址；
+   *   ③ 解析失败或官方 feed 拉不到 → **回落**到下面这条关键词搜索链路（完整保留，见下方注释）。
+   * 每次检测都会写一行日志，**行首**就写明「本次走：官方订阅 RSS」还是「本次走：回落关键词搜索」。
+   *
+   * ============ 回落链路（原样保留）的匹配规则 ============
+   * 两道硬门槛，与 v0.2.10 的差别只有第二条：
    *   ① **同一个字幕组** —— 订阅时就指定了组，串组的资源没有意义（matchesSubGroup）。
    *   ② **确实是这部番** —— 基名一致（sameBase），或标题里含订阅名字的可搜索片段（relevanceNeedles）。
    * 季数 / 集数**只参与排序**（同季优先 → 有集数优先 → 发布时间新），不作一票否决：
@@ -278,6 +294,9 @@ class MikanService {
    *     91 条全是《上伊那牡丹，醉姿如百合》之类完全无关的番剧。这就是「订阅到不相关的番」。
    *     本版把这一趟删掉：宁可这一趟给 0 条、并让日志写清是被哪一步筛掉的，
    *     也不允许任何一条「不是这部番」的资源进结果。
+   *   · v0.3.3（本版）发现：这些失误的**根因**是「让本地判据去干蜜柑自己就能干的事」——
+   *     搜索 RSS 有 100 条上限（换个写法才能翻出被截掉的条目），标题判据又有跨语言/短名的漏网，
+   *     放宽判据就会串番、收紧就会订阅不到。改用蜜柑的订阅 RSS 后，这两个判据都不再需要。
    *
    * 签名与返回结构（SubUpdateCheck）保持原样，IPC / 类型 / UI 都不用动。
    */
@@ -298,6 +317,24 @@ class MikanService {
 
     const label = sub.nameCn || sub.name || sub.mikanKeyword
     const keywords = keywordCandidates(sub)
+
+    /*
+     * 标题/季数解析先算出来（两条路径都要用：官方路径写日志，回落路径做判据与排序）。
+     * 注意这里**必须**在下面的路由之前算好 —— 路由里的日志要写 seasonLabel(subSeason)，
+     * 而 const 是块级作用域、不存在提升，放到路由后面就会踩 TDZ 直接抛异常。
+     */
+    const cnInfo = parseTitleSeason(sub.nameCn || '')
+    const nameInfo = parseTitleSeason(sub.name || '')
+    const subBase = cnInfo.base || nameInfo.base
+    // 季数以中文名优先：nameCn 认不出季数时才退回日文名（两个名字来自同一个 Bangumi 条目）
+    const subSeason = cnInfo.season ?? nameInfo.season
+
+    /*
+     * ===================== 回落：关键词搜索链路（原样保留）=====================
+     * 走到本文件后半段（搜索 → 判据 → 排序）的前提是「官方入口拿不到 / 官方 RSS 拉不到」，
+     * 两种情况的判定与日志见下面「路径选择」那一段（它在 applyFilters 定义之后、
+     * 与最终日志放在一起）。这条链路的搜索、判据、排序一字未改 —— 用户明确要求保留它作兜底。
+     */
 
     // ---------- 搜索阶段（v0.2.16 重写，本版保留）----------
     /*
@@ -366,12 +403,6 @@ class MikanService {
      *   · 搜索从 1 个关键词增加到最多 3 个（原关键词 + 中日文派生基名），并新增
      *     「按字幕组名搜索」的第 2 趟兜底 —— 这两处只扩大候选池，最终仍要过同样的硬门槛。
      */
-    const cnInfo = parseTitleSeason(sub.nameCn || '')
-    const nameInfo = parseTitleSeason(sub.name || '')
-    const subBase = cnInfo.base || nameInfo.base
-    // 季数以中文名优先：nameCn 认不出季数时才退回日文名（两个名字来自同一个 Bangumi 条目）
-    const subSeason = cnInfo.season ?? nameInfo.season
-
     /**
      * 订阅的「本名」归一化集合：用来判断「标题里就是写着这部番的名字」。
      * （《冰菓》这类短名做不出 ≥4 字符的片段，只能靠这条兜住，见 relevanceNeedles。）
@@ -391,12 +422,28 @@ class MikanService {
      * 硬门槛只有两道：① 同字幕组；② 是这部番（基名一致 / 含相关性片段 / 标题含订阅名字）。
      * 季数、集数一律不淘汰条目，只影响排序 —— 这是「不写季数但集数延续」「整季合集」
      * 「OVA/剧场版」不被整批丢掉的前提。
+     *
+     * mode='official' 是 v0.3.3 新增的官方订阅 RSS 路径，**两道判据都不做**，原因见 checkSub 顶部。
      */
-    const applyFilters = (all: Candidate[], mode: 'strict' | 'group-search'): PassResult => {
-      // ① 字幕组（硬门槛，与 v0.2.10 相同）
-      const byGroup = all.filter((c) => matchesSubGroup(sub.group, c.item.group))
+    const applyFilters = (all: Candidate[], mode: 'official' | 'strict' | 'group-search'): PassResult => {
+      /*
+       * ① 字幕组。
+       *
+       * 'official' 路径不做这道过滤 —— 这正是「直接抄蜜柑的订阅规则」的核心：
+       * feed 地址里带了 `subgroupid`，蜜柑已经在服务端按字幕组筛过一遍了。
+       * 再叠一层**按名字**的字幕组过滤反而会误杀：实测蜜柑番剧页上的字幕组名
+       * 与资源标题里的 `[组名]` 是两个来源，真的会不一致 ——
+       *   · bangumiId=4011&subgroupid=370：番剧页写「LoliHouse」，条目前缀却是
+       *     `[喵萌奶茶屋&LoliHouse]`（同一组合并署名），严格相等会把 12 条全丢掉；
+       *   · bangumiId=3995&subgroupid=45：番剧页那条**没有组名**，条目前缀是 `[爱恋字幕社]`。
+       * 所以这一层在官方路径改成「只用于**核对**（记 offGroup，写进日志）」，
+       * 拦不住的前提下也绝不静默 —— 只要出现不一致就会在日志里看到。
+       * 回落链路（strict / group-search）里它仍然是硬门槛，与旧版行为一字不改。
+       */
+      const byGroup = mode === 'official' ? all : all.filter((c) => matchesSubGroup(sub.group, c.item.group))
+      const offGroup = all.length - byGroup.length
 
-      // ② 是这部番（硬门槛）
+      // ② 是这部番（硬门槛；官方路径不做 —— feed 是蜜柑按 bangumiId 给的）
       const needles = relevanceNeedles(sub, subBase)
       const isOurs = (c: Candidate): boolean => {
         const t = normCompare(c.item.title)
@@ -412,10 +459,22 @@ class MikanService {
       const relevant: Candidate[] = []
       const rejectedSamples: string[] = []
       for (const c of byGroup) {
-        if (isOurs(c)) relevant.push(c)
+        if (mode === 'official' || isOurs(c)) relevant.push(c)
         else if (rejectedSamples.length < REJECT_SAMPLES) rejectedSamples.push(c.item.title)
       }
       const rejected = byGroup.length - relevant.length
+
+      /*
+       * 官方路径的「组名核对」样本：这些条目**照样算命中**（feed 已经筛选过了），
+       * 只是它们的标题组名与订阅的字幕组名对不上 —— 仅用于日志，方便以后核对
+       * 「蜜柑给的 feed 是不是真的只有这个组」。最多留 REJECT_SAMPLES 条，避免刷屏。
+       */
+      if (mode === 'official' && offGroup > 0) {
+        for (const c of all) {
+          if (rejectedSamples.length >= REJECT_SAMPLES) break
+          if (!matchesSubGroup(sub.group, c.item.group)) rejectedSamples.push(c.item.title)
+        }
+      }
 
       // ③ 已处理过的不算、不比上次检测新不算（这两条仍是硬门槛，与 v0.2.10 相同）
       let undated = 0
@@ -450,15 +509,23 @@ class MikanService {
       return {
         newItems,
         counts:
-          `候选 ${all.length} → 同字幕组 ${byGroup.length} → 是这部番 ${relevant.length} → 命中 ${newItems.length}` +
-          `（同季 ${sameCount} 条、带集数 ${epCount} 条；已按「同季→有集数→最新」排序` +
-          (mode === 'group-search' ? '；本趟用的是「按字幕组名搜索」补来的候选池' : '') +
-          `）` +
+          (mode === 'official'
+            ? `官方订阅RSS条目 ${all.length} → 命中 ${newItems.length}`
+            : `候选 ${all.length} → 同字幕组 ${byGroup.length} → 是这部番 ${relevant.length} → 命中 ${newItems.length}`) +
+          (mode === 'official'
+            ? ''
+            : `（同季 ${sameCount} 条、带集数 ${epCount} 条；已按「同季→有集数→最新」排序` +
+              (mode === 'group-search' ? '；本趟用的是「按字幕组名搜索」补来的候选池' : '') +
+              `）`) +
           (rejected > 0 ? `；判掉「不是这部番」${rejected} 条` : '') +
+          (mode === 'official' && offGroup > 0
+            ? `；⚠ 其中 ${offGroup} 条的标题组名与订阅的字幕组名不一致（官方 feed 仍算它们属于该组）`
+            : '') +
           (undated > 0 ? `；⚠ 发布日期取不到/解析不出的 ${undated} 条已按「有新资源」处理` : ''),
         rejectedSamples,
         rejected,
-        undated
+        undated,
+        offGroup
       }
     }
 
@@ -490,8 +557,93 @@ class MikanService {
     }
 
     /*
-     * 日志（本版加强可诊断性）：**每次检测都写一行**，把每一趟筛选的计数带上，
-     * 于是用户再报「订阅不到」时，一眼就能区分是哪种情况：
+     * ===================== 路径选择（v0.3.3 核心改动）=====================
+     *
+     * 用户要求：「直接抄蜜柑的 RSS 订阅规则，现在的订阅规则老是失误」。
+     * 旧链路是「搜索 RSS + 我们自己的标题/字幕组判据」，而**蜜柑自己就提供按番剧 + 字幕组的
+     * 订阅地址**（番剧页每个字幕组旁边的 RSS 图标）：
+     *   `RSS/Bangumi?bangumiId=<番剧ID>&subgroupid=<字幕组ID>`
+     * 用这条地址，蜜柑在服务端就把「哪部番、哪个组」筛好了，本地不再需要任何判据去猜。
+     *
+     * 实测（.e2e/.probe，真实响应）：
+     *   · bangumiId=3995&subgroupid=203 → 200 / 36 条，**全部**是《无职转生 第三季》+ 桜都字幕组；
+     *   · bangumiId=4011&subgroupid=364 → 200 / 11 条，**全部**是《二十世纪电气目录》+ 云光字幕组；
+     *   · id 不存在 → **200 + 0 条**（不是 404），所以「0 条」是正常结果、不是错误；
+     *   · 番剧页的字幕组列表里没有该组（如 3995 里找千夏字幕组）→ 直接判 0 条，
+     *     **不回落搜索**：搜索一定会搜出该组别的番，那正是「串番」的来源。
+     *
+     * 三条路径与外层日志的对应关系（每次检测必写一行，见本段之后）：
+     *   ① 官方订阅 RSS 命中      → 「本次走：官方订阅 RSS」，请求 0~1 次（缓存后不再解析）
+     *   ② 官方 RSS 拉取失败      → 「本次走：回落关键词搜索」，并写明失败原因
+     *   ③ 解析不出番剧/字幕组 ID → 同上，并写明是哪一步解析不出来
+     *
+     * 位置说明：这一段必须放在 applyFilters 定义**之后**（要用它），而 applyFilters 又要用
+     * 前面算好的 candidates / subBase / subSeason，所以顺序是「搜索 → 判据定义 → 路由」。
+     * 签名与返回结构（SubUpdateCheck）保持原样，IPC / 类型 / UI 都不用动。
+     */
+    const trace: FeedTrace = newFeedTrace()
+    const resolved = await resolveSubFeed(sub, trace)
+    /** 走官方路径失败的原因：非空 = 本次检测会回落到关键词搜索（写进日志，用户要求能一眼看出走了哪条路） */
+    let officialError = ''
+    if (resolved.bangumiId != null) {
+      // 有番剧 ID 但没有字幕组 ID，且订阅指定了字幕组 → 蜜柑明确告诉我们「该组没做这部番」。
+      // 这时**不回落搜索**：搜索必然搜出该组别的番（实测《无职转生》+ 千夏字幕组会捞回 91 条
+      // 《上伊那牡丹，醉姿如百合》之类完全无关的番剧），那正是用户抱怨的「订阅到不相关的番」。
+      if (sub.group && resolved.subgroupId == null) {
+        log.append(
+          'info',
+          'mikan',
+          `订阅《${label}》${seasonLabel(subSeason ?? null)}；本次走：官方订阅 RSS（按设计未拉取）` +
+            `；bangumiId=${resolved.bangumiId}（${resolved.fromCache ? '缓存' : '本次解析'}）` +
+            `；${resolved.reason || `该字幕组「${sub.group}」没有这部番`}；→ 0 条（不回落搜索，避免捞回该组别的番）`
+        )
+        if (!resolved.fromCache) {
+          persistSubFeedCache(sub.id, resolved.bangumiId, resolved.subgroupId, sub.group)
+        }
+        return { subId: sub.id, newItems: [], checkedAt: Date.now() }
+      }
+
+      const url = buildBangumiRssUrl(resolved.bangumiId, resolved.subgroupId)
+      const feed = await fetchOfficialFeed(resolved.bangumiId, resolved.subgroupId, trace)
+      if (!feed.error) {
+        const officialPool = new Map<string, Candidate>()
+        for (const it of feed.items) {
+          const item = toMikanItem(it)
+          const key = item.torrentUrl ? `t:${item.torrentUrl}` : `g:${item.guid}`
+          if (!officialPool.has(key)) officialPool.set(key, { item, pools: new Set<CandidatePool>(['name']) })
+        }
+        const official = applyFilters([...officialPool.values()], 'official')
+        log.append(
+          'info',
+          'mikan',
+          `订阅《${label}》${seasonLabel(subSeason ?? null)}；本次走：官方订阅 RSS ${url}` +
+            `；入口 bangumiId=${resolved.bangumiId}` +
+            (resolved.subgroupId != null
+              ? `&subgroupid=${resolved.subgroupId}`
+              : '（未指定字幕组→用整部番的 feed，仍按字幕组过滤）') +
+            `（${resolved.fromCache ? '取自订阅记录的缓存，本次未重新解析入口' : '本次解析完毕，已写回订阅记录'}）` +
+            `；入口解析请求 ${trace.requests} 次${trace.lines.length ? `（${trace.lines.join('、')}）` : ''}` +
+            `；${official.counts}` +
+            (official.offGroup > 0 ? `；组名不一致样本：${official.rejectedSamples.join(' ｜ ')}` : '')
+        )
+        if (!resolved.fromCache) {
+          persistSubFeedCache(sub.id, resolved.bangumiId, resolved.subgroupId, sub.group)
+        }
+        return { subId: sub.id, newItems: official.newItems, checkedAt: Date.now() }
+      }
+      officialError = `官方订阅 RSS 拉取失败（${feed.error}）`
+    } else {
+      officialError = `解析不出官方订阅入口：${resolved.reason || '未知原因'}`
+    }
+    // 解析到了番剧 id 却没能拉成 RSS → 仍然把 id 缓存下来：下次直接拼 feed 地址（少两个 HTML 请求）
+    if (resolved.bangumiId != null && !resolved.fromCache) {
+      persistSubFeedCache(sub.id, resolved.bangumiId, resolved.subgroupId, sub.group)
+    }
+
+    /*
+     * 日志（加强可诊断性）：**每次检测都写一行**，把「走了哪条路」放在最前面
+     * （用户要求：一眼能看出这次是官方订阅 RSS 还是回落搜索），再带上每一趟筛选的计数：
+     *   · 走了跌落路径        → 行首直接写「本次走：回落关键词搜索」+ 原因
      *   · 搜索阶段就没结果     → 「搜索 xx=0」或「xx=0(失败)」
      *   · 有候选但被判掉了     → 「同字幕组 N」很大而「是这部番 0」
      *   · 蜜柑上根本没有这部番 → 「同字幕组 0」
@@ -503,7 +655,10 @@ class MikanService {
     log.append(
       'info',
       'mikan',
-      `订阅《${label}》${seasonLabel(subSeason)}；搜索 ${searchLog.join(' / ') || '(无关键词)'}；` +
+      `订阅《${label}》${seasonLabel(subSeason)}；本次走：**回落关键词搜索**（${officialError}）` +
+        `；搜索 ${searchLog.join(' / ') || '(无关键词)'}；解析请求 ${trace.requests} 次${
+          trace.lines.length ? `（${trace.lines.join('、')}）` : ''
+        }；` +
         passLog.join(' ｜ ') +
         (mode === 'strict' ? '' : '；**使用了兜底路径：按字幕组名搜索**') +
         (needDetail
@@ -513,6 +668,11 @@ class MikanService {
             : `；没有被判为「不是这部番」的候选（${lastEval.rejected} 条）`
           : '')
     )
+    // 走到这里说明官方 feed 没拉成；若这一次解析出了番剧/字幕组 id 仍然写回缓存，
+    // 下次检测直接拼 feed 地址（少两个 HTML 请求），RSS 拉取失败时也会自然回落到这里。
+    if (resolved.bangumiId != null && !resolved.fromCache) {
+      persistSubFeedCache(sub.id, resolved.bangumiId, resolved.subgroupId, sub.group)
+    }
     return { subId: sub.id, newItems: result.newItems, checkedAt: Date.now() }
   }
 

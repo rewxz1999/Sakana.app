@@ -14,6 +14,7 @@ import {
 } from 'lucide-react'
 import type { CharacterItem, CoverImages, SearchResultItem } from '@shared/types'
 import { api } from '@/lib/api'
+import { imgUrl } from '@/lib/format'
 import { toast } from '@/stores/app'
 import { Badge, Button, IconButton, Input, Spinner } from '@/components/ui'
 import { CoverImage } from '@/components/CoverImage'
@@ -118,6 +119,8 @@ interface GridState {
   cells: Cell[][]
   title: string
   producer: string
+  /** 立绘填充方式（跟着盘面一起落 localStorage，切过一次之后刷新仍然是这个选择） */
+  fit: FitMode
 }
 
 interface Pos {
@@ -133,13 +136,32 @@ function charName(c: { name: string; name_cn: string }): string {
   return c.name_cn || c.name || '（无名）'
 }
 
-/** 从角色图片里挑一个尺寸；缺了就按顺序往下退（老接口的 images 可能没有 common） */
+/**
+ * 从角色图片里挑一个尺寸；缺了就按顺序往下退（老接口的 images 可能没有 common）。
+ *
+ * ⚠️ v0.3.3 修过一次**取图取小了**的问题：
+ * 以前这个函数的兜底顺序写死成 `[size, medium, large, grid, small]`，而三处调用都传 `'grid'` ——
+ * 于是**格子里画的是 75×75 的缩略图**（Bangumi 的 grid 档实测就是 75×75，2KB），
+ * 再被 drawCover 放大到 276×268 设备像素（≈3.7 倍），立绘糊得不成样子。
+ * 用户拿 bgm.tv 的角色页做对比（那页用的是原图）才发现 —— 现在改成：
+ *   · 格子与导出：`large`（反代给的**就是原图**，实测 CLANNAD 角色 2434×3466 / 454KB）
+ *   · 选择列表：`small`（100×142，列表项只有 48px 宽，够了且省流量）
+ *   · 已选角色条：`medium`（400×570，条上要看得清脸）
+ * 并且兜底顺序改成「优先更大的档」，宁可用大图也别用糊图。
+ */
+const PICK_ORDER: Record<'grid' | 'small' | 'medium' | 'large', (keyof CoverImages)[]> = {
+  large: ['large', 'medium', 'small', 'grid'],
+  medium: ['medium', 'large', 'small', 'grid'],
+  small: ['small', 'medium', 'large', 'grid'],
+  grid: ['grid', 'small', 'medium', 'large']
+}
+
 function pickImage(
   images: Partial<CoverImages> | null | undefined,
-  size: 'grid' | 'medium' | 'small' | 'large' = 'grid'
+  size: 'grid' | 'medium' | 'small' | 'large' = 'large'
 ): string {
   if (!images) return ''
-  const order: (keyof CoverImages)[] = [size, 'medium', 'large', 'grid', 'small']
+  const order = PICK_ORDER[size] ?? PICK_ORDER.large
   for (const k of order) {
     const v = images[k]
     if (v) return v
@@ -168,7 +190,7 @@ function defaultState(): GridState {
   const cells: Cell[][] = Array.from({ length: rows }, (_row, r) =>
     Array.from({ length: cols }, (_col, c) => makeCell(DEFAULT_LABELS[r * cols + c] ?? ''))
   )
-  return { cols, rows, cells, title: DEFAULT_TITLE, producer: '' }
+  return { cols, rows, cells, title: DEFAULT_TITLE, producer: '', fit: 'contain' }
 }
 
 function normalizeChar(raw: unknown): CellChar | null {
@@ -208,7 +230,14 @@ function loadState(): GridState {
       rows,
       cells: cells.map((row) => row.map((cell) => ({ label: String(cell?.label ?? ''), char: normalizeChar(cell?.char) }))),
       title: typeof d.title === 'string' && d.title.trim() ? d.title : DEFAULT_TITLE,
-      producer: typeof d.producer === 'string' ? d.producer : ''
+      producer: typeof d.producer === 'string' ? d.producer : '',
+      /*
+       * 旧缓存里没有 fit 字段 —— **一律按「完整显示」处理**。
+       * 这正是这次要修的问题：老盘面用的是 cover（立绘被裁），
+       * 若把「缺字段」当成 cover，老用户刷新后仍然看不到完整立绘，「默认改成完整显示」就是空话。
+       * 只有用户显式切过「铺满裁剪」（存了 'cover'）才保留。
+       */
+      fit: d.fit === 'cover' ? 'cover' : 'contain'
     }
   } catch {
     return defaultState()
@@ -261,8 +290,33 @@ const EX = {
   IMG_R: 7,
   CARD_R: 10,
   /** 立绘纵向裁切基准，与 CSS object-position: center 20% 对应 */
-  BIAS: 0.2
+  BIAS: 0.2,
+  /*
+   * 「完整显示」（contain）模式的背景层参数（v0.3.4）。
+   *
+   * 为什么要有背景层：格子的图区是高 134、宽 138 的近正方形，而 Bangumi 的立绘是竖长图
+   * （实测 CLANNAD 古河渚 large 档 2434×3466 ≈ 1:1.42）。要让整张立绘可见，只能按**高度**贴合，
+   * 于是两侧必然空出很大一块（94 宽的图放进 138 宽的框，两侧各空 22）。空着就是两块死白，
+   * 所以用**同一张立绘**的 cover 版模糊 + 压暗铺在底下填满，主体仍然尽量大。
+   *
+   * ⚠️ 这个 filter 字符串是**预览与导出共用**的：canvas 侧赋给 `ctx.filter`，
+   * 预览侧直接写进 CSS 的 `filter` —— 两边观感一致靠的是同一份参数，而不是两边各调一个数字。
+   */
+  BACKDROP_FILTER: 'blur(10px) brightness(.55)',
+  /**
+   * 背景层向外扩出的逻辑像素（模糊会把边缘的颜色抹淡，扩出 2×模糊半径才不会在四周泛出亮边）。
+   * 预览侧用 `inset: -BACKDROP_PAD` 达成同一件事（外层 overflow-hidden 负责裁回圆角内）。
+   */
+  BACKDROP_PAD: 20
 }
+
+/**
+ * 立绘在格子图区里的填充方式（v0.3.4 新增）。
+ *
+ * - `contain`：**完整显示**（默认）—— 整张立绘等比缩到框内、不裁切，空白用模糊压暗的同图填满；
+ * - `cover`：铺满裁剪 —— 旧的 object-cover 行为，按短边铺满后裁掉超出部分（竖长立绘会被切掉上下）。
+ */
+type FitMode = 'contain' | 'cover'
 
 /** 一套布局的全部尺寸（导出画布与编辑区预览共用，保证「所见即所得」） */
 interface GridMetrics {
@@ -375,6 +429,95 @@ function drawCover(
   const sy = (sh - dh) * bias
   ctx.drawImage(img, dx - sx, dy - sy, sw, sh)
   return true
+}
+
+/**
+ * 按 contain 方式把图画进目标矩形（object-fit: contain 语义，调用方已 rrect + clip）。
+ *
+ * v0.3.4 新增，解决的问题是用户报的「立绘展示不完全」：
+ * 图区是 138×134 的近正方形，而立绘是竖长图（古河渚 2434×3466），
+ * cover 只能保住 68%（见 drawCover），上下三分之一被裁掉 —— 用户看到的就是「只显示中段」。
+ * contain 按**短边**（这里是宽度 138/2434 与高度 134/3466 里更小的那个）缩放：
+ * 整张立绘 100% 落在框里，高度贴满 134，两侧各空出约 22 —— 那 22 由 drawBackdrop 填。
+ *
+ * 注意这里**刻意不做** drawCover 那条「小图不放大」的 1:1 保护：
+ * 预览走的是 CSS `object-fit: contain`，而 CSS 的 contain 对小于框的图是会放大的；
+ * 画布若自作主张留白，预览与导出就是两套样子 —— 这条一致性比「不放大」更重要
+ * （何况取图档位已经统一走 large 原图，源图比框小的情况只会在个别只有 grid 档的老角色上出现）。
+ */
+function drawContain(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  dx: number,
+  dy: number,
+  dw: number,
+  dh: number
+): boolean {
+  const iw = img.naturalWidth || img.width
+  const ih = img.naturalHeight || img.height
+  if (!iw || !ih) return false
+  const scale = Math.min(dw / iw, dh / ih)
+  const w = iw * scale
+  const h = ih * scale
+  ctx.drawImage(img, dx + (dw - w) / 2, dy + (dh - h) / 2, w, h)
+  return true
+}
+
+/**
+ * contain 模式的背景层：**同一张**立绘按 cover 铺满（并向外扩 BACKDROP_PAD），再模糊 + 压暗。
+ * 作用只有一个：把 contain 让出来的空白填掉，让竖长立绘两侧不是两块死白，不至于难看。
+ *
+ * 两个细节：
+ * ① 先扩边再模糊。blur 会把矩形边缘的颜色抹淡，直接贴着目标框画会在四周泛出一圈亮边
+ *    （预览侧对标的是 `inset: -BACKDROP_PAD` + 外层 overflow-hidden，同一个道理）；
+ * ② 这里用 0.5 的居中偏移，不套 drawCover 的 BIAS=0.2：它只是底噪，居中取景最自然。
+ * 另外它不做「小图不放大」保护 —— 背景糊一点无所谓，铺不满反而会露出一块底板。
+ */
+function drawBackdrop(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  dx: number,
+  dy: number,
+  dw: number,
+  dh: number
+): boolean {
+  const iw = img.naturalWidth || img.width
+  const ih = img.naturalHeight || img.height
+  if (!iw || !ih) return false
+  const b = EX.BACKDROP_PAD
+  const bx = dx - b
+  const by = dy - b
+  const bw = dw + b * 2
+  const bh = dh + b * 2
+  const scale = Math.max(bw / iw, bh / ih)
+  const w = iw * scale
+  const h = ih * scale
+  // filter 属于 canvas 的绘图状态，save/restore 一对把它限定在这一笔里，不影响后续绘制
+  ctx.save()
+  ctx.filter = EX.BACKDROP_FILTER
+  ctx.drawImage(img, bx + (bw - w) / 2, by + (bh - h) / 2, w, h)
+  ctx.restore()
+  return true
+}
+
+/**
+ * 按当前的填充方式画一张立绘。**导出与预览共用同一套语义**（预览是 CSS 侧的等价写法）：
+ * - `cover` → 只画一层 cover（旧行为，一字未改）；
+ * - `contain` → 先画模糊压暗背景层，再把整张立绘等比画在框内。
+ */
+function drawImageFit(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  dx: number,
+  dy: number,
+  dw: number,
+  dh: number,
+  fit: FitMode,
+  canvasScale = EX.S
+): boolean {
+  if (fit === 'cover') return drawCover(ctx, img, dx, dy, dw, dh, EX.BIAS, canvasScale)
+  drawBackdrop(ctx, img, dx, dy, dw, dh)
+  return drawContain(ctx, img, dx, dy, dw, dh)
 }
 
 function loadImage(src: string): Promise<HTMLImageElement> {
@@ -645,7 +788,12 @@ async function exportPng(
             ctx.save()
             rrect(ctx, g.rect.x, g.rect.y, g.rect.w, g.rect.h, EX.IMG_R)
             ctx.clip()
-            drawCover(ctx, img, g.rect.x, g.rect.y, g.rect.w, g.rect.h)
+            /*
+             * 立绘画法由 state.fit 决定（默认「完整显示」）。
+             * 这里**必须**和界面预览用同一套语义：预览是 CSS 侧（object-contain! / object-cover + 背景层），
+             * 画布是这一行 —— 两边一旦分叉，用户就会遇到「预览看得到全身、导出却被裁掉」。
+             */
+            drawImageFit(ctx, img, g.rect.x, g.rect.y, g.rect.w, g.rect.h, state.fit)
             ctx.restore()
             return
           } catch {
@@ -668,6 +816,19 @@ export function CharacterGridPage() {
   const navigate = useNavigate()
   const [state, setState] = useState<GridState>(() => loadState())
   const { cols, rows, cells } = state
+  const fit = state.fit
+
+  /**
+   * 切换立绘填充方式（完整显示 / 铺满裁剪）。
+   *
+   * 为什么要做一个开关而不是直接改掉：用户报的是「立绘展示不完全」，
+   * 所以**默认**必须改成「完整显示」；但 cover（铺满裁剪）本身不是 bug ——
+   * 它让格子更满、更像一张海报，有人就是喜欢那种。删掉它等于用一个新毛病换掉旧毛病，
+   * 所以做成两档可切，并且预览与导出都读 state.fit 这一份值（切换后两边同时变）。
+   */
+  const setFit = useCallback((v: FitMode): void => {
+    setState((s) => (s.fit === v ? s : { ...s, fit: v }))
+  }, [])
 
   // 作品搜索
   const [keyword, setKeyword] = useState('')
@@ -685,9 +846,18 @@ export function CharacterGridPage() {
    */
   const [charSrc, setCharSrc] = useState<CharSrc>(() => {
     try {
-      return localStorage.getItem(SOURCE_KEY) === 'bangumi' ? 'bangumi' : 'jikan'
+      /*
+       * v0.3.3：默认改成 **Bangumi**、Jikan 作为备选。
+       *
+       * 理由（实测，与最初引入 Jikan 时的假设相反）：反代给的 Bangumi 角色图 `large` 档
+       * **就是原图**（CLANNAD 角色 2434×3466 / 454KB，与 bgm.tv 角色页看到的是同一张），
+       * 而 MAL/Jikan 的角色立绘只有 225×350。以前觉得 Bangumi 糊，是因为我们取的是
+       * **grid 缩略图（75×75）**，而不是原图；取图档位修好之后 Bangumi 明显更清晰。
+       * 用户显式选过 Jikan 的话仍然尊重（localStorage 里存了 'jikan'）。
+       */
+      return localStorage.getItem(SOURCE_KEY) === 'jikan' ? 'jikan' : 'bangumi'
     } catch {
-      return 'jikan'
+      return 'bangumi'
     }
   })
   /** 实际拿到数据的来源 + 回落原因（界面常驻显示，不靠会消失的 toast） */
@@ -798,46 +968,38 @@ export function CharacterGridPage() {
   }, [keyword])
 
   /**
-   * 按当前数据源取角色（v0.3.0 引入数据源，v0.3.2 重写）。
+   * 按当前数据源取角色。
    *
-   * - `jikan`：MyAnimeList（经 Jikan）的角色图。实测**原图常见 225×350**（少量 434×675）；
-   * - `bangumi`：原来的 v0 角色接口（老接口兜底），中文名更准，但图偏小（不少只有 250×300）。
+   * v0.3.3 起**默认用 Bangumi**、Jikan 作为备选（用户实测反馈）：
+   * 反代给的 Bangumi 角色图 `large` 档**就是原图**（实测 CLANNAD 角色 2434×3466 / 454KB，
+   * 与 bgm.tv 角色页看到的是同一张），而 Jikan/MAL 的角色立绘只有 225×350；MAL 那档反而更小。
+   * 所以「为了立绘清晰度」应该选 Bangumi —— 这跟最初引入 Jikan 时的假设正好相反，
+   * 原因是我们以前取的是 Bangumi 的 **grid（75×75）** 缩略图，而不是原图（见 pickImage 的注释）。
    *
-   * 为什么 Jikan 按标题查：我们手里是 Bangumi 的条目 id，Jikan 认 MAL id，两边不通，标题是桥。
-   *
-   * v0.3.2 三处修正（都是「用户以为 Jikan 没生效」的直接原因）：
-   *   ① 标题只试一个（name_cn || name）。中文名在 MAL 上常常搜不到，
-   *      而 MAL 条目名多半是日文原名 —— 现在两种标题都会试一次，命中率明显提高；
-   *   ② 成功后把来源标成 `v0`（Bangumi 的接口名），界面徽章于是写「来源：v0 角色接口」——
-   *      用了 Jikan 却显示 v0，等于给用户一个「果然没生效」的假证据，现在如实标 `jikan`；
-   *   ③ 回落只发一个几秒就消失的 toast，不留痕。现在回落原因写进 `resolved.fallback`，
-   *      界面上常驻显示，并且可以直接点「重试 Jikan」。
+   * 两个方向的取法与回落都保留：
+   * - `bangumi`：v0 角色接口 → 老接口兜底；**全失败/为空时**自动改用 Jikan（并常驻说明原因）；
+   * - `jikan`：Jikan（MAL，必要时 AniList）→ 失败时回落到 Bangumi。
    */
   const loadChars = useCallback(async (item: SearchResultItem, src: CharSrc) => {
     setLoadingChars(true)
-    if (src === 'jikan') {
+
+    /** Jikan 那一路：成功则落地并返回 true，失败时把原因写进 note 并返回 false */
+    const tryJikan = async (note: { text: string }): Promise<boolean> => {
       /*
        * 两种标题各试一次（相同就只试一次）：中文名优先，因为用户是在中文界面里选的条目，
        * 但 MAL 上多数条目只有日文原名，所以中文名没结果时必须再拿原名试一次。
        */
       const titles = [item.name_cn, item.name].map((s) => String(s ?? '').trim()).filter(Boolean)
       const tries = [...new Set(titles)].slice(0, 2)
-      /*
-       * 回落原因用**局部变量**累积，不要放进 state 再读回来：
-       * setState 是异步的，同一次调用里读到的还是上一次的值（第一次失败时读到空串），
-       * 那样提示就成了没信息量的「Jikan 没取到角色」。这个局部变量同时喂给
-       * 「回落横幅的说明」和界面上的常驻提示。
-       */
-      let note = ''
       for (const title of tries) {
         const r = await api.bangumi.charactersJikan(title)
         if (!r.ok) {
-          note = `Jikan 接口调用失败：${r.error}`
+          note.text = `Jikan 接口调用失败：${r.error}`
           continue
         }
         if (r.data.items.length === 0) {
           // malId=0 说明连 MAL 条目都没匹配上；reason 是主进程给的具体原因（Jikan 504 / AniList 无匹配…）
-          note =
+          note.text =
             r.data.reason ||
             (r.data.malId > 0
               ? `匹配到《${r.data.animeTitle}》(MAL #${r.data.malId})，但没有返回角色`
@@ -854,7 +1016,6 @@ export function CharacterGridPage() {
         }))
         // 立绘到底来自 MAL 还是 AniList，按主进程如实回报的字段决定（不能一律写 Jikan）
         const fromAniList = r.data.imageSource === 'anilist' || r.data.via === 'anilist'
-        setLoadingChars(false)
         setChars(items)
         setResolved({
           kind: fromAniList ? 'jikan-anilist' : 'jikan',
@@ -864,14 +1025,39 @@ export function CharacterGridPage() {
         toast.success(
           fromAniList
             ? `已取到 ${items.length} 位角色（Jikan 端点不可用，改走 AniList 取图）`
-            : `已用 Jikan 取到 ${items.length} 位角色（MAL #${r.data.malId}，立绘为原图）`
+            : `已用 Jikan 取到 ${items.length} 位角色（MAL #${r.data.malId}）`
         )
-        return
+        return true
       }
-      // Jikan 这一路没拿到：回落 Bangumi，并把原因留在界面上
+      return false
+    }
+
+    /** Bangumi 那一路：成功则落地并返回 true（含「取到了但一个角色都没有」这种空结果） */
+    const tryBangumi = async (): Promise<boolean> => {
+      const r = await api.bangumi.characters(item.id)
+      if (!r.ok) {
+        toast.error(r.error)
+        return true // 接口层面的失败已经报过错了，不再去试另一个源（否则提示会打架）
+      }
+      setChars(r.data.items)
+      setResolved({ kind: r.data.source, stale: r.data.stale, count: r.data.items.length })
+      if (r.data.items.length === 0) {
+        if (r.data.error) toast.error(r.data.error.message)
+        else toast.info('这部作品没有取到角色数据')
+        return false // 空结果 → 允许调用方（Bangumi 优先时）再试 Jikan
+      }
+      if (r.data.source === 'legacy') toast.info('角色来自老接口兜底，数量可能少于完整角色表')
+      return true
+    }
+
+    if (src === 'jikan') {
+      const note = { text: '' }
+      const ok = await tryJikan(note)
+      setLoadingChars(false)
+      if (ok) return
+      // Jikan 没拿到：回落到 Bangumi，并把原因常驻留在界面上
       toast.warn('Jikan 没取到角色，已回落到 Bangumi')
       const r = await api.bangumi.characters(item.id)
-      setLoadingChars(false)
       if (!r.ok) {
         toast.error(r.error)
         return
@@ -881,29 +1067,24 @@ export function CharacterGridPage() {
         kind: r.data.source,
         stale: r.data.stale,
         count: r.data.items.length,
-        fallback: note || `Jikan 没取到「${item.name_cn || item.name}」的角色`
+        fallback: note.text || `Jikan 没取到「${item.name_cn || item.name}」的角色`
       })
-      if (r.data.items.length === 0) {
-        if (r.data.error) toast.error(r.data.error.message)
-        else toast.info('这部作品没有取到角色数据')
-      }
       if (r.data.source === 'legacy') toast.info('角色来自老接口兜底，数量可能少于完整角色表')
       return
     }
-    const r = await api.bangumi.characters(item.id)
+
+    // 默认路径：Bangumi 优先
+    const ok = await tryBangumi()
     setLoadingChars(false)
-    if (!r.ok) {
-      toast.error(r.error)
-      return
+    if (ok) return
+    // Bangumi 没有角色：再用 Jikan 兜一次（用户明确要求 Jikan 作为备选）
+    const note = { text: '' }
+    const jikanOk = await tryJikan(note)
+    if (!jikanOk) {
+      setResolved({ kind: 'v0', count: 0, fallback: note.text || 'Bangumi 与 Jikan 都没有取到角色' })
+    } else {
+      toast.info('Bangumi 没有角色数据，已改用 Jikan（MAL）')
     }
-    setChars(r.data.items)
-    // 用户自己选的 Bangumi：不该出现「回落」提示（fallback 留空）
-    setResolved({ kind: r.data.source, stale: r.data.stale, count: r.data.items.length })
-    if (r.data.items.length === 0) {
-      if (r.data.error) toast.error(r.data.error.message)
-      else toast.info('这部作品没有取到角色数据')
-    }
-    if (r.data.source === 'legacy') toast.info('角色来自老接口兜底，数量可能少于完整角色表')
   }, [])
 
   const selectSubject = useCallback(
@@ -931,7 +1112,7 @@ export function CharacterGridPage() {
       } catch {
         /* 存储不可用时忽略 */
       }
-      toast.info(v === 'jikan' ? '数据源已切到 Jikan（立绘画质优先）' : '数据源已切到 Bangumi（中文名优先）')
+      toast.info(v === 'jikan' ? '数据源已切到 Jikan（MAL，立绘 225×350）' : '数据源已切到 Bangumi（立绘为原图，更清晰）')
       if (subject) void loadChars(subject, v)
     },
     [charSrc, subject, loadChars]
@@ -1116,7 +1297,7 @@ export function CharacterGridPage() {
                     subject?.id === it.id ? 'bg-accent-soft' : ''
                   }`}
                 >
-                  <CoverImage src={pickImage(it.images, 'grid')} className="h-12 w-9 shrink-0" rounded="rounded" />
+                  <CoverImage src={pickImage(it.images, 'small')} className="h-12 w-9 shrink-0" rounded="rounded" />
                   <span className="min-w-0 flex-1">
                     <span className="block truncate text-xs font-medium">{it.name_cn || it.name}</span>
                     <span className="block truncate text-[10px] text-faint">
@@ -1162,8 +1343,8 @@ export function CharacterGridPage() {
             </div>
             <p className="mt-1 text-[10px] leading-relaxed text-faint">
               {charSrc === 'jikan'
-                ? '当前：Jikan —— 立绘取 MAL 原图（实测常见 225×350），画质优先；取不到角色时自动回落 Bangumi，并在下面写明原因。'
-                : '当前：Bangumi —— 中文名与关系更准，但角色图偏小（不少只有 250×300），导出时会被放大。'}
+                ? '当前：Jikan（MyAnimeList）—— 角色立绘只有 225×350，比 Bangumi 的原图小；取不到角色时自动回落 Bangumi，并在下面写明原因。'
+                : '当前：Bangumi —— 立绘取的是**原图**（实测 CLANNAD 角色 2434×3466，与 bgm.tv 角色页同一张），导出不会被放大糊掉；没有角色数据时自动改用 Jikan。'}
             </p>
           </div>
 
@@ -1229,7 +1410,7 @@ export function CharacterGridPage() {
                     onClick={() => placeCharacter(ch)}
                     className="flex flex-col items-center gap-1 rounded-lg border border-border bg-elev1 p-1.5 transition-colors hover:border-accent"
                   >
-                    <CoverImage src={pickImage(ch.images, 'grid')} className="h-20 w-full" rounded="rounded-md" />
+                    <CoverImage src={pickImage(ch.images, 'medium')} className="h-20 w-full" rounded="rounded-md" />
                     <span className="w-full truncate text-[11px]">{charName(ch)}</span>
                     <span className="w-full truncate text-[10px] text-faint">{ch.relation || '—'}</span>
                   </button>
@@ -1289,6 +1470,40 @@ export function CharacterGridPage() {
               {metrics.nine ? `（9 格单格 ${metrics.cellW}×${metrics.cellH}，已收紧）` : `（单格 ${metrics.cellW}×${metrics.cellH}）`}
             </span>
 
+            {/*
+              立绘填充方式（v0.3.4 新增，默认「完整显示」）。
+              默认值的理由就是用户的诉求本身：图区 138×134 近正方形、立绘 2434×3466 竖长，
+              cover 只能保住 68% 的高度，上下被裁掉三分之一 —— 用户看到的「展示不完全」正是它。
+              「铺满裁剪」作为旧行为保留（有人就想要铺满的观感），切换后预览与导出同时生效。
+            */}
+            <span className="flex items-center gap-1 text-[11px] text-dim">
+              立绘
+              <span className="flex rounded-lg border border-border bg-elev1 p-0.5">
+                {(
+                  [
+                    [
+                      'contain',
+                      '完整显示',
+                      '整张立绘等比缩进图区、不裁切；两侧空白用同一张立绘的模糊压暗版填满（默认）'
+                    ],
+                    ['cover', '铺满裁剪', '按短边铺满图区再裁掉超出部分（旧行为）：格子更满，但竖长立绘会被切掉上下']
+                  ] as const
+                ).map(([v, label, hint]) => (
+                  <button
+                    key={v}
+                    type="button"
+                    title={hint}
+                    onClick={() => setFit(v)}
+                    className={`rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                      fit === v ? 'bg-accent text-white' : 'text-dim hover:text-text'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </span>
+            </span>
+
             <span className="ml-auto flex items-center gap-2">
               <Button
                 size="sm"
@@ -1339,6 +1554,8 @@ export function CharacterGridPage() {
                 const isTarget = target.r === r && target.c === c
                 const isSwapFrom = swapFrom?.r === r && swapFrom?.c === c
                 const isEditing = editing?.r === r && editing?.c === c
+                /** 这一格要画的立绘地址（与导出同一档：large 原图） */
+                const art = cell.char ? pickImage(cell.char.images, 'large') : ''
                 return (
                   <div
                     key={`${r}-${c}`}
@@ -1379,12 +1596,41 @@ export function CharacterGridPage() {
 
                     <div className="relative min-h-0 flex-1 overflow-hidden rounded-md bg-elev2">
                       {cell.char ? (
-                        <CoverImage
-                          src={pickImage(cell.char.images, 'grid')}
-                          alt={charName(cell.char)}
-                          rounded="rounded-md"
-                          className="h-full w-full"
-                        />
+                        <>
+                          {/*
+                            完整显示时的底：**同一张**立绘 cover 铺满 + 模糊压暗，把 contain 让出来的空白填掉。
+                            参数（EX.BACKDROP_FILTER / BACKDROP_PAD）与导出画布里的 drawBackdrop 是同一份，
+                            连「向外扩一圈再模糊」这个细节都一样：不扩，模糊的羽化边会在四边泛出一圈亮边。
+                            切到「铺满裁剪」时这一层不画 —— 那时立绘自己就把图区填满了。
+                          */}
+                          {fit === 'contain' && art ? (
+                            <div
+                              aria-hidden
+                              className="absolute"
+                              style={{
+                                inset: -EX.BACKDROP_PAD,
+                                backgroundImage: `url("${imgUrl(art)}")`,
+                                backgroundSize: 'cover',
+                                backgroundPosition: 'center',
+                                filter: EX.BACKDROP_FILTER
+                              }}
+                            />
+                          ) : null}
+                          {/*
+                            前景立绘。
+                            ⚠️ `object-contain!` 的这个 `!` 不能省：CoverImage 是共用组件（本轮不动它），
+                            它的 className 里写死了 `object-cover`，而构建产物中 `.object-contain`
+                            排在 `.object-cover` **之前**（同特异性 → 后者胜），所以只写 `object-contain`
+                            会被静默吃掉、仍然按 cover 裁切。`!` 是 tailwindcss@4 的 important 修饰符
+                            （写在类名末尾），用它把 object-fit 可靠地压成 contain。
+                          */}
+                          <CoverImage
+                            src={art}
+                            alt={charName(cell.char)}
+                            rounded="rounded-md"
+                            className={`relative h-full w-full ${fit === 'contain' ? 'object-contain!' : ''}`}
+                          />
+                        </>
                       ) : (
                         <div className="flex h-full items-center justify-center text-faint">
                           <ImageOff size={18} />
@@ -1435,9 +1681,12 @@ export function CharacterGridPage() {
           <p className="mt-3 text-[10px] leading-relaxed text-faint">
             导出为 2 倍图 PNG，单格画「标签 + 立绘 + 名字」，右上角写制作人，页脚写实际用到的数据源；
             立绘由主进程取回并转成 data URL 后再画进画布（避免自定义协议污染画布导致导出失败）。
+            立绘默认按**完整显示**画：整张等比缩进图区不裁切（竖长立绘按高度贴合、两侧空白用同一张立绘的
+            模糊压暗版填满），想看铺满的效果可以切「立绘：铺满裁剪」，两档都由预览与导出共用同一套几何与绘制函数。
             画布开着高质量重采样，并且**源图比目标框小时按 1:1 设备像素居中绘制、不放大**
-            （放大只会更糊）；9 宫格的单格也特意收紧，格子越小立绘被放大的倍数越小，越清晰。
-            盘面与标签、制作人、数据源都会存到本地，刷新不丢。
+            （放大只会更糊；注意这一条只作用于「铺满裁剪」，完整显示必须和 CSS 的 object-fit: contain 一致）。
+            9 宫格的单格也特意收紧，格子越小立绘被放大的倍数越小，越清晰。
+            盘面与标签、制作人、数据源、立绘填充方式都会存到本地，刷新不丢。
           </p>
         </section>
       </div>

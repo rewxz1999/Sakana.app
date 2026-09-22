@@ -139,6 +139,19 @@ end
 
 local ASPECT_LABEL = { fit = '适应', cover = '裁剪铺满', stretch = '拉伸铺满' }
 
+--- Anime4K 模式的短名（角标用）：与 settings 里存的 id 一一对应（见 @shared/anime4k）
+local A4K_SHORT = { A = 'A', B = 'B', C = 'C', AA = 'A+A', BB = 'B+B', CA = 'C+A', custom = '自定义' }
+--- 菜单里的模式清单：id → 说明（说明文字与设置页保持一致，避免两处说法不一）
+local A4K_MENU = {
+  { 'off', '关闭超分', '按原画播放，不做任何处理' },
+  { 'A', '模式 A', '1080p 通用；模糊/压缩痕迹重时最明显' },
+  { 'B', '模式 B', '多数 720p；锯齿、振铃明显时更合适' },
+  { 'C', '模式 C', '低码率 / 噪点多；PSNR 最高' },
+  { 'AA', '模式 A+A', '画质优先（更慢，放大 ≥2 倍时再考虑）' },
+  { 'BB', '模式 B+B', '画质优先（更慢）' },
+  { 'CA', '模式 C+A', '画质优先（更慢）' },
+}
+
 --- 按最新状态刷新全部按钮
 --- @param force boolean|nil 忽略内容缓存强制重发（uosc 刚加载、或状态刚回来时用）
 local function update_buttons(force)
@@ -218,6 +231,21 @@ local function update_buttons(force)
     tooltip = dm_tip, action = { 'toggle-danmaku' }, active = dm_on,
   }
   ctrl_button { name = 'sakana-danmaku-settings', icon = 'tune', tooltip = '弹幕设置', action = { 'menu', 'danmaku' } }
+
+  -- 画质（Anime4K 超分，v0.3.3）：角标显示当前模式，点亮表示超分开着。
+  -- 用户反馈「控制栏里没有超分辨率按钮」—— 以前只能进设置页改，播放中没法切，这里补上。
+  local a4k = has and field(state, 'anime4k', nil) or nil
+  local a4k_on = type(a4k) == 'table' and field(a4k, 'enabled', false) == true or false
+  local a4k_mode = type(a4k) == 'table' and tostring(field(a4k, 'mode', 'A')) or 'A'
+  local a4k_short = A4K_SHORT[a4k_mode] or a4k_mode
+  ctrl_button {
+    name = 'sakana-a4k',
+    icon = a4k_on and 'auto_awesome' or 'movie_filter',
+    tooltip = '画质（Anime4K 超分）：' .. (a4k_on and ('模式 ' .. a4k_short) or '已关闭'),
+    action = { 'menu', 'quality' },
+    badge = a4k_on and a4k_short or '关',
+    active = a4k_on,
+  }
 
   -- 详情 / 截图 / 全屏 / 退出
   ctrl_button { name = 'sakana-info', icon = 'info', tooltip = '番剧详情', action = { 'toggle-info' } }
@@ -448,6 +476,66 @@ local function menu_danmaku()
   }
 end
 
+--- 画质 / Anime4K 超分（v0.3.3）。
+---
+--- 用户要求：控制栏里要有超分辨率按钮。这里给一个模式清单 + 档位切换 + 进完整设置的入口。
+--- 所有动作都通过 `sakana-ctrl a4k-*` 回传主进程执行（设置存在主进程的 store 里，
+--- 改完立刻用 change-list 重挂着色器链，所以是**播放中即时生效**）。
+--- 菜单项 highlight 由 `state.anime4k` 决定，按钮角标显示当前模式（关 / A / B / …）。
+---
+--- ⚠️ 这里以前误用了 JSDoc 风格的 `/** */`，Lua 只认 `--` / `--[[ ]]` ——
+--- 结果是**整个桥接脚本加载后立刻报语法错误退出**（日志里 `Lua error: … unexpected symbol near '/'`），
+--- 表现就是按钮/菜单/诊断全部失灵。Lua 文件里不要再出现 `/*`。
+local function menu_quality()
+  local a4k = state and field(state, 'anime4k', nil) or nil
+  local enabled = type(a4k) == 'table' and field(a4k, 'enabled', false) == true or false
+  local mode = type(a4k) == 'table' and tostring(field(a4k, 'mode', 'A')) or 'A'
+  local tier = type(a4k) == 'table' and tostring(field(a4k, 'tier', 'fast')) or 'fast'
+
+  local mode_items = {}
+  for _, o in ipairs(A4K_MENU) do
+    local id, title, hint = o[1], o[2], o[3]
+    local is_current = (id == 'off' and not enabled) or (id ~= 'off' and enabled and mode == id)
+    mode_items[#mode_items + 1] = item(title, { 'a4k-set', id }, {
+      hint = hint,
+      active = is_current,
+      icon = is_current and 'check' or nil,
+    })
+  end
+
+  local tier_items = {
+    item('流畅优先', { 'a4k-tier', 'fast' }, {
+      hint = '官方 Low-end 模板（S/M 变体）',
+      active = tier == 'fast',
+      icon = tier == 'fast' and 'check' or nil,
+    }),
+    item('画质优先', { 'a4k-tier', 'quality' }, {
+      hint = '官方 High-end 模板（VL/M 变体）',
+      active = tier == 'quality',
+      icon = tier == 'quality' and 'check' or nil,
+    }),
+  }
+
+  local items = {
+    { title = '模式', hint = enabled and (A4K_SHORT[mode] or mode) or '已关闭', items = mode_items },
+    { title = '显卡档位', hint = tier == 'quality' and '画质优先' or '流畅优先', items = tier_items },
+    item(enabled and '关闭超分' or '开启超分（模式 A）', { 'a4k-toggle' },
+      { icon = enabled and 'movie_filter' or 'auto_awesome' }),
+    item('完整画质设置…', { 'open-quality-settings' }, { icon = 'settings' }),
+  }
+
+  open_menu {
+    type = 'sakana-quality',
+    title = '画质（Anime4K 超分）',
+    footnote = enabled
+      and ('当前：模式 ' .. (A4K_SHORT[mode] or mode) .. ' · ' .. (tier == 'quality' and '画质优先' or '流畅优先') .. '（改完立刻生效）')
+      or '当前：已关闭。超分需要 libmpv 内核，着色器随包内置',
+    items = items,
+  }
+  -- 打一行日志：自检靠它确认「菜单确实被构造出来了、而且拿到的是最新状态」
+  msg.info(string.format('画质菜单已构造：%d 项，enabled=%s mode=%s tier=%s', #items, tostring(enabled), mode, tier))
+end
+
 local MENUS = {
   episodes = menu_episodes,
   lines = menu_lines,
@@ -455,6 +543,7 @@ local MENUS = {
   speed = menu_speed,
   aspect = menu_aspect,
   danmaku = menu_danmaku,
+  quality = menu_quality,
 }
 
 open_named_menu = function(name)
@@ -537,4 +626,14 @@ if os.getenv('SAKANA_UOSC_TEST') then
   msg.info('鼠标命中诊断已启用（user-data/sakana-mouse）')
 end
 
-msg.info('sakana-uosc-ctrl 已加载（控制栏按钮 + 菜单 + 动作回传）')
+-- ─────────────────────── 存活标记（v0.3.3） ───────────────────────
+--
+-- 脚本跑到这里才算真的活着。Electron 侧会在加载后等一会儿读这个属性：
+-- 读不到就说明脚本在运行时报错退出了（`load-script` 对这种情况依然返回成功），
+-- 那时控制栏会一个按钮都没有 —— 应用会据此回落到自己的悬浮窗控制栏，并写一条错误日志。
+--
+-- ⚠️ 改动本文件后请务必确认这条属性真的写出来了：Lua 的语法错误会让整个脚本静默退出。
+local SCRIPT_VERSION = '2026-09-uosc-ctrl-v3'
+mp.set_property('user-data/sakana-ctrl-ready', SCRIPT_VERSION)
+
+msg.info('sakana-uosc-ctrl 已加载（控制栏按钮 + 菜单 + 动作回传，版本 ' .. SCRIPT_VERSION .. '）')
