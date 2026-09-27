@@ -2,6 +2,13 @@ import { BrowserWindow } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { CH } from '@shared/channels'
+import {
+  compareStatOrder,
+  defaultSeqOf,
+  nextSeq as nextSeqByRule,
+  validateSeqRule,
+  yearOfAirDate
+} from '@shared/statSeq'
 import type {
   StatAction,
   StatAddItem,
@@ -31,6 +38,10 @@ import { saveDirsInfo } from './saveDirs'
 
 const NS = 'statTool'
 const MAX_PHOTOS = 5
+/** 条目上保留的类型标签数量上限（详情接口有 30 个 tag，全存进条目太重，界面也显示不下） */
+const MAX_GENRES = 12
+/** 类型标签单个名字的最大长度（防止有人把整段简介塞进来当标签） */
+const MAX_GENRE_LEN = 24
 const EMPTY: StatToolData = { lists: [], entries: [], revision: 0 }
 
 function numOrNull(v: unknown): number | null {
@@ -38,6 +49,56 @@ function numOrNull(v: unknown): number | null {
   const n = Number(v)
   if (Number.isNaN(n)) return null
   return Math.round(Math.min(10, Math.max(0, n)) * 10) / 10
+}
+
+/** 本地时区下的 `YYYY-MM-DD` */
+function localDayOf(d: Date): string {
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/** 毫秒时间戳 → `YYYY-MM-DD`（本地时区） */
+export function tsToDay(ts: number | null | undefined): string | null {
+  if (!ts || !Number.isFinite(ts)) return null
+  const d = new Date(ts)
+  return Number.isNaN(d.getTime()) ? null : localDayOf(d)
+}
+
+/**
+ * 看完时间归一化：**只到天**（用户要求「不用精确到分秒」）。
+ *
+ * 兼容三种历史形态，全部收敛成 `YYYY-MM-DD`：
+ * - `YYYY-MM-DD`（新形态）→ 原样返回；
+ * - `YYYY-MM-DDTHH:mm`（v0.2 的本地时间形态，没有时区）→ 直接取日期部分，
+ *   不走 `new Date()`：它对「本地时间字符串」的解析在各环境下不一致，取字符串前 10 位最稳；
+ * - 带时区的 ISO（`…Z` / `+08:00`）+ 数字时间戳 → 先解析成时间点再按**本地时区**取日期，
+ *   否则「晚上 8 点看的番」会被算成前一天/后一天。
+ */
+export function dayOnly(v: unknown): string | null {
+  if (v == null) return null
+  if (typeof v === 'number') return tsToDay(v)
+  const s = String(v).trim()
+  if (!s) return null
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s)
+  if (m && !/[zZ]$|[+-]\d{2}:?\d{2}$/.test(s)) return `${m[1]}-${m[2]}-${m[3]}`
+  const ms = Date.parse(s)
+  if (Number.isNaN(ms)) return m ? `${m[1]}-${m[2]}-${m[3]}` : null
+  return tsToDay(ms)
+}
+
+/** 类型标签归一化：去空、去重、限长、限量（详情接口按热度给出，顺序保留） */
+export function normalizeGenres(v: unknown): string[] {
+  if (!Array.isArray(v)) return []
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const raw of v) {
+    const g = String(raw ?? '').trim().slice(0, MAX_GENRE_LEN)
+    if (!g || seen.has(g)) continue
+    seen.add(g)
+    out.push(g)
+    if (out.length >= MAX_GENRES) break
+  }
+  return out
 }
 
 /**
@@ -73,8 +134,9 @@ function normalizeEntry(raw: Partial<StatEntry> & { id?: string }): StatEntry {
     nameCn: String(raw.nameCn ?? ''),
     cover: String(raw.cover ?? ''),
     airDate: raw.airDate ? String(raw.airDate) : null,
-    genres: Array.isArray(raw.genres) ? raw.genres.map((g) => String(g)) : [],
-    watchedAt: raw.watchedAt ? String(raw.watchedAt) : null,
+    genres: normalizeGenres(raw.genres),
+    // 看完时间一律归一化成「天」：老数据的 `…T21:04` 也在这里被抹掉时分
+    watchedAt: dayOnly(raw.watchedAt),
     initialRating: numOrNull(raw.initialRating),
     midRating: numOrNull(raw.midRating),
     endRating: numOrNull(raw.endRating),
@@ -104,7 +166,16 @@ export function readStatData(): StatToolData {
     createdAt: Number(l?.createdAt ?? Date.now()) || Date.now(),
     // 注意用 `=== true` 而不是 `!!`：store.get 会用 fallback 做一次浅合并，
     // 这里把非法值（字符串、数字）一律收敛成 false，避免 UI 上出现"半个置顶"
-    pinned: l?.pinned === true
+    pinned: l?.pinned === true,
+    /*
+     * 序号规则：磁盘上可能是旧版本写坏的值（手工编辑 JSON / 早期没有校验），
+     * 这里统一按 shared/statSeq.ts 校验一遍，不合法的直接当"没有规则"（= 默认编序），
+     * 否则一个非法规则会让这个列表**再也加不进条目**（nextSeq 一直报错）。
+     */
+    seqRule: (() => {
+      const c = validateSeqRule(l?.seqRule)
+      return c.ok ? c.rule : ''
+    })()
   }))
   const entries = (Array.isArray(raw.entries) ? raw.entries : []).map(normalizeEntry)
   return { lists, entries, revision: Number(raw.revision ?? 0) || 0 }
@@ -129,9 +200,9 @@ export function broadcastStat(): void {
   }
 }
 
-/** 放送年份：取 airDate 前 4 位，未知用 '0000'（与 v0.1 的 seq 规则一致，老序号不变） */
+/** 放送年份：取 airDate 前 4 位，取不到用当前年份（见 shared/statSeq.ts 的 yearOfAirDate） */
 function yearOf(airDate: string | null | undefined): string {
-  return airDate?.slice(0, 4) || '0000'
+  return yearOfAirDate(airDate)
 }
 
 /** 渲染层传来的 patch 只认白名单字段，避免把 listId / id 之类的字段改坏 */
@@ -158,7 +229,9 @@ function sanitizePatch(patch: StatEntryPatch): StatEntryPatch {
   for (const k of texts) {
     if (k in patch) (out as Record<string, unknown>)[k] = String(patch[k] ?? '')
   }
-  if ('watchedAt' in patch) out.watchedAt = patch.watchedAt ? String(patch.watchedAt) : null
+  // 看完时间：无论渲染层传什么（datetime-local 老值 / ISO）都归一到「天」
+  if ('watchedAt' in patch) out.watchedAt = dayOnly(patch.watchedAt)
+  if ('genres' in patch) out.genres = normalizeGenres(patch.genres)
   if ('seq' in patch) out.seq = String(patch.seq ?? '')
   if ('order' in patch) out.order = Number(patch.order ?? 0) || 0
   // 剧照：去空去重 + 截断到上限（渲染层的上限是 UI 约束，这里是底线）
@@ -176,53 +249,122 @@ function sanitizePatch(patch: StatEntryPatch): StatEntryPatch {
   return out
 }
 
-/** 重排某列表：按年份分组，组内 01、02…（seq = 年份 + 两位顺序） */
-function resortList(entries: StatEntry[], listId: string, entryIds?: string[]): StatEntry[] {
+/**
+ * 拖动排序：只改 `order`（1 起），**不动 seq**。
+ *
+ * 为什么拖动不改编号：`seq` 是用户自己定的编号（可能是 `A0701` 这种归档号），
+ * 拖一下就把编号重排一遍会很意外；要按新顺序重编号有单独的「重新排序」按钮。
+ */
+function applyEntryOrder(entries: StatEntry[], listId: string, entryIds: string[]): StatEntry[] {
   const inList = entries.filter((e) => e.listId === listId)
-  let ordered: StatEntry[]
-  if (entryIds && entryIds.length > 0) {
-    // 指定顺序：按 id 顺序排，未提到的条目接在后面（按原 order）
-    const pos = new Map(entryIds.map((id, i) => [id, i]))
-    ordered = [...inList].sort((a, b) => {
-      const pa = pos.has(a.id) ? (pos.get(a.id) as number) : Number.MAX_SAFE_INTEGER
-      const pb = pos.has(b.id) ? (pos.get(b.id) as number) : Number.MAX_SAFE_INTEGER
-      if (pa !== pb) return pa - pb
-      return a.order - b.order
-    })
-  } else {
-    ordered = [...inList].sort((a, b) => {
-      const ya = yearOf(a.airDate)
-      const yb = yearOf(b.airDate)
-      if (ya !== yb) return ya.localeCompare(yb)
-      return a.order - b.order
-    })
-  }
-  const counters = new Map<string, number>()
+  const pos = new Map(entryIds.map((id, i) => [id, i]))
+  // 没被提到的条目接在后面（按原 order/seq），保持确定顺序
+  const ordered = [...inList].sort((a, b) => {
+    const pa = pos.has(a.id) ? (pos.get(a.id) as number) : Number.MAX_SAFE_INTEGER
+    const pb = pos.has(b.id) ? (pos.get(b.id) as number) : Number.MAX_SAFE_INTEGER
+    if (pa !== pb) return pa - pb
+    return compareStatOrder(a, b)
+  })
+  const patched = new Map<string, number>()
+  ordered.forEach((e, i) => patched.set(e.id, i + 1))
+  return entries.map((e) => {
+    const o = patched.get(e.id)
+    return o == null || o === e.order ? e : { ...e, order: o, updatedAt: Date.now() }
+  })
+}
+
+/**
+ * 「重新排序」：按放送年份 + 当前顺序整表重排，并按列表的序号规则**重编号**。
+ *
+ * 默认规则（未设 seqRule）时保持 v0.2 的行为：同一年份内 01、02…；
+ * 设了自定义规则时按规则续号（第一条用规则本身，之后 +1，见 shared/statSeq.ts）。
+ * 规则溢出（数字部分超 8 位）等异常直接回落到默认编序并记日志 —— 宁可编号变回年份式，
+ * 也不能让「重新排序」整个失败或者写出重号。
+ */
+function resortList(entries: StatEntry[], list: StatList | undefined): StatEntry[] {
+  const listId = list?.id ?? ''
+  const rule = list?.seqRule ?? ''
+  const inList = entries.filter((e) => e.listId === listId)
+  const ordered = [...inList].sort((a, b) => {
+    const ya = yearOf(a.airDate)
+    const yb = yearOf(b.airDate)
+    if (ya !== yb) return ya.localeCompare(yb)
+    return compareStatOrder(a, b)
+  })
+  const seqs: string[] = []
   const patched = new Map<string, { seq: string; order: number }>()
-  for (const e of ordered) {
-    const y = yearOf(e.airDate)
-    const n = (counters.get(y) ?? 0) + 1
-    counters.set(y, n)
-    patched.set(e.id, { seq: `${y}${String(n).padStart(2, '0')}`, order: n })
-  }
+  ordered.forEach((e, i) => {
+    const r = nextSeqByRule(rule, seqs, { year: yearOf(e.airDate) })
+    const seq = r.ok ? r.seq : defaultSeqOf(yearOf(e.airDate), i + 1)
+    if (!r.ok) log.append('warn', 'stat', `重新排序时序号规则失效（${r.reason}），已回落到默认编序`)
+    seqs.push(seq)
+    patched.set(e.id, { seq, order: i + 1 })
+  })
   return entries.map((e) => {
     const p = patched.get(e.id)
     return p ? { ...e, seq: p.seq, order: p.order, updatedAt: Date.now() } : e
   })
 }
 
-/** 新条目的 seq/order：该年份内已有条目的最大顺序 + 1 */
-function nextSeq(
+/**
+ * 新条目的 `seq` / `order`。
+ *
+ * - `seq`：按列表的序号规则续号（没规则 = 年份 + 顺序号）；
+ * - `order`：列表内当前最大顺序 + 1（**整列**取最大，不按年份）——
+ *   界面与导出图按 `order` 排序，新加的条目就应该落在最末尾。
+ */
+function nextSeqForList(
   entries: StatEntry[],
-  listId: string,
+  list: StatList,
   airDate: string | null
 ): { seq: string; order: number } {
-  const year = yearOf(airDate)
-  const max = entries
-    .filter((e) => e.listId === listId && yearOf(e.airDate) === year)
-    .reduce((m, e) => Math.max(m, e.order), 0)
-  const order = max + 1
-  return { seq: `${year}${String(order).padStart(2, '0')}`, order }
+  const inList = entries.filter((e) => e.listId === list.id)
+  const order = inList.reduce((m, e) => Math.max(m, Number(e.order) || 0), 0) + 1
+  const r = nextSeqByRule(list.seqRule ?? '', inList.map((e) => e.seq), { year: yearOf(airDate) })
+  if (r.ok) return { seq: r.seq, order }
+  log.append('warn', 'stat', `序号规则不可用（${r.reason}），本条使用默认编序`)
+  return { seq: defaultSeqOf(yearOf(airDate), order), order }
+}
+
+/**
+ * 自动带出「已看完时间」（只到天）。
+ *
+ * 数据源结论（对着磁盘上的真实数据核对过，见本轮报告）：
+ * - `favorites.json` 的 `watchedAt` 是**用户在番剧详情页手动标记/修改**的看完时间（毫秒时间戳），
+ *   也是详情页「已看完」徽标的数据来源 —— 最可信，优先用；
+ * - 详情接口（`subject3-*.json`）本身**没有**收藏/完成时间字段（实测 data 里只有
+ *   id/name/name_cn/summary/air_date/images/rating/tags/infobox/eps/volumes/platform/totalEpisodes），
+ *   所以「详情页的已看完时间」只能来自收藏那份手动标记；
+ * - 用户没手动标记时，用详情页同一套自动判定：收藏的 `eps`（总集数）已知，
+ *   且 `watchHistory` 覆盖的集数 ≥ 总集数 → 取最后一条观看记录的时间；
+ * - **故意不用**「只要看过就用最后观看时间当看完时间」：那会给没看完的番也写上看完日期。
+ *   想要这种情况的数据可以在详情窗口点「从观看记录带入」（显式操作）。
+ */
+export function statAutoWatchedAt(
+  subjectId: number,
+  name: string,
+  nameCn: string
+): string | null {
+  const favorites = store.get<
+    { subjectId: number; name?: string; nameCn?: string; eps?: number | null; watchedAt?: number | null }[]
+  >('favorites', [])
+  const history = store.get<WatchHistoryItem[]>('watchHistory', [])
+  const fav = favorites.find((f) =>
+    subjectId > 0 ? f.subjectId === subjectId : f.name === name || f.nameCn === nameCn
+  )
+  const manual = tsToDay(fav?.watchedAt ?? null)
+  if (manual) return manual
+  const eps = typeof fav?.eps === 'number' && fav.eps > 0 ? fav.eps : null
+  if (!eps || !fav) return null
+  const seen = new Set<number>()
+  let last = 0
+  for (const h of history) {
+    if (h.subjectId !== subjectId) continue
+    if (h.episode != null) seen.add(h.episode)
+    last = Math.max(last, Number(h.watchedAt) || 0)
+  }
+  if (seen.size < eps) return null
+  return tsToDay(last)
 }
 
 /**
@@ -236,12 +378,29 @@ export function applyStatAction(action: StatAction): StatToolData {
 
   switch (action.kind) {
     case 'createList': {
+      const ruleCheck = validateSeqRule(action.seqRule)
       const list: StatList = {
         id: randomUUID(),
         name: action.name.trim() || '未命名列表',
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        seqRule: ruleCheck.ok ? ruleCheck.rule : ''
       }
+      if (!ruleCheck.ok) log.append('warn', 'stat', `新建列表时序号规则被拒绝（${ruleCheck.reason}），已按默认编序`)
       lists = [...lists, list]
+      break
+    }
+    case 'setSeqRule': {
+      const target = lists.find((l) => l.id === action.listId)
+      if (!target) break
+      const check = validateSeqRule(action.seqRule)
+      if (!check.ok) {
+        // 非法规则一律不落盘：界面上已经拦过一次，这里是底线（避免列表永远加不进条目）
+        log.append('warn', 'stat', `序号规则被拒绝（${check.reason}）：${String(action.seqRule ?? '').slice(0, 40)}`)
+        break
+      }
+      lists = lists.map((l) => (l.id === action.listId ? { ...l, seqRule: check.rule } : l))
+      // 规则本身当作起始号：如果这个列表还是空的，什么都没发生；有条目时后续按最大值续号
+      log.append('info', 'stat', `列表序号规则已更新：${check.rule || '（默认：年份 + 01、02…）'}`)
       break
     }
     case 'renameList': {
@@ -261,12 +420,18 @@ export function applyStatAction(action: StatAction): StatToolData {
       break
     }
     case 'resort': {
-      entries = resortList(entries, action.listId, action.entryIds)
+      // 给了 entryIds = 拖动排序（只写 order）；没给 = 整表按年份重排 + 重编号
+      if (action.entryIds && action.entryIds.length > 0) {
+        entries = applyEntryOrder(entries, action.listId, action.entryIds)
+      } else {
+        entries = resortList(entries, lists.find((l) => l.id === action.listId))
+      }
       break
     }
     case 'addEntries': {
       const listId = action.listId
-      if (!lists.some((l) => l.id === listId)) break
+      const list = lists.find((l) => l.id === listId)
+      if (!list) break
       const added: StatEntry[] = []
       // 展开成数组后逐个判重：同一批里重复的也只会加一次
       for (const it of action.items ?? []) {
@@ -280,7 +445,12 @@ export function applyStatAction(action: StatAction): StatToolData {
               : e.name === item.name && e.nameCn === item.nameCn)
         )
         if (dup) continue
-        const { seq, order } = nextSeq([...entries, ...added], listId, item.airDate)
+        const { seq, order } = nextSeqForList([...entries, ...added], list, item.airDate)
+        /*
+         * 看完时间：用户/收藏已经给了就用那份（归一到天），否则按番剧详情页同一套判定自动带出。
+         * 注意**不会覆盖**已有条目的值 —— 这里只处理新加入的条目，详情窗口的手动修改永远优先。
+         */
+        const watched = dayOnly(item.watchedAt) ?? statAutoWatchedAt(Number(item.subjectId) || 0, item.name ?? '', item.nameCn ?? '')
         added.push({
           id: randomUUID(),
           listId,
@@ -290,8 +460,8 @@ export function applyStatAction(action: StatAction): StatToolData {
           nameCn: String(item.nameCn ?? ''),
           cover: String(item.cover ?? ''),
           airDate: item.airDate ? String(item.airDate) : null,
-          genres: Array.isArray(item.genres) ? item.genres.map((g) => String(g)) : [],
-          watchedAt: item.watchedAt ? String(item.watchedAt) : null,
+          genres: normalizeGenres(item.genres),
+          watchedAt: watched,
           initialRating: null,
           midRating: null,
           endRating: null,

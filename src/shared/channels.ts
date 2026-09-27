@@ -165,6 +165,8 @@ export const CH = {
   // 对话框
   dialogPickFolder: 'dialog:pick-folder',
   dialogPickImages: 'dialog:pick-images',
+  /** 只选一张本地图片（v0.3.5：「最XX的角色」右键格子添加本地立绘） */
+  dialogPickImage: 'dialog:pick-image',
   dialogPickSubtitle: 'dialog:pick-subtitle',
   /** 选择本地视频文件播放（v0.2.4 本地播放） */
   dialogPickVideo: 'dialog:pick-video',

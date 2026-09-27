@@ -7,6 +7,7 @@ import {
   Download,
   Eraser,
   ImageOff,
+  ImagePlus,
   Minus,
   Plus,
   RotateCcw,
@@ -15,10 +16,11 @@ import {
 } from 'lucide-react'
 import type { CharacterItem, CoverImages, SearchResultItem } from '@shared/types'
 import { api } from '@/lib/api'
-import { imgUrl } from '@/lib/format'
+import { imgUrl, localImgUrl } from '@/lib/format'
 import { toast } from '@/stores/app'
 import { Badge, Button, IconButton, Input, Spinner } from '@/components/ui'
 import { CoverImage } from '@/components/CoverImage'
+import { ContextMenu, type ContextMenuItem } from '@/components/stat/ContextMenu'
 
 /**
  * 最XX的角色 9宫格（工具页入口 /tools/character-grid）。
@@ -140,6 +142,15 @@ interface CellChar {
   subject: string
   /** 取景框（v0.3.4）：没有就是完整显示 */
   crop?: CropRect
+  /**
+   * 本地立绘（v0.3.5）：用户右键格子「添加本地图片」选的文件。
+   *
+   * 存的是**应用数据目录里的绝对路径**（经 `api.showcase.importImages` 复制进来的），
+   * 不是用户挑图的原始位置 —— `sakana-img://local` 只放行 media.ts 白名单内的目录，
+   * 直接存原路径会 403（搜索页展示位当年踩过同一个坑）。
+   * 有它时**优先于**在线立绘（`images`），清掉它就回到在线图。
+   */
+  localImage?: string
 }
 
 interface Cell {
@@ -203,6 +214,35 @@ function pickImage(
   return ''
 }
 
+/**
+ * 这一格**实际要显示的立绘地址**（v0.3.5）。
+ *
+ * 只有一处判断、所有地方复用：有本地图就用本地路径（导入时已在应用数据目录里），
+ * 否则退回在线立绘的 large 档。预览、底图、框选、导出全部走它，
+ * 避免再出现「界面上换了一张、导出还是旧的」这类两边分叉。
+ */
+function cellArt(char: CellChar | null | undefined): string {
+  if (!char) return ''
+  return char.localImage || pickImage(char.images, 'large')
+}
+
+/** 本地图片路径 → sakana-img://local 协议地址（远程地址交给 imgUrl） */
+function artUrl(art: string): string {
+  if (!art) return ''
+  return isLocalImagePath(art) ? localImgUrl(art) : imgUrl(art)
+}
+
+/**
+ * 这个地址是不是本地文件路径。
+ * 必须与主进程 `media.isLocalImagePath` 的判据**逐字一致**（两边分叉就会出现
+ * 「界面显示本地图、导出却是空白」这种一半对一半错的状态）。
+ */
+function isLocalImagePath(p: string): boolean {
+  if (!p) return false
+  if (/^[a-zA-Z]:[\\/]/.test(p)) return true
+  return !/^[a-zA-Z][a-zA-Z0-9+.-]+:\/\//.test(p) && !/^(data|blob):/i.test(p)
+}
+
 function makeCell(label: string): Cell {
   return { label, char: null }
 }
@@ -233,7 +273,8 @@ function normalizeChar(raw: unknown): CellChar | null {
   const name = String(o.name ?? '')
   const nameCn = String(o.name_cn ?? '')
   if (!name && !nameCn) return null
-  return {
+  const local = typeof o.localImage === 'string' ? o.localImage : ''
+  const out: CellChar = {
     id: Number(o.id ?? 0),
     name,
     name_cn: nameCn,
@@ -243,6 +284,9 @@ function normalizeChar(raw: unknown): CellChar | null {
     // 老缓存没有 crop → undefined（= 完整显示），不会因为缺字段崩掉或显示空白
     crop: normalizeCrop(o.crop)
   }
+  // 本地立绘只在真有值时写入，避免老缓存里凭空多一个 undefined 字段
+  if (local) out.localImage = local
+  return out
 }
 
 /**
@@ -800,11 +844,15 @@ function drawPoster(
  * 主进程对单张超过 6MB 的图会直接拒绝（避免 base64 撑爆内存），
  * 所以这里准备一条降级链：large → medium（反代的 /r/400/ 缩放版）→ grid → small，
  * 任一张成功就画上去，全都不行才退回占位色块。
+ *
+ * v0.3.5：有本地图时**只有它一个候选** —— 用户明确指定了这张，静默换成在线图
+ * 就是「我换的图没生效」，比缺图更让人困惑（缺图至少能一眼看出来）。
  */
-function imageCandidates(images: Partial<CoverImages> | null | undefined): string[] {
-  if (!images) return []
+function imageCandidates(char: CellChar | null | undefined): string[] {
+  if (!char) return []
+  if (char.localImage) return [char.localImage]
   const list = (['large', 'medium', 'grid', 'small'] as const)
-    .map((k) => images[k])
+    .map((k) => char.images?.[k])
     .filter((u): u is string => Boolean(u))
   return [...new Set(list)]
 }
@@ -833,7 +881,9 @@ async function exportPng(
     const slice = geo.slice(i, i + BATCH)
     await Promise.all(
       slice.map(async (g) => {
-        const urls = imageCandidates(g.char.images)
+        const urls = imageCandidates(g.char)
+        // 抽出来是为了让 TS 在下面的 await 之后仍认为它是 string（闭包里的 g.char 会被放宽）
+        const crop = g.char?.crop
         if (urls.length === 0) {
           missing += 1
           return
@@ -851,7 +901,7 @@ async function exportPng(
              * 这里**必须**和界面预览用同一套语义：预览是 CSS 侧的等价写法（百分比定位 / object-contain + 背景层），
              * 画布是这一行 —— 两边一旦分叉，用户就会遇到「预览看得到全身、导出却被裁掉」。
              */
-            drawImageFit(ctx, img, g.rect.x, g.rect.y, g.rect.w, g.rect.h, state.fit, EX.S, g.char?.crop)
+            drawImageFit(ctx, img, g.rect.x, g.rect.y, g.rect.w, g.rect.h, state.fit, EX.S, crop)
             ctx.restore()
             return
           } catch {
@@ -898,7 +948,8 @@ function CropDialog({
   onCancel: () => void
   onConfirm: (crop: CropRect | undefined) => void
 }) {
-  const url = pickImage(char.images, 'large')
+  // 有本地图就用本地图（否则框选弹窗里看到的是在线图，确认后卡片上却变成另一张）
+  const url = cellArt(char)
   const VW = 320
   const VH = Math.max(120, Math.round(VW / Math.max(0.2, aspect)))
   const [nat, setNat] = useState<{ w: number; h: number } | null>(null)
@@ -1006,7 +1057,7 @@ function CropDialog({
         >
           {/* 只放一层图片：尺寸 = 原图 × 缩放，位置 = 偏移。与导出用的是同一个源矩形 */}
           <img
-            src={imgUrl(url)}
+            src={artUrl(url)}
             alt=""
             draggable={false}
             onLoad={onImgLoad}
@@ -1119,6 +1170,79 @@ export function CharacterGridPage() {
     [cells]
   )
 
+  /**
+   * 格子右键菜单（v0.3.5）。
+   *
+   * 用户要求：「新增右键格子添加本地图片（原功能不改动）」。
+   * 所以这里**只加菜单入口**：左键选中/交换、标签按钮、框选、清空全部照旧，
+   * 菜单里的「框选 / 清空」只是把已有动作换个入口，行为完全一致。
+   */
+  const [cellMenu, setCellMenu] = useState<{ r: number; c: number; x: number; y: number } | null>(null)
+  /**
+   * 「正在导入本地图片」的判据（ref，不是 state）。
+   *
+   * 用 ref 而不是 state 是必须的：选文件是异步的，用户完全可能在对话框还没关时又点一次，
+   * 那时闭包里的 state 仍是旧值（还是 null/false），两次导入会同时进行、后写的赢，
+   * 前一次复制的文件白复制一份。ref 在第一次调用时就已经置位，才真的挡得住。
+   * 界面上不需要 loading 态：系统文件对话框本身就是模态的，用户看得到自己在干什么。
+   */
+  const importingRef = useRef(false)
+
+  /**
+   * 写入/清除某一格的本地立绘。
+   *
+   * 传 `undefined` 表示「恢复在线立绘」：删掉字段而不是存空串，
+   * 这样 `cellArt()` 的 `char.localImage || …` 能自然回落到在线图，导出侧同理。
+   */
+  const applyLocalImage = useCallback((r: number, c: number, path: string | undefined): void => {
+    setState((s) => ({
+      ...s,
+      cells: s.cells.map((row, ri) =>
+        row.map((cell, ci) => {
+          if (ri !== r || ci !== c || !cell.char) return cell
+          const next: CellChar = { ...cell.char }
+          if (path) next.localImage = path
+          else delete next.localImage
+          return { ...cell, char: next }
+        })
+      )
+    }))
+  }, [])
+
+  /**
+   * 选一张本地图片作为这一格的立绘。
+   *
+   * 两步都不能省：
+   * ① `pickImage()` 拿用户挑的原路径；
+   * ② `importImages()` 把它**复制进应用数据目录**并回传新路径 ——
+   *    `sakana-img://local` 只放行 media.ts 白名单内的目录，直接存原路径会 403
+   *    （搜索页展示位当年就是因为这个「轮播全白」）。
+   * 导入失败时如实提示，不静默留一个空路径在盘面上。
+   */
+  const addLocalImage = useCallback(
+    async (r: number, c: number): Promise<void> => {
+      // 导入是异步的：以 ref 为准整体挡住第二次（见 importingRef 的说明）
+      if (importingRef.current) return
+      importingRef.current = true
+      try {
+        const picked = await api.dialog.pickImage()
+        if (!picked.ok || !picked.data) return
+        const imp = await api.showcase.importImages([picked.data])
+        if (!imp.ok || imp.data.length === 0) {
+          toast.error('导入本地图片失败（文件可能过大或不可读）')
+          return
+        }
+        applyLocalImage(r, c, imp.data[0])
+        toast.success('已把本地图片设为这一格的立绘')
+      } catch (err) {
+        toast.error(`导入本地图片失败：${String((err as Error)?.message ?? err)}`)
+      } finally {
+        importingRef.current = false
+      }
+    },
+    [applyLocalImage]
+  )
+
   /** 当前盘面的格子图片区比例（取景框与它同比例 → 框里看到的就是卡片上的） */
   const imgAspect = useMemo(() => {
     const m = gridMetrics(cols, rows)
@@ -1197,6 +1321,58 @@ export function CharacterGridPage() {
       return { ...s, cells: next }
     })
   }, [])
+
+  /**
+   * 右键菜单的菜单项（v0.3.5）。
+   *
+   * 写成函数而不是内联三元，是为了让每一项都能**先判空再取坐标**：
+   * 菜单是受控组件，`cellMenu` 在关闭瞬间就是 null，若在 onSelect 里直接解构就会崩。
+   * 菜单项随这一格是否有角色、是否已用本地图而变 —— 没有角色时不显示「框选/清空」，
+   * 没有本地图时不显示「恢复在线立绘」（避免点了一个什么都不会发生的按钮）。
+   */
+  const cellMenuItems = useCallback((): ContextMenuItem[] => {
+    if (!cellMenu) return []
+    const { r, c } = cellMenu
+    const char = cells[r]?.[c]?.char ?? null
+    const items: ContextMenuItem[] = [
+      {
+        key: 'local-image',
+        label: char?.localImage ? '更换本地图片' : '添加本地图片',
+        icon: <ImagePlus size={13} />,
+        onSelect: () => void addLocalImage(r, c)
+      }
+    ]
+    if (char?.localImage) {
+      items.push({
+        key: 'drop-local-image',
+        label: '恢复在线立绘',
+        icon: <RotateCcw size={13} />,
+        onSelect: () => {
+          applyLocalImage(r, c, undefined)
+          toast.success('已恢复在线立绘')
+        }
+      })
+    }
+    if (char) {
+      items.push(
+        {
+          key: 'crop',
+          label: '框选这一格的立绘',
+          icon: <Crop size={13} />,
+          divider: true,
+          onSelect: () => onCrop(r, c)
+        },
+        {
+          key: 'clear',
+          label: '清空这一格',
+          icon: <X size={13} />,
+          danger: true,
+          onSelect: () => updateCell(r, c, { char: null })
+        }
+      )
+    }
+    return items
+  }, [addLocalImage, applyLocalImage, cellMenu, cells, onCrop, updateCell])
 
   const resize = useCallback(
     (nextCols: number, nextRows: number) => {
@@ -1858,12 +2034,19 @@ export function CharacterGridPage() {
                 const isTarget = target.r === r && target.c === c
                 const isSwapFrom = swapFrom?.r === r && swapFrom?.c === c
                 const isEditing = editing?.r === r && editing?.c === c
-                /** 这一格要画的立绘地址（与导出同一档：large 原图） */
-                const art = cell.char ? pickImage(cell.char.images, 'large') : ''
+                /** 这一格要画的立绘地址（本地图优先，否则 large 原图；与导出同一档） */
+                const art = cellArt(cell.char)
                 return (
                   <div
                     key={`${r}-${c}`}
                     onClick={() => onCellClick(r, c)}
+                    onContextMenu={(e) => {
+                      // v0.3.5：右键格子 → 添加/更换/移除本地图片（不改动原有的左键与按钮行为）
+                      if (!cell.char && !cell.label) return
+                      e.preventDefault()
+                      e.stopPropagation()
+                      setCellMenu({ r, c, x: e.clientX, y: e.clientY })
+                    }}
                     className={`group relative flex cursor-pointer flex-col gap-1.5 rounded-xl border bg-elev1 p-1.5 transition-colors ${
                       isSwapFrom ? 'border-warn' : isTarget ? 'border-accent' : 'border-border hover:border-accent/60'
                     }`}
@@ -1907,7 +2090,7 @@ export function CharacterGridPage() {
                           所以预览看到的与导出图**逐像素对应**，不需要 object-fit 参与。
                         */
                         <img
-                          src={imgUrl(art)}
+                          src={artUrl(art)}
                           alt={charName(cell.char)}
                           draggable={false}
                           className="absolute max-w-none select-none"
@@ -1931,7 +2114,7 @@ export function CharacterGridPage() {
                               className="absolute"
                               style={{
                                 inset: -EX.BACKDROP_PAD,
-                                backgroundImage: `url("${imgUrl(art)}")`,
+                                backgroundImage: `url("${artUrl(art)}")`,
                                 backgroundSize: 'cover',
                                 backgroundPosition: 'center',
                                 filter: EX.BACKDROP_FILTER
@@ -1959,6 +2142,18 @@ export function CharacterGridPage() {
                         </div>
                       )}
                       <span className="absolute left-1 top-1 rounded bg-black/55 px-1 text-[9px] text-white">{idx}</span>
+                      {/*
+                        本地立绘角标（v0.3.5）：不标出来的话，用户没法判断这一格到底用的是
+                        自己加的图还是在线图（两者可能长得很像，尤其换的是同一部作品的另一张立绘）。
+                      */}
+                      {cell.char?.localImage ? (
+                        <span
+                          title="这一格用的是本地图片（右键可更换或恢复在线立绘）"
+                          className="absolute right-1 bottom-1 rounded bg-accent px-1 text-[9px] leading-4 text-white"
+                        >
+                          本地
+                        </span>
+                      ) : null}
                       {isTarget && !swapFrom ? (
                         <span className="absolute right-1 top-1 rounded bg-accent px-1 text-[9px] text-white">当前</span>
                       ) : null}
@@ -2043,6 +2238,19 @@ export function CharacterGridPage() {
           }}
         />
       ) : null}
+
+      {/*
+        格子右键菜单（v0.3.5）。
+        「添加本地图片」是本次新增的那一项；其余三项是把格子右下角的按钮动作原样搬过来，
+        方便不熟悉角标按钮的用户 —— 点击后执行的还是同一批函数，行为与按钮完全一致。
+      */}
+      <ContextMenu
+        open={!!cellMenu}
+        x={cellMenu?.x ?? 0}
+        y={cellMenu?.y ?? 0}
+        onClose={() => setCellMenu(null)}
+        items={cellMenuItems()}
+      />
     </div>
   )
 }

@@ -25,6 +25,8 @@ import { GalgameToolsPage } from '@/pages/GalgameToolsPage'
 import { DownloadDetailPage } from '@/pages/DownloadDetailPage'
 import { DownloaderConfigPage } from '@/pages/DownloaderConfigPage'
 import { PlayerSettingsPage } from '@/pages/PlayerSettingsPage'
+// v0.3.4：番剧表设置（分级标签屏蔽 + 黑名单），从设置总览进入
+import { ScheduleSettingsPage } from '@/pages/ScheduleSettingsPage'
 import { CacheSettingsPage } from '@/pages/CacheSettingsPage'
 import { DanmakuSettingsPage } from '@/pages/DanmakuSettingsPage'
 import { AnnouncementModal } from '@/components/AnnouncementModal'
@@ -47,6 +49,7 @@ const SMALL_WINDOW_TITLES: Record<string, string> = {
   '/save-dirs': '文件保存配置',
   '/downloader-config': '下载器配置',
   '/player-settings': '播放器设置',
+  '/schedule-settings': '番剧表设置',
   '/cache-settings': '缓存设置',
   '/danmaku-settings': '弹幕设置',
   '/downloads-win': '下载详情',
@@ -96,6 +99,8 @@ function AnimatedRoutes() {
         <Route path="/shortcuts" element={<PageTransition><ShortcutsPage /></PageTransition>} />
         <Route path="/downloader-config" element={<PageTransition><DownloaderConfigPage /></PageTransition>} />
         <Route path="/player-settings" element={<PageTransition><PlayerSettingsPage /></PageTransition>} />
+        {/* v0.3.4：番剧表设置小窗口（设置总览与番剧表提示条都指向这里） */}
+        <Route path="/schedule-settings" element={<PageTransition><ScheduleSettingsPage /></PageTransition>} />
         <Route path="/cache-settings" element={<PageTransition><CacheSettingsPage /></PageTransition>} />
         <Route path="/danmaku-settings" element={<PageTransition><DanmakuSettingsPage /></PageTransition>} />
         <Route path="/logs" element={<PageTransition><LogsPage /></PageTransition>} />

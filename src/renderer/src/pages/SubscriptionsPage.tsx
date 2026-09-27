@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
-import { Download, FolderOpen, Heart, Info, RefreshCw, Rss, Trash2, X } from 'lucide-react'
+import { Download, FolderOpen, Heart, History, Info, RefreshCw, Rss, Trash2, X } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import type { DownloadTask, MikanItem, Subscription } from '@shared/types'
 import { matchesSubGroup } from '@shared/subgroup'
@@ -88,6 +88,28 @@ function SubCard({ sub }: { sub: Subscription }) {
             }}
           >
             更新
+          </Button>
+          {/*
+            v0.3.5：「获取全部资源」。
+            用户反馈：订阅《无职转生 第三季》时字幕组已经更到第 13 集，但第 1~12 集永远不会出现
+            （订阅动作会把 lastPubDate 记成他确认的那一条的时间，之前的历史集数从此被日期门槛挡掉）。
+            这个按钮跳过日期门槛，把该番该组的**全部**资源列进确认弹窗（已下载过的仍会排除），
+            所以「败犬女主太多了」这种字幕组已经完结的老番，订阅后能一次把 12 集都确认下载。
+          */}
+          <Button
+            size="sm"
+            variant="outline"
+            icon={History}
+            loading={checking}
+            title="不看发布日期，把该番该组的历史资源也列出来（已下载过的不会再列）"
+            onClick={() => {
+              void checkSub(sub.id, true).then((u) => {
+                if (u && u.newItems.length > 0) toast.success(`《${animeTitle}》共列出 ${u.newItems.length} 个资源`)
+                else if (u) toast.info('没有可下载的资源（可能都已经下载过了）')
+              })
+            }}
+          >
+            获取全部资源
           </Button>
           <Button size="sm" variant="outline" icon={FolderOpen} onClick={() => void playLocal()}>
             本地播放

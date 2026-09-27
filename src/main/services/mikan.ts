@@ -300,7 +300,7 @@ class MikanService {
    *
    * 签名与返回结构（SubUpdateCheck）保持原样，IPC / 类型 / UI 都不用动。
    */
-  async checkSub(sub: Subscription): Promise<SubUpdateCheck> {
+  async checkSub(sub: Subscription, opts: { full?: boolean } = {}): Promise<SubUpdateCheck> {
     const downloads = store.get<DownloadTask[]>('downloads', [])
     // 该资源是否已被处理过（存在非错误状态的下载任务）
     const handled = (item: MikanItem): boolean =>
@@ -477,10 +477,21 @@ class MikanService {
       }
 
       // ③ 已处理过的不算、不比上次检测新不算（这两条仍是硬门槛，与 v0.2.10 相同）
+      /*
+       * v0.3.5：`opts.full`（「获取全部资源」）会**跳过日期门槛**。
+       *
+       * 用户反馈的正是这一点：订阅《无职转生 第三季》时字幕组已经更到第 13 集，
+       * 订阅动作会把 lastPubDate 记成「他确认的那一条」的发布时间，于是第 1~12 集从此**永远不会再出现**——
+       * 日志里就是「官方订阅RSS条目 39 → 命中 3」（3 = 最新那集的三种字幕形态）。
+       * 用户要的是：订阅后能把该番该组的**全部历史资源**列出来确认下载（例如已经完结的 12 集），
+       * 之后再靠日期门槛只提示新资源。
+       * 注意「已处理过的不算」这条**不跳过** —— 已经下过的资源不该再问一次。
+       */
       let undated = 0
       const scored = relevant
         .filter((c) => !handled(c.item))
         .filter((c) => {
+          if (opts.full) return true
           const newer = isNewerThanLast(c.item, sub.lastPubDate)
           // 日期取不到/解析不出时 isNewerThanLast 会放过；统计出来写进日志，别让它变成静默行为
           if (newer && Number.isNaN(new Date(c.item.pubDate).getTime())) undated++
@@ -510,8 +521,10 @@ class MikanService {
         newItems,
         counts:
           (mode === 'official'
-            ? `官方订阅RSS条目 ${all.length} → 命中 ${newItems.length}`
-            : `候选 ${all.length} → 同字幕组 ${byGroup.length} → 是这部番 ${relevant.length} → 命中 ${newItems.length}`) +
+            ? `官方订阅RSS条目 ${all.length} → 命中 ${newItems.length}` +
+              (opts.full ? '（**全部资源**：本次不看发布日期，历史集数一并列出）' : '')
+            : `候选 ${all.length} → 同字幕组 ${byGroup.length} → 是这部番 ${relevant.length} → 命中 ${newItems.length}` +
+              (opts.full ? '（**全部资源**：本次不看发布日期）' : '')) +
           (mode === 'official'
             ? ''
             : `（同季 ${sameCount} 条、带集数 ${epCount} 条；已按「同季→有集数→最新」排序` +

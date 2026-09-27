@@ -37,8 +37,36 @@ function looksLikeConcatenatedName(name: string): boolean {
   return n.length >= 2 && name.length >= 12
 }
 
-/** 集名里能不能稳定读出递增编号（用于判断「编号重启=新线路」） */
-function numbering(episodes: RuleEpisode[]): number[] | null {
+/**
+ * AGE 动漫的线路标识 → 站点上显示的线路名（v0.3.5）。
+ *
+ * 为什么会有这张表：AGE 详情页的线路切换按钮是 Bootstrap pill，
+ * `<button data-bs-target="#playlist-source-xigua">西瓜</button>`，而线路容器
+ * `<div class="tab-pane" id="playlist-source-xigua">` 里**只有剧集、没有线路名**。
+ * 我们能稳定取到的只有 `id`，于是界面上会出现「playlist-source-xigua」这种名字；
+ * 更糟的是它有 7 个前缀相同，`normalizeEpisodeGroups` 末尾的「重名兜底」会把它们
+ * 全部改成「线路 1…线路 7」——用户就分不出哪条是哪个源了。
+ *
+ * 这张表把已知标识翻成中文名（顺序与站点导航一致）；**不在表里的一律原样返回**，
+ * 站点改版后最多是名字变回英文标识，不会因此少一条线路、更不会切错线路。
+ */
+const AGE_SOURCE_NAMES: Record<string, string> = {
+  xigua: '西瓜',
+  ffm3u8: '非凡',
+  bfzym3u8: '暴风',
+  wjm3u8: '无尽',
+  hnm3u8: '红牛',
+  lzm3u8: '计算云',
+  wolong: '凤雏云'
+}
+
+function prettyLineName(raw: string): string {
+  const m = /^playlist-source-([a-z0-9]+)$/i.exec(raw.trim())
+  if (!m) return raw
+  return AGE_SOURCE_NAMES[m[1].toLowerCase()] ?? raw
+}
+
+/** 集名里能不能稳定读出递增编号（用于判断「编号重启=新线路」） */function numbering(episodes: RuleEpisode[]): number[] | null {
   const nums: number[] = []
   for (const e of episodes) {
     const list = episodesInName(e.name)
@@ -67,7 +95,9 @@ function splitPoints(nums: number[]): number[] {
 
 /** 单个线路内部的规范化（改名 + 拆分） */
 function normalizeGroup(group: RuleEpisodeGroup, index: number): RuleEpisodeGroup[] {
-  const name = (group.lineName ?? '').trim()
+  // 站点自己的线路标识 → 中文线路名（AGE 等站点只能取到 id，见上表说明）
+  const name = prettyLineName((group.lineName ?? '').trim())
+  const group2: RuleEpisodeGroup = name === group.lineName ? group : { ...group, lineName: name }
   const renameTo = `线路 ${index + 1}`
 
   // ① 线路名是整串集名 → 改名
@@ -75,20 +105,20 @@ function normalizeGroup(group: RuleEpisodeGroup, index: number): RuleEpisodeGrou
   if (looksLikeConcatenatedName(name)) lineName = renameTo
 
   // ② 一个列表里塞了多条线路 → 按编号重启切分
-  const nums = numbering(group.episodes)
+  const nums = numbering(group2.episodes)
   if (nums) {
     const starts = splitPoints(nums)
     if (starts.length >= 2) {
       const groups = starts.map((start, i) => {
-        const end = i + 1 < starts.length ? starts[i + 1] : group.episodes.length
+        const end = i + 1 < starts.length ? starts[i + 1] : group2.episodes.length
         return {
           lineName: `${renameTo}-${i + 1}`,
-          episodes: group.episodes.slice(start, end)
+          episodes: group2.episodes.slice(start, end)
         }
       })
       // 切出来的每一段至少要有 1 集，且总集数不能丢
       const total = groups.reduce((n, g) => n + g.episodes.length, 0)
-      if (total === group.episodes.length && groups.every((g) => g.episodes.length > 0)) {
+      if (total === group2.episodes.length && groups.every((g) => g.episodes.length > 0)) {
         log.append(
           'info',
           'rules',
@@ -101,7 +131,7 @@ function normalizeGroup(group: RuleEpisodeGroup, index: number): RuleEpisodeGrou
   if (lineName !== name) {
     log.append('info', 'rules', `线路规范化：线路名疑似整串集名，已改名为「${lineName}」`)
   }
-  return [{ lineName: lineName || renameTo, episodes: group.episodes }]
+  return [{ lineName: lineName || renameTo, episodes: group2.episodes }]
 }
 
 /** 对外入口：对规则返回的剧集分组做一次规范化（幂等） */

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { ChevronLeft, ChevronRight, Layers, Loader2, Plus, Search } from 'lucide-react'
 import type { StatAddItem, StatAddSource } from '@shared/types'
 import { absoluteSeasonIndex, fromAbsoluteSeasonIndex, seasonLabel, seasonOfDate, shiftAbsoluteSeasonIndex } from '@shared/season'
+import { validateSeqRule } from '@shared/statSeq'
 import { api } from '@/lib/api'
 import {
   bgmItemToAddItem,
@@ -15,6 +16,7 @@ import { useLibrary } from '@/stores/library'
 import { toast } from '@/stores/app'
 import { Badge, Button, EmptyState, Modal } from '@/components/ui'
 import { CoverImage } from '@/components/CoverImage'
+import { SeqRuleField } from './SeqRuleField'
 
 /**
  * 添加番剧（批量 + 快速添加当季）。
@@ -49,11 +51,14 @@ export function BatchAddDialog({
   const favorites = useLibrary((s) => s.favorites)
   const data = useStatTool((s) => s.data)
   const addEntries = useStatTool((s) => s.addEntries)
+  const setSeqRule = useStatTool((s) => s.setSeqRule)
 
   const [source, setSource] = useState<StatAddSource>('favorites')
   const [picked, setPicked] = useState<Record<string, StatAddItem>>({})
   const [query, setQuery] = useState('')
   const [busy, setBusy] = useState(false)
+  /** 本次加入使用的序号规则（打开弹窗时取目标列表的当前规则，可在这里直接改） */
+  const [rule, setRule] = useState('')
 
   // 当季番剧（默认当前季度，可前后翻季）
   const [seasonAbs, setSeasonAbs] = useState(() => {
@@ -70,13 +75,16 @@ export function BatchAddDialog({
 
   const { year, season } = fromAbsoluteSeasonIndex(seasonAbs)
 
-  // 打开时清空选择（避免上次的残留被误加进另一个列表）
+  // 打开时清空选择（避免上次的残留被误加进另一个列表），并取一次目标列表的序号规则
   useEffect(() => {
     if (open) {
       setPicked({})
       setQuery('')
+      setRule(data.lists.find((l) => l.id === listId)?.seqRule ?? '')
     }
-  }, [open])
+    // 只在「打开弹窗 / 换目标列表」时同步规则，不跟随 data 变化（否则用户正在输入会被覆盖）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, listId])
 
   // 切到「当季」时取数据：先看渲染层记忆（命中就同步渲染、不发请求），没命中才进加载态
   useEffect(() => {
@@ -171,7 +179,25 @@ export function BatchAddDialog({
       toast.warn('先勾选要添加的番剧')
       return
     }
+    const check = validateSeqRule(rule)
+    if (!check.ok) {
+      toast.error(`序号规则不合法：${check.reason}`)
+      return
+    }
     setBusy(true)
+    /*
+     * 先落序号规则、再添加条目：两步是两次 `stat:apply`，主进程每次都是读-改-写，
+     * 顺序固定，所以第一条新条目一定按刚设的规则编号（用户要求「创建条目时可自定义序号规则」）。
+     * 规则没变就跳过这次写入，省一次广播。
+     */
+    if (check.rule !== (data.lists.find((l) => l.id === listId)?.seqRule ?? '')) {
+      const ok = await setSeqRule(listId, check.rule)
+      if (!ok) {
+        setBusy(false)
+        toast.error('序号规则保存失败，已取消本次添加')
+        return
+      }
+    }
     const added = await addEntries(listId, pickedList)
     setBusy(false)
     if (added === 0) toast.warn('这些番剧都已经在列表里了')
@@ -320,6 +346,11 @@ export function BatchAddDialog({
           })}
         </div>
       )}
+
+      {/* 序号规则：在这里改等于「创建条目时自定义序号」，会先落规则再加条目 */}
+      <div className="mt-3 rounded-xl border border-border bg-elev1/60 p-2.5">
+        <SeqRuleField value={rule} onChange={setRule} placeholder="如 20260701 或 A0701（留空 = 放送年份 + 01、02…）" />
+      </div>
 
       <div className="mt-4 flex items-center justify-between gap-3">
         <span className="text-[11px] text-faint">

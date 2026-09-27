@@ -17,7 +17,8 @@ interface SubsState {
   startSubsLive: () => () => void
   startSubUpdatesLive: () => () => void
   checkAll: () => Promise<SubUpdateCheck[]>
-  checkSub: (subId: string) => Promise<SubUpdateCheck | null>
+  /** `full=true` = 获取全部资源（含历史集数，见实现处的注释） */
+  checkSub: (subId: string, full?: boolean) => Promise<SubUpdateCheck | null>
   confirmUpdate: (sub: Subscription, check: SubUpdateCheck) => Promise<void>
   removeSubscription: (id: string) => Promise<void>
   setSubFolder: (id: string, folder: string) => Promise<void>
@@ -76,9 +77,15 @@ export const useSubs = create<SubsState>((set, get) => ({
     }
     return r.ok ? r.data : []
   },
-  checkSub: async (subId) => {
+  /**
+   * 检测某个订阅。
+   *
+   * v0.3.5：`full=true` 走「获取全部资源」——不看发布日期，把该番该组的历史集数也列出来
+   * （用户反馈：订阅时字幕组已更到第 13 集，但 1~12 集永远不会出现）。
+   */
+  checkSub: async (subId, full = false) => {
     set((s) => ({ checkingIds: [...s.checkingIds, subId] }))
-    const r = await api.mikan.checkSub(subId)
+    const r = await api.mikan.checkSub(subId, full)
     set((s) => ({ checkingIds: s.checkingIds.filter((id) => id !== subId) }))
     if (!r.ok) {
       toast.error(r.error)

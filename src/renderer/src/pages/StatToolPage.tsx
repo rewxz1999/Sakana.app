@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   ArrowLeft,
   ArrowUpDown,
   Eye,
+  EyeOff,
+  GripVertical,
+  Hash,
   ImageDown,
   Info,
   ListVideo,
@@ -13,7 +16,8 @@ import {
   Trash2
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
-import type { StatEntry, StatExportField, StatList } from '@shared/types'
+import type { StatEntry, StatExportField, StatExportTheme, StatList } from '@shared/types'
+import { compareStatOrder, validateSeqRule } from '@shared/statSeq'
 import { api } from '@/lib/api'
 import { orderedListsOf, useStatTool, warmSeasonAddItems } from '@/stores/statTool'
 import { toast } from '@/stores/app'
@@ -23,33 +27,92 @@ import { ContextMenu, type ContextMenuItem } from '@/components/stat/ContextMenu
 import { StatDetailDialog } from '@/components/stat/StatDetailDialog'
 import { BatchAddDialog } from '@/components/stat/BatchAddDialog'
 import { DEFAULT_EXPORT_FIELDS, ExportDialog } from '@/components/stat/ExportDialog'
+import { SeqRuleField } from '@/components/stat/SeqRuleField'
 import { entryDeviation, shortWatchedAt } from '@/components/stat/DateTimeField'
 
 /**
- * 统计工具页（v0.2 大改）。
+ * 统计工具页（v0.2 大改，v0.3.5 续改）。
  *
- * 这一版改了什么（对着用户需求逐条）：
- * 1. 条目只显示「序号 / 封面 / 番剧名 / 放送时间 / 看完时间 / 个人评分 / bangumi 评分 / 差值 / 总体评价」，
- *    分成「序号 · 封面 · 信息列 · 评分列（右对齐、等宽数字）· 总体评价列」五栏，差值按正负着色；
- * 2. 条目**右键**（或点右侧 ⋯ 按钮，键盘/触控也能用）弹出菜单：详情 / 重新排序 / 删除列表；
- * 3. 「详情」弹 StatDetailDialog（字段与可编辑性见那个文件头的对照表）；
- * 4. 「添加番剧」弹 BatchAddDialog（收藏 / 当季 / 搜索，可批量勾选、可一键全选当季）；
- * 5. 列表可置顶（右键列表或点图钉图标），置顶排序持久化在主进程；
- * 6. 导出图片先弹 ExportDialog 勾选字段。
+ * v0.3.5 对着用户 6 条反馈改了什么：
+ * 1. **类型标签**：条目行新增标签行（数据来自 bangumi 详情接口的 tags，缺失时进页面自动回填，
+ *    见 stores/statTool.ts 的 backfillTags）—— 过去标签虽然写进了条目、列表上却没画出来；
+ * 2. **看完时间**：只显示到天（`YYYY-MM-DD`），添加条目时自动从「详情页那份已看完时间」带出；
+ * 3. **序号规则**：新建列表 / 列表设置 / 添加番剧三处都能设模板，校验与续号逻辑见 shared/statSeq.ts；
+ * 4. **拖动排序**：条目行可拖动（HTML5 DnD，无新依赖），只改顺序不改编号，顺序落盘；
+ * 5. **导出图**：条目样式按本文件的列表条目重做 + 封面预取重试（见 statExport.ts）；
+ * 6. **bangumi 评分**：默认不显示，工具栏一个开关控制；**填了个人评分的条目自动显示**。
  *
  * 数据流向：所有写操作走 `useStatTool` → 主进程 `stat:apply` → 广播 `ev:stat`，
  * 渲染层只做乐观更新与展示（见 stores/statTool.ts 的说明）。
  */
 
+/** bangumi 评分开关的本地记忆（放 localStorage：只是显示偏好，不值得进设置文件走一次 IPC） */
+const SHOW_BGM_KEY = 'sakana.stat.showBgm'
+
+function readShowBgm(): boolean {
+  try {
+    return localStorage.getItem(SHOW_BGM_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 读当前主题的配色给导出图用。
+ *
+ * 导出图由主进程在另一个 offscreen 窗口里画，读不到渲染层的主题变量；
+ * 而用户明确要求「导出图的条目样式和列表一个观感」，所以这里把当前主题的
+ * CSS 变量值原样传给主进程（见 shared/types.ts 的 StatExportTheme）。
+ */
+function readExportTheme(): StatExportTheme {
+  const fallback: StatExportTheme = {
+    bg: '#eef2f9',
+    elev1: '#ffffff',
+    elev2: '#e9eef8',
+    border: '#d4deee',
+    text: '#1c2433',
+    dim: '#4a566e',
+    faint: '#8b96ad',
+    accent: '#2f6bff',
+    accentSoft: '#e3ecff',
+    ok: '#2f9e63',
+    danger: '#d64545',
+    warn: '#c07a1a'
+  }
+  try {
+    const cs = getComputedStyle(document.documentElement)
+    const get = (name: keyof StatExportTheme, cssVar: string): string =>
+      cs.getPropertyValue(cssVar).trim() || fallback[name]
+    return {
+      bg: get('bg', '--bg'),
+      elev1: get('elev1', '--elev1'),
+      elev2: get('elev2', '--elev2'),
+      border: get('border', '--border'),
+      text: get('text', '--text'),
+      dim: get('dim', '--dim'),
+      faint: get('faint', '--faint'),
+      accent: get('accent', '--accent'),
+      accentSoft: get('accentSoft', '--accent-soft'),
+      ok: get('ok', '--ok'),
+      danger: get('danger', '--danger'),
+      warn: get('warn', '--warn')
+    }
+  } catch {
+    return fallback
+  }
+}
+
 /** 评分列的一个格子 */
 function RatingCell({
   label,
   value,
-  tone = 'default'
+  tone = 'default',
+  attrs
 }: {
   label: string
   value: string
   tone?: 'default' | 'accent' | 'ok' | 'danger' | 'warn'
+  attrs?: Record<string, string>
 }) {
   const color =
     tone === 'accent'
@@ -62,9 +125,44 @@ function RatingCell({
             ? 'text-warn'
             : 'text-text'
   return (
-    <div className="flex flex-col items-end gap-0.5">
+    <div className="flex flex-col items-end gap-0.5" {...attrs}>
       <span className="text-[10px] leading-none text-faint">{label}</span>
       <span className={`text-sm font-semibold leading-none tabular-nums ${color}`}>{value}</span>
+    </div>
+  )
+}
+
+/** 条目卡片上的类型标签（最多显示 6 个，多的折成 +N） */
+const TAGS_SHOWN = 6
+
+function EntryTags({ tags }: { tags: string[] }) {
+  if (tags.length === 0) {
+    return (
+      <div className="mt-1 text-[10px] text-faint" data-stat-tags="empty">
+        类型标签读取中…（添加时会自动带出，稍后也会自己补上）
+      </div>
+    )
+  }
+  const shown = tags.slice(0, TAGS_SHOWN)
+  return (
+    <div
+      className="mt-1 flex flex-wrap items-center gap-1"
+      data-stat-tags="filled"
+      data-stat-tag-count={String(tags.length)}
+    >
+      {shown.map((t) => (
+        <span
+          key={t}
+          className="rounded-full border border-border bg-elev2 px-2 py-0.5 text-[10px] leading-tight text-dim"
+        >
+          {t}
+        </span>
+      ))}
+      {tags.length > shown.length ? (
+        <span className="text-[10px] text-faint" title={tags.join('、')}>
+          +{tags.length - shown.length}
+        </span>
+      ) : null}
     </div>
   )
 }
@@ -72,24 +170,65 @@ function RatingCell({
 /** 条目卡片：只放用户点名的那几个字段 */
 function EntryRow({
   entry,
+  showBgm,
+  dragging,
+  dropBefore,
   onContextMenu,
-  onDetail
+  onDetail,
+  onDragStart,
+  onDragOver,
+  onDrop,
+  onDragEnd
 }: {
   entry: StatEntry
+  showBgm: boolean
+  dragging: boolean
+  dropBefore: boolean
   onContextMenu: (e: React.MouseEvent, entry: StatEntry) => void
   onDetail: () => void
+  onDragStart: () => void
+  onDragOver: (e: React.DragEvent) => void
+  onDrop: (e: React.DragEvent) => void
+  onDragEnd: () => void
 }) {
   const dev = entryDeviation(entry)
   const watched = shortWatchedAt(entry.watchedAt)
   const overall = entry.overallReview.trim()
+  // bangumi 评分显示规则：开关打开 **或** 该条已填个人评分（用户要求「填完个人评分后自动显示」）
+  const bgmVisible = showBgm || entry.personalRating != null
 
   return (
     <div
+      data-stat-entry={entry.id}
+      data-stat-seq={entry.seq}
+      data-stat-order={String(entry.order)}
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.effectAllowed = 'move'
+        // Firefox 需要 setData 才会真的开始拖拽；顺带把 id 放进 DataTransfer，
+        // 让投放方能确认拖的是哪一条（只允许同列表内排序）
+        e.dataTransfer.setData('text/plain', entry.id)
+        onDragStart()
+      }}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+      onDragEnd={onDragEnd}
       onContextMenu={(e) => onContextMenu(e, entry)}
       onDoubleClick={onDetail}
-      title="右键打开菜单：详情 / 重新排序 / 删除列表"
-      className="flex items-center gap-4 rounded-xl border border-border bg-elev1 p-3 transition-colors hover:border-accent/40"
+      title="拖动左侧手柄可排序 · 右键打开菜单（详情 / 重新排序 / 删除）"
+      className={`flex items-center gap-4 rounded-xl border bg-elev1 p-3 transition-colors hover:border-accent/40 ${
+        dragging ? 'border-accent/60 opacity-50' : dropBefore ? 'border-accent border-dashed' : 'border-border'
+      }`}
     >
+      {/* 拖动手柄（整行可拖，手柄只是"这里能拖"的可发现标识） */}
+      <span
+        data-stat-drag-handle=""
+        title="拖动排序"
+        className="-ml-1 shrink-0 cursor-grab text-faint active:cursor-grabbing"
+      >
+        <GripVertical size={14} />
+      </span>
+
       {/* 序号 */}
       <span className="w-16 shrink-0 text-center font-mono text-base font-bold tabular-nums text-accent">
         {entry.seq}
@@ -98,7 +237,7 @@ function EntryRow({
       {/* 封面 */}
       <CoverImage src={entry.cover} className="h-[74px] w-[54px] shrink-0 rounded-md" />
 
-      {/* 番剧名 + 放送时间 + 看完时间 */}
+      {/* 番剧名 + 放送时间 + 看完时间 + 类型标签 */}
       <div className="min-w-0 flex-1">
         <div className="break-words text-sm font-semibold leading-snug">{entry.nameCn || entry.name}</div>
         {entry.nameCn && entry.name && entry.nameCn !== entry.name ? (
@@ -112,12 +251,24 @@ function EntryRow({
             看完 <span className={watched ? 'text-dim' : 'text-faint'}>{watched || '未填写'}</span>
           </span>
         </div>
+        <EntryTags tags={entry.genres} />
       </div>
 
-      {/* 评分列：个人 / 相关 / 差值 */}
+      {/* 评分列：个人 / bangumi / 差值 */}
       <div className="flex shrink-0 items-end gap-4">
-        <RatingCell label="个人评分" value={entry.personalRating != null ? entry.personalRating.toFixed(1) : '—'} tone="warn" />
-        <RatingCell label="bangumi" value={entry.bgmRating != null ? entry.bgmRating.toFixed(1) : '—'} tone="accent" />
+        <RatingCell
+          label="个人评分"
+          value={entry.personalRating != null ? entry.personalRating.toFixed(1) : '—'}
+          tone="warn"
+        />
+        {bgmVisible ? (
+          <RatingCell
+            label="bangumi"
+            value={entry.bgmRating != null ? entry.bgmRating.toFixed(1) : '—'}
+            tone="accent"
+            attrs={{ 'data-stat-bgm': entry.bgmRating != null ? entry.bgmRating.toFixed(1) : '' }}
+          />
+        ) : null}
         <RatingCell
           label="差值"
           value={dev == null ? '—' : `${dev >= 0 ? '+' : '-'}${Math.abs(dev).toFixed(1)}`}
@@ -129,7 +280,10 @@ function EntryRow({
       <div className="w-[260px] shrink-0 border-l border-border pl-4">
         <div className="mb-0.5 text-[10px] text-faint">总体评价</div>
         {overall ? (
-          <div className="line-clamp-3 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-dim" title={overall}>
+          <div
+            className="line-clamp-3 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-dim"
+            title={overall}
+          >
             {overall}
           </div>
         ) : (
@@ -212,7 +366,10 @@ function ListItem({
             >
               {list.name}
             </div>
-            <div className="text-[11px] text-faint">{count} 个条目</div>
+            <div className="text-[11px] text-faint">
+              {count} 个条目
+              {list.seqRule ? <span title={`序号规则：${list.seqRule}`}> · {list.seqRule}</span> : null}
+            </div>
           </>
         )}
       </div>
@@ -242,11 +399,15 @@ export function StatToolPage() {
   const renameList = useStatTool((s) => s.renameList)
   const deleteList = useStatTool((s) => s.deleteList)
   const setPinned = useStatTool((s) => s.setPinned)
+  const setSeqRule = useStatTool((s) => s.setSeqRule)
   const resort = useStatTool((s) => s.resort)
+  const reorderEntries = useStatTool((s) => s.reorderEntries)
   const removeEntry = useStatTool((s) => s.removeEntry)
+  const backfillTags = useStatTool((s) => s.backfillTags)
 
   const [createOpen, setCreateOpen] = useState(false)
   const [listName, setListName] = useState('')
+  const [listRule, setListRule] = useState('')
   const [deleteListId, setDeleteListId] = useState<string | null>(null)
   const [addOpen, setAddOpen] = useState(false)
   const [detailId, setDetailId] = useState<string | null>(null)
@@ -255,6 +416,15 @@ export function StatToolPage() {
   const [exportFields, setExportFields] = useState<StatExportField[]>(DEFAULT_EXPORT_FIELDS)
   const [widthScale, setWidthScale] = useState(1)
   const [photoScale, setPhotoScale] = useState(1.25)
+  /** 序号规则弹窗：正在编辑哪个列表（null = 关闭） */
+  const [ruleListId, setRuleListId] = useState<string | null>(null)
+  const [ruleDraft, setRuleDraft] = useState('')
+  /** bangumi 评分开关（默认关；填了个人评分的条目不受它影响） */
+  const [showBgm, setShowBgm] = useState(readShowBgm)
+
+  // 拖动排序：拖的是谁、当前悬停在哪一行之前
+  const [dragId, setDragId] = useState<string | null>(null)
+  const [dropBeforeId, setDropBeforeId] = useState<string | null>(null)
 
   // 右键菜单（条目 / 列表共用一套状态：谁被右键、菜单画在哪儿、菜单项是什么）
   const [menu, setMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null)
@@ -278,13 +448,33 @@ export function StatToolPage() {
   const lists = useMemo(() => orderedListsOf(data), [data])
   const entries = data.entries ?? []
   const selectedList = lists.find((l) => l.id === selectedListId) ?? null
+  /*
+   * 列表内顺序 = `order`（拖动排序/加入顺序的落盘结果），`seq` 只作次键。
+   * 不能再按 seq 排：拖动只改顺序不改编号，按 seq 排会让拖动"看起来没生效"。
+   * 排序比较器与主进程导出图共用 shared/statSeq.compareStatOrder，保证两处同序。
+   */
   const listEntries = useMemo(
-    () =>
-      selectedList
-        ? entries.filter((e) => e.listId === selectedList.id).sort((a, b) => a.seq.localeCompare(b.seq))
-        : [],
+    () => (selectedList ? entries.filter((e) => e.listId === selectedList.id).sort(compareStatOrder) : []),
     [entries, selectedList]
   )
+
+  /**
+   * 类型标签回填：给这个列表里「有 subjectId 但还没有标签」的条目补一次详情标签。
+   *
+   * 只有「从收藏添加」会自带标签（收藏条目有 genres），当季/搜索两个入口拿不到，
+   * 所以老条目和当季加进来的条目都会是空的 —— 这里补上，落盘后不再请求。
+   */
+  useEffect(() => {
+    if (!selectedList || listEntries.length === 0) return
+    if (!listEntries.some((e) => e.subjectId > 0 && e.genres.length === 0)) return
+    void backfillTags(selectedList.id)
+  }, [selectedList, listEntries, backfillTags])
+
+  /** 打开某个列表的序号规则弹窗 */
+  function openRuleDialog(list: StatList): void {
+    setRuleListId(list.id)
+    setRuleDraft(list.seqRule ?? '')
+  }
 
   /**
    * 条目的右键菜单。
@@ -338,7 +528,7 @@ export function StatToolPage() {
     })
   }
 
-  /** 列表的右键菜单：置顶 / 重新排序 / 重命名 / 删除 */
+  /** 列表的右键菜单：置顶 / 序号规则 / 重新排序 / 删除 */
   function openListMenu(e: React.MouseEvent, list: StatList): void {
     e.preventDefault()
     e.stopPropagation()
@@ -356,6 +546,12 @@ export function StatToolPage() {
           }
         },
         {
+          key: 'seqrule',
+          label: '序号规则…',
+          icon: <Hash size={13} />,
+          onSelect: () => openRuleDialog(list)
+        },
+        {
           key: 'resort',
           label: '重新排序',
           icon: <ArrowUpDown size={13} />,
@@ -364,7 +560,14 @@ export function StatToolPage() {
             toast.success('已按年份与顺序重新编号')
           }
         },
-        { key: 'del', label: '删除列表', icon: <Trash2 size={13} />, danger: true, divider: true, onSelect: () => setDeleteListId(list.id) }
+        {
+          key: 'del',
+          label: '删除列表',
+          icon: <Trash2 size={13} />,
+          danger: true,
+          divider: true,
+          onSelect: () => setDeleteListId(list.id)
+        }
       ]
     })
   }
@@ -375,17 +578,99 @@ export function StatToolPage() {
       toast.warn('请输入列表名称')
       return
     }
-    const id = await createList(name)
+    const check = validateSeqRule(listRule)
+    if (!check.ok) {
+      toast.error(`序号规则不合法：${check.reason}`)
+      return
+    }
+    const id = await createList(name, true, check.rule)
     setListName('')
+    setListRule('')
     setCreateOpen(false)
-    if (id) toast.success('列表已创建')
+    if (id) toast.success(check.rule ? `列表已创建（序号规则 ${check.rule}）` : '列表已创建')
     else toast.error('创建失败，请重试')
   }
+
+  async function submitRule(): Promise<void> {
+    if (!ruleListId) return
+    const check = validateSeqRule(ruleDraft)
+    if (!check.ok) {
+      toast.error(`序号规则不合法：${check.reason}`)
+      return
+    }
+    const ok = await setSeqRule(ruleListId, check.rule)
+    setRuleListId(null)
+    if (!ok) {
+      toast.error('序号规则保存失败，请重试')
+      return
+    }
+    toast.success(
+      check.rule
+        ? `序号规则已设为 ${check.rule}（下一条按当前最大号 +1）`
+        : '已恢复默认编序（放送年份 + 01、02…）'
+    )
+  }
+
+  /** 拖动中悬停到某一行：把这一行标成插入点 */
+  const handleDragOverRow = useCallback(
+    (id: string) => (e: React.DragEvent) => {
+      if (!dragId || dragId === id) return
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'move'
+      setDropBeforeId(id)
+    },
+    [dragId]
+  )
+
+  /** 松开：把拖动项插到悬停行之前，然后整列表写回顺序 */
+  const handleDropRow = useCallback(
+    (targetId: string) => (e: React.DragEvent) => {
+      e.preventDefault()
+      const src = dragId
+      setDragId(null)
+      setDropBeforeId(null)
+      if (!src || !selectedList || src === targetId) return
+      const ids = listEntries.map((x) => x.id)
+      const rest = ids.filter((x) => x !== src)
+      const at = rest.indexOf(targetId)
+      rest.splice(at < 0 ? rest.length : at, 0, src)
+      if (rest.join('|') === ids.join('|')) return
+      reorderEntries(selectedList.id, rest)
+      toast.success('顺序已保存')
+    },
+    [dragId, selectedList, listEntries, reorderEntries]
+  )
+
+  /** 拖到列表末尾（最后一行下方那块投放区） */
+  const handleDropEnd = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault()
+      const src = dragId
+      setDragId(null)
+      setDropBeforeId(null)
+      if (!src || !selectedList) return
+      const ids = listEntries.map((x) => x.id)
+      const rest = ids.filter((x) => x !== src)
+      rest.push(src)
+      if (rest.join('|') === ids.join('|')) return
+      reorderEntries(selectedList.id, rest)
+      toast.success('顺序已保存')
+    },
+    [dragId, selectedList, listEntries, reorderEntries]
+  )
 
   async function doExport(): Promise<void> {
     if (!selectedList) return
     setExporting(true)
-    const r = await api.stat.exportImage(selectedList.id, { fields: exportFields, widthScale, photoScale })
+    const r = await api.stat.exportImage(selectedList.id, {
+      fields: exportFields,
+      widthScale,
+      photoScale,
+      // 与界面同一套规则：开关关闭时，只有填了个人评分的条目会带上 bgm 评分
+      showBgmRating: showBgm,
+      // 导出图配色 = 当前主题（用户要求「和界面列表条目一个观感」）
+      theme: readExportTheme()
+    })
     setExporting(false)
     if (!r.ok) {
       toast.error(r.error)
@@ -413,7 +698,7 @@ export function StatToolPage() {
         <div className="flex items-center gap-2 text-sm font-semibold">
           <ListVideo size={15} className="text-accent" /> 统计工具
           <span className="text-[11px] font-normal text-faint">
-            按列表记录已看番剧，右键条目打开菜单，可导出为图片
+            按列表记录已看番剧，拖动条目可排序，右键条目打开菜单，可导出为图片
           </span>
         </div>
         {api.window.isSmallWindow ? null : (
@@ -478,7 +763,8 @@ export function StatToolPage() {
                     {selectedList.name}
                   </h2>
                   <span className="text-[11px] text-faint">
-                    {listEntries.length} 个条目 · 右键条目打开菜单（详情 / 重新排序 / 删除列表）
+                    {listEntries.length} 个条目 · 序号规则{' '}
+                    {selectedList.seqRule || '默认（放送年份 + 01、02…）'} · 拖动条目可排序
                   </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -492,6 +778,9 @@ export function StatToolPage() {
                   >
                     {selectedList.pinned ? '取消置顶' : '置顶列表'}
                   </Button>
+                  <Button variant="outline" icon={Hash} onClick={() => openRuleDialog(selectedList)}>
+                    序号规则
+                  </Button>
                   <Button
                     variant="outline"
                     icon={ArrowUpDown}
@@ -503,6 +792,29 @@ export function StatToolPage() {
                   >
                     重新排序
                   </Button>
+                  {/* bangumi 评分开关：默认关；填了个人评分的条目不受影响，始终显示 */}
+                  <span data-stat-bgm-toggle={showBgm ? 'on' : 'off'}>
+                    <Button
+                      variant={showBgm ? 'soft' : 'outline'}
+                      icon={showBgm ? Eye : EyeOff}
+                      aria-pressed={showBgm}
+                      title="默认不显示 bangumi 评分；填了个人评分的条目会自动显示"
+                      onClick={() => {
+                        const next = !showBgm
+                        setShowBgm(next)
+                        try {
+                          localStorage.setItem(SHOW_BGM_KEY, next ? '1' : '0')
+                        } catch {
+                          /* 隐私模式下写不了 localStorage：开关本次会话照样生效 */
+                        }
+                        toast.success(
+                          next ? '已显示所有条目的 bangumi 评分' : '已隐藏未评分条目的 bangumi 评分'
+                        )
+                      }}
+                    >
+                      bangumi 评分
+                    </Button>
+                  </span>
                   <Button
                     variant="outline"
                     icon={ImageDown}
@@ -523,13 +835,37 @@ export function StatToolPage() {
                     <EntryRow
                       key={entry.id}
                       entry={entry}
+                      showBgm={showBgm}
+                      dragging={dragId === entry.id}
+                      dropBefore={dropBeforeId === entry.id}
                       onContextMenu={openEntryMenu}
                       onDetail={() => setDetailId(entry.id)}
+                      onDragStart={() => setDragId(entry.id)}
+                      onDragOver={handleDragOverRow(entry.id)}
+                      onDrop={handleDropRow(entry.id)}
+                      onDragEnd={() => {
+                        setDragId(null)
+                        setDropBeforeId(null)
+                      }}
                     />
                   ))}
+                  {/* 拖到末尾的投放区（拖动时才出现，避免平时多出一块空白） */}
+                  {dragId ? (
+                    <div
+                      data-stat-drop-end=""
+                      onDragOver={(e) => {
+                        e.preventDefault()
+                        setDropBeforeId(null)
+                      }}
+                      onDrop={handleDropEnd}
+                      className="rounded-xl border border-dashed border-accent/60 py-3 text-center text-[11px] text-accent"
+                    >
+                      拖到这里 = 放到最后
+                    </div>
+                  ) : null}
                   <div className="pt-1 text-center text-[11px] text-faint">
-                    共 {listEntries.length} 条 · 个人评分均值{' '}
-                    {avgRating(listEntries) ?? '—'} · bgm 均值 {avgBgm(listEntries) ?? '—'}
+                    共 {listEntries.length} 条 · 个人评分均值 {avgRating(listEntries) ?? '—'}
+                    {showBgm ? ` · bgm 均值 ${avgBgm(listEntries) ?? '—'}` : ''}
                   </div>
                 </div>
               ) : (
@@ -553,8 +889,8 @@ export function StatToolPage() {
         onClose={() => setMenu(null)}
       />
 
-      {/* 新建列表 */}
-      <Modal open={createOpen} onClose={() => setCreateOpen(false)} title="新建列表" width={420}>
+      {/* 新建列表（可顺带设序号规则） */}
+      <Modal open={createOpen} onClose={() => setCreateOpen(false)} title="新建列表" width={460}>
         <Input
           autoFocus
           value={listName}
@@ -564,11 +900,29 @@ export function StatToolPage() {
           }}
           placeholder="列表名称（如 2024 年补番）"
         />
+        <SeqRuleField className="mt-3" value={listRule} onChange={setListRule} />
         <div className="mt-5 flex flex-wrap justify-end gap-2">
           <Button variant="ghost" onClick={() => setCreateOpen(false)}>
             取消
           </Button>
           <Button onClick={() => void submitCreate()}>创建</Button>
+        </div>
+      </Modal>
+
+      {/* 序号规则（已有列表随时可改） */}
+      <Modal open={ruleListId != null} onClose={() => setRuleListId(null)} title="序号规则" width={460}>
+        <div className="mb-3 text-[11px] leading-relaxed text-faint">
+          规则里的数字部分就是**起始号**：第一条用规则本身，之后按列表里已有的最大号 +1。
+          <br />
+          纯数字最多 8 位（`20260701` → `20260702`）；字母前缀只能放在最前面（`A0701` → `A0702`）。
+          留空 = 默认「放送年份 + 01、02、03…」。
+        </div>
+        <SeqRuleField value={ruleDraft} onChange={setRuleDraft} />
+        <div className="mt-5 flex flex-wrap justify-end gap-2">
+          <Button variant="ghost" onClick={() => setRuleListId(null)}>
+            取消
+          </Button>
+          <Button onClick={() => void submitRule()}>保存</Button>
         </div>
       </Modal>
 
@@ -630,6 +984,7 @@ export function StatToolPage() {
         onWidthScaleChange={setWidthScale}
         photoScale={photoScale}
         onPhotoScaleChange={setPhotoScale}
+        showBgmRating={showBgm}
         exporting={exporting}
         onExport={() => void doExport()}
         onClose={() => setExportOpen(false)}

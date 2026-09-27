@@ -29,7 +29,7 @@ const FIELD_GROUPS: { title: string; fields: { key: StatExportField; label: stri
     fields: [
       { key: 'airDate', label: '放送时间' },
       { key: 'watchedAt', label: '看完时间' },
-      { key: 'genres', label: '类型' },
+      { key: 'genres', label: '类型标签' },
       { key: 'historyTier', label: '历史级' },
       { key: 'progress', label: '观看进度' }
     ]
@@ -70,6 +70,7 @@ export const DEFAULT_EXPORT_FIELDS: StatExportField[] = [
   'name',
   'airDate',
   'watchedAt',
+  'genres',
   'personalRating',
   'bgmRating',
   'deviation',
@@ -79,19 +80,28 @@ export const DEFAULT_EXPORT_FIELDS: StatExportField[] = [
 
 const ALL_FIELDS: StatExportField[] = FIELD_GROUPS.flatMap((g) => g.fields.map((f) => f.key))
 
-/** 与主进程 computeExportWidth 保持一致的预估公式（改这里必须同步改 statExport.ts） */
+/**
+ * 与主进程 `computeExportWidth` 保持一致的预估公式（改这里必须同步改 statExport.ts）。
+ *
+ * v0.3.5 起两边都是「条目排版 = 界面列表条目」的同一套尺寸：
+ * 基准 780（序号 76 + 封面 62 + 信息列 260 + 评分 3 格 + 间距/留白）、
+ * 评分每多一格 +88、右侧评价列 +300、剧照按一行 2 张（基准 96×64）加宽。
+ */
 export function estimateWidth(fields: StatExportField[], opts: StatExportOptions): number {
   const has = (f: StatExportField): boolean => fields.includes(f)
-  let w = 860
-  const texts = (
-    ['initialReview', 'midReview', 'endReview', 'overallReview', 'remark'] as StatExportField[]
-  ).filter(has).length
-  if (texts > 0) w += 420
+  let w = 780
   const rates = (
     ['initialRating', 'midRating', 'endRating', 'personalRating', 'bgmRating', 'deviation'] as StatExportField[]
   ).filter(has).length
-  if (rates >= 4) w += 120
-  if (has('photos')) w += 4 * 26
+  if (rates > 3) w += (rates - 3) * 88
+  const texts = (
+    ['initialReview', 'midReview', 'endReview', 'overallReview', 'remark'] as StatExportField[]
+  ).filter(has).length
+  if (texts > 0) w += 300
+  if (has('photos')) {
+    const ps = Math.min(2, Math.max(0.8, opts.photoScale ?? 1.25))
+    w += Math.round(96 * ps) * 2 + 16
+  }
   return Math.round(w * (opts.widthScale ?? 1))
 }
 
@@ -104,6 +114,7 @@ export function ExportDialog({
   onWidthScaleChange,
   photoScale,
   onPhotoScaleChange,
+  showBgmRating,
   exporting,
   onExport,
   onClose,
@@ -117,6 +128,8 @@ export function ExportDialog({
   onWidthScaleChange: (v: number) => void
   photoScale: number
   onPhotoScaleChange: (v: number) => void
+  /** 工具栏那个「bangumi 评分」开关的当前状态：关着时只有填了个人评分的条目会显示 bgm 分 */
+  showBgmRating: boolean
   exporting: boolean
   onExport: () => void
   onClose: () => void
@@ -213,10 +226,17 @@ export function ExportDialog({
           <span className="w-24 shrink-0 text-right tabular-nums text-faint">{photoScale.toFixed(2)}×</span>
         </label>
         <div className="text-[10px] leading-relaxed text-faint">
-          勾了「评价 / 备注」时画布会自动加宽 420px，评分勾满再加 120px —— 内容多时是**图片更宽**，
-          不会把条目压窄或截断。剧照默认 1.25×（约 115×70）。
+          条目排版与界面列表条目同一套（左序号 + 封面 + 番剧名/放送/看完/类型标签 + 右侧评分 + 右侧评价列），
+          配色跟随当前主题；勾了「评价 / 备注」时画布会自动加宽 300px，评分超过 3 格每格再加 88px ——
+          内容多时是**图片更宽**，不会把条目压窄或截断。剧照基准 96×64（与界面剧照条一致），默认 1.25×。
+          <br />
+          bangumi 评分：工具栏开关{showBgmRating ? '已打开（全部条目都显示）' : '未打开（只有填了个人评分的条目显示）'}，
+          与界面同一套规则。
           {sample && sample.photos.length === 0 && fields.includes('photos')
             ? ' 注意：当前列表里的条目还没有剧照，图片上不会出现剧照区。'
+            : ''}
+          {sample && sample.genres.length === 0 && fields.includes('genres')
+            ? ' 注意：列表里还有条目没取到类型标签，图片上这些条目的标签行会是空的。'
             : ''}
         </div>
       </div>

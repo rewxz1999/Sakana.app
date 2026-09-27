@@ -240,10 +240,15 @@ export function registerIpc(): void {
 
   // ---------- 蜜柑计划 ----------
   ipcMain.handle(CH.mikanSearch, (_e, keyword: string) => mikan.search(keyword))
-  ipcMain.handle(CH.mikanCheckSub, async (_e, subId: string) => {
+  ipcMain.handle(CH.mikanCheckSub, async (_e, subId: string, full?: boolean) => {
     const sub = store.get<Subscription[]>('subscriptions', []).find((s) => s.id === subId)
     if (!sub) throw new Error('订阅不存在')
-    return mikan.checkSub(sub)
+    /*
+     * v0.3.5：`full=true` 表示「获取全部资源」——不看发布日期，把该番该组的**历史集数**也列出来
+     * （用户反馈：订阅《无职转生 第三季》时字幕组已更到第 13 集，但 1~12 集永远不会出现，
+     *  日志里就是「官方订阅RSS条目 39 → 命中 3」）。订阅页有对应按钮，订阅刚创建时也会自动跑一次。
+     */
+    return mikan.checkSub(sub, { full: full === true })
   })
   ipcMain.handle(CH.mikanCheckAll, async () => {
     const updates = await mikan.checkAllSubscriptions()
@@ -672,6 +677,21 @@ export function registerIpc(): void {
       properties: ['openFile', 'multiSelections']
     })
     return r.canceled ? [] : r.filePaths
+  })
+  /*
+   * 单选一张图片：给「最XX的角色」右键格子换本地立绘用（v0.3.5）。
+   * 与上面那条只差「单选 + 标题」，但它决定了对话框文案是否与动作相符，
+   * 也避免用户多选之后系统只取第一张、剩下几张静默丢弃。
+   */
+  ipcMain.handle(CH.dialogPickImage, async () => {
+    const w = focused()
+    if (!w) return null
+    const r = await dialog.showOpenDialog(w, {
+      title: '选择一张立绘图片',
+      filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+      properties: ['openFile']
+    })
+    return r.canceled ? null : (r.filePaths[0] ?? null)
   })
   /*
    * 搜索页展示位（空态轮播图）：把 pickImages 返回的图片复制到应用数据目录后回传新路径。

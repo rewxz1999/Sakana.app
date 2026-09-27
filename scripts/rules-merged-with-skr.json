@@ -522,7 +522,7 @@
   {
     "id": "default-age",
     "name": "AGE",
-    "version": "1.5",
+    "version": "1.6-fix",
     "baseUrl": "https://www.agedm.io/",
     "search": {
       "type": "xpath",
@@ -532,8 +532,8 @@
       "query": "{}",
       "bodyType": "",
       "listXPath": "//div[contains(@class,\"cata_video_item\")]",
-      "itemNameXPath": "//a[contains(@class,\"d-block\")]",
-      "itemLinkXPath": "//a[contains(@class,\"d-block\")]",
+      "itemNameXPath": ".//h5[contains(@class,\"card-title\")]/a",
+      "itemLinkXPath": ".//a[contains(@class,\"d-block\")]",
       "listJsonPath": "",
       "itemNameJsonPath": "",
       "itemSourceJsonPath": ""
@@ -546,12 +546,13 @@
       "query": "{}",
       "bodyType": "",
       "responseFormat": "",
-      "linesXPath": "//div[2]/div/section/div/div[2]/div[2]/div[2]/div",
-      "episodesXPath": "//ul/li/a",
+      "linesXPath": "//div[contains(@class,\"tab-pane\")]",
+      "episodesXPath": ".//li/a",
       "linesJsonPath": "",
       "lineNameJsonPath": "",
       "episodesJsonPath": "",
       "episodeNameJsonPath": "",
+      "lineNameXPath": "@id",
       "vars": {},
       "playUrlTemplate": "",
       "playQuery": {}

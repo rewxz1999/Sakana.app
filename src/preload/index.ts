@@ -58,7 +58,7 @@ const api: SakanaApi = {
   },
   mikan: {
     search: (keyword) => call(CH.mikanSearch, keyword),
-    checkSub: (subId) => call(CH.mikanCheckSub, subId),
+    checkSub: (subId, full) => call(CH.mikanCheckSub, subId, full),
     checkAll: () => call(CH.mikanCheckAll),
     onSubUpdates: (cb) => subscribe(CH.evSubUpdates, cb)
   },
@@ -174,6 +174,7 @@ const api: SakanaApi = {
   dialog: {
     pickFolder: (defaultPath) => call(CH.dialogPickFolder, defaultPath),
     pickImages: () => call(CH.dialogPickImages),
+    pickImage: () => call(CH.dialogPickImage),
     pickSubtitle: () => call(CH.dialogPickSubtitle),
     pickDir: (defaultPath) => call(CH.pickDir, defaultPath),
     pickVideo: () => call(CH.dialogPickVideo),

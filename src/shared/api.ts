@@ -307,7 +307,14 @@ export interface SakanaApi {
   }
   mikan: {
     search(keyword: string): Promise<ApiResult<MikanSearchResult>>
-    checkSub(subId: string): Promise<ApiResult<SubUpdateCheck>>
+    /**
+     * 检测某个订阅有没有资源。
+     *
+     * @param full v0.3.5：**「获取全部资源」**——跳过「只看比上次更新的」这道日期门槛，
+     *   把该番该组的**历史集数**也一并列出来（订阅时字幕组已更到第 13 集、但 1~12 集
+     *   从此不再出现的问题就是它引起的）。默认 false = 只提示新资源。
+     */
+    checkSub(subId: string, full?: boolean): Promise<ApiResult<SubUpdateCheck>>
     checkAll(): Promise<ApiResult<SubUpdateCheck[]>>
     onSubUpdates(cb: (updates: SubUpdateCheck[]) => void): () => void
   }
@@ -470,6 +477,14 @@ export interface SakanaApi {
   dialog: {
     pickFolder(defaultPath?: string): Promise<ApiResult<string | null>>
     pickImages(): Promise<ApiResult<string[]>>
+    /**
+     * 只挑**一张**本地图片（v0.3.5）。
+     *
+     * 与 pickImages 分开是为了让对话框标题跟动作一致（「选择剧照（可选多张）」用在
+     * 「给这一格换张立绘」上很出戏），并且强制单选 —— 多选在「一格一张图」的语义下没有意义。
+     * 挑到的仍是**用户磁盘上的原路径**，要显示还得再过一层 `showcase.importImages`。
+     */
+    pickImage(): Promise<ApiResult<string | null>>
     pickSubtitle(): Promise<ApiResult<string | null>>
     pickDir(defaultPath?: string): Promise<ApiResult<string | null>>
     /** 选择本地视频文件（本地播放） */

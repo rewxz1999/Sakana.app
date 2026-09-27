@@ -26,6 +26,7 @@ import type {
 } from '@shared/types'
 import { api } from '@/lib/api'
 import { useLibrary } from '@/stores/library'
+import { useSubs } from '@/stores/subs'
 import { toast } from '@/stores/app'
 import { epKey, onlineKey, progressSummary, useWatchProgress } from '@/stores/watchProgress'
 import { fmtDateTime } from '@/lib/format'
@@ -950,6 +951,22 @@ function MikanSelectModal({
       if (r.ok) {
         toast.success(`已订阅《${subject.nameCn || subject.name}》的字幕组「${picked.group ?? '未识别'}」，更新时仅下载该字幕组资源`)
         onClose()
+        /*
+         * v0.3.5：订阅成功后**立刻拉一次「全部资源」**。
+         *
+         * 用户反馈：订阅时字幕组可能早就更到第 13 集了，但只有「他确认的那一条」被记进 lastPubDate，
+         * 于是第 1~12 集永远不会再出现（日志：官方订阅RSS条目 39 → 命中 3）。
+         * 订阅这个动作的语义应该是「这部番这个组的资源我都要」——所以这里直接跑一次 full 检测，
+         * 把历史集数一并列进确认弹窗；已经下载过的资源由主进程的 handled() 排除，不会重复问。
+         */
+        void useSubs
+          .getState()
+          .checkSub(r.data.subscription.id, true)
+          .then((u) => {
+            if (u && u.newItems.length > 0) {
+              toast.info(`该字幕组共有 ${u.newItems.length} 个资源可下载，请在订阅页确认`)
+            }
+          })
       } else {
         toast.error(r.error)
       }

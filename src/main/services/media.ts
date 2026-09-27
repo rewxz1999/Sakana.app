@@ -159,6 +159,28 @@ function isPathAllowed(p: string): boolean {
   return false
 }
 
+/**
+ * 这个字符串是不是**本地图片文件路径**（v0.3.5）。
+ *
+ * 判据（两条都试过才敢这么写）：
+ * - 单字母 + 冒号开头（`E:\…` / `E:/…`）→ **就是盘符**，本地路径；
+ * - 其它「协议」形状（`https://`、`sakana-img://`、`data:`、`blob:`）→ 远程/inline，交给原有链路。
+ *
+ * ⚠️ 这里踩过一个**静默致命**的坑，别再改回去：
+ * 第一版写成 `/^[a-zA-Z][a-zA-Z0-9+.-]*:/`（"字母开头 + 可有可无的字符 + 冒号"），
+ * 而 `E:` 正好满足它（`[a-zA-Z0-9+.-]*` 可以匹配 0 个字符），
+ * 于是**所有 Windows 绝对路径都被当成远程地址**丢给 `fetchImageWithCache` ——
+ * `new URL('E:\\…')` 解析出来的 `E:` 被 fetch 当作 scheme，报
+ * 「取图失败（第 1 次）E:\\…png: fetch failed」，界面上表现为
+ * 「右键加的本地图片能显示，但导出图里那一格是空白」。
+ * 现在的写法要求「单字母盘符」或「2 个字符以上的协议 + ://」，两者不会互相误伤。
+ */
+function isLocalImagePath(p: string): boolean {
+  if (!p) return false
+  if (/^[a-zA-Z]:[\\/]/.test(p)) return true
+  return !/^[a-zA-Z][a-zA-Z0-9+.-]+:\/\//.test(p) && !/^(data|blob):/i.test(p)
+}
+
 function imageCacheDir(): string {
   // 缓存根目录可由「设置 → 缓存设置」自定义（留空则 userData/cache）
   const root = getSettings().cacheDir?.trim() || join(app.getPath('userData'), 'cache')
@@ -524,6 +546,35 @@ export async function imageDataUrl(rawUrl: string): Promise<ImageDataUrlResult> 
   const raw = String(rawUrl ?? '').trim()
   const fail = (error: string): ImageDataUrlResult => ({ dataUrl: '', mime: '', bytes: 0, error })
   if (!raw) return fail('图片地址为空')
+  /*
+   * v0.3.5：本地文件路径（「最XX的角色」里用户右键格子添加的本地立绘）也要能转 data URL。
+   *
+   * 以前这里只有「远程地址 / data URL」两条路：本地路径会掉进 fetchImageWithCache，
+   * 而它用 `new URL(target)` 取扩展名 —— Windows 路径 `E:\…\a.png` 解析会抛异常，
+   * 表现就是「导出的图里，我自己加的那几张是空白占位块」。
+   * 现在直接读盘：白名单与 sakana-img://local 完全共用一套（isPathAllowed），
+   * 不会因为这条新入口让渲染层能读到任意文件。
+   */
+  if (isLocalImagePath(raw)) {
+    if (!existsSync(raw)) return fail('本地图片不存在（可能已被移动或删除）')
+    if (!isPathAllowed(raw)) {
+      log.append('warn', 'img', `拒绝读取白名单外的路径: ${raw}`)
+      return fail('本地图片不在允许读取的目录内')
+    }
+    try {
+      const buf = readFileSync(raw)
+      if (buf.length === 0) return fail('图片内容为空')
+      if (buf.length > MAX_DATA_URL_BYTES) {
+        return fail(`图片过大（${(buf.length / 1048576).toFixed(1)}MB，上限 6MB）`)
+      }
+      const mime = IMAGE_EXTS[extname(raw).toLowerCase()] ?? 'image/png'
+      return { dataUrl: `data:${mime};base64,${buf.toString('base64')}`, mime, bytes: buf.length }
+    } catch (err) {
+      const reason = String((err as Error)?.message ?? err)
+      log.append('warn', 'img', `读取本地图片失败 (${raw}): ${reason}`)
+      return fail(reason)
+    }
+  }
   // 已经是 data URL 就直接回传（同源，画进 canvas 不会污染）
   if (raw.startsWith('data:')) {
     const mime = /^data:([^;,]+)/.exec(raw)?.[1] ?? 'image/jpeg'

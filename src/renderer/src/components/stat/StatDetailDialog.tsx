@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { CalendarClock, FolderOpen, ImageUp, Star } from 'lucide-react'
+import { CalendarClock, FolderOpen, ImageUp, RefreshCw, Star, Wand2 } from 'lucide-react'
 import type { StatEntry, StatWatchProgress } from '@shared/types'
 import { STAT_MAX_PHOTOS } from '@shared/types'
 import { api } from '@/lib/api'
@@ -7,7 +7,7 @@ import { useStatTool } from '@/stores/statTool'
 import { toast } from '@/stores/app'
 import { Badge, Button, Modal, Textarea } from '@/components/ui'
 import { CoverImage } from '@/components/CoverImage'
-import { DateTimeField, entryDeviation } from './DateTimeField'
+import { DateTimeField, entryDeviation, normalizeWatchedAt } from './DateTimeField'
 import { InfoRow, LocalImageHint, PhotoStrip, ScoreBadge, ShotPicker } from './ShotPicker'
 
 /**
@@ -15,12 +15,13 @@ import { InfoRow, LocalImageHint, PhotoStrip, ScoreBadge, ShotPicker } from './S
  *
  * 字段 ↔ 数据来源对照（详见本次报告，也是本文件的组织顺序）：
  * | 字段 | 来源 | 可改 |
- * | 序号 seq | store（统计条目） | ✗ |
- * | 封面 cover / 番剧名 / 放送时间 airDate / 类型 genres | store（添加时从收藏或番剧表带出） | ✗ |
+ * | 序号 seq | store（统计条目；按列表的序号规则生成） | ✗ |
+ * | 封面 cover / 番剧名 / 放送时间 airDate | store（添加时从收藏或番剧表带出） | ✗ |
+ * | 类型标签 genres | **bangumi 详情接口的 tags**（添加时带出，缺失时自动回填；可手动「刷新标签」） | ✓（刷新） |
  * | bangumi 评分 bgmRating | store（添加时来自 bangumi，可在后台校正） | ✗ |
  * | 个人评分与 bangumi 评分差值 | 计算：personalRating - bgmRating | ✗ |
  * | 观看进度 | 主进程聚合 watchProgress + watchHistory + 收藏手动标记 | ✗ |
- * | 看完时间 | store | ✓（datetime-local 选择器） |
+ * | 看完时间 | store（**只到天**，添加时自动带出「详情页那份已看完时间」，可手改或从观看记录带入） | ✓（date 选择器） |
  * | 初始/中期/结束/个人评分 | store | ✓ |
  * | 初期/中期/结束/总体评价、历史级、备注 | store | ✓ |
  * | 剧照（≤5） | store（存**绝对路径**，不复制文件） | ✓ |
@@ -50,9 +51,11 @@ export function StatDetailDialog({
  */
 function DetailBody({ entry, onClose }: { entry: StatEntry; onClose: () => void }) {
   const updateEntry = useStatTool((s) => s.updateEntry)
+  const refreshEntryTags = useStatTool((s) => s.refreshEntryTags)
 
   const [progress, setProgress] = useState<StatWatchProgress | null>(null)
   const [pickerOpen, setPickerOpen] = useState(false)
+  const [tagsBusy, setTagsBusy] = useState(false)
 
   // 观看进度由主进程算（watchProgress / watchHistory / 收藏标记都在主进程侧读）
   useEffect(() => {
@@ -119,18 +122,40 @@ function DetailBody({ entry, onClose }: { entry: StatEntry; onClose: () => void 
               <div className="break-words text-[11px] text-dim">{entry.name}</div>
             ) : null}
             <InfoRow label="放送时间">{entry.airDate ?? '未知'}</InfoRow>
-            <InfoRow label="类型">
-              {entry.genres.length > 0 ? (
-                <span className="flex flex-wrap gap-1">
-                  {entry.genres.map((g) => (
+            <InfoRow label="类型标签">
+              <span className="flex flex-wrap items-center gap-1">
+                {entry.genres.length > 0 ? (
+                  entry.genres.map((g) => (
                     <Badge key={g} tone="neutral">
                       {g}
                     </Badge>
-                  ))}
-                </span>
-              ) : (
-                '未记录'
-              )}
+                  ))
+                ) : (
+                  <span className="text-faint">未记录（点右侧「刷新标签」从 bangumi 详情取）</span>
+                )}
+                <button
+                  type="button"
+                  data-stat-tag-refresh=""
+                  disabled={tagsBusy || entry.subjectId <= 0}
+                  title={
+                    entry.subjectId > 0
+                      ? '重新从 bangumi 详情接口取一次类型标签'
+                      : '这条没有关联的 bangumi 条目（本地番剧），取不到标签'
+                  }
+                  onClick={() => {
+                    setTagsBusy(true)
+                    void refreshEntryTags(entry.id)
+                      .then((ok) => {
+                        if (ok) toast.success('类型标签已刷新')
+                        else toast.warn('这次没取到标签（可能数据源不可达），稍后再试')
+                      })
+                      .finally(() => setTagsBusy(false))
+                  }}
+                  className="ml-1 flex h-6 items-center gap-1 rounded-md bg-elev2 px-2 text-[10px] text-dim transition-colors hover:text-accent disabled:opacity-50"
+                >
+                  <RefreshCw size={11} /> 刷新标签
+                </button>
+              </span>
             </InfoRow>
             <InfoRow label="观看进度">
               {progress ? (
@@ -161,13 +186,42 @@ function DetailBody({ entry, onClose }: { entry: StatEntry; onClose: () => void 
           </div>
         </div>
 
-        {/* ---------- 可修改：看完时间 ---------- */}
+        {/* ---------- 可修改：看完时间（只到天） ---------- */}
         <div className="rounded-xl border border-border bg-elev1/60 p-3">
-          <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-dim">
+          <div className="mb-2 flex flex-wrap items-center gap-1.5 text-xs font-semibold text-dim">
             <CalendarClock size={13} className="text-accent" /> 看完时间
-            <span className="text-[10px] font-normal text-faint">时间选择器，选完立即保存；点 × 清空</span>
+            <span className="text-[10px] font-normal text-faint">
+              只到天（`YYYY-MM-DD`）；选完立即保存，点 × 清空
+            </span>
+            <span className="flex-1" />
+            {/*
+              显式「从观看记录带入」：自动带出只认番剧详情页那套判定
+              （手动标记的看完时间 / 观看记录覆盖全部集数），
+              没看完的番不会被硬塞一个日期；用户真想填最后观看时间时点这个按钮。
+            */}
+            <button
+              type="button"
+              data-stat-watched-auto=""
+              disabled={!progress?.lastWatchedAt}
+              title={
+                progress?.lastWatchedAt
+                  ? `带入最后观看时间 ${new Date(progress.lastWatchedAt).toLocaleDateString('zh-CN')}（只取到天）`
+                  : '没有这个番剧的观看记录'
+              }
+              onClick={() => {
+                if (!progress?.lastWatchedAt) return
+                const ts = progress.lastWatchedAt
+                const d = new Date(ts)
+                const p = (n: number): string => String(n).padStart(2, '0')
+                patch({ watchedAt: `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}` })
+                toast.success('已带入最后观看时间（只到天）')
+              }}
+              className="flex h-6 items-center gap-1 rounded-md bg-elev2 px-2 text-[10px] text-dim transition-colors hover:text-accent disabled:opacity-50"
+            >
+              <Wand2 size={11} /> 从观看记录带入
+            </button>
           </div>
-          <DateTimeField value={entry.watchedAt} onChange={(v) => patch({ watchedAt: v })} />
+          <DateTimeField value={entry.watchedAt} onChange={(v) => patch({ watchedAt: normalizeWatchedAt(v) })} />
         </div>
 
         {/* ---------- 可修改：四档评分 ---------- */}

@@ -1,16 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
-import { CalendarDays, CloudOff, RefreshCw } from 'lucide-react'
+import { CalendarDays, CloudOff, RefreshCw, ShieldOff } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import type { CalendarItem, ScheduleDisplayFilters } from '@shared/types'
 import { seasonLabel, seasonOfDate } from '@shared/season'
-import { useSchedule } from '@/stores/schedule'
+import { blockReason, isBlockingActive, shouldLoadTags } from '@shared/scheduleBlock'
+import { useSchedule, useScheduleBlock, useScheduleTags } from '@/stores/schedule'
 import { useLibrary } from '@/stores/library'
 import { useSettings } from '@/stores/app'
 import { fmtDateTime, mondayOf, weekdayDate, WEEKDAY_CN } from '@/lib/format'
 import { DEFAULT_SCHEDULE_FILTERS, passesDisplayFilters, resolveScheduleFilters, watchStateOf } from '@/lib/timelineFilter'
 import { AnimeCard } from '@/components/AnimeCard'
-import { Button, EmptyState, Modal } from '@/components/ui'
+import { Button, EmptyState, Modal, Switch } from '@/components/ui'
 import { api } from '@/lib/api'
 import { toast } from '@/stores/app'
 
@@ -47,6 +48,24 @@ export function SchedulePage() {
   const saveSettings = useSettings((s) => s.save)
   const [showVpnDialog, setShowVpnDialog] = useState(false)
 
+  // ---------- 番剧表设置（分级标签屏蔽 + 黑名单） ----------
+  const blockCfg = useScheduleBlock((s) => s.cfg)
+  const loadBlock = useScheduleBlock((s) => s.load)
+  const tagMap = useScheduleTags((s) => s.tags)
+  const tagFailed = useScheduleTags((s) => s.failed)
+  const tagFetching = useScheduleTags((s) => s.fetching)
+  const ensureTags = useScheduleTags((s) => s.ensureTags)
+  /**
+   * 「临时显示全部」：只在本页会话内有效，**不写进设置**。
+   * 用户要的是一个「我怀疑误杀了，先看看全部」的临时出口，而不是又改一次设置。
+   */
+  const [showAllBlocked, setShowAllBlocked] = useState(false)
+
+  /** 打开番剧表设置小窗口（本页提示条与空列表里的入口共用） */
+  const openBlockSettings = (): void => {
+    void api.window.openSmall('/schedule-settings', { width: 720, height: 640, title: '番剧表设置' })
+  }
+
   // 「显示范围」三开关：属偏好，直接存在设置里（shared/types 的 scheduleFilters）
   const filters = resolveScheduleFilters(settings.scheduleFilters)
 
@@ -70,7 +89,67 @@ export function SchedulePage() {
     }
     return map
   })()
-  const keepItem = (it: CalendarItem): boolean => passById.get(it.id) ?? true
+
+  /*
+   * 番剧表屏蔽（用户需求第 4 条）——**只在这一层过滤**。
+   *
+   * 为什么不在数据层/接口层做：屏蔽是番剧表这一个页面的展示偏好，
+   * 一旦下沉到 store/主进程，搜索结果、收藏、详情、订阅都会被连带影响（用户明确要求不影响搜索）。
+   * 所以这里只是渲染前的一张「id → 屏蔽原因」表，其它页面拿到的数据一个字节都没变。
+   *
+   * 关键降级：`tagMap[it.id]` 取不到标签时 blockReason 返回 null = **不屏蔽**。
+   * 标签要逐条补详情才有，反代抖动/条目详情缺 tags 时宁可少屏蔽，也不能把整页番剧误杀。
+   */
+  const blockReasonById = useMemo(() => {
+    const map = new Map<number, string>()
+    for (const d of days) {
+      for (const it of d.items) {
+        if (map.has(it.id)) continue
+        const reason = blockReason(it, tagMap[it.id], blockCfg)
+        if (reason) map.set(it.id, reason)
+      }
+    }
+    return map
+  }, [days, tagMap, blockCfg])
+  const blockedCount = blockReasonById.size
+  const dayBlockedCount = showAllBlocked ? 0 : dayItems.filter((it) => blockReasonById.has(it.id)).length
+
+  const keepItem = (it: CalendarItem): boolean => {
+    if (!showAllBlocked && blockReasonById.has(it.id)) return false
+    return passById.get(it.id) ?? true
+  }
+
+  // ---------- 标签补全（只有开关打开时才做） ----------
+  const tagRulesOn = shouldLoadTags(blockCfg)
+  /** 本周（当前番剧表）去重后的全部条目 id；标签补全与进度显示都以它为分母 */
+  const weekIds = useMemo(() => [...new Set(days.flatMap((d) => d.items.map((i) => i.id)))], [days])
+
+  useEffect(() => {
+    /*
+     * 屏蔽配置在独立 store 键 `scheduleBlock` 里，而且是在**另一个窗口**（/schedule-settings 小窗口）
+     * 改的 —— 小窗口是独立渲染进程，改了那边这里不会收到任何通知。
+     * 所以除了挂载时读一次，每次窗口重新获得焦点也读一次：用户改完设置切回来立刻看到效果。
+     */
+    void loadBlock()
+    const onFocus = (): void => void loadBlock()
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [loadBlock])
+
+  useEffect(() => {
+    /*
+     * 所有标签屏蔽开关都关着时**一个请求都不发**（省流量，也保证「不影响搜索结果」在流量层面可验证）：
+     * 判据是 shared 的 shouldLoadTags（黑名单不需要标签，所以不参与这个判断）。
+     */
+    if (!tagRulesOn) return
+    if (weekIds.length === 0) return
+    // 当前显示日排在最前面：可见的那一天最先拿到标签、屏蔽最先生效，其余日子依次补齐
+    ensureTags([...new Set([...dayItems.map((i) => i.id), ...weekIds])])
+  }, [tagRulesOn, dayItems, weekIds, ensureTags])
+
+  /** 标签缓存进度：已尝试（成功 + 失败）／本周条目数（界面上写「标签缓存 87/111」） */
+  const tagDone = weekIds.filter((id) => id in tagMap || tagFailed.includes(id)).length
+  const tagFailedCount = weekIds.filter((id) => tagFailed.includes(id)).length
 
   /** 当前显示日里通过筛选的条目；星期按钮上的「N 部」也一并按同一判据计数，避免数字与列表不符 */
   const visibleItems = dayItems.filter(keepItem)
@@ -177,6 +256,41 @@ export function SchedulePage() {
         这样旧数据不会报错，将来若要恢复只需把这段 UI 加回来。
       */}
 
+      {/*
+        番剧表屏蔽提示条（用户需求第 4 条）。
+        被屏蔽的条目**既不渲染也不计数**，所以必须有一行说明「少了多少 / 去哪调 / 怎么看全部」，
+        否则用户只会看到「番剧表怎么少了几部」而不知道是自己开的开关。
+        只读配置、只提示，不影响其它页面。
+      */}
+      {isBlockingActive(blockCfg) ? (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-border bg-elev1/70 px-5 py-2 text-[11px] text-dim">
+          <span className="flex items-center gap-1.5">
+            <ShieldOff size={13} className="text-accent" />
+            {showAllBlocked
+              ? `已临时显示全部：其中 ${blockedCount} 部本应被番剧表设置屏蔽`
+              : `已按番剧表设置屏蔽 ${blockedCount} 部（可到设置里调整）`}
+          </span>
+          {tagRulesOn ? (
+            <span className="text-faint">
+              标签缓存 {tagDone}/{weekIds.length}
+              {tagFetching ? '（补齐中…）' : ''}
+              {tagFailedCount > 0 ? ` · ${tagFailedCount} 部未取到标签（不屏蔽）` : ''}
+            </span>
+          ) : null}
+          <span className="flex-1" />
+          <span className="flex items-center gap-1.5">
+            临时显示全部
+            <Switch checked={showAllBlocked} onChange={setShowAllBlocked} />
+          </span>
+          <button
+            onClick={openBlockSettings}
+            className="rounded-lg border border-border px-2 py-1 text-[11px] text-dim transition-colors hover:border-accent hover:text-accent whitespace-nowrap"
+          >
+            番剧表设置
+          </button>
+        </div>
+      ) : null}
+
       {/* 内容区 */}
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
         {loading && days.length === 0 ? (
@@ -215,6 +329,22 @@ export function SchedulePage() {
                     footer={item.air_date ? `开播 ${item.air_date.slice(0, 10)}` : undefined}
                   />
                 ))}
+              </div>
+            ) : dayBlockedCount > 0 ? (
+              /*
+               * 本日的番剧被番剧表设置**全部**屏蔽了：
+               * 给原因 + 两个出口（临时看全部 / 去改设置），而不是一个「没有符合条件的番剧」的冷冰冰空页。
+               */
+              <div className="flex flex-col items-center gap-2.5 py-16 text-center">
+                <p className="text-sm text-dim">本日 {dayBlockedCount} 部番剧都被番剧表设置屏蔽了</p>
+                <div className="flex flex-wrap justify-center gap-2">
+                  <Button variant="outline" size="sm" onClick={() => setShowAllBlocked(true)}>
+                    临时显示全部
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={openBlockSettings}>
+                    打开番剧表设置
+                  </Button>
+                </div>
               </div>
             ) : (
               /* 本日有番剧但被「显示范围」全部筛掉：给提示 + 一键恢复，而不是空列表 */

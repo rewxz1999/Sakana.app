@@ -2,6 +2,28 @@ import { useEffect, useState } from 'react'
 import { imgUrl, localImgUrl } from '@/lib/format'
 
 /**
+ * 图片地址 → sakana-img 协议地址。
+ *
+ * v0.3.5：加了一层**本地路径自动识别**。
+ * 起因是「最XX的角色」新增了「右键格子添加本地图片」，那里存的是磁盘绝对路径，
+ * 而 CoverImage 过去只认 `local` 这个布尔开关 —— 漏传就会走 `imgUrl()` 被当成远程地址
+ * （`sakana-img://fetch/<base64 的 E:\…>`），主进程按 URL 取图必然失败，图片静默变占位。
+ *
+ * 判据与主进程 `media.isLocalImagePath` **逐字一致**（那边注释记着这条判据为什么不能
+ * 写成"字母开头+可有可无的字符+冒号"：那样连 `E:` 也会被当成协议）。
+ */
+function looksLocal(p: string): boolean {
+  if (!p) return false
+  if (/^[a-zA-Z]:[\\/]/.test(p)) return true
+  return !/^[a-zA-Z][a-zA-Z0-9+.-]+:\/\//.test(p) && !/^(data|blob):/i.test(p)
+}
+
+function resolveImgSrc(src: string, local: boolean): string {
+  if (local || looksLocal(src)) return localImgUrl(src)
+  return imgUrl(src)
+}
+
+/**
  * 图片组件：经 sakana-img 协议加载（主进程带 UA/Referer + 磁盘缓存 + 图片反代改写），
  * 失败显示渐变占位。
  *
@@ -26,7 +48,7 @@ export function CoverImage({
 }) {
   const [attempt, setAttempt] = useState(0)
   const [failed, setFailed] = useState(false)
-  const base = src ? (local ? localImgUrl(src) : imgUrl(src)) : ''
+  const base = src ? resolveImgSrc(src, local) : ''
   const url = base && attempt > 0 ? `${base}${base.includes('?') ? '&' : '?'}retry=${attempt}` : base
 
   useEffect(() => {

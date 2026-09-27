@@ -14,6 +14,7 @@ import {
   Rocket,
   Image,
   Info,
+  ListFilter,
   MessagesSquare,
   MonitorPlay,
   RefreshCw,
@@ -334,6 +335,14 @@ export function SettingsPage() {
               </div>
             </div>
             {/* v0.3.1：按用户要求删除「导航栏背景」设置项（连同页面、IPC 与主进程实现一并移除） */}
+            {/* 番剧表设置入口（分级标签屏蔽 + 黑名单）：它改的是番剧表这一页显示什么，算界面偏好，所以放「外观」 */}
+            <RowDivider />
+            <OpenRow
+              icon={ListFilter}
+              title="番剧表设置"
+              desc="分级标签屏蔽（美国 / 美漫 / 英国 / 子供向…）与黑名单，只影响番剧表，不影响搜索结果"
+              onOpen={() => openSmall('/schedule-settings', 720, 640, '番剧表设置')}
+            />
           </div>
         </Section>
 

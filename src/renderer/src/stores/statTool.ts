@@ -58,19 +58,31 @@ interface StatToolState {
   /** 内部：采纳主进程数据（只有更新的 revision 才会生效） */
   accept: (next: StatToolData) => void
   selectList: (id: string | null) => void
-  createList: (name: string, makeCurrent?: boolean) => Promise<string | null>
+  createList: (name: string, makeCurrent?: boolean, seqRule?: string) => Promise<string | null>
   renameList: (id: string, name: string) => void
   deleteList: (id: string) => void
   setPinned: (id: string, pinned: boolean) => void
+  /** 设置/清空列表的序号规则（空串 = 默认「年份 + 01、02…」）；非法规则主进程会拒绝 */
+  setSeqRule: (id: string, rule: string) => Promise<boolean>
+  /** 整表按年份重排 + 按规则重编号（工具栏「重新排序」） */
   resort: (listId: string) => void
+  /** 拖动排序：按给出的条目顺序写 order（不改编号） */
+  reorderEntries: (listId: string, entryIds: string[]) => void
   /** 批量添加，返回真正新增的条数（重复的会被主进程忽略） */
   addEntries: (listId: string, items: StatAddItem[]) => Promise<number>
   updateEntry: (id: string, patch: StatEntryPatch) => void
   removeEntry: (id: string) => void
   listEntries: (listId: string) => StatEntry[]
+  /** 给缺类型标签的条目回填 bangumi 详情标签（落盘进条目，之后不再请求） */
+  backfillTags: (listId: string) => Promise<number>
+  /** 重新拉一次某条的详情标签（详情窗口的「刷新标签」按钮） */
+  refreshEntryTags: (entryId: string) => Promise<boolean>
 }
 
-/** 收藏条目 → 添加项（看完时间：手动标记过就带上，值转成本地时间字符串） */
+/** 条目上保留的类型标签上限（与主进程 statStore 的 MAX_GENRES 一致，详情接口有 30 个 tag） */
+const MAX_GENRES = 12
+
+/** 收藏条目 → 添加项（看完时间：手动标记过就带上，**只到天**） */
 export function favoriteToAddItem(f: FavoriteItem): StatAddItem {
   return {
     subjectId: f.subjectId,
@@ -80,7 +92,7 @@ export function favoriteToAddItem(f: FavoriteItem): StatAddItem {
     airDate: f.airDate,
     rating: f.rating,
     genres: f.genres,
-    watchedAt: tsToLocalInput(f.watchedAt)
+    watchedAt: tsToDay(f.watchedAt)
   }
 }
 
@@ -216,19 +228,20 @@ export function orderedListsOf(data: StatToolData): StatToolData['lists'] {
   })
 }
 
-/** 时间戳 → `<input type="datetime-local">` 的值（本地时间，YYYY-MM-DDTHH:mm） */
-export function tsToLocalInput(ts: number | null | undefined): string | null {
+/** 时间戳 → `YYYY-MM-DD`（本地时区，**只到天** —— 看完时间从 v0.3.5 起不再记时分） */
+export function tsToDay(ts: number | null | undefined): string | null {
   if (!ts) return null
   const d = new Date(ts)
   if (Number.isNaN(d.getTime())) return null
   const p = (n: number): string => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
 
-/** `<input type="datetime-local">` 的值 → 时间戳（无效返回 null） */
-export function localInputToTs(v: string | null | undefined): number | null {
-  if (!v) return null
-  const d = new Date(v)
+/** `YYYY-MM-DD` → 时间戳（取当地**中午 12 点**，与番剧详情页修改看完时间时的做法一致：避免时区把日期挪一天） */
+export function dayToTs(v: string | null | undefined): number | null {
+  const s = String(v ?? '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null
+  const d = new Date(`${s}T12:00:00`)
   return Number.isNaN(d.getTime()) ? null : d.getTime()
 }
 
@@ -276,9 +289,9 @@ export const useStatTool = create<StatToolState>((set, get) => ({
 
   selectList: (id) => set({ selectedListId: id }),
 
-  createList: async (name, makeCurrent = true) => {
+  createList: async (name, makeCurrent = true, seqRule = '') => {
     const before = new Set(get().data.lists.map((l) => l.id))
-    const r = await api.stat.apply({ kind: 'createList', name })
+    const r = await api.stat.apply({ kind: 'createList', name, seqRule })
     if (!r.ok) return null
     const created = r.data.lists.find((l) => !before.has(l.id)) ?? null
     get().accept(r.data)
@@ -312,8 +325,37 @@ export const useStatTool = create<StatToolState>((set, get) => ({
     void api.stat.apply({ kind: 'setPinned', listId: id, pinned })
   },
 
+  setSeqRule: async (id, rule) => {
+    const r = await api.stat.apply({ kind: 'setSeqRule', listId: id, seqRule: rule })
+    if (!r.ok) return false
+    get().accept(r.data)
+    return true
+  },
+
   resort: (listId) => {
     void api.stat.apply({ kind: 'resort', listId }).then((r) => {
+      if (r.ok) get().accept(r.data)
+    })
+  },
+
+  reorderEntries: (listId, entryIds) => {
+    if (entryIds.length === 0) return
+    /*
+     * 拖动排序：本地先把 order 改成新顺序（界面立刻生效，不等一次往返），
+     * 主进程回传的 revision 更高时会覆盖成本地同一份结果。
+     */
+    set((s) => {
+      const pos = new Map(entryIds.map((id, i) => [id, i + 1]))
+      return {
+        data: {
+          ...s.data,
+          entries: s.data.entries.map((e) =>
+            e.listId === listId && pos.has(e.id) ? { ...e, order: pos.get(e.id) as number } : e
+          )
+        }
+      }
+    })
+    void api.stat.apply({ kind: 'resort', listId, entryIds }).then((r) => {
       if (r.ok) get().accept(r.data)
     })
   },
@@ -346,5 +388,69 @@ export const useStatTool = create<StatToolState>((set, get) => ({
     void api.stat.apply({ kind: 'removeEntry', entryId: id })
   },
 
+  backfillTags: async (listId) => {
+    const todo = get()
+      .data.entries.filter((e) => e.listId === listId && e.subjectId > 0 && e.genres.length === 0)
+      .filter((e) => !tagAttempted.has(tagKey(e)))
+      // 一次最多补 30 条：列表很长时也不要一进页面就打一堆请求（下次进页面继续补）
+      .slice(0, 30)
+    if (todo.length === 0) return 0
+    for (const e of todo) tagAttempted.add(tagKey(e))
+
+    let filled = 0
+    for (let i = 0; i < todo.length; i += TAG_FETCH_CONCURRENCY) {
+      const slice = todo.slice(i, i + TAG_FETCH_CONCURRENCY)
+      await Promise.all(
+        slice.map(async (e) => {
+          const tags = await fetchSubjectTags(e.subjectId)
+          if (tags.length === 0) return
+          filled += 1
+          get().updateEntry(e.id, { genres: tags })
+        })
+      )
+    }
+    return filled
+  },
+
+  refreshEntryTags: async (entryId) => {
+    const e = get().data.entries.find((x) => x.id === entryId)
+    if (!e || e.subjectId <= 0) return false
+    const tags = await fetchSubjectTags(e.subjectId)
+    if (tags.length === 0) return false
+    get().updateEntry(e.id, { genres: tags })
+    return true
+  },
+
   listEntries: (listId) => get().data.entries.filter((e) => e.listId === listId)
 }))
+
+/**
+ * 取一部番剧的**类型标签**（bangumi 详情接口的 `tags`，按热度已排好序）。
+ *
+ * 为什么标签要单独补一次：用户看到的「不知道怎么没有获取到类型标签」有两个原因 ——
+ * 1. 只有「从收藏添加」那条路会带上 `genres`（收藏条目里有），而「当季 / 搜索」两个入口
+ *    拿到的候选列表（SeasonItem / SearchResultItem）**根本没有 tags 字段**，
+ *    所以从这两处加进来的条目 `genres` 一定是空的；
+ * 2. 列表条目过去也**没有把 genres 画出来**（详情窗口里有，列表里没有）。
+ * 主进程的详情接口有 7 天磁盘缓存（`subject3-<id>.json`），所以这次补取绝大多数只是读盘，
+ * 拿到后立刻写进条目落盘（`updateEntry`），以后再也不请求。
+ */
+async function fetchSubjectTags(subjectId: number): Promise<string[]> {
+  const r = await api.bangumi.subject(subjectId)
+  if (!r.ok) return []
+  const tags = r.data.data?.tags
+  if (!Array.isArray(tags)) return []
+  return tags
+    .map((t) => String(t?.name ?? '').trim())
+    .filter(Boolean)
+    .slice(0, MAX_GENRES)
+}
+
+/** 标签回填的请求并发（详情接口有磁盘缓存，但没必要一次性打满） */
+const TAG_FETCH_CONCURRENCY = 3
+/** 本会话已经尝试过取标签的条目：失败的也不反复打数据源（换页面/重开应用会重试） */
+const tagAttempted = new Set<string>()
+
+function tagKey(e: Pick<StatEntry, 'id' | 'subjectId'>): string {
+  return `${e.id}:${e.subjectId}`
+}

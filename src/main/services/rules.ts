@@ -93,9 +93,31 @@ function splitUnion(expr: string): string[] {
   return parts
 }
 
+/**
+ * 把条目/剧集链接解析成绝对地址。
+ *
+ * v0.3.5：多一步「同站 http→https 升级」。
+ * 起因是 AGE：它的搜索结果与详情页里的剧集链接都是 **HTTP 绝对地址**
+ * （`http://www.agedm.io/play/20260029/1/1`），而站点本身只提供 https 服务 ——
+ * 实测 `http://www.agedm.io/...:80` 直连是 **ETIMEDOUT**（不是 301），
+ * 浏览器之所以没事是因为 Chrome 会自己升级 https 并缓存跳转。
+ * 结果就是「搜索能搜到、名字也有了，但一点播放/选集就超时」。
+ *
+ * 升级条件卡得很死：**只有**「link 是 http、base 是 https、且 host 相同」才换协议，
+ * 不会把站点故意提供的另一个 http 域名（有些站的真源就在 http 上）改坏。
+ */
 export function resolveUrl(base: string, link: string): string {
   try {
-    return new URL(link, base).toString()
+    const u = new URL(link, base)
+    try {
+      const b = new URL(base)
+      if (u.protocol === 'http:' && b.protocol === 'https:' && u.host === b.host) {
+        u.protocol = 'https:'
+      }
+    } catch {
+      /* base 不是合法 URL 就只做普通解析 */
+    }
+    return u.toString()
   } catch {
     return link
   }

@@ -2294,16 +2294,61 @@ if (!gotLock) {
      * 约定：把结论放进 `window.__domTest` 里返回最方便，例如
      *   `window.__domTest = { at: document.elementFromPoint(100,100)?.className }`
      * 每次执行都会等 `SAKANA_DOM_DELAY`（默认 2500ms）让页面把数据拉完。
+     *
+     * v0.3.5：加了一条**免转义**的入口 `SAKANA_DOM_PROBE='/route;;/route2;;…'`。
+     * 起因：自检脚本里一旦出现 `&`、`|`、`(`、`)`、引号、中文，cmd.exe 即使在
+     * `set "VAR=..."` 的引号里也会把 `&`/`|` 当分隔符，变量被截断成
+     * `'ndex' is not recognized ...` 这种碎片（base64 也不行：渲染层 CSP 是
+     * `script-src 'self'`，eval/new Function 全被拦）。
+     * 现在这种方式命令行里**只有路由**，真正的脚本由页面去加载同源的
+     * `out/renderer/probe.js`（由 `.e2e/dom-probe.mjs` 生成），一个字符都不用转义。
      */
-    if (process.env.SAKANA_DOM_TEST) {
+    if (process.env.SAKANA_DOM_TEST || process.env.SAKANA_DOM_TEST2 || process.env.SAKANA_DOM_PROBE) {
       setTimeout(() => {
         void (async () => {
           const { openSmallWindow } = await import('./window')
           const delay = Number(process.env.SAKANA_DOM_DELAY) > 0 ? Number(process.env.SAKANA_DOM_DELAY) : 2500
-          const specs = String(process.env.SAKANA_DOM_TEST)
-            .split(';;')
-            .map((s) => s.trim())
-            .filter(Boolean)
+          /*
+           * 注入内容按 `SAKANA_DOM_TEST`、`SAKANA_DOM_TEST2` … `SAKANA_DOM_TEST9` **依次拼接**。
+           * 为什么：cmd.exe 单行上限 8191 字符，多 spec 的自检脚本会直接报
+           * 「The input line is too long.」；拆成多个变量即可绕过，对只用一个变量的老调用完全兼容。
+           * 注意注入脚本本身的两条约束（写自检脚本时踩过）：不能含反斜杠（会被 `set` 转义成 `\\`）、
+           * 不要用双引号（cmd 的 `\"` 会把反斜杠留在值里）。
+           * 内容里有这些字符时请改用上面的 `SAKANA_DOM_PROBE`。
+           */
+          const parts: string[] = []
+          for (const key of [
+            'SAKANA_DOM_TEST',
+            'SAKANA_DOM_TEST2',
+            'SAKANA_DOM_TEST3',
+            'SAKANA_DOM_TEST4',
+            'SAKANA_DOM_TEST5',
+            'SAKANA_DOM_TEST6',
+            'SAKANA_DOM_TEST7',
+            'SAKANA_DOM_TEST8',
+            'SAKANA_DOM_TEST9'
+          ]) {
+            const v = process.env[key]
+            if (v) parts.push(v)
+          }
+          const probe = String(process.env.SAKANA_DOM_PROBE ?? '').trim()
+          const specs = probe
+            ? // 免转义模式：只给路由，脚本由页面加载 probe.js 后按序号取
+              probe
+                .split(';;')
+                .map((s) => s.trim())
+                .filter(Boolean)
+                .map(
+                  (hash, i) =>
+                    `${hash}|const m=await import('./probe.js');` +
+                    `for(let k=0;k<40&&!window.__domProbeReady;k++){await new Promise(r=>setTimeout(r,100));}` +
+                    `return await window.__domProbe(${i});`
+                )
+            : parts
+                .join('')
+                .split(';;')
+                .map((s) => s.trim())
+                .filter(Boolean)
           for (const spec of specs) {
             const sep = spec.indexOf('|')
             const hash = sep >= 0 ? spec.slice(0, sep) : '/'

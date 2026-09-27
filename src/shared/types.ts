@@ -810,7 +810,36 @@ export const DEFAULT_RULES: PlayRule[] = [
   {
     id: 'default-age',
     name: 'AGE',
-    version: '1.5',
+    /*
+     * AGE 动漫（agedm.io）—— v0.3.5 按**站点当前真实结构**整条重写。
+     *
+     * 为什么必须重写（2026-09 实测，全部用应用自己那套 HTTP+XPath 栈复现）：
+     *  ① 搜索能出结果，但**名字恒为空**：`itemNameXPath` 指的是封面那个
+     *     `<a class="d-block" title="…"><img …></a>` —— 里面只有图没有文字，
+     *     而 `extractName()` 是取节点内**文本**（`title` 属性不参与）。
+     *     实际剧名在 `<h5 class="card-title"><a>…</a></h5>` 里（第一条 `<a>` 就有全集数）。
+     *  ② 选集恒为空：老的 `linesXPath`（`//div[2]/div/section/…`）在当前页面上命中 **0** 个节点，
+     *     而剧集链接其实有 70 条，结构是 Bootstrap pill：
+     *       `<ul><li><button data-bs-target="#playlist-source-xigua">西瓜</button></li>…</ul>`
+     *       `<div class="tab-content"><div class="tab-pane" id="playlist-source-xigua"><ul class="video_detail_episode">…`
+     *     每条线路就是一个 `<div class="tab-pane" id="playlist-source-xigua">`（里面装 `ul.video_detail_episode`），
+     *     所以 `linesXPath` 指向这 7 个 tab-pane、`lineNameXPath` 取 `@id`
+     *     （`playlist-source-xigua` 这种，等于站点自己的线路标识）。
+     *     ⚠️ 踩过的坑：**不要**写成 `//div[contains(@class,"tab-content")]/div[…class,"tab-pane"]`
+     *     —— xpath-html（parse5 → xmlserializer）这条链上「斜杠子轴 + class 谓词」会恒为 0，
+     *     实测 `//div[contains(@class,"tab-content")]/*` 反而能出 7 个；`parent::*` / `/..`
+     *     这类轴则直接抛 XPath parse error。宁可用平铺的 `//div[contains(@class,"tab-pane")]`，
+     *     也不要用看起来更精确的父子写法。
+     *  ③ 播放地址**不可能**靠 HTTP 算出来：`/play/{id}/{line}/{ep}` 页面里没有任何 m3u8，
+     *     真正的地址在一个第三方解析站（`jx.wuzhoupai.com:8443`）的 ArtPlayer 里，
+     *     它把请求参数用 **WASM 加密**、并带 `Video-Parse-Time/-Sign/-Uuid` 签名头 POST 换取播放地址。
+     *     所以播放这一步只能走应用的「网页视图嗅探」（打开真实浏览器 → 抓媒体请求），
+     *     这也是 AGE 唯一现实的通路。
+     *  ④ 站点页面里的链接是 **http 绝对地址**（`http://www.agedm.io/detail/…`），
+     *     而该域名只提供 https —— 实测 http:80 直连 ETIMEDOUT（不是 301）。
+     *     已在 `resolveUrl()` 里加了「同站 http→https 升级」统一处理，规则这里不用管。
+     */
+    version: '1.6-fix',
     baseUrl: 'https://www.agedm.io/',
     search: {
       type: 'xpath',
@@ -820,8 +849,10 @@ export const DEFAULT_RULES: PlayRule[] = [
       query: '{}',
       bodyType: '',
       listXPath: '//div[contains(@class,"cata_video_item")]',
-      itemNameXPath: '//a[contains(@class,"d-block")]',
-      itemLinkXPath: '//a[contains(@class,"d-block")]',
+      // 剧名：卡片标题里的链接（相对条目求值，且能避开封面 `<a>`）
+      itemNameXPath: './/h5[contains(@class,"card-title")]/a',
+      // 链接仍取封面那个 `<a>`：它带 title 属性、一定是详情页地址（实测 /detail/<id>）
+      itemLinkXPath: './/a[contains(@class,"d-block")]',
       listJsonPath: '',
       itemNameJsonPath: '',
       itemSourceJsonPath: ''
@@ -834,8 +865,12 @@ export const DEFAULT_RULES: PlayRule[] = [
       query: '{}',
       bodyType: '',
       responseFormat: '',
-      linesXPath: '//div[2]/div/section/div/div[2]/div[2]/div[2]/div',
-      episodesXPath: '//ul/li/a',
+      // 一条线路一个 tab-pane（7 个播放源：西瓜 / 非凡 / 暴风 / 无尽 / 红牛 / 计算云 / 凤雏云）
+      linesXPath: '//div[contains(@class,"tab-pane")]',
+      // 线路内剧集：相对线路取 li/a（实测 7 条线路各 10 集）
+      episodesXPath: './/li/a',
+      // 线路名 = tab-pane 的 id（playlist-source-xigua / -ffm3u8 / -wolong …）
+      lineNameXPath: '@id',
       linesJsonPath: '',
       lineNameJsonPath: '',
       episodesJsonPath: '',
@@ -1338,14 +1373,30 @@ export interface StatEntry {
   id: string
   listId: string
   subjectId: number
-  seq: string // 序号：年份+排序，如 202601
+  /** 序号：默认规则 = 放送年份 + 顺序（202601、202602…）；也可以按列表的 seqRule 自定义（见 shared/statSeq.ts） */
+  seq: string
   name: string
   nameCn: string
   cover: string
   airDate: string | null // 放送时间
-  /** v0.2：番剧类型/标签（添加时从收藏 genres 带出，详情窗口只读） */
+  /**
+   * 番剧**类型标签**（bangumi 详情页的 tags，按热度排序）。
+   *
+   * v0.3.5 起来源固定为详情接口 `SubjectDetail.tags`：
+   * 收藏里的 `genres` 也能带出一份，但「当季 / 搜索」两个添加入口拿不到标签，
+   * 所以渲染层会对 `genres` 为空的条目回填一次详情标签（见 stores/statTool.ts 的 backfillTags），
+   * 落盘进条目后不再重复请求。字段名沿用 `genres` 以免老数据要迁移。
+   */
   genres: string[]
-  watchedAt: string | null // 看完时间（YYYY-MM-DDTHH:mm，本地时间，无时区）
+  /**
+   * 看完时间，**只到天**（`YYYY-MM-DD`，本地时间，无时区）。
+   *
+   * 为什么砍掉时分秒（用户要求「看完时间不用精确到分秒，只用到天」）：
+   * 1. 统计表上多出来的 `T21:04` 没人看，导出图还被它撑宽；
+   * 2. 旧值是 `YYYY-MM-DDTHH:mm`，主进程读取时统一归一化成天（见 statStore 的 normalizeEntry），
+   *    所以这里放宽成「天」不会让老数据读不出来。
+   */
+  watchedAt: string | null
   initialRating: number | null // 初始评分 0–10
   midRating: number | null // 中期评分 0–10
   endRating: number | null // 结束评分 0–10
@@ -1361,6 +1412,10 @@ export interface StatEntry {
   remark: string // 备注
   reviews: string[] // 旧评价字段（兼容迁移用）
   finalReview: string // v0.1 的「完结评价」——迁移时并入 endReview，保留原值
+  /**
+   * 列表内顺序（1 起）：界面与导出图都按它排序，拖动条目只改它、不动 `seq`。
+   * 老数据没有该字段时按 `seq` 排序兜底（见 shared/statSeq.ts 的 compareStatOrder）。
+   */
   order: number
   /** 最近一次修改时间（详情窗口底部显示） */
   updatedAt?: number
@@ -1375,6 +1430,15 @@ export interface StatList {
   createdAt: number
   /** 置顶：置顶列表排在列表栏最前，排序持久化（undefined = 未置顶） */
   pinned?: boolean
+  /**
+   * 序号规则模板（空/未填 = 默认「放送年份 + 01、02…」）。
+   *
+   * 形态只有两种（校验与续号逻辑都在 shared/statSeq.ts，主进程与渲染层共用）：
+   * - 纯数字，最多 8 位：`20260701` → 下一条 `20260702`；
+   * - 字母前缀 + 数字（字母只能在最前）：`A0701` → 下一条 `A0702`。
+   * 规则里的数字部分就是**起始号**：第一条用规则本身，之后按「已有最大号 + 1」续。
+   */
+  seqRule?: string
 }
 
 export interface StatToolData {
@@ -1408,6 +1472,8 @@ export type StatEntryPatch = Partial<
     | 'bgmRating'
     | 'seq'
     | 'order'
+    /** 类型标签：允许渲染层回填（详情接口的 tags）与手工修正 */
+    | 'genres'
   >
 >
 
@@ -1418,11 +1484,18 @@ export type StatEntryPatch = Partial<
  * 主进程是唯一写入方，读-改-写在主进程内存里串行完成，改完广播给所有窗口。
  */
 export type StatAction =
-  | { kind: 'createList'; name: string; makeCurrent?: boolean }
+  | { kind: 'createList'; name: string; makeCurrent?: boolean; seqRule?: string }
   | { kind: 'renameList'; listId: string; name: string }
   | { kind: 'deleteList'; listId: string }
   | { kind: 'setPinned'; listId: string; pinned: boolean }
-  /** 重新排序：整表重排（按年份 + 顺序）或按给出的条目 id 顺序重排 */
+  /** 设置/清空列表的序号规则（空串 = 回到默认「年份 + 01、02…」）。非法规则会被主进程拒绝并写日志 */
+  | { kind: 'setSeqRule'; listId: string; seqRule: string }
+  /**
+   * 重新排序：
+   * - **不给 entryIds**：按「放送年份 + 当前顺序」整表重排，并按规则重编号（工具栏/右键的「重新排序」）；
+   * - **给了 entryIds**：只按这个顺序写 `order`（拖动排序），**不改 `seq`** ——
+   *   否则用户拖一下就把自己的自定义编号顺序打乱，那是另一件事（要改编号就点「重新排序」）。
+   */
   | { kind: 'resort'; listId: string; entryIds?: string[] }
   | { kind: 'addEntries'; listId: string; items: StatAddItem[] }
   | { kind: 'updateEntry'; entryId: string; patch: StatEntryPatch }
@@ -1507,13 +1580,45 @@ export type StatExportField =
   | 'progress'
   | 'remark'
 
-/** 导出选项：勾选字段 + 条目宽度 + 剧照尺寸 */
+/**
+ * 导出图用的主题色。
+ *
+ * 为什么不在主进程里写死配色：应用支持多套主题（见 styles/main.css 的 `--bg/--elev1/…`），
+ * 导出图要和「界面上的列表条目」一个观感，就必须用**当前主题**的颜色。
+ * 渲染层在导出前把 `getComputedStyle(document.documentElement)` 里的这些变量读出来传进来，
+ * 主进程只负责把它们填进导出 HTML（拿不到时用浅色主题的值兜底）。
+ */
+export interface StatExportTheme {
+  bg: string
+  elev1: string
+  elev2: string
+  border: string
+  text: string
+  dim: string
+  faint: string
+  accent: string
+  accentSoft: string
+  ok: string
+  danger: string
+  warn: string
+}
+
+/** 导出选项：勾选字段 + 条目宽度 + 剧照尺寸 + 配色 + bangumi 评分显示策略 */
 export interface StatExportOptions {
   fields: StatExportField[]
-  /** 条目宽度倍数（1 = 默认 800px 画布；内容多时渲染层自动加宽，用户也能手动再加宽） */
+  /** 条目宽度倍数（1 = 默认画布宽度；内容多时渲染层会自动加宽，用户也能手动再加宽） */
   widthScale?: number
   /** 剧照图上尺寸倍数（1 = 默认 92×56） */
   photoScale?: number
+  /**
+   * 是否显示 bangumi 评分（统计工具工具栏那个开关）。
+   *
+   * 与界面**同一套规则**：`开关打开 || 该条已有个人评分` ——
+   * 填了个人评分的条目无论开关如何都显示 bgm 评分（用户要求「填完个人评分后自动显示」）。
+   */
+  showBgmRating?: boolean
+  /** 导出图配色（缺省 = 浅色主题的一组默认值） */
+  theme?: StatExportTheme
 }
 
 // ---------------- 订阅+下载组合操作 ----------------
