@@ -7,6 +7,7 @@ import { noteCapturedStream } from './playerInfo'
 import {
   MEDIA_EXT_RE,
   extractStreamCandidates,
+  isStreamCandidate,
   notifyProbeHook,
   rememberStream,
   resolveFirstPlayable
@@ -235,12 +236,15 @@ export function openRuleWebview(
   // 1) 网络层嗅探（媒体扩展名 / media 资源类型）
   const onBeforeRequest = (details: { url: string; resourceType: string }): void => {
     if (!active) return
+    // 先排除开发服务器/打包产物的 JS 模块（`.ts` 与 MPEG-TS 撞车，见 ruleProbe.isDevServerAsset）
+    if (!isStreamCandidate(details.url)) return
     if (details.resourceType === 'media' || MEDIA_EXT_RE.test(details.url)) {
       reportFound(details.url, /\.m3u8(\?|$)/i.test(details.url) ? 'm3u8' : 'media')
     }
   }
   const onCompleted = (details: { url: string; statusCode: number }): void => {
     if (!active) return
+    if (!isStreamCandidate(details.url)) return
     if (details.statusCode < 400 && MEDIA_EXT_RE.test(details.url)) {
       reportFound(details.url, /\.m3u8(\?|$)/i.test(details.url) ? 'm3u8' : 'media')
     }
@@ -311,6 +315,7 @@ export function openRuleWebview(
             )
           }
           if (!rurl) return
+          if (!isStreamCandidate(rurl)) return
           if (/mpegurl|dash\+xml|vnd\.apple/i.test(mime) || /\.(m3u8|mpd)(\?|$)/i.test(rurl)) {
             reportFound(rurl, /mpd/i.test(rurl) ? 'dash' : 'm3u8')
             return

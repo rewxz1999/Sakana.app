@@ -160,6 +160,46 @@ function isPathAllowed(p: string): boolean {
 }
 
 /**
+ * 请求时的「自愈式」白名单复查（v0.3.5）。
+ *
+ * 解决问题：白名单是**启动时的快照**，但目录设置是**随时可改的**。
+ * 用户报的真实案例：统计工具添加剧照时日志出现
+ * `拒绝读取白名单外的路径: D:\动画应用\sakana\sakana.animation.screenshot\…png`，
+ * 剧照整块插不进去。实测该路径本身完全合法（`resolve` 后前缀比较命中），
+ * 也就是说**不是判据写错，而是那条根当时不在白名单里**：
+ * `allowedRoots` 只在 `registerDefaultRoots()` / `ensureSaveDirs()` 这两个启动时机被填充过，
+ * 一旦「设置里的目录」与「启动那一刻读到的目录」不一致（改过设置、换过数据根、外置盘晚挂载…），
+ * 该目录下所有图片都会 403，而界面上只表现为「一片空白 / 插不进去」。
+ *
+ * 这里在**每次请求**都拿当前设置里的目录再补登一次（`allowMediaRoot` 只是 Set.add，代价可忽略），
+ * 然后再判一次。命中时会记一条 info 日志，方便下次定位「到底是哪一步漏了注册」。
+ *
+ * 注意：**只覆盖应用自己管理的那些目录**，不是放宽安全边界 ——
+ * 用户随便挑的任意路径（比如桌面上的图）依旧读不到，
+ * 想让某张图可用仍然要走 `showcase.importImages()` 复制进数据目录这条路。
+ */
+function ensureAllowedBySettings(target: string): boolean {
+  if (isPathAllowed(target)) return true
+  const s = getSettings()
+  const p = dataPaths()
+  const dirs = [
+    s.downloadDir,
+    s.screenshotDir,
+    s.cacheDir,
+    p.cache,
+    p.downloads,
+    p.screenshots,
+    p.galgameShots,
+    p.root,
+    p.userData
+  ]
+  for (const d of dirs) if (d) allowMediaRoot(d)
+  if (!isPathAllowed(target)) return false
+  log.append('info', 'img', `白名单缺失已自愈：请求时补登了目录（${target.slice(0, 110)}）`)
+  return true
+}
+
+/**
  * 这个字符串是不是**本地图片文件路径**（v0.3.5）。
  *
  * 判据（两条都试过才敢这么写）：
@@ -199,7 +239,7 @@ export function registerMediaProtocols(): void {
     try {
       if (kind === 'local') {
         if (!target || !existsSync(target)) return new Response('not found', { status: 404 })
-        if (!isPathAllowed(target)) {
+        if (!ensureAllowedBySettings(target)) {
           log.append('warn', 'img', `拒绝读取白名单外的路径: ${target}`)
           return new Response('forbidden', { status: 403 })
         }
@@ -557,7 +597,7 @@ export async function imageDataUrl(rawUrl: string): Promise<ImageDataUrlResult> 
    */
   if (isLocalImagePath(raw)) {
     if (!existsSync(raw)) return fail('本地图片不存在（可能已被移动或删除）')
-    if (!isPathAllowed(raw)) {
+    if (!ensureAllowedBySettings(raw)) {
       log.append('warn', 'img', `拒绝读取白名单外的路径: ${raw}`)
       return fail('本地图片不在允许读取的目录内')
     }

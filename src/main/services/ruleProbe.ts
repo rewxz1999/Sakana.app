@@ -19,6 +19,43 @@ import { BROWSER_UA } from '../net'
 const PARTITION = 'rule-probe'
 export const MEDIA_EXT_RE = /\.(m3u8|mp4|flv|mkv|webm|ts|m4s|mov)(\?|$)/i
 
+/**
+ * 这个 URL 该不该被当成「视频流候选」（v0.3.5）。
+ *
+ * 起因是一次真实的误捕（用户报「AGE 一直卡在加载播放流，却已经能听到声音」）：
+ *   · 开发态渲染层是从 Vite 开发服务器（`http://localhost:5173/…`）加载的，
+ *     它的源码模块后缀正是 **`.ts`**；
+ *   · 而 `MEDIA_EXT_RE` 里的 `ts` 指的是 MPEG-TS 视频分片，两者撞在一起；
+ *   · 嗅探窗口一开，渲染层自己的 `src/stores/library.ts` 等模块就先被
+ *     `onBeforeRequest` 当成媒体流上报（日志：「捕获媒体流(media): http://localhost:5173/src/stores/library.ts」）；
+ *   · 渲染层只接受第一个候选（见 PlayerPage 的 onFound），于是**真流地址永远被挡在门外**，
+ *     mpv 拿到的是一个 JS 模块，界面停在加载态。
+ *
+ * 判据只针对「本机开发服务器 / 打包产物的 JS 模块」，不会误伤真实流：
+ * - 只处理 `localhost`/`127.0.0.1`/`[::1]` 上的 http(s) 请求；
+ * - 路径里出现 `/src/`、`/@vite/`、`/@fs/`、`/node_modules/`、`/assets/` 或
+ *   以 `.ts`/`.tsx`/`.js`/`.mjs`/`.css`/`.map` 结尾 → 一律不算流。
+ * 应用自己的 `127.0.0.1:<随机端口>/live/…`（FFmpeg 中转）与
+ * `127.0.0.1:<随机端口>/adfilter/…/index.m3u8`（HLS 广告过滤）都不匹配上述路径特征，仍然照常可用。
+ */
+export function isDevServerAsset(rawUrl: string): boolean {
+  const u = String(rawUrl ?? '')
+  if (!/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?\//i.test(u)) return false
+  let path = ''
+  try {
+    path = new URL(u).pathname
+  } catch {
+    return false
+  }
+  if (/\/(src|@vite|@fs|node_modules|assets)\//i.test(path)) return true
+  return /\.(ts|tsx|js|mjs|mts|cts|jsx|css|map)$/i.test(path)
+}
+
+/** 媒体流候选的统一过滤器：调用方在任何上报点都先过这一层 */
+export function isStreamCandidate(rawUrl: string): boolean {
+  return !isDevServerAsset(rawUrl)
+}
+
 /** 只解码外层混淆（解码到成为 http(s) 地址为止），保留路径内的百分号编码 */
 function decodeOuter(s: string): string {
   let out = String(s ?? '').replace(/\\\//g, '/')
@@ -529,6 +566,7 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
   const onBeforeRequest = (details: { url: string; resourceType: string }): void => {
     if (!probeActive) return
     const u = details.url
+    if (!isStreamCandidate(u)) return
     if (details.resourceType === 'media' || MEDIA_EXT_RE.test(u)) {
       if (!foundUrls.includes(u)) {
         foundUrls.push(u)
@@ -540,6 +578,7 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
   }
   const onCompleted = (details: { url: string; statusCode: number }): void => {
     if (!probeActive) return
+    if (!isStreamCandidate(details.url)) return
     if (details.statusCode < 400 && MEDIA_EXT_RE.test(details.url) && !foundUrls.includes(details.url)) {
       foundUrls.push(details.url)
       emit(mainWin, { type: 'found', url: details.url, kind: /\.m3u8(\?|$)/i.test(details.url) ? 'm3u8' : 'media' })

@@ -62,6 +62,16 @@ export function ensureSaveDirs(): SaveDirsInfo {
   const galDir = gal.dir || p.galgameShots
   if (!gal.dir) galToolsSet({ dir: galDir })
   mkdirSync(galDir, { recursive: true })
+  /*
+   * v0.3.5：galgame 截图目录也要进白名单。
+   *
+   * 它的设置存在**另一个文件**（`galgameTools.json`）里，`registerDefaultRoots()` 只读
+   * `settings` 那几个键，所以以前只建目录、没注册 —— 用户把 galgame 截图目录改到安装目录外
+   * （默认就是 `<安装目录>/galgame-screenshots`，很多人会挪到别的盘）之后，
+   * 那批截图走 `sakana-img://local` 就被 403，界面上一片空白。
+   * 与下载/截图目录保持同一处理，避免再出现「改了目录忘了改白名单」。
+   */
+  allowMediaRoot(galDir)
 
   return { baseDir, downloadDir, screenshotDir, galDir }
 }

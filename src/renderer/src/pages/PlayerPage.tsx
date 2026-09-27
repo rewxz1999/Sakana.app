@@ -345,6 +345,14 @@ export function PlayerPage() {
   const retriedCaptureRef = useRef(false)
   /** 重嗅探的兜底计时器（超时就改走中转，并随卸载清理） */
   const probeFallbackTimerRef = useRef<number | undefined>(undefined)
+  /**
+   * 「嗅探窗口该关，但要等确认开播再关」（v0.3.5）。
+   *
+   * 以前一抓到候选就立刻销毁网页视图，于是：万一这个候选是广告短片 / 失效地址，
+   * 后续真正的流请求再也没人接得住 —— 界面卡在加载态，声音却还在（网页播放器还在放）。
+   * 现在改为命中后置位，真正开播时（playing 事件或状态轮询确认）再关。
+   */
+  const pendingCloseWebviewRef = useRef(false)
 
   /** 直连播放失败时：用内置 FFmpeg 带站点会话去取流并 remux，再交给播放器 */
   const startFfmpegRelay = async (url: string, referer?: string, cookies?: string) => {
@@ -484,6 +492,8 @@ export function PlayerPage() {
     // 新一轮嗅探：重置播放/中转状态并停掉上一条中转流
     playingRef.current = false
     relayTriedRef.current = false
+    // 上一轮留下的「待关网页视图」标记作废（这一轮会重新决定）
+    pendingCloseWebviewRef.current = false
     if (relayRef.current) {
       void api.media.stopLive(relayRef.current.sessionId)
       relayRef.current = null
@@ -521,16 +531,49 @@ export function PlayerPage() {
       if (usedWebview) void api.ruleWebview.close()
       void api.ruleProbe.stop()
     }
+    /*
+     * 嗅探窗口「用完即毁」但**必须等到真的开播**（v0.3.5）。
+     *
+     * 用户报的现象：AGE 一直卡在「加载播放流」却已经能听到声音。
+     * 查日志发现真因是「第一个候选被锁死」：嗅探窗口一开，
+     * 渲染层自己的模块 `http://localhost:5173/src/stores/library.ts` 先被当成媒体流
+     * 上报（开发服务器源码后缀就是 `.ts`，与 MPEG-TS 撞车，主进程已加过滤），
+     * 而这里旧代码是「已经有一个流地址就再也不接受新的、非 m3u8 的候选」——
+     * 于是随后捕获到的**真流地址被无声丢弃**，mpv 拿到一个 JS 模块，
+     * 界面停在加载态、声音却来自仍在播放的网页播放器。
+     * 现在两处都修了：主进程过滤掉开发服务器资源；这里改成
+     * 「只要还没真正开播，后来的候选（尤其 m3u8）可以顶掉前一个」，并且
+     * **网页视图保留到确认开播**（`pendingCloseWebviewRef`），
+     * 这样万一第一个地址是个广告/短片，后续请求还能被抓到并自动接管。
+     */
+    /** 确认开播后收尾：关掉嗅探窗口并清掉待关标记（多处调用，收敛成一个函数） */
+    const closeWebviewIfIdle = (): void => {
+      if (!usedWebview) return
+      if (playingRef.current) {
+        void api.ruleWebview.close()
+        return
+      }
+      pendingCloseWebviewRef.current = true
+    }
     const offFound = api.ruleProbe.onFound((ev) => {
       if (cancelled) return
-      if (!ruleStreamRef.current || ev.kind === 'm3u8') {
+      const current = ruleStreamRef.current
+      const started = playingRef.current
+      // 已经在放这一个地址 → 忽略重复上报
+      if (current === ev.url) return
+      /*
+       * 已开播：只有 m3u8（真正的列表地址）才值得换，避免播放中被打断；
+       * 未开播：后到的候选一律可以顶掉先到的（先到的很可能是广告/失效地址）。
+       */
+      if (current && started && ev.kind !== 'm3u8') return
+      {
         ruleStreamRef.current = ev.url
         setRuleStreamUrl(ev.url)
         setRuleProbing(false)
         probingRef.current = false
         relayTriedRef.current = false
-        // 命中即移除网页视图（用完即毁），再交给 libmpv（带站点 Cookie）
-        if (usedWebview) void api.ruleWebview.close()
+        // 命中后先别销毁网页视图：等确认开播再关（见上面的说明）
+        closeWebviewIfIdle()
         void api.ruleProbe.stop()
         playingRef.current = false
         // referer 语义：undefined=未判定（回退规则站点）；''=经校验确定不带 Referer
@@ -1036,6 +1079,15 @@ export function PlayerPage() {
             setRuleProbing(false)
             probeCancelRef.current?.()
             probeCancelRef.current = null
+          }
+          /*
+           * v0.3.5：真开播了，这才把「命中时留着」的网页视图关掉。
+           * 留着它的意义见 startRuleProbe 里 pendingCloseWebviewRef 的说明 ——
+           * 万一第一个候选是广告/失效地址，后面的真流请求还能被抓到并自动接管。
+           */
+          if (pendingCloseWebviewRef.current) {
+            pendingCloseWebviewRef.current = false
+            void api.ruleWebview.close()
           }
           // 本集真正开播了：这之后的时间/结束事件才算数
           awaitingStartRef.current = false
@@ -1667,6 +1719,11 @@ export function PlayerPage() {
           setRuleProbing(false)
           probeCancelRef.current?.()
           probeCancelRef.current = null
+        }
+        // 轮询这条路也要负责关掉「命中时留着」的网页视图（同 'playing' 事件里的处理）
+        if (pendingCloseWebviewRef.current) {
+          pendingCloseWebviewRef.current = false
+          void api.ruleWebview.close()
         }
       })
     }, 800)
