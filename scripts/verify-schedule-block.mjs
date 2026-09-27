@@ -405,7 +405,17 @@ section('5. 真实缓存标签（subject3-*.json）跑真实规则')
 // ------------------------------------------------------------------
 if (process.argv.includes('--live')) {
   section('6. 真实反代标签（--live，需要网络）')
-  const API = 'https://sankana-bangumi.de5.net/api'
+  /*
+   * 反代地址**不在这里写死**：从 `src/main/services/bangumi.ts` 里读应用自己的默认值。
+   * 一是避免仓库里多一份内网/反代地址副本（本项目约定不在提交物里散落这些地址），
+   * 二是保证自检用的就是应用真正会请求的那个地址，不会两边漂移。
+   */
+  const API = (() => {
+    const src = readFileSync(join(root, 'src/main/services/bangumi.ts'), 'utf8')
+    const hit = /const\s+PROXY_API\s*=\s*'([^']+)'/.exec(src)
+    if (!hit) throw new Error('未能从 bangumi.ts 里取到默认反代地址（PROXY_API）')
+    return hit[1]
+  })()
   // 从本周番剧表里挑几条"看起来会命中"的（欧美 / 里番 / 国产），只为展示真实命中长什么样
   const probe = weekItems.filter((it) => [481295, 574041, 668113, 633354].includes(it.id))
   const ids = probe.length > 0 ? probe.map((p) => p.id) : [481295, 574041, 668113, 633354]
