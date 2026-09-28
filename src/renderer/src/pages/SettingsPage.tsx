@@ -14,6 +14,7 @@ import {
   Rocket,
   Image,
   Info,
+  Keyboard,
   ListFilter,
   MessagesSquare,
   MonitorPlay,
@@ -393,8 +394,21 @@ export function SettingsPage() {
                * 但原来这里只写「播放内核、FFmpeg、快捷键」，用户在设置总览里看不到「画质」二字，
                * 自然找不到入口。总览是唯一的入口清单，说明文字要点名关键功能。
                */
-              desc="播放内核（libmpv）、Anime4K 超分与画质（饱和度/对比度/HDR）、FFmpeg 路径与快捷键"
+              desc="播放内核（libmpv）、Anime4K 超分与画质与音频（音量增益/均衡器/压缩）、FFmpeg 路径与快捷键"
               onOpen={() => openSmall('/player-settings', 700, 620, '播放器设置')}
+            />
+            <RowDivider />
+            {/*
+              v0.3.6：补上「快捷键」总览入口（审计发现 `/shortcuts` 是**有路由但没有任何入口**的孤儿页）。
+              它的面板其实已经内嵌在播放器设置页里，但那个页面很长，用户很难意识到「快捷键可以在这里全部改」——
+              而设置总览是唯一的入口清单，清单上没有的东西等于不存在。
+              点进来是同一个面板（ShortcutsPage 只是给面板包了一层 SubPage 外壳）。
+            */}
+            <OpenRow
+              icon={Keyboard}
+              title="快捷键"
+              desc="播放器的播放/暂停、快进、音量、选集、截屏、退出等键位，可逐个自定义"
+              onOpen={() => openSmall('/shortcuts', 640, 620, '快捷键')}
             />
             <RowDivider />
             <OpenRow

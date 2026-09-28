@@ -9,10 +9,27 @@ import {
   anime4kChain,
   type Anime4kMode
 } from '@shared/anime4k'
+/*
+ * 音频设置（v0.3.6）：`EQ_PRESETS` / `EQ_BANDS` / `resolveAudioSettings` 与主进程用的是
+ * **同一份** `@shared/audio` —— 界面上显示的段数、默认值、收窄规则都与真正下发给 mpv 的一致，
+ * 不会出现「界面写着 125% 实际内核收到 100%」这类分叉。
+ */
+import {
+  EQ_BANDS,
+  EQ_BAND_COUNT,
+  EQ_CURVE_MAX_HZ,
+  EQ_CURVE_MIN_HZ,
+  EQ_GAIN_MAX,
+  EQ_GAIN_MIN,
+  EQ_PRESETS,
+  eqResponseCurve,
+  resolveAudioSettings,
+  type AudioSettings
+} from '@shared/audio'
 import { api } from '@/lib/api'
 import { useSettings } from '@/stores/app'
 import { toast } from '@/stores/app'
-import { Button, Input } from '@/components/ui'
+import { Button, Input, Switch } from '@/components/ui'
 import { AssetLink, Card, SubPage, type BuiltinAsset } from '@/components/SettingsShell'
 import { ShortcutsPanel } from './ShortcutsPage'
 
@@ -35,18 +52,31 @@ function AssetRow({ name, ok, hint }: { name: string; ok: boolean | null; hint: 
   )
 }
 
-/** 画面微调滑杆：值域 -100~100，0 = 原始画面（拨回中间即恢复） */
+/** 画面微调滑杆：默认值域 -100~100（0 = 原始画面）；音频那边用 min/max/suffix 覆盖 */
 function TuneSlider({
   label,
   hint,
   value,
-  onChange
+  onChange,
+  min = ANIME4K_TUNE_RANGE.min,
+  max = ANIME4K_TUNE_RANGE.max,
+  step = ANIME4K_TUNE_RANGE.step,
+  suffix = '',
+  zeroAt
 }: {
   label: string
   hint: string
   value: number
   onChange: (v: number) => void
+  min?: number
+  max?: number
+  step?: number
+  /** 数值后缀（例如 % / LUFS） */
+  suffix?: string
+  /** 哪个值算「中性」（显示成灰色）。默认 0；音量增益那类滑杆的中性值不是 0 */
+  zeroAt?: number
 }) {
+  const neutral = zeroAt ?? 0
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-center justify-between gap-2">
@@ -54,20 +84,131 @@ function TuneSlider({
           {label}
           <span className="ml-2 text-[10px] text-faint">{hint}</span>
         </span>
-        <span className={`w-12 text-right font-mono text-[11px] ${value === 0 ? 'text-faint' : 'text-accent'}`}>
-          {value > 0 ? `+${value}` : value}
+        <span className={`w-16 text-right font-mono text-[11px] ${value === neutral ? 'text-faint' : 'text-accent'}`}>
+          {value > neutral ? `+${value}` : value}
+          {suffix}
         </span>
       </div>
       <input
         type="range"
-        min={ANIME4K_TUNE_RANGE.min}
-        max={ANIME4K_TUNE_RANGE.max}
-        step={ANIME4K_TUNE_RANGE.step}
+        min={min}
+        max={max}
+        step={step}
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
         className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-elev2 accent-accent"
       />
     </div>
+  )
+}
+
+/** 卡片内的分隔线（与设置总览页同名同款，保持视觉一致） */
+function RowDivider() {
+  return <div className="my-1 border-t border-border" />
+}
+
+/**
+ * 「开关 + 标题 + 说明」一行的通用排布（v0.3.6）。
+ *
+ * 为什么抽出来：音频卡片里有 **7 个**这样的一行（启用增强 / 削波保护 / 均衡器 /
+ * 精细音色 / 动态压缩 / 响度归一化 / 截图剪贴板），
+ * 各写一遍不仅重复，更麻烦的是**自动化自检没法稳定找到某一个开关** ——
+ * 没有稳定锚点时只能靠"先找到文字再往上找父元素再 querySelector('button')"这种脆弱写法，
+ * 实测就踩过：点击落到了相邻的滑杆上（presets 与 eqBands 都读到 0）。
+ * 于是给每个开关一个 `data-audio-switch` 锚点：结构稳定、探针能精确定位、也不影响外观。
+ */
+function SwitchRow({
+  id,
+  title,
+  desc,
+  checked,
+  onChange,
+  children
+}: {
+  /** 稳定锚点（自检用；见上面的说明） */
+  id: string
+  title: string
+  desc: string
+  checked: boolean
+  onChange: (v: boolean) => void
+  /** 开关下方的附加内容（例如展开后的滑杆） */
+  children?: React.ReactNode
+}) {
+  return (
+    <div className="py-1.5" data-audio-row={id}>
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-xs font-semibold text-text">{title}</div>
+          <div className="mt-0.5 text-[10px] leading-snug text-faint">{desc}</div>
+        </div>
+        <span data-audio-switch={id}>
+          <Switch checked={checked} onChange={onChange} />
+        </span>
+      </div>
+      {children}
+    </div>
+  )
+}
+
+/**
+ * 音色响应曲线（v0.3.6）。
+ *
+ * 用 SVG 画而不是 canvas：这条曲线**不需要**逐帧刷新（只有用户改设置时才变），
+ * SVG 天生随容器缩放、也能直接跟着主题的 CSS 变量上色，比 canvas 省一大截代码。
+ *
+ * 纵轴固定 ±15dB：这是「看得出形状」与「不被极端值压扁」的折中 ——
+ * 单段最大 ±12dB，叠加后偶尔破 15，超出的部分**夹在边上**（不画到框外）。
+ */
+function EqCurve({ gains }: { gains: number[] }) {
+  const W = 560
+  const H = 120
+  const PAD = 6
+  const { hz, db } = eqResponseCurve(gains, 200)
+  const DB_MAX = 15
+  const x = (f: number): number => {
+    const lo = Math.log10(EQ_CURVE_MIN_HZ)
+    const hi = Math.log10(EQ_CURVE_MAX_HZ)
+    return PAD + ((Math.log10(f) - lo) / (hi - lo)) * (W - PAD * 2)
+  }
+  const y = (v: number): number => {
+    const clamped = Math.max(-DB_MAX, Math.min(DB_MAX, v))
+    return PAD + ((DB_MAX - clamped) / (DB_MAX * 2)) * (H - PAD * 2)
+  }
+  const path = hz.map((f, i) => `${i === 0 ? 'M' : 'L'}${x(f).toFixed(1)},${y(db[i]).toFixed(1)}`).join(' ')
+  const active = db.some((v) => Math.abs(v) > 0.05)
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="mt-2 h-[120px] w-full" role="img" aria-label="音色响应曲线">
+      {/* 0dB 基准线 + 每 5dB 的刻度线：没有基准线就看不出"抬了多少" */}
+      {[-10, -5, 0, 5, 10].map((g) => (
+        <line
+          key={g}
+          x1={PAD}
+          x2={W - PAD}
+          y1={y(g)}
+          y2={y(g)}
+          stroke={g === 0 ? 'var(--color-border)' : 'var(--color-elev3)'}
+          strokeWidth={g === 0 ? 1 : 0.6}
+          strokeDasharray={g === 0 ? '' : '3 4'}
+        />
+      ))}
+      {/* 每个滑杆的中心频率画一条竖线，让曲线和推子位置对得上 */}
+      {EQ_BANDS.map((f) => (
+        <line key={f} x1={x(f)} x2={x(f)} y1={PAD} y2={H - PAD} stroke="var(--color-elev3)" strokeWidth={0.5} />
+      ))}
+      {active ? (
+        <path d={path} fill="none" stroke="var(--color-accent)" strokeWidth={1.6} strokeLinejoin="round" />
+      ) : (
+        <text x={W / 2} y={H / 2} textAnchor="middle" dominantBaseline="middle" className="fill-faint text-[11px]">
+          均衡器未启用（曲线为一条 0dB 直线）
+        </text>
+      )}
+      {/* 频率刻度 */}
+      {[100, 1000, 10000].map((f) => (
+        <text key={f} x={x(f)} y={H - 1} textAnchor="middle" className="fill-faint text-[8px]">
+          {f >= 1000 ? `${f / 1000}k` : f}
+        </text>
+      ))}
+    </svg>
   )
 }
 
@@ -108,6 +249,15 @@ export function PlayerSettingsPage() {
   const a4kMode: Anime4kMode = a4k.mode ?? 'A'
   const a4kTier = a4k.tier ?? 'fast'
   const a4kChain = anime4kChain(a4kMode, a4kTier, a4k.custom)
+
+  /*
+   * 音频（v0.3.6）：界面上的值一律取自 `resolveAudioSettings`（与主进程同源），
+   * 写回时只 patch 变化的字段 —— 这样旧设置文件里没有的字段也不会被界面覆盖成 undefined。
+   */
+  const audio = resolveAudioSettings(settings.audio)
+  const patchAudio = (patch: Partial<AudioSettings>): void => {
+    save({ audio: { ...(settings.audio ?? {}), ...patch } })
+  }
   const a4kMissing = assets !== null && assets.anime4k === false
   const installedShaders = assets?.shaders ?? []
 
@@ -403,7 +553,8 @@ export function PlayerSettingsPage() {
             驱动。
             <span className="text-dim">
               {' '}
-              切换在**下次进入播放器**时生效；无论用哪一个，弹幕画布、番剧详情浮层、选集抽屉都不受影响。
+              切换在<strong className="font-medium">下次进入播放器</strong>时生效；无论用哪一个，
+              弹幕画布、番剧详情浮层、选集抽屉都不受影响。
             </span>
           </p>
           <p className="text-[11px] leading-relaxed text-faint">
@@ -411,6 +562,260 @@ export function PlayerSettingsPage() {
             鼠标移到画面下方（或任意位置移动，应用会主动唤出），控制栏就会浮现；
             <span className="text-dim">键盘兜底：</span>按 <code className="font-mono">Tab</code> 可显隐整条控制栏。
           </p>
+        </div>
+      </Card>
+
+      {/*
+        ── 音频（音质调控）（v0.3.6）──────────────────────────────────────────────
+        全部设置都存在 `settings.audio`，由 `@shared/audio` 收窄并拼成 ffmpeg 的 `af` 滤镜链，
+        主进程写设置的钩子里会重应用一次 —— 所以这里动任何一项，正在播放的声音立刻变。
+
+        ⚠️ 界面上要**如实说明哪些做了、哪些没做**（见卡片底部的说明）：
+        用户原话里点名的 firequalizer（线性相位 FIR）、sofalizer（HRTF 空间音频）经真机探针
+        验证在 libmpv 的 af 串里无法表达（原因写在 @shared/audio 文件头），
+        这里不能装作有 —— 否则用户调半天听不出差别，只会以为是坏了。
+      */}
+      <Card title="音频（音质调控）" desc="音量增益、均衡器、动态与降噪。改动立刻生效（播放中可听）">
+        {/* ① 总开关 + 音量增益 */}
+        <RowDivider />
+        <SwitchRow
+          id="enabled"
+          title="启用音质增强"
+          desc="关掉 = 完全原声（所有滤镜都不挂，音量增益仍然可用）"
+          checked={audio.enabled !== false}
+          onChange={(v) => patchAudio({ enabled: v })}
+        />
+        <RowDivider />
+        <div className="py-2">
+          {/*
+            音量增益：用户明确说「100% 也有点偏小，可能要增加 0.25 倍左右」，
+            所以默认就是 125%，上限 200%（mpv 的 volume-max 也同步抬到 200，否则会被夹回 100）。
+          */}
+          <TuneSlider
+            label="音量增益"
+            hint="默认 125%：解决「100% 也偏小」；超过 100% 会由限幅器防削波"
+            value={Math.round((audio.gain ?? 1.25) * 100) - 100}
+            min={-100}
+            max={100}
+            step={5}
+            suffix="%"
+            onChange={(v) => patchAudio({ gain: (100 + v) / 100 })}
+          />
+          <SwitchRow
+            id="clipping"
+            title="削波保护（限幅器）"
+            desc="音量超过 100% 或有正增益时自动挂 alimiter；关掉会更「冲」，但大音量素材可能破音"
+            checked={audio.clippingProtection !== false}
+            onChange={(v) => patchAudio({ clippingProtection: v })}
+          />
+        </div>
+
+        {/* ② 均衡器 */}
+        <RowDivider />
+        <SwitchRow
+          id="eq"
+          title="均衡器（10 段）"
+          desc="逐段 ±12dB，能升也能降（每段一个 equalizer 滤镜，Q≈1 倍频程）"
+          checked={audio.eqEnabled === true}
+          onChange={(v) => patchAudio({ eqEnabled: v })}
+        >
+          {audio.eqEnabled ? (
+            <div data-audio-eq="open">
+              {/* 预设 */}
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                {EQ_PRESETS.map((p) => {
+                  const on = (audio.eqPreset ?? 'flat') === p.id
+                  return (
+                    <button
+                      key={p.id}
+                      title={p.desc}
+                      onClick={() => patchAudio({ eqPreset: p.id, eqGains: [...p.gains] })}
+                      className={`rounded-lg border px-2 py-1 text-[11px] transition-colors ${
+                        on ? 'border-accent bg-accent-soft text-accent' : 'border-border text-dim hover:border-accent/50'
+                      }`}
+                    >
+                      {p.name}
+                    </button>
+                  )
+                })}
+              </div>
+              <div className="mt-1 text-[10px] text-faint">
+                {EQ_PRESETS.find((p) => p.id === (audio.eqPreset ?? 'flat'))?.desc ?? ''}
+              </div>
+
+              {/*
+                10 段推子：**分两行**（v0.3.6 按用户要求改）。
+                为什么必须分两行：10 个竖排推子挤在 700px 的小窗里时，
+                每段只剩 40px 不到，滑杆只有 6px 宽、鼠标很难精确抓到某一格；
+                而且频率标签（16k）在那个宽度下会被截断。
+                现在每行 5 段（低频 31–500 / 高频 1k–16k），横向空间翻倍，
+                数字不再被截断、拖动也稳。行的划分与 EQ_BANDS 的顺序一致，用户看曲线时不会错位。
+              */}
+              <div className="mt-3 space-y-3">
+                {[0, 1].map((row) => (
+                  <div key={row} className="flex items-end justify-between gap-2">
+                    {EQ_BANDS.slice(row * 5, row * 5 + 5).map((f, k) => {
+                      const i = row * 5 + k
+                      const g = audio.eqGains?.[i] ?? 0
+                      return (
+                        <div key={f} className="flex min-w-0 flex-1 flex-col items-center gap-1">
+                          <span
+                            className={`font-mono text-[10px] ${Math.abs(g) < 0.05 ? 'text-faint' : 'text-accent'}`}
+                          >
+                            {g > 0 ? `+${g.toFixed(0)}` : g.toFixed(0)}
+                          </span>
+                          <input
+                            type="range"
+                            min={EQ_GAIN_MIN}
+                            max={EQ_GAIN_MAX}
+                            step={1}
+                            value={g}
+                            data-eq-band={i}
+                            title={`${f >= 1000 ? `${f / 1000}kHz` : `${f}Hz`}：${g > 0 ? '+' : ''}${g}dB`}
+                            onChange={(e) => {
+                              const next = [...(audio.eqGains ?? new Array(EQ_BAND_COUNT).fill(0))]
+                              next[i] = Number(e.target.value)
+                              // 手调过之后预设就"对不上"了，清掉 id 让界面不再高亮某个预设
+                              patchAudio({ eqGains: next, eqPreset: '' })
+                            }}
+                            /* 竖排推子：writing-mode 是标准做法，Chromium 支持 */
+                            className="h-20 w-2 cursor-pointer appearance-none rounded-full bg-elev2 accent-accent"
+                            style={{ writingMode: 'vertical-lr', direction: 'rtl' }}
+                          />
+                          <span className="font-mono text-[10px] text-faint">
+                            {f >= 1000 ? `${f / 1000}k` : f}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                ))}
+              </div>
+
+              <div className="mt-2">
+                <SwitchRow
+                  id="linear-phase"
+                  title="精细音色（线性相位）"
+                  desc="额外挂一条 firequalizer zero_phase。它只有整体增益、没有分段；听不出差别就别开"
+                  checked={audio.eqLinearPhase === true}
+                  onChange={(v) => patchAudio({ eqLinearPhase: v })}
+                />
+              </div>
+            </div>
+          ) : null}
+        </SwitchRow>
+
+        {/* ③ 立体声与耳机 */}
+        <RowDivider />
+        <div className="py-2">
+          <TuneSlider
+            label="立体声宽度"
+            hint="100% = 原样；调大左右分离更明显（多声道源更明显）"
+            value={Math.round((audio.stereoWidth ?? 1) * 100) - 100}
+            min={-100}
+            max={200}
+            step={5}
+            suffix="%"
+            onChange={(v) => patchAudio({ stereoWidth: (100 + v) / 100 })}
+          />
+          <div className="mt-3">
+            <TuneSlider
+              label="耳机串音（crossfeed）"
+              hint="100% = 关闭；调小左右互串更多，耳机久听不累、声场更靠前"
+              value={Math.round((audio.crossfeed ?? 1) * 100)}
+              min={20}
+              max={100}
+              step={5}
+              suffix="%"
+              onChange={(v) => patchAudio({ crossfeed: v / 100 })}
+            />
+          </div>
+        </div>
+
+        {/* ④ 动态与响度 */}
+        <RowDivider />
+        <div className="py-2">
+          <SwitchRow
+            id="compressor"
+            title="动态压缩"
+            desc="把大声音压小、小声音抬起来：深夜小音量看番时对白更清楚（-18dB / 2:1）"
+            checked={audio.compressorEnabled === true}
+            onChange={(v) => patchAudio({ compressorEnabled: v })}
+          />
+          <SwitchRow
+            id="loudnorm"
+            title="响度归一化"
+            desc={`不同片源音量忽大忽小？统一到 ${audio.loudnormTarget ?? -16} LUFS（EBU R128）`}
+            checked={audio.loudnormEnabled === true}
+            onChange={(v) => patchAudio({ loudnormEnabled: v })}
+          >
+            {audio.loudnormEnabled ? (
+              <div className="mt-3">
+                <TuneSlider
+                  label="目标响度"
+                  hint="数值越大越响；-16 比广播标准（-23）更响一点，-14 更冲"
+                  value={audio.loudnormTarget ?? -16}
+                  min={-26}
+                  max={-10}
+                  step={1}
+                  suffix=" LUFS"
+                  onChange={(v) => patchAudio({ loudnormTarget: v })}
+                />
+              </div>
+            ) : null}
+          </SwitchRow>
+        </div>
+
+        {/* ⑤ 音色响应曲线 + 截图剪贴板 */}
+        <RowDivider />
+        <div className="py-2">
+          {/*
+            音色响应曲线：**由用户自己的 EQ 增益算出来的合成频响**（见 @shared/audio 的
+            `eqResponseCurve`），不是跟着滑杆动的装饰动画 —— 上面每个推子动一下，这条曲线
+            就跟着变形，能直接看出「我这一拨到底抬了哪一段、抬了多少」。
+            这也是本版对「可视化」的交付方式：真正能反映声音的东西，而不是假动画（见下方说明）。
+          */}
+          <div className="text-xs font-semibold text-text">音色响应曲线</div>
+          <div className="mt-0.5 text-[10px] leading-snug text-faint">
+            当前均衡器设置会把各频段抬高/压低多少（对数刻度 20Hz–20kHz，竖直范围 ±15dB）
+          </div>
+          <EqCurve gains={audio.eqEnabled ? (audio.eqGains ?? []) : []} />
+        </div>
+
+        <RowDivider />
+        <SwitchRow
+          id="clipboard"
+          title="截图后自动复制到剪贴板"
+          desc="在聊天/文档里直接 Ctrl+V 就能粘贴；同时会进入 Win+V 剪贴板历史。注意这会顶掉剪贴板里原有的内容（截图本身照常存盘）"
+          checked={settings.screenshotClipboard !== false}
+          onChange={(v) => save({ screenshotClipboard: v })}
+        />
+
+        {/* 说明：如实交代哪些没做 */}
+        <RowDivider />
+        {/*
+          ⚠️ 这里的文案**不能写 Markdown**：JSX 里的 `**...**` 会被当成普通星号原样显示给用户
+          （审计在几个页面都发现了这个毛病）。要强调就用 <span className="text-dim"> 之类的样式。
+        */}
+        <div className="space-y-1.5 pt-2 text-[10px] leading-relaxed text-faint">
+          <div className="text-dim">关于两条点名、但本版没有做的功能（均为真机实测结论）：</div>
+          <div>
+            · <span className="text-dim">firequalizer 的多段线性相位 EQ</span>：它用分号分隔各频段，
+            而分号在 mpv 的 af 串里是「另一条链」的分隔符，转义成反斜杠加分号也过不去（试过 6 种写法）。
+            所以均衡器改用<strong className="font-medium text-dim">能升能降的 10 段 equalizer 逐段串联</strong>，
+            另提供上面那个「精细音色」开关来拿线性相位的味道。
+          </div>
+          <div>
+            · <span className="text-dim">sofalizer（HRTF 虚拟环绕）</span>：需要外部 .sofa HRTF 数据文件，
+            应用没有随包分发这类文件（体积大且有授权问题），所以空间音频用 crossfeed 近似。
+          </div>
+          <div>
+            · <span className="text-dim">播放器上的实时频谱/电平可视化</span>：libmpv 不把音频采样交给宿主，
+            它的 astats 滤镜 metadata（<code className="font-mono">af-metadata</code>）实测读出来是 null，
+            拿不到任何真实音频数据。与其画一个跟声音无关的假动画，不如画上面那条
+            <strong className="font-medium text-dim">由你自己的 EQ 设置算出来的音色响应曲线</strong> ——
+            调均衡器时真正想看的其实是它。
+          </div>
         </div>
       </Card>
 

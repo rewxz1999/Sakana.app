@@ -430,11 +430,23 @@ export interface SakanaApi {
       }) => void
     ): () => void
     /** 截图（v0.2.9：目录/文件名规则统一由主进程处理，见 snapshotPath） */
-    screenshot(title?: string, episode?: number): Promise<ApiResult<string>>
-    /** 探测随包内置的播放/下载组件（libmpv / FFmpeg / aria2） */
+    screenshot(title?: string, episode?: number): Promise<ApiResult<string>>    /** 探测随包内置的播放/下载组件（libmpv / FFmpeg / aria2） */
     assets(): Promise<ApiResult<PlayerAssets>>
     /** 当前流的详细信息（分辨率/编码/码率等），供播放状态栏展示 */
     streamInfo(): Promise<ApiResult<StreamInfo>>
+  }
+  /**
+   * 系统剪贴板（v0.3.6「快速粘贴」）。
+   *
+   * 番剧/galgame 截图存盘后会按设置自动写进剪贴板（设置 → 播放器设置 → 截图片区可关），
+   * 这里额外提供手动入口：内容区取图后想在别处粘贴时不用回播放器重新截一次。
+   * 同时写**图片 + 文件名文本**：只写图片时粘到纯文本目标会没反应，只写文本又贴不了图。
+   */
+  clipboard: {
+    /** 把一张图片文件写进系统剪贴板（返回写进去的文件名文本） */
+    copyImage(file: string): Promise<ApiResult<{ ok: boolean; text: string; file: string; error?: string }>>
+    /** 剪贴板里当前是否有图片（界面据此提示「已复制 / 可粘贴」） */
+    hasImage(): Promise<ApiResult<boolean>>
   }
   /** 全屏控制栏悬浮窗：主窗口播放页 ↔ 悬浮窗渲染层 */
   overlay: {
@@ -447,6 +459,13 @@ export interface SakanaApi {
     show(): Promise<ApiResult<{ ok: boolean; gen: number }>>
     hide(gen?: number): Promise<ApiResult<boolean>>
     setInteractive(interactive: boolean): Promise<ApiResult<boolean>>
+    /**
+     * v0.3.6：上报「这里点了一下，但按钮没接住」（坐标）。
+     * 主进程据此判定是否属于「点击击穿」，连续命中会给回一条 `onClickThrough` 提示。
+     */
+    reportMissedClick(x: number, y: number): void
+    /** v0.3.6：订阅「疑似点击击穿」的提示（悬浮窗用来弹自救浮层） */
+    onClickThrough(cb: (payload: { count: number; at: number }) => void): () => void
     pushState(state: OverlayState): void
     /** v0.2.6：推送选集数据（低频），供悬浮窗绘制半透明选集浮层 */
     setEpisodes(payload: OverlayEpisodes): void

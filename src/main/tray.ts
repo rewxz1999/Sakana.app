@@ -39,8 +39,7 @@ function showMain(): void {
 export async function askCloseBehavior(win: BrowserWindow): Promise<void> {
   const saved = (getSettings() as unknown as { closeBehaviorRemembered?: string }).closeBehaviorRemembered
   if (saved === 'tray') {
-    win.hide()
-    log.append('info', 'app', '最小化至托盘（已记住选择）')
+    hideToTray(win)
     return
   }
   if (saved === 'quit') {
@@ -63,13 +62,37 @@ export async function askCloseBehavior(win: BrowserWindow): Promise<void> {
   const remember = res.checkboxChecked === true
   if (res.response === 0) {
     if (remember) saveCloseBehavior('tray')
-    win.hide()
-    log.append('info', 'app', `最小化至托盘${remember ? '（已记住选择）' : ''}`)
+    hideToTray(win, remember)
   } else if (res.response === 1) {
     if (remember) saveCloseBehavior('quit')
     markQuitting()
     app.quit()
   }
+}
+
+/**
+ * 最小化到托盘（v0.3.6 抽出，并顺手**停掉播放内核**）。
+ *
+ * 审计 R3：托盘路径以前只 `win.hide()` —— 窗口没销毁、React 没卸载，
+ * 于是**视频还在放（用户能听到声音）**，mpv 的三个轮询定时器（400/250/200ms）也继续跑。
+ * 用户的心智是「我关了窗口，它应该停下来」，而不是「它变成一个我看不见的播放器」。
+ *
+ * 这里用**动态 import** 调 `mpvDestroy()`：tray.ts 被 window.ts 依赖，直接静态 import
+ * `services/mpv` 会把 libmpv 原生模块拉进启动路径（它只在真正播放时才需要加载）。
+ * 销毁是异步发生的（原生 `destroy()` 内部有延迟），`hide()` 不等它，所以不会被拖慢。
+ *
+ * 不销毁**下载器**：托盘模式承诺的就是「下载任务不中断」（见上面对话框文案）。
+ */
+function hideToTray(win: BrowserWindow, remembered = false): void {
+  win.hide()
+  void import('./services/mpv')
+    .then((m) => {
+      if (m.mpvAvailable()) m.mpvDestroy()
+    })
+    .catch(() => {
+      /* 原生模块没加载过（没播过）时什么都不用做 */
+    })
+  log.append('info', 'app', `最小化至托盘${remembered ? '（已记住选择）' : ''}，播放内核已停止`)
 }
 
 /** 记住关闭行为（写进设置；下次关闭不再询问） */
@@ -217,6 +240,20 @@ export function createTray(): void {
 }
 
 export function destroyTray(): void {
+  /*
+   * v0.3.6（审计 R4）：**先清掉两个延迟计时器再销毁**。
+   *
+   * `showTimer` 的 250ms 回调是 `showPanel()` → `ensurePanel()` → **new BrowserWindow**。
+   * 用户「鼠标划过托盘」之后立刻退出应用时（或 before-quit 已经跑过之后才划过），
+   * 这个回调会在退出过程中**重新建一个窗口**，让退出流程变得不可预期。
+   * `hideTimer` 的回调有 `panelWin && !panelWin.isDestroyed()` 守卫，危害小一些，
+   * 但一并清掉更省心 —— 反正托盘都要没了。
+   */
+  cancelHide()
+  if (showTimer) {
+    clearTimeout(showTimer)
+    showTimer = null
+  }
   try {
     tray?.destroy()
   } catch {

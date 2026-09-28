@@ -1281,6 +1281,25 @@ export function PlayerPage() {
         void api.ruleWebview.close()
         void api.ruleProbe.stop()
         void api.player.detach()
+        /*
+         * v0.3.6 修（审计查出的高危遗留）：**FFmpeg 中转会话必须在这里停掉**。
+         *
+         * 以前只有 `exitPlayer()`（用户主动点退出/按 Esc）里才 `stopLive(relayRef…)`，
+         * 而「切集」是**重新挂载播放页**（App.tsx 用 playKey 做 key），走的是这条卸载清理 ——
+         * 于是：上一集如果已经切到了 FFmpeg 中转，新一集直接直连播放时，
+         * **上一集的 ffmpeg.exe 会一直在后台拉流**，占带宽、占进程，
+         * 一直到下一次 `startLiveUrl`（它会先杀旧会话）或应用退出才死。
+         * 讽刺的是同文件 839 行的注释恰好写着「旧流继续拉流会和新一轮嗅探抢带宽」——
+         * 说的是嗅探窗口，真正拉流的那个进程反倒没人管。
+         *
+         * 放在 `whenPlayerGone` 里（而不是直接放在清理函数里）：切集时新旧实例会在同一次提交里
+         * 交替，新实例可能**已经**建好了自己的中转会话；只有在确认没有别的播放实例存活时才停，
+         * 才不会把新实例刚建好的那个会话杀掉。
+         */
+        if (relayRef.current) {
+          void api.media.stopLive(relayRef.current.sessionId)
+          relayRef.current = null
+        }
         // 带上 show 时拿到的代号：迟到的 hide 不会关掉新实例刚建好的控制栏（v0.2.8 附加）
         void api.overlay.hide(overlayGenRef.current ?? undefined)
         // 世代号判定：只要新实例已经进入过播放页，上面这些清理就不会执行
@@ -1322,14 +1341,16 @@ export function PlayerPage() {
     return api.window.onFullscreenChange(setFullscreen)
   }, [])
 
-  // 离开播放页时确保退出全屏（避免下次点击播放直接被全屏）
-  useEffect(() => {
-    return () => {
-      void api.window.isFullscreen().then((full) => {
-        if (full) void api.window.setFullscreen(false)
-      })
-    }
-  }, [])
+  /*
+   * ⚠️ v0.3.6 删掉了这里原有的「离开播放页时确保退出全屏」。
+   *
+   * 它原来是为了「避免下次点击播放直接被全屏」—— 但那条理由在用户要求
+   * 「主窗口全屏时进播放器也自然是全屏」之后就不成立了：窗口全屏是**主窗口**的状态，
+   * 播放器只是借它显示；离开播放器就把用户的全屏踢掉，等于"我从全屏主页点进播放器再退回来，
+   * 全屏没了"。这恰恰是用户这次报的 bug 之一（退出播放器后回不到原来那个全屏主窗口）。
+   * 现在全屏完全跟随主窗口：进播放器时读它、退出时不动它。
+   * 用户想退出全屏，用播放器里的全屏按钮或 Esc（Esc 在全屏时会先退全屏）即可。
+   */
 
   const videoSrc = src
 
@@ -1519,7 +1540,7 @@ export function PlayerPage() {
           break
         }
         case 'volumeUp': {
-          const nv = Math.min(100, playerVolume + 10)
+          const nv = Math.min(200, playerVolume + 10)
           setPlayerVolume(nv)
           void api.player.setVolume(nv)
           break
@@ -1881,8 +1902,23 @@ export function PlayerPage() {
     }
   }
 
+  /**
+   * 全屏切换（v0.3.6 修）。
+   *
+   * 老实现只有一句 `void api.window.setFullscreen(!fullscreen)`，完全依赖主进程回发
+   * `onFullscreenChange` 事件来更新这里的 `fullscreen` 状态。但 `setFullScreen()` 是
+   * **异步**生效的，且窗口已经处于目标状态（或窗口未显示）时 Electron **不发**那对事件 ——
+   * 于是状态永远停在旧值：按钮图标不变、退出时不会调 setFullscreen(false)、
+   * 界面卡在「以为全屏」的布局里（用户报的「退出时播放器卡白、退不出去」）。
+   *
+   * 现在主进程的 `setFullscreen` 直接返回**切换后的实际状态**，这里立刻用上，
+   * 不再把状态同步押在事件上（事件仍然保留，用于用户用系统方式全屏/退出全屏的情形）。
+   */
   const toggleFullscreen = () => {
-    void api.window.setFullscreen(!fullscreen)
+    const target = !fullscreen
+    void api.window.setFullscreen(target).then((now) => {
+      if (typeof now === 'boolean') setFullscreen(now)
+    })
   }
 
   // ---------------- 弹幕（v0.2.8） ----------------
@@ -2189,6 +2225,30 @@ export function PlayerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engineState])
 
+  /**
+   * 退出播放器（v0.3.6 重排了这里的清理顺序）。
+   *
+   * ## 用户报的现象
+   * 「全屏主窗口进入播放器时，退出播放会卡在播放内容空白、控制栏不消失，没有返回主窗口」。
+   *
+   * ## 三个真因（都在"顺序"上，不在"有没有清理"上）
+   *
+   * ① **控制栏悬浮窗要等到 `whenPlayerGone`（600ms 后）才隐藏**。
+   *    那 600ms 里主窗口已经切回主页了，而覆盖整窗的透明控制栏还浮在上面 ——
+   *    用户看到的就是「控制栏不消失、也回不到主窗口」（其实主页已经在下面了，只是被盖着）。
+   *    现在**退出时立刻 hide**，不等 600ms。
+   *
+   * ② **退出全屏被延后 150ms**，而 `navigate` 是同步的。于是窗口先画主页、
+   *    再退出全屏，中间那一帧是「全屏尺寸的主页」→ 原生视频子窗口也是全屏大小，
+   *    看起来就是一块空白。现在**先退出全屏、再导航**（同步做完，不留这一帧）。
+   *
+   * ③ **视频子窗口在窗口缩小后没有立刻跟着缩**：`notifyLayout` 只由页面里的
+   *    resize 监听触发，而页面马上就要卸载了。现在退出时显式把画面区域通知成
+   *    **整个窗口**（退出全屏后就是窗口大小），让内核先缩到正确尺寸再销毁。
+   *
+   * 另外：只有**全屏时**才退出全屏。用户明确要求「全屏主窗口进播放器也自然是全屏」，
+   * 所以从全屏主窗口进来时退出播放器本就该回到全屏主页 —— 那个场景下不该动窗口状态。
+   */
   const exitPlayer = () => {
     probingRef.current = false
     playingRef.current = false
@@ -2197,19 +2257,37 @@ export function PlayerPage() {
     relayRef.current = null
     // 退出前落一次进度，「继续观看」才能接着上次的位置
     reportPosition(true)
-    // ① 先离开播放页：渲染层不再等待主进程清理（避免退出卡死）
+
+    // ① 控制栏悬浮窗立刻收掉（不等 whenPlayerGone 的 600ms，那段时间它会盖住主页）
+    void api.overlay.hide(overlayGenRef.current ?? undefined)
+    // ② 全屏时先退出全屏再导航：避免"主页已经画出来、窗口还是全屏"的那一帧空白
+    if (fullscreen) void api.window.setFullscreen(false)
+    // ③ 让内核把画面区域先缩回窗口大小（退出全屏后 window.innerWidth/Height 已经是窗口尺寸）
+    if (needDetach) {
+      void api.player.notifyLayout({
+        x: 0,
+        y: 0,
+        width: window.innerWidth,
+        height: window.innerHeight
+      })
+    }
+
+    // ④ 再离开播放页：渲染层不再等待主进程清理（避免退出卡死）
     //    有番剧 id 时回到该番剧详情页（也就是播放源列表所在的页面），否则退回上一页
     if (state.subjectId != null) {
       navigate(`/subject/${state.subjectId}`, { state: { openSources: true }, replace: true })
     } else {
       navigate(-1)
     }
-    // ② 主进程清理全部延后执行：销毁网页视图 / detach 内核都可能阻塞
+    /*
+     * ⑤ 主进程的其余清理延后执行：销毁网页视图 / detach 内核都可能阻塞。
+     * 注意这里**不再重复退出全屏**（已在上面同步做过），也不再重复 hide 控制栏 ——
+     * 都在上面做完了，重复发一遍只会给主进程增加无意义的时序竞争。
+     */
     window.setTimeout(() => {
       if (relayId) void api.media.stopLive(relayId)
       void api.ruleWebview.close()
       void api.ruleProbe.stop()
-      if (fullscreen) void api.window.setFullscreen(false)
       if (needDetach) void api.player.detach()
     }, 150)
   }
@@ -2272,7 +2350,7 @@ export function PlayerPage() {
           break
         case 'volumeUp':
           if (useEngine) {
-            const nv = Math.min(100, playerVolume + 10)
+            const nv = Math.min(200, playerVolume + 10)
             setPlayerVolume(nv)
             void api.player.setVolume(nv)
             if (playerMuted) {

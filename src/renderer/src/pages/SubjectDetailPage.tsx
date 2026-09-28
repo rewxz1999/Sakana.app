@@ -24,6 +24,8 @@ import type {
   RuleSearchEntry,
   SubjectDetail
 } from '@shared/types'
+// 值导入（不是 type）：推荐规则名单是运行时要用的常量，见来源选择弹窗里的用法
+import { RECOMMENDED_RULES } from '@shared/types'
 import { api } from '@/lib/api'
 import { useLibrary } from '@/stores/library'
 import { useSubs } from '@/stores/subs'
@@ -158,6 +160,33 @@ export function SubjectDetailPage() {
     // 无历史记录（如直接以 hash 打开详情页）时 navigate(-1) 无效果，兜底回首页
     navigate('/')
   }
+
+  /**
+   * Esc 退出详情页（v0.3.6，用户要求「退出响应对 esc 按钮」）。
+   *
+   * ⚠️ 三个「不该抢」的情况都按顺序让开，否则会出现「按 Esc 关掉弹窗的同时把详情页也退了」：
+   *   ① 有弹窗打开（来源选择 / 蜜柑订阅 / 确认框）→ 交给弹窗自己处理，这里不动作；
+   *   ② 有输入框 / 文本域正在聚焦（用户在写东西）→ 不动作；
+   *   ③ 有 IME 组字中（`isComposing`，中文输入法打拼音时按 Esc 是取消候选）→ 不动作。
+   *
+   * 另外：用 **capture 阶段**监听并在动作后 `stopPropagation`，
+   * 这样同一层里如果有别的 Esc 处理（比如未来的抽屉/浮层），不会被重复触发两次返回。
+   * 依赖里带上所有弹窗状态，保证闭包里读到的是最新值（挂载时捕获一次会失效）。
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key !== 'Escape' || e.isComposing) return
+      if (ruleOpen || mikanOpen) return
+      const el = document.activeElement as HTMLElement | null
+      const tag = el?.tagName?.toLowerCase()
+      if (tag === 'input' || tag === 'textarea' || el?.isContentEditable) return
+      e.stopPropagation()
+      goBack()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ruleOpen, mikanOpen, fromSearch])
 
   /** 本地播放传给播放页的标题 */
   const playerTitle = detail?.name_cn || detail?.name || '本地播放'
@@ -320,18 +349,27 @@ export function SubjectDetailPage() {
       ) : null}
 
       <div className="relative mx-auto max-w-5xl px-8 py-6">
+        {/*
+          返回按钮（v0.3.6 调整）。
+          用户要求：「番剧详情页的退出按钮增大一点（不需要太大），且退出响应对 esc 按钮」。
+          · 尺寸：图标 14→16、内边距 px-3 py-1.5、字号 text-xs 保持不变 ——
+            只放大可点区域与图标，不改变整体观感（用户特别说了「不需要太大」）。
+          · 非全屏下也补上边框与浅底：以前非全屏是一个纯文字按钮，点击热区只有文字那么大，
+            鼠标要精准怼上去；现在它是一个明确的按钮，热区至少 28px 高。
+          · 键盘：Esc 绑定见下面的 useEffect（只在没有打开弹窗时生效，见注释）。
+        */}
         <button
           onClick={goBack}
-          title={fromSearch ? '返回搜索结果' : '返回上一页'}
+          title={fromSearch ? '返回搜索结果（Esc）' : '返回上一页（Esc）'}
           className={`whitespace-nowrap ${
             fullscreen
               ? // 全屏时窗口边框消失、左侧留白变窄，按钮显得贴边：向右让出 4rem（ml-16），
                 // 既不与标题栏/侧边栏等控件重叠，也加浅色底以适配全屏下的毛玻璃背景
-                'mb-4 ml-16 flex items-center gap-1.5 rounded-lg border border-border bg-elev1/80 px-3 py-1.5 text-xs text-dim backdrop-blur transition-colors hover:border-accent hover:text-text'
-              : 'mb-4 flex items-center gap-1.5 text-xs text-dim transition-colors hover:text-text'
+                'mb-4 ml-16 flex items-center gap-2 rounded-lg border border-border bg-elev1/80 px-3.5 py-2 text-xs text-dim backdrop-blur transition-colors hover:border-accent hover:text-text'
+              : 'mb-4 flex items-center gap-2 rounded-lg border border-border bg-elev1/60 px-3.5 py-2 text-xs text-dim transition-colors hover:border-accent hover:text-text'
           }`}
         >
-          <ArrowLeft size={14} /> {fromSearch ? '返回搜索' : '返回'}
+          <ArrowLeft size={16} /> {fromSearch ? '返回搜索' : '返回'}
         </button>
 
         {loading ? (
@@ -541,7 +579,16 @@ function RuleSelectModal({
       ) : (
         <div className="flex flex-col gap-2">
           {rules.map((rule, i) => {
-            const recommended = /^(aafun|akianime|mxdm)$/i.test(rule.name) || i < 3
+            /*
+             * 推荐标记（v0.3.6）：名单收敛到 `@shared/types` 的 `RECOMMENDED_RULES`
+             * （产品指定 aafun / sorani）。
+             * 老实现是 `/^(aafun|akianime|mxdm)$/i.test(...) || i < 3` ——
+             * 那个 `|| i < 3` 会让**前三条一律标推荐**（哪怕它是搜不到的站），
+             * 等于推荐位被"列表顺序"而不是"可用性"决定，用户按推荐点进去常常搜不到番。
+             * 现在只认名单，名单里没有就老老实实不标。
+             */
+            const recommended = RECOMMENDED_RULES.includes(rule.name.toLowerCase())
+            void i
             return (
               <button
                 key={rule.id}

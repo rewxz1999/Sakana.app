@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
-import { CalendarDays, CloudOff, RefreshCw, ShieldOff } from 'lucide-react'
+import { Ban, CalendarDays, CloudOff, RefreshCw, ShieldOff, Tags, Trash2 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import type { CalendarItem, ScheduleDisplayFilters } from '@shared/types'
 import { seasonLabel, seasonOfDate } from '@shared/season'
-import { blockReason, isBlockingActive, shouldLoadTags } from '@shared/scheduleBlock'
+import { blockReason, isBlockingActive, normalizeTag, shouldLoadTags, tagMatches } from '@shared/scheduleBlock'
 import { useSchedule, useScheduleBlock, useScheduleTags } from '@/stores/schedule'
 import { useLibrary } from '@/stores/library'
 import { useSettings } from '@/stores/app'
@@ -12,6 +12,7 @@ import { fmtDateTime, mondayOf, weekdayDate, WEEKDAY_CN } from '@/lib/format'
 import { DEFAULT_SCHEDULE_FILTERS, passesDisplayFilters, resolveScheduleFilters, watchStateOf } from '@/lib/timelineFilter'
 import { AnimeCard } from '@/components/AnimeCard'
 import { Button, EmptyState, Modal, Switch } from '@/components/ui'
+import { ContextMenu, type ContextMenuItem } from '@/components/stat/ContextMenu'
 import { api } from '@/lib/api'
 import { toast } from '@/stores/app'
 
@@ -25,6 +26,67 @@ const FILTER_CHIPS: { key: keyof ScheduleDisplayFilters; label: string; title: s
   },
   { key: 'onlyWatching', label: '只看在看的番剧', title: '只显示已收藏且尚未看完的番剧' }
 ]
+
+/** 右键菜单里最多列几个候选标签：再长就不叫「快速选择」了，菜单也会顶到屏幕边缘被翻转 */
+const MENU_TAG_LIMIT = 5
+
+/** 候选标签：`label` 是详情里的原标签名（给人看），`keyword` 是写进 customTags 的归一化关键词 */
+interface MenuTagCandidate {
+  label: string
+  keyword: string
+}
+
+/**
+ * 从一条番剧的**详情标签**里挑出值得摆进右键菜单的屏蔽候选。
+ *
+ * 为什么不能把标签原样列一串：Bangumi 的详情标签里混着一大批**没有区分度**的元标签
+ * （动画 / TV / 日本 / 连载 / 2024 …），随手点一个等于把整个番剧表清空 —— 那不是屏蔽，是自毁。
+ * 所以这里拿「本周**其它**已经取到标签的条目」当样本，估算「点这个关键词会连带藏掉几部」：
+ * 会命中一半以上其它条目的标签不列（它区分不了任何东西）；顺序也按这个估算升序 ——
+ * 越「专有」的标签，越可能正是用户想屏蔽的那一类。
+ *
+ * 为什么样本就用本周的标签：番剧表页本来就在补这一周的标签（见 useScheduleTags 的缓存），
+ * 这是现成的数据，为了排个菜单不需要再发任何请求。
+ *
+ * 两个兜底（都是为了「屏蔽」这一项不会凭空消失、也不会一点就清空番剧表）：
+ * 1. 一个样本都没有（用户平时屏蔽开关全关，本周标签一个都没缓存）：统计无从下手，
+ *    退回**标签顺序的倒序** —— Bangumi 详情标签按热度降序（见 shared/scheduleBlock 的注释），
+ *    倒序取就是从最冷门的那头开始挑，至少不会一上来就把「动画 / TV / 日本」摆给用户点；
+ * 2. 有样本但所有标签都太通用（全被筛掉）：退回按命中数升序的前几个，真点错了也能在番剧表设置里删掉关键词。
+ */
+function pickMenuTagCandidates(
+  tags: readonly string[],
+  subjectId: number,
+  tagById: Record<number, string[]>,
+  idsInWeek: readonly number[]
+): MenuTagCandidate[] {
+  const pool: MenuTagCandidate[] = []
+  for (const raw of tags) {
+    const label = String(raw ?? '').trim()
+    const keyword = normalizeTag(label)
+    if (!keyword) continue
+    /*
+     * 互相包含的标签只留先出现的那个：tagMatches 是「包含」判定，
+     * 同时列出「后宫」与「逆后宫」，点后者会把前者一起屏蔽，等于给了两个重复入口。
+     */
+    if (pool.some((p) => p.keyword.includes(keyword) || keyword.includes(p.keyword))) continue
+    pool.push({ label, keyword })
+  }
+  if (pool.length === 0) return []
+
+  const others = idsInWeek.filter((id) => id !== subjectId && (tagById[id]?.length ?? 0) > 0)
+  if (others.length === 0) return [...pool].reverse().slice(0, MENU_TAG_LIMIT)
+
+  /** 「其它条目」里有多少条含这个关键词 —— 判定复用 blockReason 用的 tagMatches，绝不另写一套匹配规则 */
+  const hitCount = (keyword: string): number =>
+    others.filter((id) => tagById[id].some((t) => tagMatches(t, keyword))).length
+
+  const ranked = pool
+    .map((candidate) => ({ candidate, hits: hitCount(candidate.keyword) }))
+    .sort((a, b) => a.hits - b.hits) // sort 稳定：命中数相同就保持详情里的标签顺序
+  const discriminative = ranked.filter((p) => p.hits * 2 <= others.length)
+  return (discriminative.length > 0 ? discriminative : ranked).slice(0, MENU_TAG_LIMIT).map((p) => p.candidate)
+}
 
 function SkeletonCard() {
   return (
@@ -51,6 +113,9 @@ export function SchedulePage() {
   // ---------- 番剧表设置（分级标签屏蔽 + 黑名单） ----------
   const blockCfg = useScheduleBlock((s) => s.cfg)
   const loadBlock = useScheduleBlock((s) => s.load)
+  // 右键菜单的两条写入路径：黑名单走 store 里现成的 toggleBlacklist，标签走 save 的自定义标签
+  const toggleBlacklist = useScheduleBlock((s) => s.toggleBlacklist)
+  const saveBlock = useScheduleBlock((s) => s.save)
   const tagMap = useScheduleTags((s) => s.tags)
   const tagFailed = useScheduleTags((s) => s.failed)
   const tagFetching = useScheduleTags((s) => s.fetching)
@@ -200,6 +265,103 @@ export function SchedulePage() {
     return `${mon.format('MM月DD日')} ~ ${mon.add(6, 'day').format('MM月DD日')}`
   }, [weekOffset])
 
+  // ---------- 番剧卡片右键菜单（快速加入黑名单 / 按标签屏蔽） ----------
+  /*
+   * 菜单状态里**只存「画在哪、弹给谁」**，菜单项每次渲染现算（见下面的 menuItems）。
+   *
+   * 为什么不把 items 一起存进 state：按标签屏蔽这条路依赖番剧详情的标签，
+   * 右键的那一瞬间标签可能还没缓存到 —— 现算的菜单项能在标签到位后自动补出「按标签屏蔽：XXX」，
+   * 用户不必关掉菜单再右键一次。存快照的话菜单就永远停在右键那一刻的旧数据上了。
+   */
+  const [menu, setMenu] = useState<{ x: number; y: number; id: number } | null>(null)
+
+  /**
+   * 右键番剧卡片：拦掉默认菜单，记下坐标与目标条目。
+   *
+   * 这里**只加 contextmenu**，不动任何左键路径（点击进详情、卡片上的收藏按钮都由 AnimeCard 自己处理，
+   * 见下面的卡片渲染）—— 右键菜单是纯新增，左键行为一点都不改。
+   */
+  const openCardMenu = (e: React.MouseEvent, item: CalendarItem): void => {
+    e.preventDefault()
+    setMenu({ x: e.clientX, y: e.clientY, id: item.id })
+    /*
+     * 顺手补一次这条番剧的详情标签。
+     * 平时（屏蔽开关全关时）本页一个标签请求都不发，这里之所以敢发：右键是**用户明确的意图**
+     * ——他就是为了屏蔽这部番剧而来；而且 ensureTags 是幂等的（已缓存 / 已失败 / 在途的 id 都会跳过），
+     * 请求还会命中主进程的详情缓存，所以反复右键不会反复联网。
+     */
+    ensureTags([item.id])
+  }
+
+  /**
+   * 菜单项。两条路各管一件事，语义上划得很清楚：
+   * - **加入黑名单**：只藏这一部（按 id 记录，优先级最高），点了立刻从番剧表消失；
+   * - **按标签屏蔽**：把选中的标签写进四级「自定义标签屏蔽」，**同类的番剧一起藏**
+   *   （番剧表接口不返回标签，所以标签只能来自番剧详情；取不到标签时这一组项会如实说明，不假装能用）。
+   */
+  const menuItems = useMemo<ContextMenuItem[]>(() => {
+    if (!menu) return []
+    const id = menu.id
+    const inBlacklist = blockCfg.blacklist.includes(id)
+    const items: ContextMenuItem[] = [
+      {
+        key: 'blacklist',
+        label: inBlacklist ? '移出黑名单' : '加入黑名单',
+        icon: inBlacklist ? <Trash2 size={13} /> : <Ban size={13} />,
+        danger: !inBlacklist,
+        onSelect: () => {
+          toggleBlacklist(id)
+          if (inBlacklist) {
+            toast.success('已移出黑名单')
+          } else {
+            toast.success(
+              showAllBlocked
+                ? '已加入黑名单（当前开着「临时显示全部」，关掉它才会隐藏）'
+                : '已加入黑名单：这部番剧不再出现在番剧表中'
+            )
+          }
+        }
+      }
+    ]
+
+    const tags = tagMap[id]
+    if (tags && tags.length > 0) {
+      for (const c of pickMenuTagCandidates(tags, id, tagMap, weekIds)) {
+        items.push({
+          key: `tag-${c.keyword}`,
+          label: `按标签屏蔽：${c.label}`,
+          icon: <Tags size={13} />,
+          divider: items.length === 1, // 与黑名单之间画一条分割线：两条路是不同的事
+          onSelect: () => {
+            saveBlock({ customTags: [...blockCfg.customTags, c.keyword] })
+            toast.success(`已按标签「${c.label}」屏蔽：番剧表里含该标签的番剧都不再显示`)
+          }
+        })
+      }
+    } else if (tagFailed.includes(id)) {
+      // 宁可不屏蔽也不能误杀：拿不到标签就明说，并把用户引到一定生效的黑名单那条路
+      items.push({
+        key: 'tag-failed',
+        label: '未取到该番剧的标签',
+        icon: <Tags size={13} />,
+        divider: true,
+        onSelect: () => toast.warn('没能读到这部番剧的详情标签（数据源可能不可用），可改用「加入黑名单」')
+      })
+    } else {
+      items.push({
+        key: 'tag-loading',
+        label: '正在读取该番剧的标签…',
+        icon: <Tags size={13} />,
+        divider: true,
+        onSelect: () => {
+          ensureTags([id])
+          toast.info('正在读取标签，稍候菜单里会补出「按标签屏蔽」项')
+        }
+      })
+    }
+    return items
+  }, [menu, blockCfg, tagMap, tagFailed, weekIds, showAllBlocked, toggleBlacklist, saveBlock, ensureTags])
+
   return (
     <div className="flex h-full flex-col">
       {/* 顶部导航：日期 + 季节 + 星期切换 */}
@@ -309,25 +471,32 @@ export function SchedulePage() {
             {visibleItems.length > 0 ? (
               <div className="grid grid-cols-2 gap-3.5 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
                 {visibleItems.map((item: CalendarItem) => (
-                  <AnimeCard
-                    key={item.id}
-                    item={{
-                      id: item.id,
-                      name: item.name,
-                      nameCn: item.name_cn,
-                      cover: item.images?.large ?? item.images?.common ?? null,
-                      rating: ratings[item.id]?.score ?? item.rating?.score ?? null,
-                      airDate: item.air_date
-                    }}
-                    fav={favorites.some((f) => f.subjectId === item.id)}
-                    onFav={() => {
-                      const wasFav = favorites.some((f) => f.subjectId === item.id)
-                      toggleFavorite(item)
-                      toast.success(wasFav ? '已取消收藏' : '已收藏')
-                    }}
-                    onClick={() => navigate(`/subject/${item.id}`)}
-                    footer={item.air_date ? `开播 ${item.air_date.slice(0, 10)}` : undefined}
-                  />
+                  /*
+                   * 外层 div 只是**右键的挂载点**：AnimeCard 不接受 contextmenu 回调，而它不在本次改动范围内。
+                   * 用 grid 而不是普通 div 是为了不动原有布局：外层作为网格项会被拉伸到行高，
+                   * 内层卡片再跟着被拉伸（grid 的 auto 行/列默认 stretch），
+                   * 效果与改动前「卡片自己就是网格项」完全一致；min-w-0 防止长标题把网格列撑宽。
+                   */
+                  <div key={item.id} className="grid min-w-0" onContextMenu={(e) => openCardMenu(e, item)}>
+                    <AnimeCard
+                      item={{
+                        id: item.id,
+                        name: item.name,
+                        nameCn: item.name_cn,
+                        cover: item.images?.large ?? item.images?.common ?? null,
+                        rating: ratings[item.id]?.score ?? item.rating?.score ?? null,
+                        airDate: item.air_date
+                      }}
+                      fav={favorites.some((f) => f.subjectId === item.id)}
+                      onFav={() => {
+                        const wasFav = favorites.some((f) => f.subjectId === item.id)
+                        toggleFavorite(item)
+                        toast.success(wasFav ? '已取消收藏' : '已收藏')
+                      }}
+                      onClick={() => navigate(`/subject/${item.id}`)}
+                      footer={item.air_date ? `开播 ${item.air_date.slice(0, 10)}` : undefined}
+                    />
+                  </div>
                 ))}
               </div>
             ) : dayBlockedCount > 0 ? (
@@ -399,6 +568,19 @@ export function SchedulePage() {
         </span>
         <span>图片与数据本地缓存，减少重复请求</span>
       </div>
+
+      {/*
+        番剧卡片的右键菜单（复用统计工具的通用组件 ContextMenu）。
+        组件自己处理「点外面 / Esc / 滚动 / resize 时关闭」，这里只负责给坐标和菜单项；
+        注意它内部在 window 的**捕获阶段**监听 mousedown，父元素 stopPropagation 拦不住，也不必拦。
+      */}
+      <ContextMenu
+        open={menu != null}
+        x={menu?.x ?? 0}
+        y={menu?.y ?? 0}
+        items={menuItems}
+        onClose={() => setMenu(null)}
+      />
 
       {/*
         数据源不可达提示（v0.2.7）。

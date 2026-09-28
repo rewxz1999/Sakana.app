@@ -9,6 +9,7 @@ import {
   ChevronLeft,
   CloudOff,
   GripVertical,
+  Heart,
   History,
   Pencil,
   Plus,
@@ -21,7 +22,7 @@ import { useNavigate } from 'react-router-dom'
 import type { MarkItem, MarkList, SearchResultItem } from '@shared/types'
 import { api } from '@/lib/api'
 import { yearOf } from '@/lib/format'
-import { HISTORY_LIMIT, defaultListName, useMarks } from '@/stores/marks'
+import { HISTORY_LIMIT, defaultListName, quickFavoriteTarget, useMarks } from '@/stores/marks'
 import { toast, useSettings } from '@/stores/app'
 import {
   Badge,
@@ -35,6 +36,7 @@ import {
 } from '@/components/ui'
 import { CoverImage } from '@/components/CoverImage'
 import { ImageCarousel } from '@/components/ImageCarousel'
+import { FishStrip, RecommendRail } from '@/components/RecommendRail'
 
 /** 拖拽载荷 MIME：只带最小字段，避免把整个搜索结果对象（含长 summary）塞进 dataTransfer */
 const DRAG_MIME = 'application/x-sakana-subject'
@@ -217,6 +219,7 @@ export function SearchPage() {
     addMark,
     removeMark,
     isMarked,
+    toggleQuickFavorite,
     pushHistory,
     clearHistory,
     addShowcase,
@@ -320,6 +323,17 @@ export function SearchPage() {
     () => lists.find((l) => l.id === currentListId) ?? lists[0] ?? null,
     [lists, currentListId]
   )
+
+  /**
+   * 快速收藏的落点书签（需求 A）。
+   *
+   * 规则只有一份、在 stores/marks.ts 的 quickFavoriteTarget 里：
+   * 有「我的收藏」就用它 → 否则用第一本书签 → 一本都没有时返回 null。
+   * 这里**只在渲染时"看"结果**（决定心形按钮是不是已收藏态），
+   * 真正需要新建书签的那一步落在 store 的 toggleQuickFavorite 里 ——
+   * 一屏几十行结果都在渲染，渲染期间绝不能写盘、更不该凭空多出一本书签。
+   */
+  const favoriteList = useMemo(() => quickFavoriteTarget(lists), [lists])
 
   useEffect(() => {
     // 书签还没从磁盘载入完：此时 lists 为空只代表「还没加载」，不能把恢复出来的当前书签清掉
@@ -428,6 +442,19 @@ export function SearchPage() {
     addMark(listId, subject)
     setCurrentListId(listId) // 顺手切到目标书签，用户能立刻看到刚标记的条目
     toast.success(`已加入「${name}」`)
+  }
+
+  /**
+   * 快速收藏（需求 A）：结果行上心形按钮的一键收藏 / 取消。
+   *
+   * 与旁边「标记」按钮的分工：标记按钮弹列表选择框（用户要挑进哪本书签），
+   * 快速收藏**不弹任何东西**，直接落到默认收藏列表（落点规则见 favoriteList 的注释），
+   * 所以它才要放在标记按钮**左侧**：一次点击就能完成的高频动作放更顺手的位置。
+   */
+  const quickFavorite = (item: SearchResultItem): void => {
+    const r = toggleQuickFavorite(toDragSubject(item))
+    if (r.added) toast.success(`已收藏到「${r.listName}」`)
+    else toast.info(`已取消收藏（「${r.listName}」）`)
   }
 
   /** 拖到书签条空白处：进当前书签；没有书签时先建一个，否则拖拽会因为「无目标」而变成一次无效操作 */
@@ -1028,6 +1055,11 @@ export function SearchPage() {
                 {results.map((item) => {
                   const subject = toDragSubject(item)
                   const marked = currentList ? isMarked(currentList.id, item.id) : false
+                  /*
+                   * 已收藏态用**默认收藏列表**判定（与心形按钮的落点同一本书签）。
+                   * favoriteList 为 null 代表用户一本书签都还没有，此时不可能已收藏。
+                   */
+                  const favorited = favoriteList ? isMarked(favoriteList.id, item.id) : false
                   const year = yearOf(item.air_date)
                   return (
                     <div
@@ -1069,6 +1101,29 @@ export function SearchPage() {
                           <span>{year ? `${year} 年` : '年份未知'}</span>
                         </div>
                       </div>
+                      {/*
+                        快速收藏（需求 A）：在「标记」按钮**左侧**。
+                        - 一键落到默认收藏列表，不弹列表选择框（标记按钮才弹）；
+                        - 已收藏时心形填充 + 危险色 + 淡红底，再点一次即取消；
+                        - e.stopPropagation() 必须保留：整行挂着 onClick 跳详情页，
+                          不拦住的话点一下收藏会连带跳走（与右侧标记按钮同一个写法）。
+                      */}
+                      <IconButton
+                        title={
+                          favorited
+                            ? `已收藏到「${favoriteList?.name ?? ''}」，再点一次取消`
+                            : `快速收藏${favoriteList ? `到「${favoriteList.name}」` : '（自动新建「我的收藏」）'}`
+                        }
+                        className={`shrink-0 hover:!text-danger ${
+                          favorited ? 'bg-danger/12 text-danger' : ''
+                        }`}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          quickFavorite(item)
+                        }}
+                      >
+                        <Heart size={14} fill={favorited ? 'currentColor' : 'none'} />
+                      </IconButton>
                       <IconButton
                         title={
                           marked
@@ -1095,6 +1150,12 @@ export function SearchPage() {
               空态（初次进入 / 没搜到结果）：原来只有一段居中的文案，整页看着很空。
               现在下面接一块轮播展示位（用户可自定义图片与切换间隔），把空白填满。
               文案区不缩小、滚动/拖拽等行为都不变 —— 展示位只是补在文案下方。
+
+              需求 B：**没有进行搜索时**（`!searched`）这块空白还要有内容 ——
+              在文案下方接「随机推荐番剧」（热门/高分/冷门/当季，四个分组竖向排列），
+              空置区域的最底部再放一排大肥鱼图（轮流切换 + 标注来源）。
+              搜索过但没结果（`searched`）时保持原样：只给「没有搜索到结果」的提示 + 展示位，
+              推荐区不出现（用户已经给过关键词了，这时该做的是换词，不是看推荐）。
             */
             <div className="flex min-h-full flex-col">
               {searched ? (
@@ -1114,7 +1175,14 @@ export function SearchPage() {
                   desc="输入关键词后回车开始搜索，结果可直接拖到右侧书签条；点书签条上的书签可查看详情、重新搜索或管理条目"
                 />
               )}
+              {/* 未搜索：随机推荐区（数据来源与判据见 components/RecommendRail.tsx 的顶部注释） */}
+              {searched ? null : <RecommendRail onOpen={openSubject} />}
               {emptyShowcase}
+              {/*
+                大肥鱼图放在**空置区域最底部**（用户要求「空置区域显示底部显示图片」），
+                所以排在用户自己的展示位轮播之后；文件缺失/复制失败时组件自己返回 null（静默隐藏）。
+              */}
+              {searched ? null : <FishStrip className="mt-4" />}
             </div>
           )}
         </div>

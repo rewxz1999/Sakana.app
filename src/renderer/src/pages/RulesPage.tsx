@@ -1,11 +1,40 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ArrowLeft, CirclePlus, CloudDownload, RotateCcw, Save, Search, Trash2 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
-import type { PlayRule, RuleEpisodesDef, RuleSearchDef } from '@shared/types'
+import type { PlayRule, RuleEpisodesDef, RuleSearchDef, RulesRepoMeta } from '@shared/types'
 import { DEFAULT_RULES, emptyRule } from '@shared/types'
 import { api } from '@/lib/api'
 import { toast } from '@/stores/app'
 import { Badge, Button, Input, Modal, Select, Spinner, Switch, Textarea } from '@/components/ui'
+
+/** 上次自动检测时间：当天只显示 HH:mm，跨天补上 MM-DD（主进程记录的是毫秒时间戳） */
+function fmtCheckTime(ts: number): string {
+  const d = new Date(ts)
+  const now = new Date()
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate()
+  return sameDay ? hm : `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${hm}`
+}
+
+/**
+ * 自动更新状态文案。检测失败只是**网络不可用的常态**（镜像全挂），因此这里只做文字说明，
+ * 不弹错误框、也不要求用户处理 —— 与主进程「静默降级」的处理方式保持一致。
+ */
+function repoAutoUpdateText(meta: RulesRepoMeta | null): string {
+  if (!meta?.lastCheckAt) return '上次自动检测：暂无记录'
+  const n = meta.updated?.length ?? 0
+  const fail = meta.failed?.length ?? 0
+  const tail =
+    meta.lastResult === 'updated'
+      ? `更新 ${n} 条${fail > 0 ? `，失败 ${fail} 条` : ''}`
+      : meta.lastResult === 'failed'
+        ? `检测失败${fail > 0 ? `（${fail} 条导入失败）` : ''}`
+        : '已是最新'
+  return `上次自动检测：${fmtCheckTime(meta.lastCheckAt)} · ${tail}`
+}
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
@@ -39,6 +68,17 @@ export function RulesPage() {
   const [repoFilter, setRepoFilter] = useState('')
   const [repoSelected, setRepoSelected] = useState<Set<string>>(new Set())
   const [repoImporting, setRepoImporting] = useState(false)
+  /** 规则仓库自动更新状态（主进程写在 store 的 rulesRepoMeta 里，不新增 IPC 通道） */
+  const [repoMeta, setRepoMeta] = useState<RulesRepoMeta | null>(null)
+
+  const loadRepoMeta = async () => {
+    try {
+      const r = await api.store.get('rulesRepoMeta')
+      setRepoMeta(r.ok && r.data && typeof r.data === 'object' ? (r.data as RulesRepoMeta) : null)
+    } catch {
+      setRepoMeta(null)
+    }
+  }
 
   const load = async () => {
     const r = await api.store.get('rules')
@@ -49,6 +89,14 @@ export function RulesPage() {
   }
   useEffect(() => {
     void load()
+  }, [])
+
+  useEffect(() => {
+    void loadRepoMeta()
+    // 启动时的自动检测排在启动后 12 秒（见 src/main/index.ts），若用户在这之前就打开了本页，
+    // 首次读到的还是"暂无记录" —— 15 秒后再读一次，把这次检测结果显示出来。
+    const timer = setTimeout(() => void loadRepoMeta(), 15000)
+    return () => clearTimeout(timer)
   }, [])
 
   useEffect(() => {
@@ -122,6 +170,16 @@ export function RulesPage() {
           <div className="text-sm font-semibold">规则配置</div>
           <div className="text-[11px] text-faint">
             播放规则（Kazumi 风格：XPath / API）· 已启用 {enabledCount} / {rules.length}
+          </div>
+          <div
+            className="whitespace-nowrap text-[11px] text-faint"
+            title={[
+              ...(repoMeta?.updated?.length ? [`已更新：${repoMeta.updated.join('、')}`] : []),
+              ...(repoMeta?.failed?.length ? [`失败：${repoMeta.failed.join('、')}`] : []),
+              ...(repoMeta?.remoteTotal ? [`远端仓库共 ${repoMeta.remoteTotal} 条`] : [])
+            ].join('\n')}
+          >
+            {repoAutoUpdateText(repoMeta)}
           </div>
         </div>
         <div className="flex flex-wrap gap-2">

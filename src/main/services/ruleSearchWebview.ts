@@ -57,21 +57,45 @@ async function loadAndWait(
 ): Promise<void> {
   await new Promise<void>((resolve) => {
     let done = false
-    const finish = (): void => {
-      if (done) return
-      done = true
-      resolve()
-    }
     const wc = w.webContents
-    wc.once('did-finish-load', finish)
-    wc.once('did-fail-load', (_e, code, desc) => {
+    /*
+     * v0.3.6（审计 R9）：**完成时必须把监听与计时器都撤掉**。
+     *
+     * 这个窗口是**复用**的（`ensureWindow()` 只在窗口被销毁时才新建），
+     * 而旧实现每次调用都挂两个 `once`、再挂一个不清的 `setTimeout`：
+     *   · `did-finish-load` 正常触发时，`did-fail-load` 那个 once 还挂着；
+     *   · 超时路径更糟 —— 两个 once 都还挂着，而它们要等**下一次**加载才会触发，
+     *     于是每多搜一次就多两个监听器。网页搜索跑几十次之后 Node 会打
+     *     `MaxListenersExceededWarning`，用户看到的就是控制台一片警告。
+     * 现在用一个 `cleanup()` 统一收口：无论是加载成功、失败、还是超时，
+     * 三条路都走它，监听器与计时器都不会残留。
+     */
+    const onFail = (_e: unknown, code: number, desc: string): void => {
       // -3 = ERR_ABORTED：多为跳转导致，不影响后续提取
       if (code !== -3) log.append('warn', 'rules', `页面加载失败 ${code} ${desc} (${url.slice(0, 80)})`)
       finish()
-    })
+    }
+    const timer = setTimeout(() => finish(), timeoutMs)
+    const cleanup = (): void => {
+      clearTimeout(timer)
+      // 用 removeListener（而不是再挂一个 once）确保成对撤销；窗口可能已在销毁途中
+      try {
+        wc.removeListener('did-finish-load', finish)
+        wc.removeListener('did-fail-load', onFail)
+      } catch {
+        /* 窗口/webContents 已销毁：监听器随对象一起没了 */
+      }
+    }
+    function finish(): void {
+      if (done) return
+      done = true
+      cleanup()
+      resolve()
+    }
+    wc.once('did-finish-load', finish)
+    wc.once('did-fail-load', onFail)
     // 必须用浏览器 UA：默认的 Electron UA 会被部分站点直接挂起/拦截
     wc.loadURL(url, { userAgent: userAgent && userAgent.trim() ? userAgent : BROWSER_UA }).catch(() => finish())
-    setTimeout(finish, timeoutMs)
   })
 }
 

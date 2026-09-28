@@ -25,6 +25,14 @@ import { downloadManager } from './services/downloader/manager'
 import { deleteLocalResources, localDirInfo, removeDownloadRecords } from './services/downloader/localCleanup'
 import { aria2 } from './services/downloader/aria2'
 import { imageDataUrl, listVideos } from './services/media'
+import { clipboardHasImage, copyImageToClipboard, copyScreenshotIfEnabled } from './services/clipboardCopy'
+/*
+ * v0.3.6：这个 import 不只是"为了用函数"，它还有**副作用** ——
+ * audioSettings 在模块顶层向 mpv 注册了三个回调（实例就绪后应用设置、实例销毁后复位指纹、
+ * 倍速变化时重拼滤镜链）。不 import 的话那些回调永远不会被注册，
+ * 表现就是「设置页改了音频设置但播放器毫无反应」（而且完全不报错）。
+ */
+import { applyAudio } from './services/audioSettings'
 import { ruleEpisodes, rulePlay, ruleSearch, rulesRepoImport, rulesRepoIndex } from './services/rules'
 import {
   getCachedStreamOrWait,
@@ -74,6 +82,9 @@ import {
   pokeOverlay,
   pushOverlayEpisodes,
   pushOverlayDanmaku,
+  noteOverlayMissedClick,
+  onOverlayClickThrough,
+  pushOverlayClickThrough,
   pushOverlayState,
   sendOverlayAction,
   setOverlayInteractive,
@@ -82,7 +93,7 @@ import {
 import { toolService } from './services/tools'
 import { listSubscriptions, mutateSubscriptions } from './services/subsStore'
 import { hidePanelNow } from './tray'
-import { focusedOrMain, getMainWindow, openSmallWindow, openUpdateWindow } from './window'
+import { focusedOrMain, getMainWindow, isSmallWindow, openSmallWindow, openUpdateWindow } from './window'
 import {
   galApplyYmgal as galApplyYmgalFn,
   galImport as galImportFn,
@@ -149,18 +160,51 @@ function snapshotPath(title?: string, episode?: number): string {
 }
 
 export function registerIpc(): void {
-  // ---------- 窗口控制 ----------
-  ipcMain.handle(CH.winMinimize, () => focused()?.minimize())
-  ipcMain.handle(CH.winMaximizeToggle, () => {
-    const w = focused()
+  /*
+   * ---------- 窗口控制 ----------
+   *
+   * ⚠️ v0.3.6 修的一个严重 bug：这些 handler 以前一律用 `focused()`（= 当前有焦点的窗口）。
+   * 但播放器一开始就会创建一个**透明、无边框的控制栏悬浮窗**（playerOverlay），
+   * 而且它是主窗口的 owned window、点一下控制栏/点一下画面它就可能成为焦点窗口。
+   * 于是播放页点「全屏」时：
+   *   · `focused()` 拿到的是**悬浮窗**，`setFullScreen(true)` 作用在了一个
+   *     不该全屏的透明覆盖窗上（主窗口一点变化都没有 → 用户看到「全屏按钮没反应」）；
+   *   · `winIsFullscreen` 同样返回悬浮窗的状态（恒 false）→ 渲染层的 `fullscreen`
+   *     状态永远不更新 → 退出时不会调 setFullscreen(false)，界面卡在「以为全屏」的布局里
+   *     （用户报的「退出时播放器卡白、无法退出」）；
+   *   · `winClose` 可能去关悬浮窗而不是主窗口。
+   *
+   * 现在窗口控制一律以**主窗口**为准（`getMainWindow()`）；只有在没有主窗口、
+   * 或调用方确实来自某个小窗口（设置小窗自己的关闭/最小化按钮）时才回退到焦点窗口。
+   * 判据：小窗口里的按钮点的是自己，用焦点窗口是对的；播放器/播放页永远属于主窗口。
+   */
+  const controlWindow = (e: Electron.IpcMainInvokeEvent): BrowserWindow | null => {
+    const sender = BrowserWindow.fromWebContents(e.sender)
+    // 来自小窗口的请求：操作它自己（设置小窗的关闭/最小化按钮）
+    if (sender && isSmallWindow(sender)) return sender
+    const main = getMainWindow()
+    if (main && !main.isDestroyed()) return main
+    return sender && !sender.isDestroyed() ? sender : (focused() ?? null)
+  }
+  ipcMain.handle(CH.winMinimize, (e) => controlWindow(e)?.minimize())
+  ipcMain.handle(CH.winMaximizeToggle, (e) => {
+    const w = controlWindow(e)
     if (!w) return
     if (w.isMaximized()) w.unmaximize()
     else w.maximize()
   })
-  ipcMain.handle(CH.winClose, () => focused()?.close())
-  ipcMain.handle(CH.winIsMaximized, () => !!focused()?.isMaximized())
-  ipcMain.handle(CH.winSetFullscreen, (_e, full: boolean) => focused()?.setFullScreen(full))
-  ipcMain.handle(CH.winIsFullscreen, () => !!focused()?.isFullScreen())
+  ipcMain.handle(CH.winClose, (e) => controlWindow(e)?.close())
+  ipcMain.handle(CH.winIsMaximized, (e) => !!controlWindow(e)?.isMaximized())
+  ipcMain.handle(CH.winSetFullscreen, (e, full: boolean) => {
+    const w = controlWindow(e)
+    if (!w) return false
+    w.setFullScreen(!!full)
+    // 主动回一条状态：setFullScreen 是**异步**生效的，而 enter/leave-full-screen 事件
+    // 在部分情况下（窗口未显示、已处于目标状态）不会发出 —— 渲染层就永远等不到更新。
+    // 这里在事件之外补一条，保证按钮图标与布局立刻跟手。
+    return w.isFullScreen()
+  })
+  ipcMain.handle(CH.winIsFullscreen, (e) => !!controlWindow(e)?.isFullScreen())
   ipcMain.handle(CH.winShowMain, () => {
     const win = getMainWindow()
     if (!win) return
@@ -183,7 +227,15 @@ export function registerIpc(): void {
      * 用户改完设置立刻能看到画面变化，不必退出播放页再进来。
      * 只在播放器实例存在时才有实际动作（mpvApplyVideoEnhance 自己会判 ready）。
      */
-    if (ns === 'settings') mpvApplyVideoEnhance()
+    if (ns === 'settings') {
+      mpvApplyVideoEnhance()
+      /*
+       * v0.3.6：音频设置（音量增益、均衡器、压缩、响度、可视化）同样是 mpv 的**运行时**状态，
+       * 走同一钩子重应用一次 —— 用户在设置页拖 EQ 滑杆就能当场听到变化。
+       * `applyAudio()` 内部有指纹去重，连续拖动不会反复重建滤镜链（那会听得见断音）。
+       */
+      applyAudio()
+    }
     return true
   })
 
@@ -341,7 +393,11 @@ export function registerIpc(): void {
   ipcMain.handle(CH.dlRetry, (_e, id: string) => downloadManager.retry(id))
   ipcMain.handle(CH.dlRemove, (_e, id: string) => downloadManager.remove(id))
   ipcMain.handle(CH.dlList, () => downloadManager.list())
-  ipcMain.handle(CH.dlStatus, () => downloadManager.test())
+  /*
+   * v0.3.6（清理）：删掉了 `CH.dlStatus` 的 handler —— 它与下一行 `dlTest` 完全重复
+   * （两个 handler 都是 `downloadManager.test()`），而 `dlStatus` 那条通道在 preload 里
+   * 从来没有暴露过，渲染层不可能调到它。留着的唯一效果是让人以为有两条不同的接口。
+   */
   ipcMain.handle(CH.dlTest, () => downloadManager.test())
 
   // ---------- 本地资源（自动推导下载目录 / 删除本地资源 / 只删下载记录） ----------
@@ -617,6 +673,13 @@ export function registerIpc(): void {
   ipcMain.on(CH.overlayPoke, () => pokeOverlay())
   // 悬浮窗 → 播放页
   ipcMain.on(CH.overlayAction, (_e, action: Record<string, unknown>) => sendOverlayAction(action))
+  /*
+   * v0.3.6「点击击穿」自救（三条通道，配合 playerOverlay.ts 里那一大段说明读）：
+   *   ① 悬浮窗每次指针按下 → ② 主进程判定是否属于击穿 → ③ 命中就给悬浮窗发一条提示。
+   * 判定与节流都在 playerOverlay 里，这里只做转发。
+   */
+  ipcMain.on(CH.overlayMissedClick, (_e, x: number, y: number) => noteOverlayMissedClick(Number(x) || 0, Number(y) || 0))
+  onOverlayClickThrough((payload) => pushOverlayClickThrough(payload))
   ipcMain.handle(CH.playerScreenshot, async (_e, title?: string, episode?: number) => {
     const w = focused()
     if (!w) throw new Error('窗口不存在')
@@ -624,9 +687,19 @@ export function registerIpc(): void {
     const file = snapshotPath(title, episode)
     writeFileSync(file, image.toPNG())
     log.append('info', 'player', `截图已保存: ${file}`)
+    /*
+     * v0.3.6「快速粘贴」：按设置把刚存的截图写进系统剪贴板。
+     * 必须 await —— Electron 44 的 clipboard 是**异步 API**（见 clipboardCopy.ts 的文件头说明：
+     * 同步版 readImage/writeImage 已经没有了）。内部不抛异常，所以不影响「截图已成功」这个事实。
+     */
+    await copyScreenshotIfEnabled(file)
     maybeShowSaveHint()
     return file
   })
+  /** 手动把某张截图复制到剪贴板（截图提示条上的「复制」按钮 / 剧照右键菜单用） */
+  ipcMain.handle(CH.clipboardCopyImage, (_e, file: string) => copyImageToClipboard(String(file ?? '')))
+  /** 剪贴板是否已有图片（界面提示用） */
+  ipcMain.handle(CH.clipboardHasImage, () => clipboardHasImage())
 
   // 内置组件探测：libmpv / FFmpeg / aria2 是否随包内置
   ipcMain.handle(CH.playerAssets, async () => ({

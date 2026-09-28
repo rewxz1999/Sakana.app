@@ -51,7 +51,6 @@ export const CH = {
   dlRetry: 'dl:retry',
   dlRemove: 'dl:remove',
   dlList: 'dl:list',
-  dlStatus: 'dl:status',
   dlTest: 'dl:test',
   /** 推导某番剧的本地目录（自动用下载目录，不再让用户选文件夹） */
   dlLocalDir: 'dl:local-dir',
@@ -100,11 +99,19 @@ export const CH = {
   playerSetAspect: 'player:set-aspect',
   evPlayer: 'ev:player',
   playerScreenshot: 'player:screenshot',
+  /** v0.3.6：把一张截图写进系统剪贴板（快速粘贴） */
+  clipboardCopyImage: 'clipboard:copy-image',
+  /** v0.3.6：剪贴板里是否已有图片 */
+  clipboardHasImage: 'clipboard:has-image',
   // 全屏控制栏悬浮窗（原生视频窗口永远盖在网页之上，全屏时控制栏需独立透明窗口叠加）
   overlayShow: 'overlay:show',
   overlayHide: 'overlay:hide',
   overlaySetSpace: 'overlay:set-interactive',
   overlayState: 'overlay:state',
+  /** v0.3.6：控制栏点不动时的自救提示（疑似点击击穿 → 告诉用户按 F 重全屏 / Esc 退出） */
+  overlayClickThrough: 'overlay:click-through',
+  /** v0.3.6：渲染层上报「这个位置点了但没落到按钮上」（主进程据此判定击穿） */
+  overlayMissedClick: 'overlay:missed-click',
   // v0.2.6：选集数据单独走一条低频通道（状态推送是每秒多次的，不适合塞大数组）
   overlayEpisodes: 'overlay:episodes',
   // v0.2.8：弹幕数据同理（一集可能上千条，换集/改设置时才推）
@@ -123,8 +130,12 @@ export const CH = {
   playerUoscStatus: 'player:uosc-status',
   playerUoscMenu: 'player:uosc-menu',
   playerUoscVisible: 'player:uosc-visible',
-  /** 直接给插件 episodeId（插件自己去 api_server 取弹幕）—— 应用侧本地弹幕文件不可用时的第二级 */
-  playerUoscEpisode: 'player:uosc-episode',
+  /*
+   * v0.3.6（清理）：删掉了 `playerUoscEpisode`（'player:uosc-episode'）。
+   * 它是全仓唯一的**完全死通道**：没有 ipcMain handler、preload 里也没暴露给渲染层，
+   * 它原本的消费方（mpv.ts 的 `mpvPushDanmakuEpisode`）同样没有任何调用方。
+   * 留着会让人误以为「还有一条给插件喂 episodeId 的路」。
+   */
   playerUoscClear: 'player:uosc-clear',
   playerUoscDelay: 'player:uosc-delay',
   /**

@@ -5,6 +5,7 @@ import type { GalRecentShot, GalToolsConfig } from '@shared/types'
 import { DEFAULT_GAL_TOOLS } from '@shared/types'
 import { galReadWindowTitle, galRunningInfo } from './galgame'
 import { maybeShowSaveHint } from './onboarding'
+import { copyScreenshotIfEnabled } from './clipboardCopy'
 import { log } from '../log'
 import { store } from '../store'
 
@@ -322,6 +323,11 @@ export async function galScreenshotNow(): Promise<string> {
     const file = join(gameDir, `${name}_${tsName()}.png`)
     writeFileSync(file, png)
     log.append('info', 'gal', `游戏窗口截图已保存: ${file}`)
+    /*
+     * v0.3.6「快速粘贴」：与播放器截图走**同一个**收尾函数（copyScreenshotIfEnabled），
+     * 保证两个截图入口行为一致（都要按设置写剪贴板、都不抛异常）。
+     */
+    await copyScreenshotIfEnabled(file)
     maybeShowSaveHint()
     return file
   } finally {

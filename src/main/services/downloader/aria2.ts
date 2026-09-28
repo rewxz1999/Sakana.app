@@ -319,14 +319,41 @@ class Aria2Client {
     }
   }
 
+  /**
+   * 停止 aria2c。
+   *
+   * ⚠️ v0.3.6 修（审计查出的高危遗留）：**不能只 `this.proc?.kill()`**。
+   *
+   * `ensureRunning()` 有一段「复用已运行实例」的逻辑：启动时先等 RPC 就绪，
+   * 如果端口上**已经有一个 aria2c**（最典型的来源是上次被强杀/崩溃留下的孤儿进程），
+   * 它会连上那个实例并把 `started = true` —— 而 `this.proc` 此时指向的是**自己刚 spawn 的、
+   * 因为端口被占已经退出的那个子进程**。于是旧实现的两个后果都很糟：
+   *   ① 孤儿 aria2c 永远不会被停（`kill()` 杀的是一个已经死掉的 pid），
+   *      它会继续占着 6800 端口、可能仍在做 BT 下载，用户看起来就是「有没用的进程一直在跑」；
+   *   ② 下次启动会再「复用」它，一直循环下去；而且它占着
+   *      `resources\aria2\aria2c.exe`，增量更新脚本的 `Copy-Item -Force` 会失败
+   *      （脚本里 `$ErrorActionPreference='Continue'`，失败是静默的）→ 新旧文件混装。
+   *
+   * 现在的策略是「先礼后兵」：先发 aria2 自己的 `aria2.shutdown` RPC（它会让进程体面退出），
+   * 再对本进程 spawn 出来的那个子进程 `kill()` 兜底。
+   * 两步都包在 try 里：RPC 通道已经断了、或进程早已退出，都不该让退出流程报错。
+   */
   stop(): void {
+    const proc = this.proc
+    this.proc = null
+    const wasStarted = this.started
+    this.started = false
+    if (wasStarted) {
+      // 异步发完就不管了：Electron 退出流程不该等网络往返（RPC 超时上限 6 秒）
+      void this.rpc('aria2.shutdown', []).catch(() => {
+        /* 通道已断、或那个实例不是我们启的（会报未授权）—— 都交给下面的 kill 兜底 */
+      })
+    }
     try {
-      this.proc?.kill()
+      proc?.kill()
     } catch {
       /* ignore */
     }
-    this.proc = null
-    this.started = false
   }
 }
 

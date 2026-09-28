@@ -3,6 +3,7 @@
 // ============================================================
 
 import type { Anime4kMode, Anime4kTier } from './anime4k'
+import type { AudioSettings } from './audio'
 
 /**
  * Anime4K 超分辨率与画面微调（v0.3.1）。
@@ -1257,6 +1258,20 @@ export interface AppSettings {
    * 老设置文件里没有这个键时按「关闭」处理。
    */
   anime4k?: Anime4kSettings
+  /**
+   * 音频（音质调控）设置（v0.3.6）。
+   *
+   * 结构定义在 `@shared/audio`（`AudioSettings`）—— 那边同时负责收窄（脏数据夹到合法区间）
+   * 与「拼成 mpv 的 af 滤镜链」，渲染层设置页与主进程共用同一份，
+   * 所以界面上显示的值与真正下发给内核的一定一致。
+   */
+  audio?: AudioSettings
+  /**
+   * 截图后自动复制到系统剪贴板（v0.3.6「快速粘贴」）。
+   * 默认开启（`!== false`）；关掉后截图仍会存盘，只是不动剪贴板
+   * —— 因为写剪贴板会顶掉用户原先复制的内容，必须给一个能关的开关。
+   */
+  screenshotClipboard?: boolean
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -1746,3 +1761,95 @@ export const DEFAULT_GAL_TOOLS: GalToolsConfig = {
 export type GalEvent =
   | { type: 'games'; games: GalGame[] }
   | { type: 'running'; gameId: string; running: boolean }
+
+// ---------------- 规则仓库（KazumiRules）自动更新元信息 ----------------
+
+/**
+ * 产品指定的「推荐规则」名单（详情页搜索结果的「推荐」角标只用这份名单判定）。
+ *
+ * 为什么单独抽成常量：推荐名单是**产品决策**，而判定代码落在详情页组件里，
+ * 两处一旦分叉（组件里写死正则、文档里写另一个名单）就会出现「界面上标了推荐，
+ * 但产品并没有推荐它」这种对不上的情况。名单只此一份，组件引用它即可。
+ *
+ * ⚠️ 注意：名单里的名字必须能在**本地规则库**里找到才有意义 ——
+ * 内置 DEFAULT_RULES 只有 AGE / aafun / TvTFun / 樱之空 / 7sefun，**没有 sorani**，
+ * 因此 sorani 只有先从规则仓库导入（启动自动更新或「从仓库导入」）之后才会出现在搜索结果里。
+ */
+export const RECOMMENDED_RULES = ['aafun', 'sorani']
+
+/**
+ * 规则仓库自动更新状态（store 命名空间 `rulesRepoMeta`，规则页读它展示「上次自动检测」）。
+ * 网络失败只落到这里的 'failed'，不会弹错误框。
+ */
+export interface RulesRepoMeta {
+  /** 上次自动检测时间（毫秒时间戳）；无记录时为空 */
+  lastCheckAt?: number
+  /** updated=有更新且已导入 / latest=本地都不低于远端 / failed=取不到索引或全部导入失败 */
+  lastResult?: 'updated' | 'latest' | 'failed'
+  /** 本次实际成功导入（含覆盖）的规则名 */
+  updated?: string[]
+  /** 本次导入失败的规则名 */
+  failed?: string[]
+  /** 远端索引条目总数（便于一眼看出"检测到了多少条"） */
+  remoteTotal?: number
+}
+
+// ---------------- 搜索页空态：随机推荐番剧 ----------------
+
+/**
+ * 推荐分组的种类（搜索页「没有进行搜索」时的空态区）。
+ *
+ * 四条判据由产品指定，实现集中在 renderer 的 components/RecommendRail.tsx ——
+ * 那里同时写明**候选池从哪来**（为什么只用这几个接口、为什么不需要逐条补评分）。
+ */
+export type RecommendGroupKey = 'hot' | 'top' | 'hidden' | 'season'
+
+/**
+ * 推荐区里的一部番剧。
+ *
+ * 刻意**不**直接复用 SearchResultItem / SeasonItem / CalendarItem：
+ * 三个池子的字段名并不一致（放送日期有 `air_date` 也有 `date`，封面可能为 null），
+ * 归一化放在取数那一层做，界面层只认这一种形状，卡片代码才不会到处判空。
+ */
+export interface RecommendItem {
+  id: number
+  name: string
+  /** 中文名（可能为空串，卡片回退到 name） */
+  nameCn: string
+  images: CoverImages | null
+  /** bangumi 评分；null = 该条目还没有评分 */
+  score: number | null
+  /** 评分人数；0 = 没有评分。四条推荐规则全都靠它和 score 判定 */
+  total: number
+  airDate: string | null
+}
+
+/** 一个推荐分组（四个分组在页面上竖向排列，组内条目也竖向排列） */
+export interface RecommendGroup {
+  key: RecommendGroupKey
+  title: string
+  /**
+   * 该组的筛选判据文案，界面照实写出来。
+   * 推荐这种东西最怕「说不清为什么是这几部」，把判据写在组标题旁，用户自己能核对。
+   */
+  rule: string
+  /** 随机挑出的条目，最多 RECOMMEND_PICK（5）部 */
+  items: RecommendItem[]
+  /** 候选池里符合该判据的**总数**；< 5 时组末尾显示「真的没有了」 */
+  candidates: number
+}
+
+/** 空态推荐区的整体状态（候选池可能分几次到位，见 RecommendRail 的渐进式取数） */
+export interface RecommendState {
+  groups: RecommendGroup[]
+  /** 候选池还没取完（界面显示「正在挑选推荐…」） */
+  loading: boolean
+  /** 候选池整体不可用时的原因；非空时界面给一个重试入口，已有内容照常显示 */
+  error: string
+}
+
+/** 每个推荐分组最多挑几部（用户要求：每种推荐五部） */
+export const RECOMMEND_PICK = 5
+
+/** 候选不足 5 部时组末尾的文案（用户指定的原话） */
+export const RECOMMEND_EMPTY_TEXT = '真的没有了'

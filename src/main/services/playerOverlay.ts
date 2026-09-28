@@ -238,6 +238,20 @@ export function showOverlay(owner: BrowserWindow): number {
   overlayWin.on('closed', () => {
     overlayWin = null
   })
+  /*
+   * v0.3.6：主进程侧的鼠标活动兜底。
+   *
+   * `setIgnoreMouseEvents(true, { forward: true })` 会把鼠标移动转发到渲染层，
+   * 但那条路要经过 IPC + React 的 mousemove 监听 —— 页面一旦卡住就断了。
+   * 而「点击击穿」侦测必须知道"鼠标刚刚确实在控制栏上"，所以这里在主进程侧
+   * 再记一次：`before-input-event` 会在渲染层处理之前拿到原始的输入事件，
+   * 鼠标类事件的 `type` 是 `mouseMove` / `mouseDown`。
+   */
+  overlayWin.webContents.on('before-input-event', (_e, input) => {
+    if (input.type === 'mouseMove' || input.type === 'mouseDown' || input.type === 'mouseUp') {
+      noteOverlayMouse()
+    }
+  })
   overlayWin.webContents.on('render-process-gone', (_e, d) => {
     log.append('warn', 'overlay', `控制栏悬浮窗渲染进程结束: ${d.reason}`)
     destroyOverlay()
@@ -327,6 +341,109 @@ function applyInteractive(): void {
 export function setOverlayInteractive(interactive: boolean): void {
   rendererWantsInteractive = interactive
   applyInteractive()
+}
+
+/**
+ * 「点击击穿」侦测（v0.3.6）。
+ *
+ * ## 这个 bug 到底是什么（用户问的就是这个）
+ *
+ * 播放画面是 libmpv 的**原生子窗口**（Windows 上的 `WS_CHILD` + `CreateWindowExW`，
+ * 见 `native/mpv/src/addon.cc`），它**永远绘制在网页内容之上**，z-index 对它没有任何意义。
+ * 所以我们的控制栏不可能是网页里的一层 div —— 它必须是一个**独立的透明悬浮窗**
+ * （`playerOverlay.ts` 就是干这个的），叠在视频之上。
+ *
+ * 于是就有两个窗口抢同一块屏幕区域，鼠标落下去到底进谁的口袋由 Windows 决定：
+ *   · 悬浮窗**接收点击**时：用户能点按钮，但 mpv 收不到鼠标（不能拖进度、不能单击暂停）；
+ *   · 悬浮窗**点击穿透**时：鼠标直达 mpv 画面，但**看不见的悬浮窗此时只是"不接收"而已** ——
+ *     只要它的"接收点击"状态与实际显示的 UI 不一致，用户点下去的感觉就是
+ *     **"看得见控制栏，但按了没反应"**，也就是用户说的「点击击穿」。
+ *
+ * 真正会发生的错位只有两类，而它们都是**时序**问题：
+ *   ① 渲染层刚把控制栏显示出来 → 心跳还没送到主进程 → 那一瞬间还是穿透态。
+ *      用户手快，在几十毫秒的窗口里点了一下，事件落到了 mpv 或干脆没人接。
+ *   ② 渲染层把控制栏**藏了**（5 秒无操作自动隐藏），但心跳或 `setInteractive(false)`
+ *      还在路上 → 悬浮窗仍然"接收点击" → 它成了一张**看不见却挡事**的网：
+ *      用户想点画面暂停/拖动，全被这张网吃掉，表现同样是"按钮失灵"（但其实按钮已经没了）。
+ *
+ * 主进程能观测到的**硬证据**是：鼠标确实落在悬浮窗上（`mousemove` 到达悬浮窗），
+ * 但随后短时间内**没有任何按钮点击回传**。这既可能是 ①（点空了），
+ * 也可能是 ②（点在透明网上的空白处）。两种情况的处置建议完全一样：
+ * **按 F 重新全屏一次（强制重建视频子窗口与悬浮窗的几何关系）、或按 Esc 退出播放器**。
+ *
+ * 所以这里做的不是"修复"（无法从主进程单方面修，因为根因是渲染层状态与窗口状态的时间差），
+ * 而是**如实告诉用户 + 给出逃生手段**，并把这次事件写进日志便于复现统计。
+ */
+let clickThroughStreak = 0
+let lastOverlayMouseAt = 0
+let lastOverlayClickAt = 0
+let clickThroughCb: ((payload: { count: number; at: number }) => void) | null = null
+
+/** 渲染层订阅「疑似点击击穿」（用于弹出提示浮层） */
+export function onOverlayClickThrough(cb: ((payload: { count: number; at: number }) => void) | null): void {
+  clickThroughCb = cb
+}
+
+/**
+ * 悬浮窗收到鼠标移动：记录时间戳，作为「用户确实在对控制栏动手」的证据。
+ *
+ * 两个调用来源（v0.3.6 起是两个，因为只靠渲染层上报会漏）：
+ *   ① 悬浮窗渲染层每次 mousemove 上报（`overlayMissedMove`）；
+ *   ② 主进程侧 `webContents` 的 `before-input-event` 里带坐标的鼠标事件（兜底，
+ *      即使渲染层的上报因为页面卡住没发出来，主进程也知道鼠标来过）。
+ * 自检也直接调它（`.e2e/dom-probe-036.mjs`）。
+ */
+export function noteOverlayMouse(): void {
+  lastOverlayMouseAt = Date.now()
+}
+
+/**
+ * 悬浮窗收到了鼠标移动，但用户显然是想点按钮（调用方在点击穿透态下调用这个）。
+ *
+ * 判定刻意保守，避免误报打扰用户：
+ *   · 只在**点击穿透**（`!overlayInteractive`）时计数 —— 接收点击时不存在这个问题；
+ *   · 鼠标必须在最近 1.2 秒内动过（证明用户不是在跟键盘较劲）；
+ *   · 连续命中 3 次才提示（单次可能只是鼠标划过）。
+ */
+export function noteOverlayMissedClick(x: number, y: number): void {
+  if (overlayInteractive) {
+    clickThroughStreak = 0
+    return
+  }
+  const now = Date.now()
+  if (now - lastOverlayMouseAt > 1200) return
+  if (now - lastOverlayClickAt < 400) return
+  lastOverlayClickAt = now
+  clickThroughStreak += 1
+  log.append(
+    'warn',
+    'overlay',
+    `疑似点击击穿（第 ${clickThroughStreak} 次）：鼠标在 (${x},${y}) 落在悬浮窗上，但当前是点击穿透态`
+  )
+  if (clickThroughStreak >= 3) {
+    clickThroughStreak = 0
+    clickThroughCb?.({ count: 3, at: now })
+  }
+}
+
+/** 用户恢复交互（点到了按钮 / 控制栏重新显示）后清掉计数 */
+export function clearOverlayMissedClicks(): void {
+  clickThroughStreak = 0
+}
+
+/** 把「疑似点击击穿」的提示推给悬浮窗，由它弹自救浮层 */
+export function pushOverlayClickThrough(payload: { count: number; at: number }): void {
+  if (!overlayWin || overlayWin.isDestroyed()) return
+  try {
+    overlayWin.webContents.send(CH.overlayClickThrough, payload)
+  } catch {
+    /* 窗口正在销毁 */
+  }
+}
+
+/** 自检：当前的穿透状态与计数器 */
+export function overlayInputDiagnostics(): { interactive: boolean; wants: boolean; streak: number } {
+  return { interactive: overlayInteractive, wants: rendererWantsInteractive, streak: clickThroughStreak }
 }
 
 /** 自检：读当前是否可交互 */

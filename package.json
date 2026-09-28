@@ -1,6 +1,6 @@
 {
   "name": "sakana",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "Sakana - 番剧管理及播放桌面客户端",
   "main": "./out/main/index.js",
   "author": "Sakana Team",
@@ -17,7 +17,10 @@
     "aria2:fetch": "node scripts/fetch-aria2.js",
     "ffmpeg:fetch": "node scripts/fetch-ffmpeg.js",
     "libmpv:fetch": "node scripts/fetch-libmpv.js",
-    "mpv:build": "node-gyp rebuild --directory native/mpv"
+    "mpv:build": "node-gyp rebuild --directory native/mpv",
+    "verify:audio": "node .e2e/verify-audio-chain.mjs",
+    "verify:schedule-block": "node scripts/verify-schedule-block.mjs",
+    "verify:favorites-season": "node scripts/verify-favorites-season.mjs"
   },
   "build": {
     "appId": "com.sakana.app",

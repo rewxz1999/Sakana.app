@@ -59,6 +59,12 @@ interface MarksState {
   addMark: (listId: string, subject: MarkSubjectInput) => void
   removeMark: (id: string) => void
   isMarked: (listId: string, subjectId: number) => boolean
+  /**
+   * 快速收藏（搜索结果行左侧的心形按钮）：一键**加入 / 取消**默认收藏列表。
+   * 落点规则见 `quickFavoriteTarget`；必须走 store 而不是在页面里拼 addMark，
+   * 因为「没有书签时要先建一本」这一步要写盘，只有 store 知道最新的 lists。
+   */
+  toggleQuickFavorite: (subject: MarkSubjectInput) => QuickFavoriteResult
   pushHistory: (kw: string) => void
   clearHistory: () => void
   /** 追加展示图片，返回真正新增的张数（已存在的会被忽略） */
@@ -81,6 +87,46 @@ export function defaultListName(lists: MarkList[]): string {
   }
   while (used.has(`书签 ${n}`)) n += 1
   return `书签 ${n}`
+}
+
+// ---------------- 快速收藏（搜索结果行上的一键收藏） ----------------
+
+/**
+ * 快速收藏的默认书签名。
+ *
+ * 「快速收藏」= 一键加入**默认收藏列表**，不弹列表选择框（用户要求）。
+ * 一个固定名字是这套规则能成立的前提：靠名字认出「用户已经有一本默认收藏」，
+ * 才能既不每次都新建、又能在没有任何书签时自动补一本出来。
+ */
+export const QUICK_FAVORITE_LIST_NAME = '我的收藏'
+
+/**
+ * 快速收藏要落到哪本书签（**规则只此一份**，界面与 store 都调它，避免两处判定分叉）。
+ *
+ * ⚠️ v0.3.6 改掉了「否则用列表里的第一本」这条回落 —— 用户实测报了 bug：
+ * 「结果列表上面点击快速收藏后标记也响应了，这两应该是分开的」。
+ *
+ * 真因就是那条回落：搜索页右侧书签条的「当前书签」默认也是**第一本**，
+ * 于是当用户只有一本书签时，「快速收藏」的落点和「标记」的落点是**同一本** ——
+ * 点一下心形，右边的书签图标立刻跟着亮起来，用户看到的就是"两个按钮联动"。
+ *
+ * 现在的规则只有一条：**落点永远是名为「我的收藏」的那本书签**。
+ *   ① 已有「我的收藏」→ 用它；
+ *   ② 没有 → 返回 null，由 `toggleQuickFavorite` 在**真正点击时**创建（渲染期不建，见下方注释）；
+ * 这样只要用户自己没有把「我的收藏」设为当前书签，两个按钮的状态就是彼此独立的。
+ * 代价是用户可能多出一本叫「我的收藏」的书签 —— 但那是**看得见、可改名可删除**的，
+ * 比"两个按钮莫名其妙联动"要好得多。
+ */
+export function quickFavoriteTarget(lists: MarkList[]): MarkList | null {
+  return lists.find((l) => l.name === QUICK_FAVORITE_LIST_NAME) ?? null
+}
+
+/** 一次快速收藏的结果：界面据此决定 toast 文案 */
+export interface QuickFavoriteResult {
+  /** true = 本次是**加入**收藏；false = 本次是**取消**收藏 */
+  added: boolean
+  /** 落点书签名（toast 里写清「收藏到哪本书签」，用户才知道东西去哪了） */
+  listName: string
 }
 
 export const useMarks = create<MarksState>((set, get) => ({
@@ -163,6 +209,23 @@ export const useMarks = create<MarksState>((set, get) => ({
   },
   isMarked: (listId, subjectId) =>
     get().items.some((it) => it.listId === listId && it.subjectId === subjectId),
+  /*
+   * 快速收藏：加入 / 取消默认收藏列表（搜索结果行左侧的心形按钮）。
+   *
+   * 无论加入还是取消都返回落点书签名 —— 界面只负责按 `added` 选一条 toast，
+   * 「收藏到哪本书签」这件事由这里说了算，页面不需要再复算一次落点。
+   */
+  toggleQuickFavorite: (subject) => {
+    // 一本都没有时才现建：规则见 quickFavoriteTarget 的注释（不能每次点击都新建）
+    const list = quickFavoriteTarget(get().lists) ?? get().createList(QUICK_FAVORITE_LIST_NAME)
+    const existing = get().items.find((it) => it.listId === list.id && it.subjectId === subject.subjectId)
+    if (existing) {
+      get().removeMark(existing.id)
+      return { added: false, listName: list.name }
+    }
+    get().addMark(list.id, subject)
+    return { added: true, listName: list.name }
+  },
   // 重复关键词只保留最新一条并置顶，避免历史里堆满同一个词
   pushHistory: (kw) => {
     const q = kw.trim()

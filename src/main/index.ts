@@ -9,7 +9,7 @@ import { mikan } from './services/mikan'
 import { downloadManager } from './services/downloader/manager'
 import { registerMediaProtocols } from './services/media'
 import { CH } from '@shared/channels'
-import { ensureDefaultRules } from './services/rules'
+import { ensureDefaultRules, rulesRepoAutoUpdate } from './services/rules'
 import { createTray, destroyTray, markQuitting } from './tray'
 import { createMainWindow, getMainWindow, realWindows } from './window'
 import { ruleEpisodes, ruleSearch } from './services/rules'
@@ -204,6 +204,18 @@ if (!gotLock) {
 
     // v0.2.4：启动时自动检查 git 仓库是否有新版本（延迟 8 秒；结果写日志，设置页可见并可跳转下载）
     void import('./services/updater').then((m) => m.scheduleAutoCheck())
+
+    /*
+     * 启动时自动检测规则仓库是否有更新（延迟 12 秒：排在订阅(4s)/番剧表(6s)/应用更新(8s)之后，
+     * 避免和它们抢带宽）。只导入「本地没有的」与「远端版本更高的」规则，本地版本不低于远端就跳过，
+     * 免得每次启动都重导一遍、把用户手工微调过的规则冲掉。
+     * 网络失败是常态：失败只写日志 + 状态（规则页可见），不弹框、不阻塞启动。
+     */
+    setTimeout(() => {
+      void rulesRepoAutoUpdate().catch((err) =>
+        log.append('warn', 'rules', `规则仓库自动检测异常: ${String(err)}`)
+      )
+    }, 12000)
 
     app.on('second-instance', () => {
       // 只看业务窗口：离屏取数窗口也是 BrowserWindow，误选它会把镜像站页面当成主窗口弹出来
@@ -407,6 +419,289 @@ if (!gotLock) {
           app.quit()
         })()
       }, 3000)
+    }
+
+    /*
+     * 音频滤镜自检（SAKANA_AUDIO_TEST=音频文件，v0.3.6）。
+     *
+     * 要证的不是「我们拼出了字符串」，而是**libmpv 到底认哪些滤镜**：
+     * `af set <链>` 在滤镜名不认识时会同步返回错误（native 的 command() 带回 mpv_error_string），
+     * 所以这里逐个试、把原始错误打出来。这条自检是「音质调控」这一版能不能上的前提 ——
+     * 靠翻 DLL 里的字符串是不可靠的（可能只是别处的引用），必须真让 mpv 去建图。
+     *
+     * 可选 SAKANA_AUDIO_SETTINGS='<JSON>'：用指定设置跑一次完整链并读回 mpv 规范化后的 af。
+     */
+    if (process.env.SAKANA_AUDIO_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const file = process.env.SAKANA_AUDIO_TEST!
+          const {
+            mpvAttach,
+            mpvPlay,
+            mpvGetState,
+            mpvDestroy,
+            mpvAvailable,
+            mpvTryAudioFilter,
+            mpvCurrentAudioFilter,
+            mpvProbeProperties,
+            mpvSetVolumeRaw
+          } = await import('./services/mpv')
+          const { buildAudioFilterChain, EQ_PRESETS } = await import('@shared/audio')
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
+          console.log(`[audio-test] 运行时可用=${mpvAvailable()} 文件=${file}`)
+          if (!win) {
+            console.log('[audio-test] 无主窗口')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const att = mpvAttach(win, { x: 0, y: 60, width: 960, height: 480 })
+          console.log(`[audio-test] 嵌入: ${JSON.stringify(att)}`)
+          mpvPlay(file)
+          await new Promise((r) => setTimeout(r, 2500))
+          console.log(`[audio-test] 播放状态 ${JSON.stringify(mpvGetState())}`)
+
+          /** 逐条滤镜：单独建链，看 mpv 认不认 */
+          const singles: [string, string][] = [
+            ['loudnorm', 'loudnorm=I=-16:TP=-1.5:LRA=11'],
+            ['alimiter', 'alimiter=limit=0.97:attack=5:release=50'],
+            ['acompressor', 'acompressor=threshold=-18dB:ratio=2:attack=20:release=250:makeup=1.00'],
+            ['extrastereo', 'extrastereo=m=1.60'],
+            ['superequalizer', 'superequalizer=1b=3:2b=2:10b=2:18b=3'],
+            ['dynaudnorm', 'dynaudnorm=f=200:g=15'],
+            ['adynamicequalizer', 'adynamicequalizer=threshold=0.05'],
+            ['scaletempo2', 'scaletempo2=max-speed=8'],
+            ['volume', 'volume=1.25'],
+            ['stereotools', 'stereotools=mlev=1.2'],
+            ['anequalizer', 'anequalizer=c0 f=100 w=100 g=3 t=1|c1 f=100 w=100 g=3 t=1'],
+            /*
+             * pan 的语法在 FFmpeg 7 之后收紧了：老写法用输入声道名当变量
+             * （`FL=0.8*FL+0.2*FR`），新写法要用**编号** `c0/c1`。三种都试。
+             */
+            ['pan · 老写法（FL/FR 变量）', 'pan=stereo|FL=0.825*FL+0.175*FR|FR=0.175*FL+0.825*FR'],
+            ['pan · 新写法（c0/c1）', 'pan=stereo|c0=0.825*c0+0.175*c1|c1=0.175*c0+0.825*c1'],
+            ['pan · 只给增益', 'pan=stereo|c0=0.9*c0|c1=0.9*c1'],
+            /*
+             * firequalizer 的写法差异：`gain_entry` 里的分号在 af 串里是分隔符，
+             * 转义层级（一次 `\;` vs 两次 `\\;`）最容易错，另外用 `gain` 做对照。
+             */
+            [
+              'firequalizer · gain_entry 转义一次',
+              `firequalizer=gain_entry='31 4.0\\;1000 3.0\\;8000 -1.0':zero_phase=on:delay=0.05`
+            ],
+            [
+              'firequalizer · gain_entry 转义两次',
+              `firequalizer=gain_entry='31 4.0\\\\;1000 3.0\\\\;8000 -1.0':zero_phase=on:delay=0.05`
+            ],
+            ['firequalizer · 只给 gain（扫频模式）', 'firequalizer=gain=3:zero_phase=on'],
+            ['firequalizer · 最简', 'firequalizer=gain_entry=31'],
+            // 再试几种 gain_entry 的写法（分号在 af 串里是分隔符，转义层级是最容易错的地方）
+            ['fq · 无引号 + 转义一次', `firequalizer=gain_entry=31 4.0\\;1000 3.0:zero_phase=on`],
+            ['fq · 无引号 + 不转义', `firequalizer=gain_entry=31 4.0;1000 3.0:zero_phase=on`],
+            ['fq · 方括号语法', `firequalizer[gain_entry=31 4\\;1000 3]`],
+            ['fq · 单条 entry + 转义', `firequalizer=gain_entry=31 4.0\\;:zero_phase=on`],
+            ['fq · entry 用冒号分隔', `firequalizer=gain_entry='31 4.0:1000 3.0':zero_phase=on`],
+            ['fq · 多条 entry 不转义 + 引号', `firequalizer=gain_entry='31 4.0;1000 3.0;8000 -1.0':zero_phase=on:delay=0.05`],
+            [
+              'fq · 10 段不转义 + 线性相位',
+              `firequalizer=gain_entry='31 -1.0;62 0.0;125 2.0;250 4.0;500 5.0;1000 3.0;2000 1.0;4000 0.0;8000 -1.0;16000 -1.0':zero_phase=on:delay=0.05`
+            ],
+            ['fq · zero_phase 关掉对照', `firequalizer=gain_entry=31;1000`],
+            // 有空格的那条到底是「空格」还是「分号」的问题？（探针用，最终实现另有判断）
+            ['fq · 单条 entry 带空格', `firequalizer=gain_entry=31 4.0`],
+            ['fq · 两条分隔符写成逗号', `firequalizer=gain_entry=31 4.0,1000 3.0`],
+            ['fq · 用 gain 传浮点', `firequalizer=gain=3.5:zero_phase=on`],
+            ['fq · 用 gain 传列表文本', `firequalizer=gain='31 4.0;1000 3.0':zero_phase=on`],
+            // 关键对照：在源码里写「反斜杠+分号」（编译后就是 mpv 常见写法），看是不是编译/透传问题
+            ['fq · 源码里写 \\; (JS 转义后为 \\;)', 'firequalizer=gain_entry=31 4.0' + String.fromCharCode(92) + ';1000 3.0'],
+            ['fq · 源码里写 \\\\; ', 'firequalizer=gain_entry=31 4.0' + String.fromCharCode(92) + String.fromCharCode(92) + ';1000 3.0'],
+            ['stereotools 各种参数', 'stereotools=mlev=0.5:slev=1.1'],
+            ['superequalizer 全 18 段', 'superequalizer=1b=2:2b=2:3b=2:4b=2:5b=2:6b=2:7b=2:8b=2:9b=2:10b=2:11b=2:12b=2:13b=2:14b=2:15b=2:16b=2:17b=2:18b=2'],
+            ['sofalizer（无文件，反向对照）', 'sofalizer=sofa=nonexistent.sofa:speakers=FL|FR'],
+            ['不存在的滤镜（反向对照）', 'totally-not-a-filter=1']
+          ]
+          console.log('[audio-test] === 单条滤镜 ===')
+          const accepted: string[] = []
+          for (const [name, chain] of singles) {
+            const r = mpvTryAudioFilter(chain)
+            if (r.ok) accepted.push(name)
+            console.log(`[audio-test]   ${r.ok ? '接受' : '拒绝'}  ${name}${r.ok ? '' : `  ← ${r.error}`}`)
+          }
+          console.log(`[audio-test] 接受清单: ${accepted.join(' / ')}`)
+
+          /** 组合链：真实设置下的整链 */
+          console.log('[audio-test] === 组合链 ===')
+          const combos: [string, unknown][] = [
+            ['默认（增益 125% + 限幅）', {}],
+            ['均衡器·流行 + 线性相位', { eqEnabled: true, eqPreset: 'pop', eqGains: EQ_PRESETS[1].gains }],
+            [
+              '全都开 + 变速 1.25',
+              {
+                enabled: true,
+                gain: 1.35,
+                eqEnabled: true,
+                eqGains: EQ_PRESETS[2].gains,
+                stereoWidth: 1.4,
+                spatial: 'crossfeed',
+                spatialStrength: 0.4,
+                compressorEnabled: true,
+                loudnormEnabled: true
+              }
+            ]
+          ]
+          for (const [name, s] of combos) {
+            const chain = buildAudioFilterChain(s, { speed: name.includes('变速') ? 1.25 : 1 })
+            const r = mpvTryAudioFilter(chain)
+            console.log(`[audio-test]   ${r.ok ? '接受' : '拒绝'}  ${name}${r.ok ? '' : `  ← ${r.error}`}`)
+            console.log(`[audio-test]      af=${chain}`)
+            if (r.ok) console.log(`[audio-test]      mpv 读回: ${mpvCurrentAudioFilter()}`)
+          }
+
+          /** 音量上限：150 是不是真的生效（volume-max 没设的话会被夹回 100） */
+          mpvSetVolumeRaw(150)
+          console.log(
+            `[audio-test] 音量 150% 读回 ${JSON.stringify(mpvProbeProperties(['volume', 'volume-max', 'audio-params', 'audio-out-params', 'audio-codec', 'audio-samplerate', 'audio-channels']))}`
+          )
+          mpvSetVolumeRaw(100)
+
+          /*
+           * 可视化探针：挂 astats 之后能不能从 `af-metadata` 里读到实时 RMS ——
+           * 这是「音频可视化」能不能用**真数据**的分水岭（读不到就只能画个假的动画）。
+           */
+          console.log('[audio-test] === 可视化：af-metadata 探针 ===')
+          const vizChain =
+            'astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,alimiter=limit=0.97'
+          const vizOk = mpvTryAudioFilter(vizChain)
+          console.log(`[audio-test]   astats 链 ${vizOk.ok ? '接受' : '拒绝'}${vizOk.ok ? '' : ` ← ${vizOk.error}`}`)
+          // astats 是按音频块更新 metadata 的，等一会儿再读
+          await new Promise((r) => setTimeout(r, 1500))
+          for (const label of ['', 'astats', 'lavfi.astats.Overall', 'astats.Overall']) {
+            const base = label ? `af-metadata/${label}` : 'af-metadata'
+            const props = mpvProbeProperties([`${base}/RMS_level`, `${base}/Overall/RMS_level`])
+            console.log(`[audio-test]   label="${label}" → ${JSON.stringify(props)}`)
+          }
+          console.log(
+            `[audio-test]   其它: ${JSON.stringify(mpvProbeProperties(['af', 'audio-bitrate', 'audio-pts'])).slice(0, 400)}`
+          )
+          console.log(
+            `[audio-test]   af-metadata 全量: ${JSON.stringify(mpvProbeProperties(['af-metadata'])).slice(0, 700)}`
+          )
+
+          console.log('[audio-test] done')
+          mpvDestroy()
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
+    }
+
+    /*
+     * 全屏联动自检（SAKANA_FS_TEST='<播放页 hash>'，v0.3.6）。
+     *
+     * 要复现的用户场景（他报的 bug）：
+     *   ① 主窗口**已经是全屏** → 进播放器 → 期望播放器也是全屏；
+     *   ② 从播放器**退出** → 期望窗口和播放器一起回到小窗（而不是卡在空白）。
+     *
+     * 所以这里把整条链的每一步都打出来：窗口的 isFullScreen、渲染层读到/上报的 fullscreen、
+     * mpv 视频子窗口的实际 bounds（它是造成"空白"的第一嫌疑：窗口退出全屏后若子窗口还是全屏时的大小，
+     * 就只显示画面左上角一块或整块黑）。
+     *
+     * 用法：`SAKANA_FS_TEST='/player'` 或带注入态的 `?ts=…`（见 PlayerPage 的自检通道）。
+     */
+    if (process.env.SAKANA_FS_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const hash = process.env.SAKANA_FS_TEST!
+          const win = getMainWindow()
+          if (!win) {
+            console.log('[fs-test] 无主窗口')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const mpv = await import('./services/mpv')
+          const snap = (label: string): void => {
+            const b = win.getBounds()
+            console.log(
+              `[fs-test] ${label} 窗口 fullScreen=${win.isFullScreen()} bounds=${b.width}x${b.height}@${b.x},${b.y}` +
+                ` | mpvBounds=${JSON.stringify(mpv.mpvDiagnosticBounds())}`
+            )
+          }
+          // ① 先把主窗口置为全屏（模拟用户先全屏主窗口）
+          win.setFullScreen(true)
+          await new Promise((r) => setTimeout(r, 1200))
+          snap('① 主窗口全屏后')
+          // ② 渲染层读到的是什么？
+          const readFull = await win.webContents
+            .executeJavaScript('window.sakana.window.isFullscreen()', true)
+            .catch((e: Error) => `ERR ${e.message}`)
+          console.log(`[fs-test] ② 渲染层 isFullscreen() 读到 = ${JSON.stringify(readFull)}`)
+          // ③ 进播放器
+          win.webContents.executeJavaScript(`window.location.hash = ${JSON.stringify(hash)}`, true).catch(() => undefined)
+          await new Promise((r) => setTimeout(r, 6000))
+          snap('③ 进入播放器后')
+          const inner = await win.webContents
+            .executeJavaScript(
+              `(() => {
+                 const host = document.getElementById('player-host')
+                 const r = host ? host.getBoundingClientRect() : null
+                 return { path: location.hash, host: r ? { w: Math.round(r.width), h: Math.round(r.height), x: Math.round(r.x), y: Math.round(r.y) } : null }
+               })()`,
+              true
+            )
+            .catch((e: Error) => `ERR ${e.message}`)
+          console.log(`[fs-test] ③ 页面内 player-host = ${JSON.stringify(inner)}`)
+          // ④ 退出播放器（点返回；这里直接改 hash 回首页，模拟"退出播放"）
+          win.webContents.executeJavaScript('window.location.hash = "#/"', true).catch(() => undefined)
+          await new Promise((r) => setTimeout(r, 3500))
+          snap('④ 退出播放器后（期望回到小窗）')
+          const after = await win.webContents
+            .executeJavaScript('window.sakana.window.isFullscreen()', true)
+            .catch((e: Error) => `ERR ${e.message}`)
+          console.log(`[fs-test] ④ 退出后 渲染层 isFullscreen() = ${JSON.stringify(after)}`)
+          console.log('[fs-test] done')
+          mpv.mpvDestroy()
+          markQuitting()
+          app.quit()
+        })()
+      }, 3000)
+    }
+
+    /*
+     * 点击击穿侦测自检（SAKANA_CLICKTHROUGH_TEST=1，v0.3.6）。
+     *
+     * 这条自检要证的是**侦测链路本身是通的**：模拟「用户对着控制栏连点三次、但没点到按钮」，
+     * 看主进程是否：
+     *   ① 每次都记一条 warn 日志（可诊断）；
+     *   ② 第 3 次时把提示推给悬浮窗（onOverlayClickThrough → overlay:click-through）。
+     * 真机上这三下由悬浮窗捕获阶段的 pointerdown 上报（PlayerOverlayPage），
+     * 而悬浮窗只在播放中才存在 —— 所以这里直接调主进程的判定入口，
+     * 不依赖有没有在播放（自检就该把一段逻辑单独拎出来验）。
+     */
+    if (process.env.SAKANA_CLICKTHROUGH_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const { noteOverlayMouse, noteOverlayMissedClick, overlayInputDiagnostics, onOverlayClickThrough } =
+            await import('./services/playerOverlay')
+          let notified = 0
+          onOverlayClickThrough(() => {
+            notified += 1
+          })
+          console.log(`[ct-test] 初始状态 ${JSON.stringify(overlayInputDiagnostics())}`)
+          for (let i = 0; i < 4; i++) {
+            noteOverlayMouse()
+            noteOverlayMissedClick(400, 500)
+            console.log(
+              `[ct-test] 第 ${i + 1} 次点击 → ${JSON.stringify(overlayInputDiagnostics())} 已提示=${notified}`
+            )
+            await new Promise((r) => setTimeout(r, 420))
+          }
+          console.log(`[ct-test] 结论：提示回调被调用 ${notified} 次（期望 ≥1）`)
+          console.log('[ct-test] done')
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
     }
 
     // libmpv 端到端自检（SAKANA_MPV_TEST=视频文件）：嵌入子窗口 → 播放 → 读状态
@@ -3434,13 +3729,83 @@ if (!gotLock) {
     app.quit()
   })
 
+  /**
+   * 退出前的统一收尾（v0.3.6 补齐）。
+   *
+   * 审计发现以前这里只清了「下载器 / 中转 FFmpeg / store / 托盘」四样，
+   * 而**播放内核、控制栏悬浮窗、嗅探窗口、本机 HTTP 中转服务**都没有收：
+   *   · `mpvDestroy()` 只在渲染层卸载播放页时被调（player:detach），
+   *     而「最小化到托盘」走的是 `win.hide()`（窗口没销毁、React 没卸载）——
+   *     结果就是**用户以为关了窗口，视频还在放（有声音）**，且 mpv 的三个轮询定时器
+   *     （400/250/200ms）继续跑；
+   *   · 嗅探/搜索窗口是屏幕外可见窗口，进程退出虽然会被 OS 回收，
+   *     但「窗口还在、外网请求还在发」的几百毫秒里退出会明显变慢；
+   *   · 本机中转 HTTP 服务从来没有 `close()`（审计标注 R8）。
+   *
+   * 这些都放在 `before-quit` 里**同步触发**（销毁动作本身是异步/延迟的，不阻塞退出），
+   * 用 try/catch 包住每一项：退出流程里任何一项失败都不该拦住用户关应用。
+   */
   app.on('before-quit', () => {
     markQuitting()
     downloadManager.stop()
     stopAllLive()
     store.flushAll()
     destroyTray()
+    // v0.3.6：播放内核 + 播放相关窗口/服务一并收掉（见上面的说明）
+    void cleanupPlaybackOnQuit()
   })
+
+  /**
+   * 退出前把「播放相关」的东西全部收掉（v0.3.6）。
+   *
+   * 为什么单独一个函数而不是散在 before-quit 里：这里的每一项都要 `await import()`
+   * （主进程是懒加载服务，顶层 import 会把启动路径拖长），
+   * 而 `before-quit` 的回调不该是 async（Electron 不等它）。
+   * 所以这里返回 Promise，调用方 `void` 掉即可 —— 各项都是「发个命令就返回」的同步动作，
+   * 真正的销毁由各服务自己 setImmediate/延时完成，不会拖住退出。
+   */
+  async function cleanupPlaybackOnQuit(): Promise<void> {
+    const step = async (label: string, fn: () => void | Promise<void>): Promise<void> => {
+      try {
+        await fn()
+      } catch (err) {
+        log.append('warn', 'app', `退出清理「${label}」失败（忽略）: ${String((err as Error)?.message ?? err)}`)
+      }
+    }
+    // ① 播放内核（libmpv + 原生子窗口）：托盘最小化时它是唯一还在出声的东西
+    await step('libmpv', async () => {
+      const { mpvDestroy, mpvAvailable } = await import('./services/mpv')
+      if (mpvAvailable()) mpvDestroy()
+    })
+    // ② 控制栏悬浮窗
+    await step('控制栏悬浮窗', async () => {
+      const { destroyOverlay } = await import('./services/playerOverlay')
+      destroyOverlay()
+    })
+    // ③ 网页嗅探窗口 / 隐藏窗口嗅探
+    await step('嗅探窗口', async () => {
+      const { closeRuleWebview } = await import('./services/ruleWebview')
+      closeRuleWebview()
+    })
+    await step('嗅探会话', async () => {
+      const { stopRuleProbe } = await import('./services/ruleProbe')
+      stopRuleProbe()
+    })
+    // ④ 网页内搜索窗口（它只靠 20 秒空闲计时器自关，退出时不该等）
+    await step('搜索窗口', async () => {
+      const { closeSearchWindow } = await import('./services/ruleSearchWebview')
+      closeSearchWindow()
+    })
+    // ⑤ 离屏取数窗口 + 本机中转 HTTP 服务（审计 R8：以前从来没有 close 过）
+    await step('离屏取数窗口', async () => {
+      const { closeOffscreen } = await import('./services/offscreenFetch')
+      closeOffscreen()
+    })
+    await step('本机中转服务', async () => {
+      const { closeLiveServer } = await import('./services/transcode')
+      closeLiveServer()
+    })
+  }
 
   process.on('uncaughtException', (err) => {
     log.append('error', 'app', `未捕获异常: ${err?.stack ?? String(err)}`)

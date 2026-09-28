@@ -311,6 +311,32 @@ export function stopAllLive(): void {
   for (const id of [...sessions.keys()]) stopSession(id)
 }
 
+/**
+ * 关掉本机中转 HTTP 服务（v0.3.6）。
+ *
+ * 审计发现：这个 server 从 `initLiveServer()` 起监听之后就**从来没有 close 过**
+ * （`stopAllLive()` 只杀 FFmpeg 会话、不动监听本身）。
+ * 进程退出时端口会被系统释放，所以它不是「僵尸进程」那种问题；
+ * 但优雅退出应该把监听关掉 —— 否则在「关了窗口还留在托盘、稍后又重开窗口」这类路径上，
+ * 监听会一直占着端口与一条 libuv 句柄，也让 `app.quit()` 之后仍有一小段收尾时间。
+ *
+ * 关之前先 `stopAllLive()`：会话里挂着的 FFmpeg 要一起收掉，
+ * 否则会出现「监听没了、ffmpeg 还在拉流」的孤儿。
+ */
+export function closeLiveServer(): void {
+  stopAllLive()
+  const srv = liveServer
+  liveServer = null
+  livePort = 0
+  if (!srv) return
+  try {
+    srv.close()
+    log.append('info', 'ffmpeg', '本机中转服务已关闭')
+  } catch {
+    /* 已经关了就算了 */
+  }
+}
+
 /** 启动转码流会话（vcopy=视频复制 / vtranscode=视频转 H.264） */
 export function startLive(
   path: string,

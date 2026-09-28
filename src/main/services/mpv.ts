@@ -394,7 +394,11 @@ function slashPath(p: string): string {
  * B 站弹幕脚本配置（v0.2.8 附加七）：mpv 选项 + 需要用 load-script 加载的脚本路径。
  *
  * 管线：yt-dlp 抓 danmaku 字幕 → biliass 转 ASS → `sub-add` 给 mpv。
- * libmpv 默认**不加载脚本**，所以必须显式给 `load-scripts=yes`；
+ *
+ * ⚠️ 这里**只返回 `script-opts`，不返回 `script`**：libmpv 不接受 `script` 选项，
+ * 脚本必须由 `mpvAttach()` 用运行时的 `load-script` 命令加载（那边有详细说明）。
+ * （老注释曾写「必须显式给 load-scripts=yes」——恰恰相反：`load-scripts` 现在是 `no`，
+ *   为的是不让 mpv 自动扫描 `<config-dir>/scripts/` 把 uosc 加载两份。）
  * `script-opts` 里带上 ytdlp / biliass / tmpdir —— 其中 tmpdir 是必须的：
  * biliass 在 Windows 上需要一个可写的临时目录，否则弹幕下载会失败。
  *
@@ -545,13 +549,6 @@ export function uoscDanmakuRequested(): boolean {
 }
 
 /**
- * uosc 控制栏是否接管（v0.2.18）。
- *
- * 默认开启；用户在「设置 → 播放器设置 → 播放器控制栏」里可以关掉，
- * 那时应用回落到自己那套悬浮窗控制栏（代码原样保留，见 playerOverlay.ts）。
- * 内置 uosc 缺失（安装目录不完整）时也回落到旧控制栏 —— 不能让人没有控制栏可用。
- */
-/**
  * uosc 控制栏是否接管（v0.2.18 引入，**v0.3.3 起默认关闭**）。
  *
  * 为什么默认关掉：用户明确要求「撤销 uosc，就用我们原来自建的控制栏」。
@@ -562,6 +559,13 @@ export function uoscDanmakuRequested(): boolean {
  *
  * 仍保留 uosc 这条路（设置里可手动打开）：弹幕插件 uosc_danmaku 的菜单要用 uosc 渲染，
  * 所以 uosc 本身还会被加载，只是**不再让它画控制栏**（见 loadUoscPlugins 里的 disable-elements）。
+ *
+ * ⚠️ v0.3.6 补：**这个开关只决定"画不画控制栏"，不再决定 input.conf 生不生效**。
+ * 老代码把 `config-dir` 也挂在这个条件上（不画控制栏就不给 config-dir），
+ * 于是默认配置下 mpv 读不到 `input.conf`，ESC / q / f / l / c / x 等键位全部失效 ——
+ * 用户报的「按 Esc 也退不出播放器」就是这么来的，而快捷键恰好只在 mpv 子窗口持焦时才是唯一出路
+ * （应用侧那套快捷键要求 Electron 窗口有键盘焦点）。现在 `config-dir` 无条件给，
+ * 见 `mpvAttach()` 里的说明。
  */
 export function uoscControlBarRequested(): boolean {
   const s = getSettings() as unknown as { uoscControlBar?: boolean }
@@ -1256,6 +1260,29 @@ function tuneValue(v: unknown): number | null {
 let lastEnhanceKey = ''
 
 /**
+ * 实例销毁时要复位的音频指纹（v0.3.6）。
+ *
+ * 音频指纹本身在 `services/audioSettings.ts` 里维护（那边才有「怎么拼链」的知识），
+ * 而 `audioSettings.ts` 已经 import 了本模块（要用 mpvSetAudioFilter）——
+ * 本模块再反向 import 就会形成循环依赖。所以这里放一个**回调插槽**：
+ * audioSettings 在被主进程加载时注册进来，mpvDestroy 调用它即可。
+ * 没注册（例如只在跑 mpv 自检）时就是个空操作，没有副作用。
+ */
+let audioResetHook: (() => void) | null = null
+
+/** 由 audioSettings 注册「实例销毁后复位音频指纹」的回调 */
+export function setAudioResetHook(fn: (() => void) | null): void {
+  audioResetHook = fn
+}
+
+/** 由 audioSettings 注册「实例就绪后应用音频设置」的回调（避免循环依赖，同 audioResetHook） */
+let audioApplyHook: (() => void) | null = null
+
+export function setAudioApplyHook(fn: (() => void) | null): void {
+  audioApplyHook = fn
+}
+
+/**
  * 把 Anime4K 与画面微调**当场**应用到正在播放的实例（v0.3.1）。
  *
  * 三个调用点：① mpvAttach 建好实例之后；② 用户在设置页改动画质选项（主进程在
@@ -1515,6 +1542,63 @@ export function mpvProbeProperties(names: string[]): Record<string, unknown> {
 }
 
 /**
+ * 试设一条 `af` 链并把 mpv 的错误原样带回来（**仅供自检**：SAKANA_AUDIO_TEST）。
+ *
+ * 为什么需要：`af` 里写了 mpv 不认识的滤镜时，`mpv_command` 会**同步返回错误**
+ * （native 的 `command()` 返回 false 并把 `mpv_error_string` 放进 `lastError()`），
+ * 这正是判断「这个滤镜在 libmpv 里到底有没有」的最可靠办法 ——
+ * 比翻 DLL 里的字符串靠谱得多（那些字符串可能只是别处的引用）。
+ *
+ * @returns `{ ok, error }`；error 为 mpv 的原始错误字符串（含 `No such filter` 之类）
+ */
+export function mpvTryAudioFilter(chain: string): { ok: boolean; error: string } {
+  if (!ready || !native) return { ok: false, error: '播放器未就绪' }
+  try {
+    const ok = chain
+      ? native.command(['af', 'set', chain])
+      : native.command(['af', 'clr'])
+    return { ok, error: ok ? '' : native.lastError?.() || '命令被拒' }
+  } catch (err) {
+    return { ok: false, error: String((err as Error)?.message ?? err) }
+  }
+}
+
+/** 读回当前 `af` 链（自检用；mpv 会把它规范化后返回） */
+export function mpvCurrentAudioFilter(): string {
+  if (!ready || !native) return ''
+  try {
+    const v = native.getProperty('af')
+    return typeof v === 'string' ? v : JSON.stringify(v ?? '')
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 设置 `af` 链（音频服务用）。
+ * `chain` 为空串 = 清空滤镜链（**不能**用 `af set ""`，mpv 会报错）。
+ */
+export function mpvSetAudioFilter(chain: string): { ok: boolean; error: string } {
+  if (!ready || !native) return { ok: false, error: '播放器未就绪' }
+  try {
+    const ok = chain ? native.command(['af', 'set', chain]) : native.command(['af', 'clr'])
+    return { ok, error: ok ? '' : native.lastError?.() || '命令被拒' }
+  } catch (err) {
+    return { ok: false, error: String((err as Error)?.message ?? err) }
+  }
+}
+
+/**
+ * 直接设音量属性（音频服务用；与 `mpvSetVolume` 的区别是不再做 0~1 的语义换算，
+ * 收窄逻辑统一在 `@shared/audio` 里做过了）。
+ */
+export function mpvSetVolumeRaw(volume: number): void {
+  if (!ready || !native) return
+  const v = Math.max(0, Math.min(VOLUME_MAX, Math.round(volume)))
+  native.setProperty('volume', v)
+}
+
+/**
  * 把当前画面存成 PNG（**仅供自检**：SAKANA_ANIME4K_TEST / SAKANA_UOSC_TEST 用它对比
  * 「开着色器 / 关着色器」或「控制栏显示 / 未显示」两块画面是否真的不同）。
  *
@@ -1541,7 +1625,33 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
   // 两件不同的事：控制栏交给 uosc（默认开）／弹幕交给 uosc_danmaku 插件（设置里选）
   const wantUoscDanmaku = uoscDanmakuRequested()
   const wantUoscBar = uoscControlBarRequested()
-  const cfgDir = wantUoscDanmaku || wantUoscBar ? bundledMpvConfigDir() : ''
+  /*
+   * config-dir **必须无条件给上**（v0.3.6 修的一个严重 bug）。
+   *
+   * 老代码是 `wantUoscDanmaku || wantUoscBar ? bundledMpvConfigDir() : ''` ——
+   * 也就是「不用 uosc 就不给 config-dir」。而 v0.3.3 起 uosc **默认关闭**（控制栏改回应用自建），
+   * 于是这条链整条断掉，后果比「少个配置文件」严重得多：
+   *
+   *   config-dir 没给 → mpv 用默认配置目录 → `config=yes` 也读不到我们的
+   *   `resources/mpv-config/input.conf` → **input.conf 里的全部快捷键都不存在**：
+   *     · `ESC`  → 应用侧的「退出全屏 / 退出播放」收不到（用户报「按 esc 也无法退出播放器」）
+   *     · `q`    → 退出播放失效
+   *     · `f`    → 全屏切换失效
+   *     · `l/c/x/a/d/i/s` 等 → 选集/线路/字幕/倍速/比例/详情/截图 菜单全部失效
+   *   只剩下 mpv **内置**的默认键位还在（SPACE 播放暂停、↑↓ 音量、m 静音）——
+   *   这与用户描述的「按钮失灵、但快捷键还有效」完全吻合。
+   *   注意这里说的是 **mpv 侧**的快捷键：应用侧那套是渲染层监听 keydown，
+   *   只在 Electron 窗口有键盘焦点时生效；用户点过画面之后焦点在 mpv 子窗口上，
+   *   所以那时能救场的只有 input.conf。两套是互补的，缺一套就等于没有。
+   *
+   * 现在无条件给 config-dir：它同时被 `config=yes` 用来定位
+   * `input.conf`（快捷键）与 `script-opts/uosc.conf`（uosc 布局/字体）。
+   * 不给 uosc 也不会多出任何东西 —— `load-scripts=no` 已经保证 scripts/ 目录不会被自动扫描。
+   */
+  const cfgDir = bundledMpvConfigDir()
+  if (!cfgDir) {
+    log.append('warn', 'mpv', '未找到内置 mpv 配置目录：播放器的键盘快捷键（含 ESC 退出）会全部失效')
+  }
   let hwnd: Buffer | undefined
   try {
     hwnd = win.getNativeWindowHandle()
@@ -1602,6 +1712,8 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
        */
       osc: 'no',
       'load-scripts': 'no',
+      // v0.3.6：音量上限抬到 200%（用户反馈 100% 偏小）；不设这条的话 volume 会被夹回 100
+      'volume-max': String(VOLUME_MAX),
       ...(cfgDir ? { 'config-dir': slashPath(cfgDir), config: 'yes' } : {}),
       ...(scriptOptsParts.length > 0 ? { 'script-opts': scriptOptsParts.join(',') } : {})
     }
@@ -1632,8 +1744,10 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
   /*
    * uosc 控制栏三件套：同样只加载一次（create() 在实例已存在时只更新尺寸，
    * 重复 load-script 会出现两套控制栏 / 两份弹幕插件）。
+   * v0.3.6：cfgDir 现在**无条件存在**，所以要显式判断「用户到底要不要 uosc」，
+   * 否则默认关闭 uosc 的机器上会被塞进一套用不上的控制栏（还会抢走鼠标）。
    */
-  if (cfgDir && !uoscBarLoaded) {
+  if (cfgDir && !uoscBarLoaded && (wantUoscBar || wantUoscDanmaku)) {
     loadUoscPlugins(mod, cfgDir, wantUoscDanmaku, wantUoscBar)
   }
   /*
@@ -1644,6 +1758,16 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
    */
   lastEnhanceKey = ''
   mpvApplyVideoEnhance()
+  /*
+   * 音频（v0.3.6）：实例就绪后按设置挂上滤镜链并设音量。
+   * 同样先复位指纹 —— 滤镜链挂在实例上，新实例什么都不剩（见 audioSettings 的注释）。
+   * 放在 Anime4K 之后没有依赖关系，只是让日志顺序保持「先画质后音频」。
+   */
+  try {
+    audioApplyHook?.()
+  } catch (err) {
+    log.append('warn', 'mpv', `音频设置应用失败: ${String((err as Error)?.message ?? err)}`)
+  }
   attachedWin = win
   lastPlaying = false
   lastLength = 0
@@ -1670,6 +1794,19 @@ export function mpvSetSurfaceVisible(visible: boolean): void {
     lastRaiseAt = 0
     raiseSurface()
   }
+}
+
+/**
+ * 当前视频子窗口的 bounds（自检用）。
+ *
+ * 为什么要暴露它：用户报「退出播放器后卡在播放内容空白」——
+ * 视频是**主窗口的原生 WS_CHILD 子窗口**，窗口退出全屏后如果它没有跟着 resize，
+ * 就会比窗口还大（只显示画面左上角一块）或者位置错位（整块黑）。
+ * 把每一步的 bounds 打出来，就能一眼看出是"没跟着改"还是"renderer 没上报"。
+ */
+export function mpvDiagnosticBounds(): MpvBounds | null {
+  if (!currentBounds) return null
+  return { ...currentBounds }
 }
 
 export function mpvSetBounds(bounds: MpvBounds): void {
@@ -1756,8 +1893,19 @@ export function mpvSeekSec(sec: number): void {
 
 export function mpvSetVolume(volume: number): void {
   if (!ready || !native) return
-  native.setProperty('volume', Math.max(0, Math.min(100, Math.round(volume))))
+  native.setProperty('volume', Math.max(0, Math.min(VOLUME_MAX, Math.round(volume))))
 }
+
+/**
+ * 音量上限（v0.3.6）。
+ *
+ * 用户反馈「就算 100% 声音也偏小，想再加 0.25 倍左右」。
+ * mpv 的 `volume` 属于**软件增益**，可以把上限抬到 200 —— 关键是必须同时设 `volume-max`，
+ * 否则 mpv 会按默认 100 把音量夹回去（`setProperty('volume', 150)` 静默变成 100）。
+ * 超过 100 的部分有削波风险，由 `clipping-protection`（alimiter）兜住，
+ * 见 `@shared/audio` 的 `needsLimiter()`。
+ */
+export const VOLUME_MAX = 200
 
 export function mpvSetMute(muted: boolean): void {
   if (!ready || !native) return
@@ -1765,24 +1913,38 @@ export function mpvSetMute(muted: boolean): void {
 }
 
 /**
- * 播放倍速（v0.2.9 最后更新）。
+ * 播放倍速（v0.2.9 最后更新；v0.3.6 改为与音频滤镜链合并）。
  *
- * README 一直写着「支持倍速」，但代码里其实没有实现 —— 这是与 Kazumi 对照时发现的真实缺口。
  * 两个关键点：
  * 1. 变速必须挂 `af=scaletempo2`：不加音频滤镜时变速会**变调**，听起来像快进磁带；
  *    `max-speed=8` 足够覆盖 0.25–4 倍。
  * 2. 速度夹在 0.25–4：0 或负数会让播放器无声/卡死，误操作传进来就麻烦了。
+ *
+ * v0.3.6 的**行为修正**：老实现是 `af clr` / `af set scaletempo2` 的整链替换，
+ * 一旦用户开了均衡器/压缩器，变速就会把它们整条冲掉（「变速之后音效没了」）。
+ * 现在链的拼装只有一处（`@shared/audio.buildAudioFilterChain`），
+ * 由 `services/audioSettings.applyAudio()` 统一应用；这里只把 speed 记下来并触发重拼。
+ * 为避免循环依赖，通过回调插槽调用（audioSettings 注册）。
  */
+let speedApplyHook: ((speed: number) => void) | null = null
+
+/** 由 audioSettings 注册「倍速变化 → 重拼滤镜链」的回调 */
+export function setSpeedApplyHook(fn: ((speed: number) => void) | null): void {
+  speedApplyHook = fn
+}
+
 export function mpvSetSpeed(speed: number): void {
   if (!ready || !native) return
   try {
     const s = Math.max(0.25, Math.min(4, Number(speed) || 1))
     native.setProperty('speed', s)
-    if (s === 1) {
-      // 恢复原速时移除滤镜，免得白吃一点 CPU
-      native.command(['af', 'clr'])
+    if (speedApplyHook) {
+      // 链里带不带 scaletempo2 由音频服务决定（它同时管着其它音效）
+      speedApplyHook(s)
     } else {
-      native.command(['af', 'set', 'scaletempo2=max-speed=8'])
+      // 没注册（例如只跑 mpv 自检）：退回最小实现，保证变速不变调
+      if (s === 1) native.command(['af', 'clr'])
+      else native.command(['af', 'set', 'scaletempo2=max-speed=8'])
     }
   } catch (err) {
     log.append('warn', 'mpv', `设置倍速失败: ${String((err as Error)?.message ?? err)}`)
@@ -2018,6 +2180,15 @@ export function mpvDestroy(): void {
   // 画质设置的指纹也要复位：实例没了，新实例必须被重新设置一次（哪怕设置值没变）
   lastEnhanceKey = ''
   lastVolume = -1
+  /*
+   * 音频指纹同样要复位（v0.3.6）：滤镜链挂在实例上，实例销毁后什么都不剩，
+   * 指纹还是旧值的话新实例不会再应用一次 —— 表现就是「第二次进播放器音效没了」。
+   */
+  try {
+    audioResetHook?.()
+  } catch {
+    /* 复位失败不影响销毁流程 */
+  }
   latestPluginDanmakuFile = ''
   injectedForPath = ''
   lastMpvPath = ''

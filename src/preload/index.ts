@@ -39,6 +39,10 @@ const api: SakanaApi = {
     onMaximizeChange: (cb) => subscribe<[boolean]>(CH.evWinMaximize, cb),
     onFullscreenChange: (cb) => subscribe<[boolean]>(CH.evWinFullscreen, cb)
   },
+  clipboard: {
+    copyImage: (file) => call(CH.clipboardCopyImage, file),
+    hasImage: () => call(CH.clipboardHasImage)
+  },
   store: {
     get: (ns) => call(CH.storeGet, ns),
     set: (ns, data) => call(CH.storeSet, ns, data)
@@ -154,6 +158,13 @@ const api: SakanaApi = {
     onDanmaku: (cb) => subscribe(CH.overlayDanmaku, cb),
     poke: () => ipcRenderer.send(CH.overlayPoke),
     action: (action) => ipcRenderer.send(CH.overlayAction, action),
+    /*
+     * v0.3.6「点击击穿」自救：渲染层把每次指针按下报上来（含坐标），
+     * 主进程结合「当前是不是穿透态 + 鼠标最近有没有动过」判断是否属于击穿，
+     * 连续命中就发 overlayClickThrough 事件回来，由悬浮窗弹一条提示浮层。
+     */
+    reportMissedClick: (x: number, y: number) => ipcRenderer.send(CH.overlayMissedClick, x, y),
+    onClickThrough: (cb) => subscribe(CH.overlayClickThrough, cb),
     onState: (cb) => subscribe(CH.overlayState, cb),
     onPoke: (cb) => subscribe<[]>(CH.overlayPoke, cb),
     onAction: (cb) => subscribe(CH.overlayAction, cb)

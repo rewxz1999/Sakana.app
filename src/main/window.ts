@@ -209,6 +209,24 @@ export function createMainWindow(): BrowserWindow {
   win.on('unmaximize', () => win.webContents.send(CH.evWinMaximize, false))
   win.on('enter-full-screen', () => win.webContents.send(CH.evWinFullscreen, true))
   win.on('leave-full-screen', () => win.webContents.send(CH.evWinFullscreen, false))
+  /*
+   * v0.3.6：进/出全屏后再补发一次状态。
+   *
+   * 起因是用户报的「全屏后退出播放器卡白」：`leave-full-screen` 事件触发时，
+   * 窗口尺寸在 Windows 上还没完成还原（事件与 SetWindowPos 是两步），
+   * 渲染层若在这时重新测量播放区并把尺寸下发给 mpv，视频子窗口就会被摆到
+   * 一个**已经不存在的大小**上 —— 看起来就是一块空白。
+   * 延后一帧再发一次，让渲染层拿到稳定后的状态与布局。
+   */
+  const notifyFullscreenSettled = (): void => {
+    if (win.isDestroyed()) return
+    setTimeout(() => {
+      if (win.isDestroyed()) return
+      win.webContents.send(CH.evWinFullscreen, win.isFullScreen())
+    }, 140)
+  }
+  win.on('enter-full-screen', notifyFullscreenSettled)
+  win.on('leave-full-screen', notifyFullscreenSettled)
   win.on('closed', () => {
     if (mainWindow === win) mainWindow = null
     /*

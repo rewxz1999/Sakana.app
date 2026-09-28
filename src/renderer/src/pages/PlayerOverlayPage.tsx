@@ -20,6 +20,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Subtitles,
+  TriangleAlert,
   Volume1,
   Volume2,
   VolumeX,
@@ -99,23 +100,31 @@ function detailRows(d: SubjectDetail): { key: string; value: string }[] {
 }
 
 /**
- * 音量滑杆（v0.2.9）。
+ * 音量滑杆（v0.2.9；v0.3.6 扩到 200%）。
  *
  * 用户要求：控制栏要能调音量，**不需要静音键**。
  * 所以这里没有「点一下静音」的行为 —— 图标只是当前音量档位的指示（拖到 0 自然就没声音），
  * 拖动过程中持续发送 setVolume；用 pointer capture 保证拖出滑杆外也不断。
+ *
+ * v0.3.6：滑杆上限从 100 提到 **200**。用户反馈「100% 也有点偏小」，
+ * 主进程那边 `volume-max` 也同步抬到 200（不设那条 mpv 会把音量夹回 100）。
+ * 100% 的位置画一条刻度线：**200 的滑杆如果没有任何标记，用户会以为拖到底才是正常音量**。
  */
+const VOLUME_UI_MAX = 200
+
 function VolumeSlider({ volume, onSet }: { volume: number; onSet: (v: number) => void }): React.ReactElement {
   const trackRef = useRef<HTMLDivElement | null>(null)
   const [dragging, setDragging] = useState(false)
-  const v = Math.max(0, Math.min(100, volume))
+  const v = Math.max(0, Math.min(VOLUME_UI_MAX, volume))
+  /** 100% 在滑杆上的位置（百分比），用来画那条刻度线 */
+  const hundredPct = 100 / (VOLUME_UI_MAX / 100)
 
   const applyFromEvent = (clientX: number): void => {
     const el = trackRef.current
     if (!el) return
     const r = el.getBoundingClientRect()
     const ratio = r.width > 0 ? (clientX - r.left) / r.width : 0
-    onSet(Math.round(Math.max(0, Math.min(1, ratio)) * 100))
+    onSet(Math.round(Math.max(0, Math.min(1, ratio)) * VOLUME_UI_MAX))
   }
 
   const Icon = v === 0 ? VolumeX : v > 50 ? Volume2 : Volume1
@@ -155,16 +164,23 @@ function VolumeSlider({ volume, onSet }: { volume: number; onSet: (v: number) =>
         onPointerCancel={() => setDragging(false)}
       >
         <div className="h-1 w-full overflow-hidden rounded-full bg-white/25">
-          <div className="h-full rounded-full bg-white/85" style={{ width: `${v}%` }} />
+          {/* 填充宽度按 200 的满量程算；100% 处另画一条刻度（见 VOLUME_UI_MAX 的说明） */}
+          <div className="h-full rounded-full bg-white/85" style={{ width: `${(v / VOLUME_UI_MAX) * 100}%` }} />
         </div>
+        {/* 100% 刻度线：越过它就进入「增益」区，超过这个点才需要限幅器 */}
+        <div
+          aria-hidden
+          className="pointer-events-none absolute top-1/2 h-2.5 w-px -translate-y-1/2 bg-white/45"
+          style={{ left: `${hundredPct}%` }}
+        />
         <div
           className={`absolute top-1/2 h-3 w-3 -translate-y-1/2 rounded-full bg-white shadow transition-opacity ${
             dragging ? 'opacity-100' : 'opacity-80 group-hover:opacity-100'
           }`}
-          style={{ left: `calc(${v}% - 6px)` }}
+          style={{ left: `calc(${(v / VOLUME_UI_MAX) * 100}% - 6px)` }}
         />
       </div>
-      <span className="w-7 shrink-0 text-[11px] tabular-nums text-white/60">{v}</span>
+      <span className="w-9 shrink-0 text-[11px] tabular-nums text-white/60">{v}%</span>
     </div>
   )
 }
@@ -172,6 +188,15 @@ function VolumeSlider({ volume, onSet }: { volume: number; onSet: (v: number) =>
 /** 倍速档位（与控制栏按钮里的显示顺序一致；播放页那份是给快捷键循环用的） */
 const SPEED_CHOICES = [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3]
 const fmtSpeed = (s: number): string => `${Number.isInteger(s) ? s.toFixed(1) : s}x`
+
+/** 键位提示小胶囊（自救浮层里用；JSX 里不能写 Markdown，键位要用样式标出来） */
+function Key({ children }: { children: React.ReactNode }) {
+  return (
+    <kbd className="mx-0.5 rounded border border-white/25 bg-white/10 px-1 font-mono text-[10px] text-white">
+      {children}
+    </kbd>
+  )
+}
 
 /** 弹幕设置面板里的小胶囊按钮（v0.2.8） */
 function Chip({
@@ -276,6 +301,16 @@ export default function PlayerOverlay(): React.ReactElement {
    * 改动写回 settings 后主进程的 store 钩子会立刻重挂着色器链 —— 播放中即时生效。
    */
   const [qualityMenu, setQualityMenu] = useState(false)
+  /**
+   * 「疑似点击击穿」自救浮层（v0.3.6）。
+   *
+   * 用户反馈：控制栏按钮偶尔点了没反应，而且**没法自救**（连 Esc 也没用，因为那时焦点在
+   * mpv 的窗口上、应用侧快捷键收不到）。主进程侦测到「鼠标落在悬浮窗上、但连按三次都没点到按钮」
+   * 之后会发一条事件过来，这里弹一个小浮层告诉用户两条逃生路线：
+   * **按 F 重新全屏一次**（强制重建视频子窗口与悬浮窗的几何关系）或 **Esc 退出播放器**。
+   * 为什么这两条有用、以及这个 bug 的成因，写在 playerOverlay.ts 的 noteOverlayMissedClick 上面。
+   */
+  const [clickThrough, setClickThrough] = useState(false)
   const [a4k, setA4k] = useState<Anime4kSettings>({})
   const [showInfo, setShowInfo] = useState(false)
   /** 选集浮层里正在查看的线路（悬浮窗本地状态，切换线路不打断播放） */
@@ -476,6 +511,38 @@ export default function PlayerOverlay(): React.ReactElement {
       void api.overlay.setInteractive(false)
     }
   }, [visible, uoscBar])
+  /**
+   * v0.3.6「点击击穿」自救侦测。
+   *
+   * 悬浮窗在**点击穿透**状态下依然收得到 `mousemove`（`setIgnoreMouseEvents(true, { forward: true })`
+   * 会把鼠标移动转发过来），但收不到 click —— 所以能观测到的信号是：
+   * **鼠标在这个窗口里按下了，却没有任何按钮接住**。
+   * 这里用捕获阶段的 pointerdown 记录这个事实并上报（坐标一起给主进程，
+   * 便于日志里看出用户点的是控制栏哪个位置）。
+   *
+   * 注意 `pointerdown` 在我们的按钮上是**先于 click** 触发的，而按钮自己会 `stopPropagation`，
+   * 所以「按钮真的接住了」时这段代码根本不会跑到 —— 这正是我们想要的判据。
+   */
+  useEffect(() => {
+    const onDown = (e: PointerEvent): void => {
+      void api.overlay.reportMissedClick(e.clientX, e.clientY)
+    }
+    window.addEventListener('pointerdown', onDown, true)
+    return () => window.removeEventListener('pointerdown', onDown, true)
+  }, [])
+
+  /**
+   * 收到主进程的「疑似点击击穿」提示 → 显示自救浮层（见 clickThrough 的状态定义）。
+   * 浮层只在悬浮窗里画，不影响播放页；用户按 F/Esc 后自行消失（或点「知道了」）。
+   */
+  useEffect(
+    () =>
+      api.overlay.onClickThrough(() => {
+        setClickThrough(true)
+      }),
+    []
+  )
+
   useEffect(() => {
     // 点击穿透时 mousemove 依然会转发到本窗口，因此可以自行感知鼠标移动
     const onMove = (): void => poke()
@@ -516,6 +583,65 @@ export default function PlayerOverlay(): React.ReactElement {
       style={{ background: 'transparent' }}
       onDoubleClick={() => send({ type: 'playPause' })}
     >
+      {/*
+        v0.3.6「点击击穿」自救浮层。
+        它必须画在**最上面**（z-[60]，高于选集/详情浮层），因为出现这个提示时
+        用户很可能已经点不动别的东西了 —— 提示本身要是也被挡住就毫无意义。
+        三个按钮都走 onPointerDown（与整个控制栏一致，click 在原生窗口叠层下更不可靠）。
+      */}
+      {clickThrough ? (
+        <div
+          data-sakana-clickthrough="1"
+          className="absolute left-1/2 top-4 z-[60] w-[min(560px,90vw)] -translate-x-1/2 rounded-xl border border-warn/50 bg-black/85 px-4 py-3 text-white shadow-2xl backdrop-blur"
+        >
+          <div className="flex items-start gap-3">
+            <TriangleAlert size={18} className="mt-0.5 shrink-0 text-warn" />
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-semibold">控制栏似乎没接住你的点击</div>
+              <p className="mt-1 text-[11px] leading-relaxed text-white/75">
+                播放画面是内核的原生子窗口，永远盖在网页之上，所以控制栏是一层独立的透明窗口；
+                鼠标事件偶尔会落在两个窗口之间，表现为「按钮看得见、点了没反应」。
+                <br />
+                两条逃生路线：按 <Key>F</Key> 重新全屏一次（重建视频窗口与控制栏的位置关系），
+                或按 <Key>Esc</Key> 退出播放器回主界面。
+              </p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onPointerDown={(e) => {
+                    e.stopPropagation()
+                    send({ type: 'toggleFullscreen' })
+                    setClickThrough(false)
+                  }}
+                  className="rounded-lg bg-accent px-3 py-1.5 text-[11px] font-medium text-white hover:opacity-90 whitespace-nowrap"
+                >
+                  重新全屏（F）
+                </button>
+                <button
+                  type="button"
+                  onPointerDown={(e) => {
+                    e.stopPropagation()
+                    send({ type: 'escape' })
+                  }}
+                  className="rounded-lg bg-white/15 px-3 py-1.5 text-[11px] text-white hover:bg-white/25 whitespace-nowrap"
+                >
+                  退出播放器（Esc）
+                </button>
+                <button
+                  type="button"
+                  onPointerDown={(e) => {
+                    e.stopPropagation()
+                    setClickThrough(false)
+                  }}
+                  className="rounded-lg px-3 py-1.5 text-[11px] text-white/60 hover:text-white whitespace-nowrap"
+                >
+                  知道了
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {/*
         v0.2.8：弹幕层 —— 画在悬浮窗里才能盖在原生视频之上（页面里的元素会被视频整个挡住）。
         位置取播放页推送过来的视频区域矩形，再**往里收一圈**：

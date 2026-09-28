@@ -10,7 +10,8 @@ import type {
   RulePlayResult,
   RuleSearchDef,
   RuleSearchEntry,
-  RuleSearchResult
+  RuleSearchResult,
+  RulesRepoMeta
 } from '@shared/types'
 import { DEFAULT_RULES, emptyRule } from '@shared/types'
 import { log } from '../log'
@@ -861,4 +862,128 @@ export async function rulesRepoImport(names: string[]): Promise<{ imported: numb
   store.set('rules', rules)
   log.append('info', 'rules', `规则仓库导入完成：${imported} 条成功，${failed.length} 条失败`)
   return { imported, failed }
+}
+
+// ---------------- 启动时自动检测规则仓库更新 ----------------
+
+/**
+ * 规则版本比较（仓库里的 version 是 `1.0` / `1.4` / `2.3` 这类点分数字，
+ * 也可能出现 `1.0.1-fix` 这种**本地位**——见 RULE_FIXES 的 version 字段）。
+ *
+ * 逐段比较：纯数字段按数值比大小（避免 '10' < '9' 这种字典序错误），
+ * 非数字段按字典序；段数不足的一侧按 '0' 补，因此 `1.0` 与 `1.0.0` 视为相同版本。
+ * 返回 <0：a 比 b 旧；0：相同；>0：a 比 b 新。
+ */
+function compareRuleVersion(a: string, b: string): number {
+  const toSeg = (v: string): string[] =>
+    String(v ?? '')
+      .trim()
+      .split(/[.\-_+]/)
+      .filter((s) => s !== '')
+  const x = toSeg(a)
+  const y = toSeg(b)
+  const n = Math.max(x.length, y.length)
+  for (let i = 0; i < n; i++) {
+    const p = x[i] ?? '0'
+    const q = y[i] ?? '0'
+    const pNum = /^\d+$/.test(p)
+    const qNum = /^\d+$/.test(q)
+    if (pNum && qNum) {
+      const d = Number(p) - Number(q)
+      if (d !== 0) return d < 0 ? -1 : 1
+      continue
+    }
+    if (p !== q) return p < q ? -1 : 1
+  }
+  return 0
+}
+
+/**
+ * 启动时自动检测规则仓库是否有更新，并把「本地没有的」与「远端版本更高的」导入。
+ *
+ * 为什么按版本比对、而不是每次启动无脑重导一遍：
+ *  导入是按**规则名**整体覆盖的（见 rulesRepoImport），而用户完全可能在导入后手工微调过某条规则
+ *  （站点改版时这是最常用的应急手段：改一个 XPath 就能继续用）。若每次启动都无条件重导，
+ *  这些手改会被静默冲掉 —— 用户只会看到「昨天改好的规则今天又坏了」。所以本地版本 ≥ 远端即视为
+ *  「没有更新」直接跳过；只有远端真的更高（或本地根本没有这条）才落盘。
+ *
+ * 为什么失败必须静默（只写日志 + 状态，不弹框、不抛给调用方）：
+ *  它是**启动路径上的后台任务**，而镜像/网络不可用是常态（大陆网络下 GitHub 直连常年不通，
+ *  jsDelivr 也会偶发超时）。这不是用户刚刚触发的操作失败，没有任何需要用户决策的信息，
+ *  弹错误框只会让「打开应用」变成一件会被打断的事。因此：全镜像失败 → 状态记 'failed'、写一条 warn 日志，
+ *  然后正常返回（调用方是 setTimeout，抛出去就会变成没人接的 unhandledRejection）。
+ *
+ * 另注：内置规则（default- 前缀）由 ensureDefaultRules() 在每次启动时按内置定义恢复，
+ * 因此对内置规则名的导入是「本会话生效、下次启动先被恢复再按版本重新判定」——
+ * 版本门禁保证了只有仓库真的更高时才会付这一次网络与写盘成本。
+ */
+export async function rulesRepoAutoUpdate(): Promise<RulesRepoMeta> {
+  const meta: RulesRepoMeta = {
+    lastCheckAt: Date.now(),
+    lastResult: 'failed',
+    updated: [],
+    failed: [],
+    remoteTotal: 0
+  }
+  try {
+    // 全镜像都取不到时 rulesRepoIndex() 会 throw，由下面的 catch 兜住
+    const index = await rulesRepoIndex()
+    meta.remoteTotal = index.length
+
+    const local = store.get<PlayRule[]>('rules', [])
+    /*
+     * 本地匹配口径与 rulesRepoImport 保持一致（先按 id `repo-<小写name>`，再退回按名称），
+     * 否则「用户改过 id 但名字相同」的规则会被当成"本地没有"，导入后又多出一条同名规则。
+     */
+    const findLocal = (name: string): PlayRule | undefined => {
+      const id = `repo-${name.toLowerCase()}`
+      return (
+        local.find((r) => r.id === id) ??
+        local.find((r) => r.name.toLowerCase() === name.toLowerCase())
+      )
+    }
+
+    const pending: string[] = []
+    for (const item of index) {
+      if (!item?.name) continue
+      const mine = findLocal(item.name)
+      // 本地没有 → 新规则，导入
+      if (!mine) {
+        pending.push(item.name)
+        continue
+      }
+      // 本地版本不低于远端 → 无更新，跳过（保护用户手改）
+      if (compareRuleVersion(mine.version, item.version) >= 0) continue
+      pending.push(item.name)
+    }
+
+    if (pending.length === 0) {
+      meta.lastResult = 'latest'
+      log.append(
+        'info',
+        'rules',
+        `规则仓库自动检测：已是最新（远端 ${index.length} 条 / 本地 ${local.length} 条，无更新）`
+      )
+    } else {
+      // rulesRepoImport 对每条规则单独 try/catch：某条拉取或解析失败只会进 failed，不影响其它条
+      const r = await rulesRepoImport(pending)
+      meta.failed = r.failed
+      meta.updated = pending.filter((n) => !r.failed.includes(n))
+      meta.lastResult = meta.updated.length > 0 ? 'updated' : 'failed'
+      log.append(
+        meta.updated.length > 0 ? 'info' : 'warn',
+        'rules',
+        `规则仓库自动检测：检出 ${pending.length} 条需更新（远端 ${index.length} 条）` +
+          `，已更新 ${meta.updated.length} 条${meta.updated.length ? `（${meta.updated.join('、')}）` : ''}` +
+          `，失败 ${meta.failed.length} 条${meta.failed.length ? `（${meta.failed.join('、')}）` : ''}`
+      )
+    }
+  } catch (err) {
+    // 静默降级：仅写日志与状态，绝不弹框、绝不影响启动
+    meta.lastResult = 'failed'
+    log.append('warn', 'rules', `规则仓库自动检测失败（已静默跳过，不影响启动）: ${String(err)}`)
+  }
+  // 状态落 store，规则页通过 api.store.get('rulesRepoMeta') 读取展示
+  store.set('rulesRepoMeta', meta)
+  return meta
 }
