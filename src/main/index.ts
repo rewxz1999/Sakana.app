@@ -768,6 +768,62 @@ if (!gotLock) {
     }
 
     /*
+     * 播放器截图 → 系统剪贴板 的端到端自检（SAKANA_SNAPSHOT_TEST=视频文件，v0.3.7）。
+     *
+     * 为什么必须单独立一个：
+     * 用户报「截图快速导入到剪贴板没有实现」，而上一版的自检是在**另一条**截图路径上验的
+     * （`playerScreenshot` = 截网页的兜底路径），那条一直是好的 —— 于是自检通过、功能照旧不生效。
+     * 这条自检刻意去跑**真实播放时走的那条**：嵌入 mpv → 播本地视频 → 等画面出来 →
+     * 调 `snapshotViaMpv()`（就是 IPC handler 调的那个函数）→ 打印「是否落盘 / 是否复制成功」。
+     *
+     * 验证方式（缺一不可，见 .e2e/verify-snapshot-clipboard.ps1）：
+     * ① 日志里出现「已复制到剪贴板」；② 截图 PNG 真的在磁盘上；
+     * ③ 应用退出后，**Windows 自己的**剪贴板里有一张与那个 PNG 同尺寸的图。
+     */
+    if (process.env.SAKANA_SNAPSHOT_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const file = process.env.SAKANA_SNAPSHOT_TEST!
+          const { mpvAttach, mpvPlay, mpvGetState, mpvDestroy, mpvAvailable } = await import('./services/mpv')
+          const { snapshotViaMpv } = await import('./ipc')
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
+          console.log(`[snapshot-test] 运行时可用=${mpvAvailable()} 媒体=${file}`)
+          if (!win) {
+            console.log('[snapshot-test] 无主窗口')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const att = mpvAttach(win, { x: 0, y: 60, width: 960, height: 480 })
+          console.log(`[snapshot-test] 嵌入: ${JSON.stringify(att)}`)
+          if (!att.ok) {
+            markQuitting()
+            app.quit()
+            return
+          }
+          mpvPlay(file)
+          // 等真的一帧画面出来（时间 > 0 且不在暂停）再截，否则 mpv 会拒绝「无视频画面」
+          let playing = false
+          for (let i = 0; i < 12; i++) {
+            await new Promise((r) => setTimeout(r, 1000))
+            const st = mpvGetState()
+            console.log(`[snapshot-test] 状态(${i + 1}s) ${JSON.stringify(st)}`)
+            if (st?.ready && st.time > 0 && !st.paused) {
+              playing = true
+              break
+            }
+          }
+          if (!playing) console.log('[snapshot-test] ⚠ 视频没能播起来，截图大概率失败（结果仅供参考）')
+          const r = await snapshotViaMpv('快照自检', 3)
+          console.log(`[snapshot-test] 截图结果 ${JSON.stringify(r)}`)
+          mpvDestroy()
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
+    }
+
+    /*
      * Anime4K 超分自检（SAKANA_ANIME4K_TEST=视频文件，v0.3.1）。
      *
      * 要证的不是「我们拼出了路径」，而是**mpv 真的接受了这条链**：

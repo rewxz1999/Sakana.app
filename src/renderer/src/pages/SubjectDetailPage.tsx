@@ -18,6 +18,7 @@ import {
 } from 'lucide-react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import type {
+  EpisodeProgress,
   MikanItem,
   PlayRule,
   RuleEpisodeGroup,
@@ -95,6 +96,13 @@ export function SubjectDetailPage() {
   const fromSearch = (location.state as { from?: string } | null | undefined)?.from === 'search'
   const subjectId = Number(id)
   const [detail, setDetail] = useState<SubjectDetail | null>(null)
+  /**
+   * 「更新到第几集」（v0.3.7，用户要求）。
+   * 单独一个请求（分集接口），失败/取不到就是 null —— 界面据此**整行不显示**。
+   * 刻意不把它塞进 `detail`：详情接口 30 天缓存，而集数进度一周一变、还要 6 小时刷新一次，
+   * 两者生命周期不同，混在一起会互相拖累。
+   */
+  const [epProgress, setEpProgress] = useState<EpisodeProgress | null>(null)
   const [loading, setLoading] = useState(true)
   const [failed, setFailed] = useState('')
   const [ruleOpen, setRuleOpen] = useState(false)
@@ -119,6 +127,16 @@ export function SubjectDetailPage() {
       else if (!r.ok) setFailed(r.error)
       else if (r.ok && r.data.error) setFailed(r.data.error.message)
       setLoading(false)
+    })()
+    /*
+     * 集数进度与详情**并行**请求，谁先回来先渲染谁：
+     * 分集接口是独立的一次请求（约 300ms），串行只会让详情页整体慢一拍。
+     * 失败不置错、不弹提示 —— 这只是详情页的一个附加信息，不该因为它让整页显示「加载失败」。
+     */
+    void (async () => {
+      const p = await api.bangumi.episodeProgress(subjectId)
+      if (!alive) return
+      setEpProgress(p.ok ? p.data : null)
     })()
     return () => {
       alive = false
@@ -417,6 +435,30 @@ export function SubjectDetailPage() {
                     </Badge>
                   ) : null}
                   {detail.eps != null ? <Badge>全 {detail.eps} 话</Badge> : null}
+                  {/*
+                    「更新到第几集」（v0.3.7）：数据来自分集接口每集的放送日期，数出来的真值。
+                    · 还在播：显示「更新至 第 N 集」（有下一集日期时补一句「下集 MM-DD」）；
+                    · 已播完：显示「已完结 · 共 N 集」（和上面的「全 X 话」不重复 ——
+                      那个是 bangumi 登记的计划集数，这个是真的播完了）。
+                    取不到进度（离线 / 兜底数据源 / 没登记分集）时整块不渲染，不显示 0。
+                  */}
+                  {epProgress && epProgress.aired > 0 ? (
+                    epProgress.finished ? (
+                      <Badge tone="ok">
+                        <CircleCheck size={11} /> 已完结 · 共 {epProgress.total} 集
+                      </Badge>
+                    ) : (
+                      <>
+                        <Badge tone="accent">
+                          <CirclePlay size={11} /> 更新至 第 {epProgress.aired} 集
+                          {epProgress.total > 0 ? ` / 全 ${epProgress.total} 集` : ''}
+                        </Badge>
+                        {epProgress.nextAirDate ? (
+                          <Badge>下集 {String(epProgress.nextAirDate).slice(5)}</Badge>
+                        ) : null}
+                      </>
+                    )
+                  ) : null}
                   {finalWatchedAt ? (
                     <Badge tone="ok">
                       <CircleCheck size={11} /> 看完于 {fmtDateTime(finalWatchedAt)}

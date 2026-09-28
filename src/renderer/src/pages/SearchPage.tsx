@@ -22,7 +22,8 @@ import { useNavigate } from 'react-router-dom'
 import type { MarkItem, MarkList, SearchResultItem } from '@shared/types'
 import { api } from '@/lib/api'
 import { yearOf } from '@/lib/format'
-import { HISTORY_LIMIT, defaultListName, quickFavoriteTarget, useMarks } from '@/stores/marks'
+import { HISTORY_LIMIT, defaultListName, useMarks } from '@/stores/marks'
+import { isFavorite, useLibrary, type FavoriteSubjectInput } from '@/stores/library'
 import { toast, useSettings } from '@/stores/app'
 import {
   Badge,
@@ -98,6 +99,27 @@ function toDragSubject(item: SearchResultItem): DragSubject {
     subjectId: item.id,
     title: item.name_cn || item.name,
     cover: item.images?.large ?? item.images?.common ?? ''
+  }
+}
+
+/**
+ * 搜索结果 → 收藏页（/favorites）所需的条目字段（`FavoriteSubjectInput`，见 stores/library.ts）。
+ *
+ * 搜索结果里能拿到的字段全部传过去：
+ * - `air_date` **必须传**：收藏页的季度导航（favoritesSeason.ts）靠它分季，
+ *   缺了就会被归到「未知年份」；
+ * - `images` / `rating` 收藏页直接展示，也一并带上；
+ * - `genres` 搜索接口不返回（要详情才有），留空即可 ——
+ *   library 的 enrichFavorites 会在收藏页进页面时后台补全。
+ */
+function toFavoriteSubject(item: SearchResultItem): FavoriteSubjectInput {
+  return {
+    id: item.id,
+    name: item.name,
+    name_cn: item.name_cn,
+    images: item.images,
+    rating: item.rating,
+    air_date: item.air_date
   }
 }
 
@@ -219,13 +241,19 @@ export function SearchPage() {
     addMark,
     removeMark,
     isMarked,
-    toggleQuickFavorite,
     pushHistory,
     clearHistory,
     addShowcase,
     removeShowcase,
     clearShowcase
   } = useMarks()
+
+  /**
+   * 收藏页的数据源（只读不改地使用 stores/library.ts）：
+   * 「快速收藏」这个心形按钮落到的就是这里的 `favorites`（`/favorites` 页展示的同一份数据），
+   * 与上面的书签（markLists / markItems）是**两套完全独立**的存储。
+   */
+  const { favorites, toggleFavorite } = useLibrary()
 
   // 返回搜索页（从详情页 navigate(-1) 回来）时恢复上次的一屏结果；只读一次，不吃二次渲染
   const [restored] = useState(readSnapshot)
@@ -323,17 +351,6 @@ export function SearchPage() {
     () => lists.find((l) => l.id === currentListId) ?? lists[0] ?? null,
     [lists, currentListId]
   )
-
-  /**
-   * 快速收藏的落点书签（需求 A）。
-   *
-   * 规则只有一份、在 stores/marks.ts 的 quickFavoriteTarget 里：
-   * 有「我的收藏」就用它 → 否则用第一本书签 → 一本都没有时返回 null。
-   * 这里**只在渲染时"看"结果**（决定心形按钮是不是已收藏态），
-   * 真正需要新建书签的那一步落在 store 的 toggleQuickFavorite 里 ——
-   * 一屏几十行结果都在渲染，渲染期间绝不能写盘、更不该凭空多出一本书签。
-   */
-  const favoriteList = useMemo(() => quickFavoriteTarget(lists), [lists])
 
   useEffect(() => {
     // 书签还没从磁盘载入完：此时 lists 为空只代表「还没加载」，不能把恢复出来的当前书签清掉
@@ -445,16 +462,30 @@ export function SearchPage() {
   }
 
   /**
-   * 快速收藏（需求 A）：结果行上心形按钮的一键收藏 / 取消。
+   * 快速收藏（需求 2）：结果行上心形按钮的一键收藏 / 取消。
+   *
+   * 落点是**收藏页**（`/favorites` 展示的那份数据，即 stores/library.ts 的 `favorites`），
+   * 用户原话：「搜索结果列表上的快速收藏是快速收藏到收藏页面的意思，不是创建收藏标签放入」——
+   * 所以这里直接调 library 的 `toggleFavorite`，既不再新建/使用任何书签，
+   * 心形的高亮也由 `isFavorite(favorites, id)` 说了算（见下方渲染处）。
    *
    * 与旁边「标记」按钮的分工：标记按钮弹列表选择框（用户要挑进哪本书签），
-   * 快速收藏**不弹任何东西**，直接落到默认收藏列表（落点规则见 favoriteList 的注释），
-   * 所以它才要放在标记按钮**左侧**：一次点击就能完成的高频动作放更顺手的位置。
+   * 快速收藏**不弹任何东西**，直接切换收藏页里的收藏，所以它放在标记按钮**左侧**：
+   * 一次点击就能完成的高频动作放更顺手的位置。两者读写的是两套独立存储，互不联动。
    */
   const quickFavorite = (item: SearchResultItem): void => {
-    const r = toggleQuickFavorite(toDragSubject(item))
-    if (r.added) toast.success(`已收藏到「${r.listName}」`)
-    else toast.info(`已取消收藏（「${r.listName}」）`)
+    /*
+     * 备用数据源（Jikan / AniList 兜底）条目的 id 是**负数**，library 的 toggleFavorite
+     * 会拦下来并自己给一句提示。这里原样转发、不再叠一条 toast，免得一次点击弹两句。
+     */
+    if (item.id < 0) {
+      toggleFavorite(toFavoriteSubject(item))
+      return
+    }
+    const wasFavorited = isFavorite(favorites, item.id)
+    toggleFavorite(toFavoriteSubject(item))
+    if (wasFavorited) toast.info('已取消收藏')
+    else toast.success('已收藏到收藏页')
   }
 
   /** 拖到书签条空白处：进当前书签；没有书签时先建一个，否则拖拽会因为「无目标」而变成一次无效操作 */
@@ -713,12 +744,16 @@ export function SearchPage() {
   const emptyShowcaseOpen = view === 'search' && !hasListContent && !searching
 
   /**
-   * 空态轮播展示位：文案下面撑满剩余高度的一块大轮播图。
-   * 外层 `flex-1`（父容器是 `flex min-h-full flex-col`，见下面的空态分支）让它吃掉文案之外的空白，
-   * `min-h-[200px]` 保证窗口再矮也有一块像样的图，不够高时跟着滚动区正常滚动。
+   * 空态轮播展示位：撑满剩余高度的一块大轮播图（用户可自定义图片与间隔）。
+   * 外层 `flex-1` 让它在**内容区**（`flex grow flex-col`）里吃掉其它内容之外的空白；
+   * `min-h-[200px]` 保证窗口再矮也有一块像样的图，不够高时整块跟着外层滚动区正常滚动。
+   *
+   * ⚠️ v0.3.7：它必须排在**最后**（文案 → 随机推荐 → 大肥鱼轮播 → 它）。
+   * 它是这一列里唯一会长个儿的元素，排在谁后面就把谁往下推 ——
+   * 之前排中间/排前面时，用户看到的正是「随机推荐和底部轮播离搜索说明太远」。
    */
   const emptyShowcase = (
-    <div className="mt-4 min-h-[200px] flex-1">
+    <div className="mt-2 min-h-[200px] flex-1">
       <ImageCarousel
         images={showcase}
         onUpload={() => void uploadShowcase()}
@@ -1056,10 +1091,11 @@ export function SearchPage() {
                   const subject = toDragSubject(item)
                   const marked = currentList ? isMarked(currentList.id, item.id) : false
                   /*
-                   * 已收藏态用**默认收藏列表**判定（与心形按钮的落点同一本书签）。
-                   * favoriteList 为 null 代表用户一本书签都还没有，此时不可能已收藏。
+                   * 已收藏态用**收藏页的数据**判定（library 的 favorites + isFavorite），
+                   * 与上面那个书签态 `marked` 是两套独立存储：
+                   * 点心形不会让书签图标亮起来，点标记也不会改变心形。
                    */
-                  const favorited = favoriteList ? isMarked(favoriteList.id, item.id) : false
+                  const favorited = isFavorite(favorites, item.id)
                   const year = yearOf(item.air_date)
                   return (
                     <div
@@ -1102,18 +1138,14 @@ export function SearchPage() {
                         </div>
                       </div>
                       {/*
-                        快速收藏（需求 A）：在「标记」按钮**左侧**。
-                        - 一键落到默认收藏列表，不弹列表选择框（标记按钮才弹）；
+                        快速收藏（需求 2）：在「标记」按钮**左侧**。
+                        - 一键收藏到**收藏页**（/favorites），不弹列表选择框、也不创建书签（标记按钮才弹/才建书签）；
                         - 已收藏时心形填充 + 危险色 + 淡红底，再点一次即取消；
                         - e.stopPropagation() 必须保留：整行挂着 onClick 跳详情页，
                           不拦住的话点一下收藏会连带跳走（与右侧标记按钮同一个写法）。
                       */}
                       <IconButton
-                        title={
-                          favorited
-                            ? `已收藏到「${favoriteList?.name ?? ''}」，再点一次取消`
-                            : `快速收藏${favoriteList ? `到「${favoriteList.name}」` : '（自动新建「我的收藏」）'}`
-                        }
+                        title={favorited ? '已收藏到收藏页，再点一次取消' : '快速收藏到收藏页'}
                         className={`shrink-0 hover:!text-danger ${
                           favorited ? 'bg-danger/12 text-danger' : ''
                         }`}
@@ -1152,37 +1184,83 @@ export function SearchPage() {
               文案区不缩小、滚动/拖拽等行为都不变 —— 展示位只是补在文案下方。
 
               需求 B：**没有进行搜索时**（`!searched`）这块空白还要有内容 ——
-              在文案下方接「随机推荐番剧」（热门/高分/冷门/当季，四个分组竖向排列），
-              空置区域的最底部再放一排大肥鱼图（轮流切换 + 标注来源）。
+              在文案**正下方**先接「随机推荐番剧」（热门/高分/冷门/当季，四个横向排列的分组），
+              紧接着再放一排大肥鱼图（轮流切换 + 标注来源）；用户自己的展示位排在最后填满剩余空白。
               搜索过但没结果（`searched`）时保持原样：只给「没有搜索到结果」的提示 + 展示位，
-              推荐区不出现（用户已经给过关键词了，这时该做的是换词，不是看推荐）。
+              推荐区与轮播都不出现（用户已经给过关键词了，这时该做的是换词，不是看推荐）。
+
+              【布局（v0.3.7 第三次调整，用户要求「随机推荐和底部轮播图再往上移动一些，直接紧贴在搜索说明的下面」）】
+              整块是一列 flex（`min-h-full` = 至少占满外层滚动区的可视高度），顺序就是**用户要的顺序**：
+                ① 搜索说明（EmptyState）；
+                ② 随机推荐（RecommendRail）；
+                ③ 大肥鱼轮播（FishStrip，水平居中）；
+                ④ 用户自己的展示位（`flex-1`，吃掉剩下的全部空白）。
+              所以①②③永远紧挨在一起、贴着文案，**窗口再高也不会把它们顶开** ——
+              空白全部由排最后的展示位吸收（它 `min-h-[200px]`，窗口再矮也有一块像样的图）。
+
+              之前两次调整的教训都在这条链上：
+                · 展示位是 `flex-1`，谁排在它后面谁就被推到底部 —— 第一版它夹在推荐区与轮播之间，
+                  于是「离得太远」；第二版挪到推荐区之前，推荐区与轮播相邻了，但整体仍在展示位下面那一大段之后。
+                · 现在干脆把展示位放到**最后**：它是唯一会长大的元素，长个儿只会往下长，不会推开上面三块。
+
+              内容超过一屏时整列跟着外层滚动区一起变高、正常滚动 ——
+              推荐列表始终完整可见，不会被压住或裁掉。
+              ⚠️ 内容区用 `grow`（flex-grow:1 + basis:auto）而**不是** `flex-1`（basis:0）：
+              basis:0 在没有剩余空间（内容超过一屏）时会把自己算成 0 高，
+              里面的文案/推荐列表就会被压扁；basis:auto 没有这个隐患。
             */
             <div className="flex min-h-full flex-col">
-              {searched ? (
-                <EmptyState
-                  icon={Search}
-                  title="没有搜索到结果"
-                  desc={
-                    searchError
-                      ? `${searchError}\n可点下方按钮检查/切换数据源`
-                      : '换个关键词试试；若一直失败，可到设置里检查数据源是否可用'
-                  }
-                />
-              ) : (
-                <EmptyState
-                  icon={Search}
-                  title="搜索番剧"
-                  desc="输入关键词后回车开始搜索，结果可直接拖到右侧书签条；点书签条上的书签可查看详情、重新搜索或管理条目"
-                />
-              )}
-              {/* 未搜索：随机推荐区（数据来源与判据见 components/RecommendRail.tsx 的顶部注释） */}
-              {searched ? null : <RecommendRail onOpen={openSubject} />}
-              {emptyShowcase}
-              {/*
-                大肥鱼图放在**空置区域最底部**（用户要求「空置区域显示底部显示图片」），
-                所以排在用户自己的展示位轮播之后；文件缺失/复制失败时组件自己返回 null（静默隐藏）。
-              */}
-              {searched ? null : <FishStrip className="mt-4" />}
+              <div className="flex grow flex-col">
+                {searched ? (
+                  <EmptyState
+                    icon={Search}
+                    title="没有搜索到结果"
+                    desc={
+                      searchError
+                        ? `${searchError}\n可点下方按钮检查/切换数据源`
+                        : '换个关键词试试；若一直失败，可到设置里检查数据源是否可用'
+                    }
+                  />
+                ) : (
+                  /*
+                    这个 `-mb-14` 是给「直接紧贴在搜索说明的下面」这条要求用的：
+                    共用的 `EmptyState` 自带 `py-14`（上下各 56px），在只有一段文案的页面上
+                    这样留白很好看，但这一页文案**下面紧跟着推荐区与轮播** ——
+                    那 56px 底边距就变成了一段纯粹的空档（实测文案到推荐区 72px）。
+                    这里把那 56px 抵消掉，只留推荐区自己的 `mt-4`（16px）—— 文案与推荐区之间就只剩这一道间距。
+                    ⚠️ 数值与 `EmptyState` 的 `py-14` 是绑定的：那边改了内边距，这里要跟着改
+                    （`.e2e/probe-search-layout.mjs` 会量出实际间距，改歪了一眼能看出来）。
+                  */
+                  <div className="-mb-14">
+                    <EmptyState
+                      icon={Search}
+                      title="搜索番剧"
+                      desc="输入关键词后回车开始搜索，结果可直接拖到右侧书签条；点书签条上的书签可查看详情、重新搜索或管理条目"
+                    />
+                  </div>
+                )}
+                {/*
+                  未搜索：随机推荐区（数据来源与判据见 components/RecommendRail.tsx 的顶部注释）。
+                  `shrink-0`：这一块永远按内容高度完整显示 —— 窗口再矮也只是让外层滚动区变长，
+                  不会被压扁或裁掉。
+                */}
+                {searched ? null : <RecommendRail onOpen={openSubject} className="shrink-0" />}
+                {/*
+                  大肥鱼轮播：**紧跟在推荐区下面**（v0.3.7 用户要求「直接紧贴在搜索说明的下面」）。
+                  它是普通流里的一行（不用 fixed/absolute），所以不会浮在内容上；
+                  上间距只留 8px，水平居中；文件缺失/复制失败时组件自己返回 null（静默隐藏）。
+                */}
+                {searched ? null : (
+                  <div className="flex shrink-0 justify-center pt-2">
+                    <FishStrip />
+                  </div>
+                )}
+                {/*
+                  用户自己的展示位放**最后**：它是这一列里唯一 `flex-1` 的元素，
+                  剩余空白全归它，因此上面的文案 / 推荐区 / 轮播永远紧贴在一起。
+                */}
+                {emptyShowcase}
+              </div>
             </div>
           )}
         </div>

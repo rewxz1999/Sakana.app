@@ -753,7 +753,14 @@ export function FishStrip({ className = '' }: { className?: string }) {
   const height = ratio === undefined ? 150 : ratio >= 1.6 ? 110 : ratio >= 1 ? 150 : 180
 
   return (
-    <div className={`flex items-end gap-3 ${className}`}>
+    /*
+     * v0.3.7：改成**竖排**（图在上、来源标注在下），让「图片本体」正好居中。
+     *
+     * 原来是横排（图在左、来源标注在右，`items-end gap-3`）：整行居中的结果是
+     * **图片被那行标注挤到左边**（实测偏左 86px）—— 用户要的是「图片轮换区域位于底部中间」，
+     * 居中的应该是图，而不是「图 + 一行字」。标注放到下面居中，图的中心就落在内容区中心上。
+     */
+    <div className={`flex flex-col items-center gap-1 ${className}`}>
       <div
         className="relative overflow-hidden rounded-xl border border-border bg-gradient-to-br from-accent-soft/40 via-elev2 to-elev3"
         style={{ height, aspectRatio: ratio ? String(ratio) : '16 / 9', maxWidth: '100%' }}
@@ -785,9 +792,7 @@ export function FishStrip({ className = '' }: { className?: string }) {
           </span>
         ) : null}
       </div>
-      <span className="shrink-0 pb-1 text-[10px] leading-relaxed text-faint whitespace-nowrap">
-        {FISH_SOURCE_NOTE}
-      </span>
+      <span className="text-center text-[10px] leading-relaxed text-faint">{FISH_SOURCE_NOTE}</span>
     </div>
   )
 }

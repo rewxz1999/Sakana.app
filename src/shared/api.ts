@@ -11,6 +11,7 @@ import type {
   DanmakuSettings,
   DeleteLocalResult,
   DownloadTask,
+  EpisodeProgress,
   GalEvent,
   GalGame,
   GalLaunchResult,
@@ -259,6 +260,11 @@ export interface SakanaApi {
      * month 可传该季度内的任意一个月，主进程会规范化到季度并按季度缓存。
      */
     season(year: number, month: number, force?: boolean): Promise<ApiResult<SeasonResult>>
+    /**
+     * 「更新到第几集」（v0.3.7）：按分集接口每集的 airdate 数出**已放送集数**。
+     * 取不到（离线 / 兜底数据源的负数 id / 条目没有分集）时 data 为 null，界面隐藏这一行。
+     */
+    episodeProgress(id: number): Promise<ApiResult<EpisodeProgress | null>>
     testMirrors(): Promise<ApiResult<MirrorTestResult[]>>
     /**
      * 角色列表（「最XX的角色 9宫格」工具）。

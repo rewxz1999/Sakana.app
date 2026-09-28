@@ -144,6 +144,26 @@ export interface SeasonResult {
   dataSource?: JikanFallbackMeta
 }
 
+/**
+ * 「更新到第几集」（v0.3.7，用户要求番剧表详情页显示）。
+ *
+ * 数据来自 Bangumi 的**分集接口**（`/v0/episodes?subject_id=…&type=0`），每一集都带
+ * `airdate`，所以「已更新到第几集」是**真的数出来的**，不是按「开播日 + 每周一集」猜的
+ * （猜的算法遇到停播、连播、分割放送就会错）。
+ */
+export interface EpisodeProgress {
+  /** 已放送集数（airdate <= 今天 的集数） */
+  aired: number
+  /** 本篇总集数（**已经登记**的集数；未播完的番可能只登记到当前集） */
+  total: number
+  /** 已放送的最后一集日期（YYYY-MM-DD），没有则 null */
+  lastAirDate: string | null
+  /** 下一集的放送日期（今天之后最近的一集），全部播完/未登记则 null */
+  nextAirDate: string | null
+  /** 是否已全部放送完（aired >= total 且 total > 0） */
+  finished: boolean
+}
+
 export interface SubjectDetail {
   id: number
   name: string

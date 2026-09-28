@@ -159,6 +159,67 @@ function snapshotPath(title?: string, episode?: number): string {
   return join(dir, `${name}${ep}_${stamp}.png`)
 }
 
+/**
+ * 等一个文件真的落盘（存在且非空），最多等 `timeoutMs` 毫秒。
+ *
+ * 为什么需要它：mpv 的 `screenshot-to-file` 是**异步**命令 —— 命令返回只代表「已受理」，
+ * 文件通常还要几十到几百毫秒才写完。紧接着去读文件会扑空（表现为「截图存了，但没进剪贴板」）。
+ * 轮询而不是 `fs.watch`：这里等的是**一次性的短事件**，watch 在 Windows 上对
+ * 「目录还不存在 / 文件被重命名」等边角情况要处理的失败模式更多，轮询反而更稳。
+ * 每 40ms 探一次，2.5s 上限 —— 正常情况两三次就命中，超时说明 mpv 那边真出问题了，
+ * 调用方只记日志、不报错（截图本身可能仍然是成功的）。
+ */
+async function waitForFile(file: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs)
+  for (;;) {
+    try {
+      if (existsSync(file) && statSync(file).size > 0) return true
+    } catch {
+      /* 文件正在被写、暂时 stat 不到：继续等 */
+    }
+    if (Date.now() >= deadline) return false
+    await new Promise((r) => setTimeout(r, 40))
+  }
+}
+
+/**
+ * 播放器截图（mpv 路径）的完整收尾：交给 mpv 存盘 → 等它真的落盘 → 按设置写进系统剪贴板。
+ *
+ * v0.3.7 修复（用户报「上个版本的截图快速导入到剪贴板没有实现」）：
+ *
+ * 播放器里有**两条**截图路径，而用户实际走的这条以前**根本没有复制剪贴板**：
+ *   · 这条（mpv 的 `screenshot-to-file`，截图带 OSD/弹幕、不受网页限制）——
+ *     `s` 键、控制栏截图按钮走的都是它，之前只有一行「已保存」日志，没有复制；
+ *   · 另一条 `playerScreenshot`（`webContents.capturePage()` 截网页，mpv 内核不可用时的兜底）——
+ *     那条在 v0.3.6 就接了剪贴板。所以上一版自检「通过」了：自检验的是兜底那条，
+ *     真正播放时走的是这条，于是用户那边永远不生效。
+ *
+ * 还有一个必须处理的时序问题：`screenshot-to-file` 是**异步落盘**的，
+ * 命令返回时文件往往还没写完 —— 立刻去复制只会得到「文件不存在」。
+ * 所以这里等文件真的出现（最多 2.5s）再复制；等不到只记日志，不影响「截图已保存」这个事实。
+ *
+ * 抽成导出函数的原因：`SAKANA_SNAPSHOT_TEST` 自检（index.ts）要跑到**同一段代码**。
+ * 自检里另写一遍的话，验的是副本 —— 产品代码里的 bug 照样漏过去（上一版就是这么漏的）。
+ */
+export async function snapshotViaMpv(
+  title?: string,
+  episode?: number
+): Promise<{ file: string; wrote: boolean; copied: boolean }> {
+  const file = snapshotPath(title, episode)
+  engineSnapshot(file)
+  const wrote = await waitForFile(file, 2500)
+  const copied = wrote ? await copyScreenshotIfEnabled(file) : false
+  log.append(
+    'info',
+    'player',
+    `播放器截图已保存: ${file}` +
+      (wrote ? '' : '（等待落盘超时）') +
+      (wrote ? (copied ? '；已复制到剪贴板' : '；未复制剪贴板（按设置关闭或写入失败）') : '')
+  )
+  maybeShowSaveHint()
+  return { file, wrote, copied }
+}
+
 export function registerIpc(): void {
   /*
    * ---------- 窗口控制 ----------
@@ -247,6 +308,8 @@ export function registerIpc(): void {
   ipcMain.handle(CH.bgmSeason, (_e, year: number, month: number, force?: boolean) =>
     bangumi.season(Number(year), Number(month), !!force)
   )
+  /** 「更新到第几集」（v0.3.7）：取不到返回 null，界面据此隐藏这一行而不是显示 0 */
+  ipcMain.handle(CH.bgmEpisodeProgress, (_e, id: number) => bangumi.episodeProgress(Number(id)))
   ipcMain.handle(CH.bgmTestMirrors, () => bangumi.testMirrors())
   // 「最XX的角色 9宫格」：角色列表（v0 优先 + 老接口兜底）与导出用的图片 data URL
   ipcMain.handle(CH.bgmCharacters, (_e, id: number) => bangumi.characters(Number(id)))
@@ -576,12 +639,9 @@ export function registerIpc(): void {
     engineAddSubtitleFile(path)
     return true
   })
-  ipcMain.handle(CH.playerSnapshot, (_e, title?: string, episode?: number) => {
-    const file = snapshotPath(title, episode)
-    engineSnapshot(file)
-    log.append('info', 'player', `播放器截图已保存: ${file}`)
-    maybeShowSaveHint()
-    return file
+  ipcMain.handle(CH.playerSnapshot, async (_e, title?: string, episode?: number) => {
+    const r = await snapshotViaMpv(title, episode)
+    return r.file
   })
   ipcMain.handle(CH.playerDetach, () => {
     // 异步销毁：内核的 stop/destroy 可能阻塞主进程（表现为退出播放时界面卡死）

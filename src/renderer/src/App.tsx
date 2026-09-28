@@ -11,6 +11,7 @@ import { FavoritesPage } from '@/pages/FavoritesPage'
 import { SearchPage } from '@/pages/SearchPage'
 import { ToolsPage } from '@/pages/ToolsPage'
 import { CharacterGridPage } from '@/pages/CharacterGridPage'
+import { CustomHistoryPage } from '@/pages/CustomHistoryPage'
 import { SettingsPage } from '@/pages/SettingsPage'
 import { SubjectDetailPage } from '@/pages/SubjectDetailPage'
 import { PlayerPage } from '@/pages/PlayerPage'
@@ -56,6 +57,8 @@ const SMALL_WINDOW_TITLES: Record<string, string> = {
   '/galgame/tools': 'Galgame 工具',
   // v0.2.11：最XX的角色 9宫格（工具页入口，独立小窗口里用）
   '/tools/character-grid': '最XX的角色 9宫格',
+  // 自建历史表（工具页入口，独立小窗口里用）
+  '/tools/custom-history': '自建历史表',
   // v0.2.12：独立的更新窗口
   '/update': '软件更新'
 }
@@ -92,6 +95,8 @@ function AnimatedRoutes() {
         <Route path="/tools" element={<PageTransition><ToolsPage /></PageTransition>} />
         {/* v0.2.11：最XX的角色 9宫格（工具页卡片入口指向这里） */}
         <Route path="/tools/character-grid" element={<PageTransition><CharacterGridPage /></PageTransition>} />
+        {/* 自建历史表（工具页卡片入口指向这里） */}
+        <Route path="/tools/custom-history" element={<PageTransition><CustomHistoryPage /></PageTransition>} />
         <Route path="/settings" element={<PageTransition><SettingsPage /></PageTransition>} />
         <Route path="/rules" element={<PageTransition><RulesPage /></PageTransition>} />
         <Route path="/datasource" element={<PageTransition><DataSourcePage /></PageTransition>} />

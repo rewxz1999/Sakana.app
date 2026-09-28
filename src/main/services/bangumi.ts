@@ -9,6 +9,7 @@ import type {
   CharacterItem,
   CharactersResult,
   CoverImages,
+  EpisodeProgress,
   MirrorTestResult,
   Rating,
   SearchResult,
@@ -59,7 +60,27 @@ const TTL_CALENDAR = 30 * 60 * 1000
  */
 const TTL_SUBJECT = 30 * 24 * 3600 * 1000
 const TTL_SEARCH = 30 * 60 * 1000
-const TTL_RATING = 30 * 24 * 3600 * 1000
+/**
+ * 评分缓存（番剧表「补评分」用）。
+ *
+ * ⚠️ v0.3.7 修正：原来是 **30 天**，用户实测报「一些番剧的评分和 bangumi 原站有出入」——
+ * 取证结果（`.e2e/probe-rating-stale.mjs`）：本地 12 份评分缓存里 **9 份已经和反代当前值不同**，
+ * 缓存年龄约 266 小时（11 天），例如同一部番缓存里是 5.3、当时是 4.9。
+ * 正在放送的番剧评分**每天都在动**，30 天对这类数据等于「永久钉住」。
+ *
+ * 现在改成 6 小时：一天最多 4 次，仍远低于「每次打开番剧表都请求」的压力，
+ * 又能保证用户看到的分数与站点最多差半天。
+ * （番剧表的卡片显示也一并改成**优先用日历自带的新评分**，见 SchedulePage —— 双保险。）
+ */
+const TTL_RATING = 6 * 3600 * 1000
+/**
+ * 分集进度缓存（「更新到第几集」）。
+ *
+ * 集数一周才动一次，理论上可以缓存很久；但用户点进详情页时最想看到的就是
+ * **刚刚更新的那一集**，所以取 6 小时这个「半天内必然刷新一次」的值，
+ * 一个条目一天最多 4 次请求，相对反代的其它请求量可以忽略。
+ */
+const TTL_EPISODES = 6 * 3600 * 1000
 /**
  * 季度条目缓存（v0.2.9 附加）。
  *
@@ -131,6 +152,21 @@ interface FallbackOutcome<T> {
  * 他无从判断「兜底到底试没试、为什么没兜到」——而这两件事决定了下一步该做什么
  * （是去换镜像，还是等 Jikan 上游恢复）。所以把兜底用过的端点与最终原因直接附在后面。
  */
+/**
+ * 本地日期字符串 `YYYY-MM-DD`（**不用** `toISOString()`）。
+ *
+ * 「更新到第几集」要拿今天的日期和每集的 `airdate` 比大小，而 `airdate` 就是
+ * 放送日历上的日期（东八区的番剧「7 月 6 日播出」指的就是本地的 7 月 6 日）。
+ * `toISOString()` 走 UTC：在 UTC+8 的凌晨 0–8 点会把本地「今天」算成 UTC 的昨天，
+ * 于是刚播出的那一集会被判成「还没播」—— 追番的人恰恰常在这个点看更新。
+ */
+function localDateString(d: Date = new Date()): string {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
 function appendFallbackFailure(error: SourceError, meta: JikanFallbackMeta): void {
   if (!meta.reason) return
   error.message = `${error.message}；Jikan 兜底也失败：${meta.reason}`
@@ -1032,7 +1068,13 @@ class BangumiService {
     }
     try {
       const items = await this.fetchSeason(y, season)
-      this.writeCache(key, items)
+      /*
+       * v0.3.7：**空结果不写缓存**。
+       * 一个季度完全取不到条目，通常意味着「这一季还没开播 / 条目还没登记」，
+       * 而季度缓存是 7 天 —— 把空列表写进去，会让「明天就有了」变成「一周以后才有」。
+       * 不写缓存的话下次打开会重新问一遍，代价只是多一次请求。
+       */
+      if (items.length > 0) this.writeCache(key, items)
       return { year: y, season, fromCache: false, fetchedAt: Date.now(), items }
     } catch (err) {
       const error: SourceError =
@@ -1084,9 +1126,37 @@ class BangumiService {
     return items
   }
 
-  /** 取某个季度的单个月份（`/v0/subjects?type=2&year=&month=&sort=rank`） */
+  /** 取某个季度的单个月份（`/v0/subjects?type=2&year=&month=&sort=…`） */
   private async fetchSeasonMonth(year: number, month: number): Promise<SeasonItem[]> {
-    const path = `/v0/subjects?type=2&year=${year}&month=${month}&sort=rank&limit=${SEASON_PAGE_LIMIT}`
+    /*
+     * v0.3.7 修复（用户报「马上就要进入秋季了，10 月的番剧数据完全没有」）：
+     *
+     * 以前固定用 `sort=rank`。取证（`.e2e/probe-season-sort.mjs`）：
+     *   · 2026-10（还没开播）→ `sort=rank` **total=0**，而 `sort=date` → total=108；
+     *   · 2025-10（已播完）→ `sort=rank` 73 条，不带 sort 却有 148 条。
+     * 也就是说 `sort=rank` **只返回「已经有人打分、进了排行榜」的条目**，
+     * 未开播 / 冷门的新番会被整批丢掉 —— 新一季的番剧表因此空空如也。
+     *
+     * 所以按放送日期的 `sort=date` 兜底：rank 拿不到东西时再问一次，
+     * 拿到的是「这一季登记在案的全部条目」（含未开播的）。
+     * 反过来不直接用 date 是因为 rank 的排序对**已播完**的季度更有用（热度高的在前）。
+     */
+    const byRank = await this.fetchSeasonMonthSorted(year, month, 'rank')
+    if (byRank.length > 0) return byRank
+    const byDate = await this.fetchSeasonMonthSorted(year, month, 'date')
+    if (byDate.length > 0) {
+      log.append(
+        'info',
+        'bangumi',
+        `季度检索 ${year}-${month} 用 sort=rank 取不到条目（多半是还没开播），已改用 sort=date 取到 ${byDate.length} 条`
+      )
+    }
+    return byDate
+  }
+
+  /** 季度检索的单次请求（sort 由调用方决定，见 fetchSeasonMonth 的说明） */
+  private async fetchSeasonMonthSorted(year: number, month: number, sort: 'rank' | 'date'): Promise<SeasonItem[]> {
+    const path = `/v0/subjects?type=2&year=${year}&month=${month}&sort=${sort}&limit=${SEASON_PAGE_LIMIT}`
     /*
      * 三个路径都给同一个地址：季度检索只有 v0 JSON 接口有（官方网页版的 /anime/browser
      * 是另一套 HTML，解析成本高且公共镜像已基本不可达）。
@@ -1285,6 +1355,58 @@ class BangumiService {
     })
     await Promise.all(workers)
     return out
+  }
+
+  /**
+   * 「更新到第几集」（v0.3.7，用户要求加在番剧表详情页）。
+   *
+   * 为什么要单独请求分集接口，而不是用详情里的 `eps` 或「开播日 + 每周一集」去算：
+   *   · 详情接口的 `eps` / `total_episodes` 是**计划集数**（12、24…），跟「播到第几集」无关；
+   *   · 按开播日期每 7 天推一集，遇到停播、连播两集、分割放送（第 2 季隔一季再播）、
+   *     中途改档就会算错 —— 追番时这个数字错了比没有还糟。
+   * `/v0/episodes?subject_id=…&type=0` 每一集都带 `airdate`，直接数「airdate <= 今天」的条数就是真值
+   * （type=0 = 本篇，排除 OP/ED/SP 这些特别篇）。
+   *
+   * 实测（`.e2e/probe-episodes.mjs`）：反代的这个端点可用，一部 12 集的番约 300ms、返回 12 条。
+   * 缓存 6 小时：集数一周才动一次，短缓存只是为了让「刚更新完的那一集」尽快出现。
+   */
+  async episodeProgress(id: number): Promise<EpisodeProgress | null> {
+    const sid = Math.trunc(Number(id))
+    // 负数 id = Jikan/AniList 兜底条目，bangumi 这边必然 404，直接不给（界面据此隐藏这一行）
+    if (!Number.isFinite(sid) || sid <= 0) return null
+    const key = `episodes-${sid}`
+    const cache = this.readCache<EpisodeProgress>(key)
+    if (cache && Date.now() - cache.fetchedAt < TTL_EPISODES) return cache.data
+    try {
+      const path = `/v0/episodes?subject_id=${sid}&type=0&limit=100`
+      const { text, mirror } = await this.requestBest({ api: path, web: path, customApi: path })
+      if (!isApiMirror(mirror)) return cache?.data ?? null
+      const parsed = JSON.parse(text) as { data?: Record<string, unknown>[] }
+      const list = Array.isArray(parsed?.data) ? parsed.data : []
+      const dates = list
+        .map((e) => String(e?.airdate ?? '').trim())
+        .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d))
+        .sort()
+      if (dates.length === 0) return null
+      // 用**本地日期**比：接口给的 airdate 就是本地日历上的放送日，
+      // 用 toISOString() 会在 UTC+8 的凌晨把「今天该播的那一集」算成还没播。
+      const today = localDateString()
+      const aired = dates.filter((d) => d <= today)
+      const upcoming = dates.filter((d) => d > today)
+      const data: EpisodeProgress = {
+        aired: aired.length,
+        total: list.length,
+        lastAirDate: aired.length > 0 ? aired[aired.length - 1] : null,
+        nextAirDate: upcoming.length > 0 ? upcoming[0] : null,
+        finished: list.length > 0 && aired.length >= list.length
+      }
+      this.writeCache(key, data)
+      return data
+    } catch (err) {
+      log.append('warn', 'bangumi', `获取分集进度失败（id=${sid}）：${String((err as Error)?.message ?? err)}`)
+      // 取不到就退回过期缓存：集数进度旧一点，也比整行消失强
+      return cache?.data ?? null
+    }
   }
 
   async testMirrors(): Promise<MirrorTestResult[]> {

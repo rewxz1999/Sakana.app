@@ -5,21 +5,29 @@
 // 为什么单独放一个 shared 纯函数文件：
 // 1. 收藏页要按「年 → 季度」二级分组并显示每组条数，判据只能有一份，否则数字与列表会漂移；
 // 2. 不依赖 React / DOM，`scripts/verify-favorites-season.mjs` 能直接 import **真实源码**跑断言
-//    （Node 24 自带 TS 类型擦除），自检结果就是产品代码的真实行为。
+//    （Node 24 自带 TS 类型擦除），自检结果就是产品代码的真实行为；
+// 3. 本文件**刻意不 import** `@shared/season`（保持零依赖，脚本才能直接跑），
+//    但两套约定现在**完全一致**：1–3 月 = 冬、4–6 = 春、7–9 = 夏、10–12 = 秋。
+//    自检脚本会同时 import 两个文件并断言它们对 1..12 月的判定逐月相同 ——
+//    将来谁改歪了，脚本立刻红。
 //
-// ⚠️ 与项目里已有的 `shared/season.ts` **不是同一套约定**，不要互相替换：
-//   - `shared/season.ts`（新番季取数用）：1–3 月 = 冬、4–6 = 春、7–9 = 夏、10–12 = 秋，
-//     它决定「向接口要哪三个月的数据」，改了会导致取错季度的番剧；
-//   - 本文件（收藏页分季度显示用，用户指定）：**三个月一季、整体后移一个月**：
-//       3/4/5 = 春季、6/7/8 = 夏季、9/10/11 = 秋季、12/1/2 = 冬季；
-//     并且 **1、2 月播出的番剧归属「上一年」的冬季**（例：2026-01-10 播出 → 2025 年冬季，
-//     这正是日番「1 月新番 = 上一年 12 月开播的那一季」的算法）。
-//   两套约定影响面不同，所以刻意不复用，避免把取数逻辑一起改坏。
+// ------------------------------------------------------------------
+// ⚠️ v0.3.7 修正（用户指出的错误划分）
+// ------------------------------------------------------------------
+// 上一版用的是「整体后移一个月」的划分（3/4/5 = 春、6/7/8 = 夏、9/10/11 = 秋、12/1/2 = 冬），
+// 还把 1、2 月的番剧算到**上一年**的冬季。用户明确纠正：
+//
+//     1-3 月为冬季新番，4-6 月为春季新番，7-9 月为夏季新番，10-12 月为秋季新番
+//
+// 所以现在就是标准的日式四半期，且**不再有跨年回退**：
+// 2026-01-10 播出的番剧属于「2026 年冬季」，不是 2025 年冬季。
+// 季度顺序也随之一并改成**自然年内的先后顺序**：冬 → 春 → 夏 → 秋
+// （原来是 春→夏→秋→冬，在新划分下会让「1 月的番」排到「12 月的番」后面，看着像排错了）。
 //
 // ------------------------------------------------------------------
 // 归属判据（按顺序判定，任一步失败就往下走，绝不抛异常）
 // ------------------------------------------------------------------
-//  ① 解析出「年 + 月 + 日」三者 → 按月份定季度（表见上）；1、2 月的季度**所属年**回退一年；
+//  ① 解析出「年 + 月 + 日」三者 → 按月份定季度（表见上）；
 //  ② 只解析出「年 + 月」、没有「日」 → **不判季度**，按月份分组（如「7月」）。
 //     用户要求：「只有年月、日期缺失、落在季度边界之外的，一律按月份分组显示」——
 //     只有年月时无法确认它落在哪一季的播出周期里（可能是季末补档），所以宁可按月份如实展示，
@@ -29,25 +37,25 @@
 //  脏数据判据：年份必须在 1900..2100、月份必须在 1..12，否则一律当解析不出——
 //  脏年份会算出一个「看着像真的」的假季度（例如 "0000-07" 算成 0 年夏季），比不判季度更糟。
 
-/** 季度序号：1=春季 2=夏季 3=秋季 4=冬季 */
+/** 季度序号（与 `@shared/season.ts` 一致）：1=冬季 2=春季 3=夏季 4=秋季 */
 export type FavoriteSeasonIndex = 1 | 2 | 3 | 4
 
 /** 季度显示名（下标 = 季度序号 - 1） */
-export const FAVORITE_SEASON_NAMES: readonly string[] = ['春季', '夏季', '秋季', '冬季']
+export const FAVORITE_SEASON_NAMES: readonly string[] = ['冬季', '春季', '夏季', '秋季']
 
 /** 每个季度覆盖的月份（用于显示提示文案，判据本体在 favoriteSeasonOfMonth） */
 const SEASON_MONTHS: Record<FavoriteSeasonIndex, readonly number[]> = {
-  1: [3, 4, 5],
-  2: [6, 7, 8],
-  3: [9, 10, 11],
-  4: [12, 1, 2]
+  1: [1, 2, 3],
+  2: [4, 5, 6],
+  3: [7, 8, 9],
+  4: [10, 11, 12]
 }
 
 /** 年份合理范围：超出即视为脏数据（见文件头说明） */
 const MIN_YEAR = 1900
 const MAX_YEAR = 2100
 
-/** 排序权重：季度占 1–4，月份分组排在季度之后，未知月份永远最后 */
+/** 排序权重：季度占 1–4（冬→春→夏→秋），月份分组排在季度之后，未知月份永远最后 */
 const MONTH_ORDER_BASE = 10
 const UNKNOWN_MONTH_ORDER = 100
 
@@ -90,15 +98,12 @@ export function parseAirDate(raw: unknown): AirDateParts | null {
 }
 
 /**
- * 月份 → 季度序号。用户指定的划分：3/4/5 春、6/7/8 夏、9/10/11 秋、12/1/2 冬。
- * ⚠️ 只适用于**已校验过的**月份（1..12）；非法月份会落到冬季分支，调用前请先过 parseAirDate。
+ * 月份 → 季度序号。1–3 冬、4–6 春、7–9 夏、10–12 秋（三个月一季，与 `@shared/season.ts` 相同）。
+ * ⚠️ 只适用于**已校验过的**月份（1..12）；非法月份会被夹到边界，调用前请先过 parseAirDate。
  */
 export function favoriteSeasonOfMonth(month: number): FavoriteSeasonIndex {
-  const m = Math.trunc(month)
-  if (m >= 3 && m <= 5) return 1
-  if (m >= 6 && m <= 8) return 2
-  if (m >= 9 && m <= 11) return 3
-  return 4
+  const m = Math.min(12, Math.max(1, Math.trunc(month) || 1))
+  return (Math.floor((m - 1) / 3) + 1) as FavoriteSeasonIndex
 }
 
 /**
@@ -111,16 +116,16 @@ export function favoriteSeasonOfMonth(month: number): FavoriteSeasonIndex {
 export interface FavoritesSeasonBucket {
   /** 季度组：`season:1`..`season:4`；月份组：`month:7` / `month:unknown` */
   key: string
-  /** 界面显示名：春季 / 7月 / 未知月份 */
+  /** 界面显示名：冬季 / 7月 / 未知月份 */
   label: string
   kind: 'season' | 'month'
-  /** 排序权重（小 → 大）：春 1 夏 2 秋 3 冬 4，月份组 10+月，未知月份 100 */
+  /** 排序权重（小 → 大）：冬 1 春 2 夏 3 秋 4，月份组 10+月，未知月份 100 */
   order: number
   /** 季度序号（月份组为 null） */
   season: FavoriteSeasonIndex | null
   /** 月份组的月份（1..12）；季度组与未知月份都为 null——要单条收藏的月份请用 parseAirDate 取 */
   month: number | null
-  /** 季度**所属年份**（月份组为 null）：1、2 月播出会回退到上一年 */
+  /** 季度**所属年份**（月份组为 null）：就是开播日期的年份，不再跨年回退 */
   seasonYear: number | null
   /** 悬停提示：把判据说清楚，用户不用猜「为什么这条在这一组」 */
   hint: string
@@ -141,11 +146,11 @@ export function seasonBucketOf(season: FavoriteSeasonIndex, seasonYear: number |
     hint:
       seasonYear === null
         ? `${label}（${months} 月播出）`
-        : `${seasonYear} 年${label}（${months} 月播出${season === 4 ? '；1、2 月归上一年的冬季' : ''}）`
+        : `${seasonYear} 年${label}（${months} 月播出）`
   }
 }
 
-/** 四个季度分组，恒定存在（顺序 = 春 → 夏 → 秋 → 冬）：季度栏即使某季为 0 也要显示出来 */
+/** 四个季度分组，恒定存在（顺序 = 冬 → 春 → 夏 → 秋）：季度栏即使某季为 0 也要显示出来 */
 export const FAVORITE_SEASON_BUCKETS: readonly FavoritesSeasonBucket[] = (
   [1, 2, 3, 4] as FavoriteSeasonIndex[]
 ).map((s) => seasonBucketOf(s))
@@ -180,10 +185,8 @@ export function favoritesSeasonBucket(raw: unknown): FavoritesSeasonBucket {
       hint: `${parts.year} 年 ${parts.month} 月（只有年月，无法确认落在哪一季的播出周期）`
     }
   }
-  const season = favoriteSeasonOfMonth(parts.month)
-  // 1、2 月归上一年的冬季：12 月仍然算当年冬季，所以只有 1、2 月需要回退一年
-  const seasonYear = parts.month <= 2 ? parts.year - 1 : parts.year
-  return seasonBucketOf(season, seasonYear)
+  // 新划分下「年 + 月」直接定季度，年份就是开播年份 —— 1 月的番属于**当年**冬季
+  return seasonBucketOf(favoriteSeasonOfMonth(parts.month), parts.year)
 }
 
 /** 只要分组键时的快捷入口（筛选比较用，界面别拿它当显示名） */

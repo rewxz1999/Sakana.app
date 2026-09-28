@@ -1,7 +1,7 @@
 {
   "name": "sakana",
-  "version": "0.3.6",
-  "description": "Sakana - 番剧管理及播放桌面客户端",
+  "version": "0.3.7",
+  "description": "Sakana - 鐣墽绠＄悊鍙婃挱鏀炬闈㈠鎴风",
   "main": "./out/main/index.js",
   "author": "Sakana Team",
   "license": "MIT",
@@ -25,7 +25,7 @@
   "build": {
     "appId": "com.sakana.app",
     "productName": "Sakana",
-    "copyright": "Copyright © 2026 Sakana",
+    "copyright": "Copyright 漏 2026 Sakana",
     "directories": {
       "output": "release",
       "buildResources": "resources"

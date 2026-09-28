@@ -22,6 +22,8 @@ export const CH = {
   bgmSubject: 'bgm:subject',
   bgmSearch: 'bgm:search',
   bgmRatings: 'bgm:ratings',
+  /** 「更新到第几集」（v0.3.7）：按分集接口的 airdate 数已放送集数 */
+  bgmEpisodeProgress: 'bgm:episode-progress',
   // 季度（新番季）预览：年份 + 该季度内任意月份
   bgmSeason: 'bgm:season',
   bgmTestMirrors: 'bgm:test-mirrors',

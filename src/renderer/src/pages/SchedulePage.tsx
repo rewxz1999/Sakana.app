@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
-import { Ban, CalendarDays, CloudOff, RefreshCw, ShieldOff, Tags, Trash2 } from 'lucide-react'
+import { Ban, CalendarDays, CloudOff, History, RefreshCw, ShieldOff, Tags, Trash2 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import type { CalendarItem, ScheduleDisplayFilters } from '@shared/types'
 import { seasonLabel, seasonOfDate } from '@shared/season'
@@ -11,6 +11,7 @@ import { useSettings } from '@/stores/app'
 import { fmtDateTime, mondayOf, weekdayDate, WEEKDAY_CN } from '@/lib/format'
 import { DEFAULT_SCHEDULE_FILTERS, passesDisplayFilters, resolveScheduleFilters, watchStateOf } from '@/lib/timelineFilter'
 import { AnimeCard } from '@/components/AnimeCard'
+import { HistoryTableModal } from '@/components/HistoryTableModal'
 import { Button, EmptyState, Modal, Switch } from '@/components/ui'
 import { ContextMenu, type ContextMenuItem } from '@/components/stat/ContextMenu'
 import { api } from '@/lib/api'
@@ -265,6 +266,12 @@ export function SchedulePage() {
     return `${mon.format('MM月DD日')} ~ ${mon.add(6, 'day').format('MM月DD日')}`
   }, [weekOffset])
 
+  /**
+   * 历史表弹窗（v0.3.7，用户要求：点顶部那块「日期 + 当前季度」的时间区域进入）。
+   * 默认停在今年 —— 用户点进来的第一眼通常是「今年都有什么番」。
+   */
+  const [historyOpen, setHistoryOpen] = useState(false)
+
   // ---------- 番剧卡片右键菜单（快速加入黑名单 / 按标签屏蔽） ----------
   /*
    * 菜单状态里**只存「画在哪、弹给谁」**，菜单项每次渲染现算（见下面的 menuItems）。
@@ -366,14 +373,32 @@ export function SchedulePage() {
     <div className="flex h-full flex-col">
       {/* 顶部导航：日期 + 季节 + 星期切换 */}
       <div className="flex items-center gap-3 border-b border-border bg-elev1/70 px-5 py-3 backdrop-blur">
-        <div className="min-w-[120px] text-center">
-          <div className="text-sm font-semibold">
-            {headerDate.d.format('YYYY年MM月DD日')}
-            {headerDate.isToday && <span className="ml-1 text-xs font-normal text-accent">今天</span>}
+        {/*
+          「时间区域」= 日期 + 当前季度这一块（v0.3.7 起可点）：
+          点击进入历史表弹窗（按年份横轴浏览 2005 年以来每一年的番剧）。
+          做成按钮而不是 div：键盘能 Tab 到、Enter/Space 能打开，鼠标悬停也有明确反馈
+          （`title` + hover 高亮 + 右上角那个小箭头），否则用户根本不知道它能点。
+        */}
+        <button
+          type="button"
+          onClick={() => setHistoryOpen(true)}
+          title="点击查看历史表（2005 年至今每年有哪些番剧）"
+          className="group flex min-w-[120px] items-center gap-1.5 rounded-lg px-2 py-1 text-center transition-colors hover:bg-elev2"
+        >
+          <div className="min-w-0">
+            <div className="text-sm font-semibold">
+              {headerDate.d.format('YYYY年MM月DD日')}
+              {headerDate.isToday && <span className="ml-1 text-xs font-normal text-accent">今天</span>}
+            </div>
+            {/* 原「第 N 周」文案的位置，现在显示本季新番季名 */}
+            <div className="text-[11px] text-faint group-hover:text-accent">{currentSeasonLabel}</div>
           </div>
-          {/* 原「第 N 周」文案的位置，现在显示本季新番季名 */}
-          <div className="text-[11px] text-faint">{currentSeasonLabel}</div>
-        </div>
+          <History
+            size={14}
+            className="shrink-0 text-faint transition-colors group-hover:text-accent"
+            aria-hidden
+          />
+        </button>
         <div className="flex flex-1 items-center justify-center gap-1">
           {WEEKDAY_CN.map((label, i) => {
             const id = i + 1
@@ -484,7 +509,15 @@ export function SchedulePage() {
                         name: item.name,
                         nameCn: item.name_cn,
                         cover: item.images?.large ?? item.images?.common ?? null,
-                        rating: ratings[item.id]?.score ?? item.rating?.score ?? null,
+                        /*
+                         * 评分取值顺序（v0.3.7 修）：
+                         * **日历自带的评分优先**，`ratings` 只是「日历没带评分时补上来的」。
+                         * 以前是反过来的（`ratings[id] ?? item.rating`），而 `ratings` 在主进程里
+                         * 缓存 30 天 —— 于是只要某部番曾经被补过一次评分，之后一个月里
+                         * 卡片都显示那份旧分数，盖掉了日历里刚取回的新分数，
+                         * 用户看到的就是「评分和 bangumi 原站对不上」。
+                         */
+                        rating: item.rating?.score ?? ratings[item.id]?.score ?? null,
                         airDate: item.air_date
                       }}
                       fav={favorites.some((f) => f.subjectId === item.id)}
@@ -631,6 +664,19 @@ export function SchedulePage() {
           </Button>
         </div>
       </Modal>
+
+      {/*
+        历史表弹窗（v0.3.7）：点顶部时间区域打开。
+        点里面的番剧 → 先关弹窗再跳详情（开着弹窗跳页面会留下遮罩，用户以为卡住了）。
+      */}
+      <HistoryTableModal
+        open={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+        onOpenSubject={(id) => {
+          setHistoryOpen(false)
+          navigate(`/subject/${id}`)
+        }}
+      />
     </div>
   )
 }

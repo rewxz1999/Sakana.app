@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { motion } from 'framer-motion'
-import { BarChart3, FileDown, FileText, LayoutGrid, Play, Puzzle, SquareTerminal, Trash2 } from 'lucide-react'
+import { BarChart3, FileDown, FileText, History, LayoutGrid, Play, Puzzle, SquareTerminal, Trash2 } from 'lucide-react'
 import { useTools } from '@/stores/tools'
 import { timeAgo } from '@/lib/format'
 import { api } from '@/lib/api'
@@ -29,6 +29,22 @@ const BUILTIN_CHARACTER_GRID_TOOL = {
     '搜索作品并挑选角色，排成「最喜欢 / 最遗憾 / 最神秘 …」的九宫格（最多 4×10 = 40 格，标签可改写），导出 PNG（导出前需填写制作人）。',
   icon: LayoutGrid,
   hash: '/tools/character-grid'
+}
+
+/**
+ * 内置「自建历史表」。
+ *
+ * 按年份摆自己挑的番剧：简易显示（横向年份轴在窗口中间，每年前 4 部只画封面 + 名字）
+ * 与清晰显示（年份竖轴在左侧，右侧卡片网格，每年最多 10 部），两种版式可分别导出 PNG。
+ * 与统计工具、9宫格一样在新窗口里打开：它是一整块画布式的版面，主窗口里摆不下。
+ */
+const BUILTIN_CUSTOM_HISTORY_TOOL = {
+  id: '__custom-history',
+  name: '自建历史表',
+  description:
+    '选年份挑番剧（或搜索添加，放送年份对不上会自动提示）→ 用「简易显示 / 清晰显示」两种版式查看 → 导出 PNG（导出时可选版式与清晰度）。',
+  icon: History,
+  hash: '/tools/custom-history'
 }
 
 export function ToolsPage() {
@@ -140,6 +156,45 @@ export function ToolsPage() {
               width: 1320,
               height: 880,
               title: BUILTIN_CHARACTER_GRID_TOOL.name
+            })
+          }}>
+            启动
+          </Button>
+        </div>
+      </motion.div>
+
+      {/* 内置「自建历史表」（与统计工具、9宫格并列，同样在新窗口中打开） */}
+      <motion.div
+        layout
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        onClick={() =>
+          void api.window.openSmall(BUILTIN_CUSTOM_HISTORY_TOOL.hash, {
+            width: 1320,
+            height: 880,
+            title: BUILTIN_CUSTOM_HISTORY_TOOL.name
+          })
+        }
+        whileHover={{ y: -3 }}
+        className="mt-4 flex cursor-pointer flex-col overflow-hidden rounded-xl border border-accent/40 bg-elev1 transition-colors hover:border-accent"
+      >
+        <div className="flex items-center gap-4 p-4">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-accent/15 text-accent">
+            <BUILTIN_CUSTOM_HISTORY_TOOL.icon size={24} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold">{BUILTIN_CUSTOM_HISTORY_TOOL.name}</span>
+              <span className="rounded-full bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent whitespace-nowrap">内置</span>
+            </div>
+            <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-dim">{BUILTIN_CUSTOM_HISTORY_TOOL.description}</p>
+          </div>
+          <Button size="sm" icon={Play} onClick={(e) => {
+            e.stopPropagation()
+            void api.window.openSmall(BUILTIN_CUSTOM_HISTORY_TOOL.hash, {
+              width: 1320,
+              height: 880,
+              title: BUILTIN_CUSTOM_HISTORY_TOOL.name
             })
           }}>
             启动
