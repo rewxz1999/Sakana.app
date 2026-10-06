@@ -103,7 +103,7 @@ function SkeletonCard() {
 
 export function SchedulePage() {
   const navigate = useNavigate()
-  const { days, loading, error, fetchedAt, fromCache, stale, fallbackSource, selectedDay, weekOffset, ratings, load, loadRatings, selectDay } = useSchedule()
+  const { days, loading, error, fetchedAt, fromCache, stale, fallbackSource, selectedDay, weekOffset, ratings, ratingsAt, load, loadRatings, selectDay } = useSchedule()
   const favorites = useLibrary((s) => s.favorites)
   const watchHistory = useLibrary((s) => s.watchHistory)
   const toggleFavorite = useLibrary((s) => s.toggleFavorite)
@@ -427,8 +427,15 @@ export function SchedulePage() {
           icon={RefreshCw}
           loading={loading}
           onClick={() => {
+            /*
+             * v0.3.7：刷新要**连评分一起刷**。
+             * 以前这里只 `load(true)`（放送数据绕缓存重取），评分仍旧是会话内存里那份旧值 ——
+             * 用户点了刷新，卡片上的分数却一动不动，这就是「评分更新不及时」的观感来源。
+             */
+            const ids = days.flatMap((d) => d.items).map((i) => i.id)
             void load(true).then(() => {
               if (!error) toast.success('番剧表已刷新')
+              void loadRatings(ids, true)
             })
           }}
         >
@@ -510,14 +517,17 @@ export function SchedulePage() {
                         nameCn: item.name_cn,
                         cover: item.images?.large ?? item.images?.common ?? null,
                         /*
-                         * 评分取值顺序（v0.3.7 修）：
-                         * **日历自带的评分优先**，`ratings` 只是「日历没带评分时补上来的」。
-                         * 以前是反过来的（`ratings[id] ?? item.rating`），而 `ratings` 在主进程里
-                         * 缓存 30 天 —— 于是只要某部番曾经被补过一次评分，之后一个月里
-                         * 卡片都显示那份旧分数，盖掉了日历里刚取回的新分数，
-                         * 用户看到的就是「评分和 bangumi 原站对不上」。
+                         * 评分取值（v0.3.7 再修一次）：
+                         * 日历自带的评分与「补评分」接口（`/v0/subjects/:id`）是两个不同来源，
+                         * 谁更新取决于**谁取得更晚** —— 所以按时间戳比：补评分那次比日历这次晚，
+                         * 就用补来的分数（6 小时 TTL + 用户点刷新时强制重取）；
+                         * 否则用日历自带的那份。
+                         * 以前是固定「日历优先」，于是补到的**新**分数反而被日历里的旧分数盖掉。
                          */
-                        rating: item.rating?.score ?? ratings[item.id]?.score ?? null,
+                        rating:
+                          ratingsAt > (fetchedAt ?? 0)
+                            ? (ratings[item.id]?.score ?? item.rating?.score ?? null)
+                            : (item.rating?.score ?? ratings[item.id]?.score ?? null),
                         airDate: item.air_date
                       }}
                       fav={favorites.some((f) => f.subjectId === item.id)}

@@ -3,6 +3,10 @@ import type {
   AppSettings,
   AspectMode,
   CalendarResult,
+  CardExportImageRequest,
+  CardExportImageResult,
+  BatchProbeTarget,
+  BatchProbeUpdate,
   CharactersResult,
   CharacterItem,
   DanmakuComment,
@@ -254,7 +258,16 @@ export interface SakanaApi {
     calendar(force?: boolean): Promise<ApiResult<CalendarResult>>
     subject(id: number): Promise<ApiResult<SubjectResult>>
     search(keyword: string): Promise<ApiResult<SearchResult>>
-    ratings(ids: number[]): Promise<ApiResult<Record<number, { score: number | null; total: number }>>>
+    /**
+     * 补全 / 刷新番剧评分与评分人数。
+     *
+     * v0.3.7 加 `force`：用户点「刷新」时应当拿到刚取回的值，而不是最多 6 小时前的缓存
+     * （评分每天都在动，这曾是「评分、评分人数更新不及时」的一半原因）。
+     */
+    ratings(
+      ids: number[],
+      force?: boolean
+    ): Promise<ApiResult<Record<number, { score: number | null; total: number }>>>
     /**
      * 某个季度的番剧列表（番剧表「预览 20xx年春」弹窗）。
      * month 可传该季度内的任意一个月，主进程会规范化到季度并按季度缓存。
@@ -410,6 +423,23 @@ export interface SakanaApi {
     seek(sec: number): Promise<ApiResult<boolean>>
     setVolume(volume: number): Promise<ApiResult<boolean>>
     getState(): Promise<ApiResult<{ time: number; length: number; playing: boolean; volume: number; muted: boolean }>>
+    /**
+     * 画面子窗口的诊断快照（v0.3.7）。
+     *
+     * 为什么要暴露它：视频不是网页画的，而是**主窗口里的一个原生子窗口**，
+     * 「正在播放但没有画面」这种问题的证据全在窗口层（子窗口在不在、尺寸对不对、
+     * 画面中心点上命中的是视频窗口还是 Chromium 的网页层），渲染层自己看不到。
+     * 有了这个接口，出问题时可以在播放页里直接取一份现场（也是自检脚本的抓手）。
+     */
+    surfaceDebug(): Promise<
+      ApiResult<{
+        bounds: { x: number; y: number; width: number; height: number } | null
+        state: { time: number; length: number; playing: boolean; volume: number; muted: boolean } | null
+        hit: { hitClass: string; isOurChild: boolean; ourChain: string[]; hitChain: string[] } | null
+        windows: { parentChildren: string[]; childChildren: string[] } | null
+        raiseStats: { paint: number; raise: number }
+      }>
+    >
     setMute(muted: boolean): Promise<ApiResult<boolean>>
     /** v0.2.9 最后更新：播放倍速（0.25–4，scaletempo2 变速不变调） */
     setSpeed(speed: number): Promise<ApiResult<boolean>>
@@ -491,6 +521,14 @@ export interface SakanaApi {
     remove(id: string): Promise<ApiResult<boolean>>
     run(id: string): Promise<ApiResult<ToolRunResult>>
     exportDocs(format: 'md' | 'txt'): Promise<ApiResult<string>>
+    /**
+     * 把一张自制版式导出成高清 PNG（v0.3.7）。
+     *
+     * 渲染层给出完整 HTML（图片写成 `{{img:key}}` 占位符）+ 图片清单，
+     * 主进程负责取图 / 替换 / 离屏渲染 / 放大 / 弹保存框 / 落盘，
+     * 并把缺图情况如实报回来（`path === ''` 表示用户取消了保存）。
+     */
+    exportCardImage(req: CardExportImageRequest): Promise<ApiResult<CardExportImageResult>>
   }
   logs: {
     list(): Promise<ApiResult<LogEntry[]>>
@@ -537,6 +575,47 @@ export interface SakanaApi {
     stop(): Promise<ApiResult<boolean>>
     onFound(cb: (ev: { url: string; kind: string; referer?: string; cookies?: string }) => void): () => void
     onDone(cb: (ev: { found: boolean; message?: string }) => void): () => void
+  }
+  /**
+   * 播放源列表的批量预嗅探（v0.3.7）。
+   *
+   * 用户要求「在选择播放源页就自动加载所有规则下是否嗅探到资源、嗅探到多少资源，
+   * 并显示在规则条目上」——这里提供的就是那个后台任务：给一批规则 + 一个关键词，
+   * 主进程逐条探测（搜索 → 剧集 → 播放页 → 嗅探），每完成一步就推一条 `onUpdate`。
+   */
+  ruleBatchProbe: {
+    /**
+     * 开始一批（同一时刻只有一批，再开会取消上一批）。
+     * `force: false`（默认）会先吃 30 分钟内的缓存，命中就直接回放上次结果、一个窗口都不开；
+     * 用户在界面上点「重新探测」时传 force: true 才会真的重跑。
+     */
+    start(req: {
+      keyword: string
+      rules: BatchProbeTarget[]
+      force?: boolean
+    }): Promise<ApiResult<{ jobId: string; total: number; cached: boolean; probedAt?: number }>>
+    /** 停止当前批次（离开播放源列表时调用，别让它在后台空跑） */
+    stop(): Promise<ApiResult<boolean>>
+    /** 每条规则的进度/结果；返回取消订阅函数 */
+    onUpdate(cb: (ev: BatchProbeUpdate) => void): () => void
+  }
+  /**
+   * 人机验证窗口（v0.3.7）。
+   *
+   * 有些线路的站点会给非浏览器请求返回「人机验证」页（搜索引擎式 403）。这时在应用内
+   * 弹一个窗口把这条规则的**搜索页**显示出来，让用户自己过一次验证：
+   * 窗口与网页内搜索共用同一个会话，验证完的 Cookie 会直接让后续搜索/嗅探变成"已通过"状态。
+   */
+  ruleVerify: {
+    /** 打开验证窗口（bounds 是蒙层中间那块洞的矩形，CSS 像素/视口坐标） */
+    open(
+      ruleId: string,
+      keyword: string,
+      bounds: { x: number; y: number; width: number; height: number }
+    ): Promise<ApiResult<{ ok: boolean; ruleName: string; url: string }>>
+    /** 蒙层尺寸变化时重新摆放窗口 */
+    setBounds(bounds: { x: number; y: number; width: number; height: number }): Promise<ApiResult<boolean>>
+    close(): Promise<ApiResult<boolean>>
   }
   ruleWebview: {
     /** Kazumi 式在线播放：用可见网页视图打开播放页并嗅探流地址 */

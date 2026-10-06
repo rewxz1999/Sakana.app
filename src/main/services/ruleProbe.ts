@@ -4,7 +4,7 @@ import { noteCapturedStream } from './playerInfo'
 import axios from 'axios'
 import { CH } from '@shared/channels'
 import { log } from '../log'
-import { BROWSER_UA } from '../net'
+import { BROWSER_UA, httpGetText } from '../net'
 
 /**
  * 播放页流嗅探（Kazumi 同思路）：隐藏窗口加载播放页，
@@ -492,6 +492,59 @@ let doneSent = false
 let probeActive = false
 let timeoutTimer: NodeJS.Timeout | null = null
 
+/** 自动点击脚本：播放页大多要"交互"才会加载播放器（见 runAutoPlayClicks 的说明） */
+const AUTOPLAY_SCRIPT = `(() => {
+    const tryPlay = () => {
+      const videos = Array.from(document.querySelectorAll('video'))
+      for (const v of videos) {
+        try { v.muted = true; v.play && v.play() } catch (e) {}
+      }
+      const sels = ['#play','.play','.play-btn','.play-button','.vjs-big-play-button','.dplayer-play-icon','.artplayer-plugin-video-control','[class*="play" i]','[title*="播放"]','[aria-label*="播放"]']
+      for (const sel of sels) {
+        const el = document.querySelector(sel)
+        if (el && el.click) { try { el.click() } catch (e) {} }
+      }
+      const iframes = Array.from(document.querySelectorAll('iframe'))
+      for (const f of iframes) {
+        try { f.contentWindow && f.contentWindow.postMessage('play', '*') } catch (e) {}
+      }
+    }
+    let n = 0
+    const t = setInterval(() => { n++; tryPlay(); if (n > 8) clearInterval(t) }, 1500)
+    tryPlay()
+  })()`
+
+/**
+ * 往一个窗口的所有子框架注入"自动点击播放"，再点一次页面里的 iframe 元素。
+ *
+ * 为什么单独抽出来（v0.3.7）：批量预嗅探（ruleProbeBatch）要开自己的窗口，
+ * 它面对的是同一批站点、同一个"不点就不播"的问题。复制一份脚本出来
+ * 迟早会出现"单规则探得到、批量探不到"这种最难查的差异，所以只有这一份。
+ *
+ * 为什么要点进每一个子框架：播放器常常在**跨域 iframe** 里，主框架的脚本够不着它。
+ */
+export function runAutoPlayClicks(win: BrowserWindow | null): void {
+  const w = win
+  if (!w || w.isDestroyed() || w.webContents.isDestroyed()) return
+  try {
+    const frames = [w.webContents.mainFrame, ...w.webContents.mainFrame.framesInSubtree]
+    for (const f of frames) {
+      if (!f || f.isDestroyed()) continue
+      void f.executeJavaScript(AUTOPLAY_SCRIPT, true).catch(() => undefined)
+    }
+    // 再直接点击页面里的 iframe 元素（部分站点靠父页点击才初始化播放器）
+    void w.webContents
+      .executeJavaScript(
+        `Array.from(document.querySelectorAll('iframe')).forEach(f=>{try{f.click()}catch(e){}})`,
+        true
+      )
+      .catch(() => undefined)
+  } catch {
+    /* 窗口正在销毁时会抛，忽略 */
+  }
+}
+
+
 /** 自检钩子：主进程内直接观察嗅探事件（SAKANA_ONLINE_TEST 使用） */
 let probeHook: ((payload: Record<string, unknown>) => void) | null = null
 export function setProbeHook(cb: ((payload: Record<string, unknown>) => void) | null): void {
@@ -562,26 +615,93 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
     return false
   }
 
+  /*
+   * 候选流的「疑似广告短片」判定（v0.3.7）。
+   *
+   * 为什么需要：有些站点（实测 gugu3 是 `player.gugu3.com/milimili.mp4`）的播放页会先请求一段
+   * **几秒钟的广告/占位视频**，而 webRequest 嗅探是"谁先请求谁先被捕获" ——
+   * 于是我们把这个广告短片当成片源交给了播放器，用户看到的就是"一进去就在放广告"
+   * （用户报的"广告跳屏"里就有这一类）。
+   *
+   * 判据只做**保守**的两条，宁可放过也不误杀：
+   *   · 非 HLS（整段 mp4/flv）：HEAD 一下看 Content-Length，小于 4MB 的当作疑似广告
+   *     （正片动辄几十上百 MB，一集 24 分钟的 mp4 不可能只有几 MB）；
+   *   · HLS：把列表拉下来把 #EXTINF 加起来，总时长小于 90 秒的当作疑似广告
+   *     （正片播放列表的时长都是整集）。
+   * 判定为"疑似"后**不移除**，只是不立刻上报：继续等真正的正片；
+   * 若直到超时都只有疑似候选，收尾时仍会把它交出去（有广告看总比什么都放不出来强），
+   * 日志里会写明"只抓到疑似广告短片"，用户与我们都还能看出发生了什么。
+   */
+  const AD_CLIP_MAX_BYTES = 4 * 1024 * 1024
+  const AD_CLIP_MAX_SECONDS = 90
+  const adClipUrls = new Set<string>()
+
+  const looksLikeAdClip = async (u: string): Promise<boolean> => {
+    try {
+      if (/\.m3u8(\?|$)/i.test(u)) {
+        const text = await httpGetText(u, 8000, {})
+        if (!text.includes('#EXTM3U')) return false
+        const durs = [...text.matchAll(/#EXTINF:\s*([\d.]+)/g)].map((m) => Number(m[1]) || 0)
+        // 主列表（EXT-X-STREAM-INF）里没有 EXTINF，看不到真实时长 → 不判定
+        if (durs.length === 0) return false
+        const total = durs.reduce((n, d) => n + d, 0)
+        return total > 0 && total < AD_CLIP_MAX_SECONDS
+      }
+      const head = await axios.head(u, {
+        timeout: 6000,
+        maxRedirects: 6,
+        validateStatus: () => true,
+        headers: { 'User-Agent': BROWSER_UA }
+      })
+      const len = Number(head.headers['content-length'] ?? 0)
+      if (!Number.isFinite(len) || len <= 0) return false
+      return len < AD_CLIP_MAX_BYTES
+    } catch {
+      // 探测失败一律按"不是广告"处理：不能因为一次 HEAD 失败就把真片源扔了
+      return false
+    }
+  }
+
+  /** 捕获到一个候选：先过疑似广告判定，再决定是立刻上报还是留作兜底 */
+  const captureCandidate = (u: string, channel: string): void => {
+    if (!probeActive || foundUrls.includes(u)) return
+    foundUrls.push(u)
+    log.append('info', 'rule-probe', `捕获媒体流: ${u.slice(0, 120)}`)
+    void looksLikeAdClip(u).then((suspect) => {
+      if (!probeActive) return
+      if (suspect) {
+        adClipUrls.add(u)
+        log.append(
+          'warn',
+          'rule-probe',
+          `疑似广告短片（先不交给播放器，继续等正片）: ${u.slice(0, 110)}`
+        )
+        return
+      }
+      noteCapturedStream({
+        url: u,
+        kind: /\.m3u8(\?|$)/i.test(u) ? 'm3u8' : 'media',
+        channel,
+        capturedAt: Date.now()
+      })
+      emit(mainWin, { type: 'found', url: u, kind: /\.m3u8(\?|$)/i.test(u) ? 'm3u8' : 'media' })
+    })
+  }
+
   // 嗅探会话结束：注销共享监听，避免与其它实现互相覆盖
   const onBeforeRequest = (details: { url: string; resourceType: string }): void => {
     if (!probeActive) return
     const u = details.url
     if (!isStreamCandidate(u)) return
     if (details.resourceType === 'media' || MEDIA_EXT_RE.test(u)) {
-      if (!foundUrls.includes(u)) {
-        foundUrls.push(u)
-        log.append('info', 'rule-probe', `捕获媒体流: ${u.slice(0, 120)}`)
-        noteCapturedStream({ url: u, kind: /\.m3u8(\?|$)/i.test(u) ? 'm3u8' : 'media', channel: 'webRequest', capturedAt: Date.now() })
-        emit(mainWin, { type: 'found', url: u, kind: /\.m3u8(\?|$)/i.test(u) ? 'm3u8' : 'media' })
-      }
+      captureCandidate(u, 'webRequest')
     }
   }
   const onCompleted = (details: { url: string; statusCode: number }): void => {
     if (!probeActive) return
     if (!isStreamCandidate(details.url)) return
-    if (details.statusCode < 400 && MEDIA_EXT_RE.test(details.url) && !foundUrls.includes(details.url)) {
-      foundUrls.push(details.url)
-      emit(mainWin, { type: 'found', url: details.url, kind: /\.m3u8(\?|$)/i.test(details.url) ? 'm3u8' : 'media' })
+    if (details.statusCode < 400 && MEDIA_EXT_RE.test(details.url)) {
+      captureCandidate(details.url, 'webRequest')
     }
   }
   // 共享嗅探监听（webRequest 每事件只允许一个监听器，统一在 probeEvents 注册）
@@ -595,9 +715,19 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
     if (!probeActive || !ok) return
     if (foundUrls.includes(ok.url)) return
     foundUrls.push(ok.url)
+    log.append('info', 'rule-probe', `直出地址命中: ${ok.url.slice(0, 120)}`)
+    /*
+     * 直出地址也过一遍"疑似广告短片"判定（v0.3.7）。
+     * 为什么连直出也要查：MacCMS 系的播放页里 `player_aaaa.url` 指向的**就是**播放器第一个要放的媒体，
+     * 而有些站点把它填成了前置广告 —— 这一条进了 6 分钟直链缓存，用户下次进来还会再看一遍广告。
+     */
+    if (await looksLikeAdClip(ok.url)) {
+      adClipUrls.add(ok.url)
+      log.append('warn', 'rule-probe', `直出地址疑似广告短片（不缓存、先不交播放器）: ${ok.url.slice(0, 110)}`)
+      return
+    }
     // 记进会话直链缓存（同一集来回切 / 退出再进可直接命中）
     rememberStream(url, ok.url, ok.referer ?? referer)
-    log.append('info', 'rule-probe', `直出地址命中: ${ok.url.slice(0, 120)}`)
     noteCapturedStream({
       url: ok.url,
       kind: /\.m3u8(\?|$)/i.test(ok.url) ? 'm3u8' : 'direct',
@@ -704,47 +834,8 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
   })
 
   // 播放页大多需要“交互”才会加载播放器：注入脚本自动点击播放按钮 / 触发 video.play()
-  const autoPlayScript = `(() => {
-    const tryPlay = () => {
-      const videos = Array.from(document.querySelectorAll('video'))
-      for (const v of videos) {
-        try { v.muted = true; v.play && v.play() } catch (e) {}
-      }
-      const sels = ['#play','.play','.play-btn','.play-button','.vjs-big-play-button','.dplayer-play-icon','.artplayer-plugin-video-control','[class*="play" i]','[title*="播放"]','[aria-label*="播放"]']
-      for (const sel of sels) {
-        const el = document.querySelector(sel)
-        if (el && el.click) { try { el.click() } catch (e) {} }
-      }
-      const iframes = Array.from(document.querySelectorAll('iframe'))
-      for (const f of iframes) {
-        try { f.contentWindow && f.contentWindow.postMessage('play', '*') } catch (e) {}
-      }
-    }
-    let n = 0
-    const t = setInterval(() => { n++; tryPlay(); if (n > 8) clearInterval(t) }, 1500)
-    tryPlay()
-  })()`
-
   probeWin.webContents.on('did-finish-load', () => {
-    // 关键：播放器常位于跨域 iframe 内，主框架脚本点不到它。
-    // 用 WebFrameMain 把自动点击注入到每一个子框架（含跨域 iframe）。
-    const runAutoPlay = (): void => {
-      const w = probeWin
-      if (!w || w.isDestroyed()) return
-      const frames = [w.webContents.mainFrame, ...w.webContents.mainFrame.framesInSubtree]
-      for (const f of frames) {
-        if (!f || f.isDestroyed()) continue
-        void f.executeJavaScript(autoPlayScript, true).catch(() => undefined)
-      }
-      // 再直接点击页面里的 iframe 元素（部分站点靠父页点击才初始化播放器）
-      void w.webContents
-        .executeJavaScript(
-          `Array.from(document.querySelectorAll('iframe')).forEach(f=>{try{f.click()}catch(e){}})`,
-          true
-        )
-        .catch(() => undefined)
-    }
-    for (const delay of [1200, 3000, 6000, 10000]) setTimeout(runAutoPlay, delay)
+    for (const delay of [1200, 3000, 6000, 10000]) setTimeout(() => runAutoPlayClicks(probeWin), delay)
   })
 
   // 20 秒后收尾：把最佳候选地址通知渲染层
@@ -752,10 +843,19 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
     const best = pickBest(foundUrls)
     if (!doneSent) {
       doneSent = true
+      /*
+       * 收尾时如果只剩"疑似广告短片"，仍然交出去（有得看总比什么都没有强），
+       * 但 message 里写清楚 —— 用户看到的是"已捕获视频流"，日志里能看出这次只抓到广告。
+       */
+      const onlyAdClip = !!best && adClipUrls.has(best)
       emit(mainWin, {
         type: 'done',
         found: !!best,
-        message: best ? '已捕获视频流' : '未捕获到视频流，可回退到网页播放',
+        message: best
+          ? onlyAdClip
+            ? '只捕获到疑似广告短片，已按兜底交给播放器（继续等待正片）'
+            : '已捕获视频流'
+          : '未捕获到视频流，可回退到网页播放',
         url: best ?? undefined
       })
     }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
 import {
   ArrowLeft,
@@ -14,10 +14,12 @@ import {
   Play,
   Rss,
   Search,
-  Star
+  Star,
+  X
 } from 'lucide-react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import type {
+  BatchProbeUpdate,
   EpisodeProgress,
   MikanItem,
   PlayRule,
@@ -25,8 +27,8 @@ import type {
   RuleSearchEntry,
   SubjectDetail
 } from '@shared/types'
-// 值导入（不是 type）：推荐规则名单是运行时要用的常量，见来源选择弹窗里的用法
-import { RECOMMENDED_RULES } from '@shared/types'
+// 值导入（不是 type）：推荐名单与置顶排序都是运行时要用的，见来源选择弹窗里的用法
+import { RECOMMENDED_RULES, sortRulesPinnedFirst } from '@shared/types'
 import { api } from '@/lib/api'
 import { useLibrary } from '@/stores/library'
 import { useSubs } from '@/stores/subs'
@@ -109,6 +111,8 @@ export function SubjectDetailPage() {
   const [mikanOpen, setMikanOpen] = useState(false)
   const [rules, setRules] = useState<PlayRule[]>([])
   const [playRule, setPlayRule] = useState<PlayRule | null>(null)
+  /** 需要人机验证的那条规则（非空时弹出验证窗口，v0.3.7） */
+  const [verify, setVerify] = useState<{ rule: PlayRule } | null>(null)
   /** 全屏状态（原生窗口全屏 / 页面级全屏）：全屏时返回按钮改为悬浮定位，避免贴边 */
   const [fullscreen, setFullscreen] = useState(false)
   /** 本地播放选择/扫描中（按钮 loading） */
@@ -319,16 +323,13 @@ export function SubjectDetailPage() {
   const openRules = async () => {
     const r = await api.store.get('rules')
     const list: PlayRule[] = r.ok && Array.isArray(r.data) ? (r.data as PlayRule[]) : []
-    // 实测可用的规则优先展示（aafun / akianime / MXdm 为首选），其余按原顺序
-    const preferred = ['aafun', 'akianime', 'mxdm', 'moonci', 'giriGirilove']
-    const rank = (rule: PlayRule): number => {
-      const idx = preferred.findIndex((n) => rule.name.toLowerCase() === n.toLowerCase())
-      return idx < 0 ? 99 : idx
-    }
-    const enabled = list
-      .filter((rule) => rule.enabled)
-      .slice()
-      .sort((a, b) => rank(a) - rank(b))
+    /*
+     * v0.3.7：置顶顺序统一由 shared 的 PINNED_RULES 决定（用户要求 aafun / AGE / sorani 置顶）。
+     *
+     * 以前这里写死了一份 preferred 名单，只影响本弹窗 —— 于是「置顶」在规则管理页看不到，
+     * 用户会以为置顶没生效。现在两处都调同一个 sortRulesPinnedFirst()。
+     */
+    const enabled = sortRulesPinnedFirst(list.filter((rule) => rule.enabled))
     setRules(enabled)
     if (enabled.length === 0) {
       toast.warn('暂无启用的播放规则，请先在「设置 → 规则管理」中添加')
@@ -574,7 +575,18 @@ export function SubjectDetailPage() {
         </motion.div>
       ) : null}
 
-      <RuleSelectModal open={ruleOpen} onClose={() => setRuleOpen(false)} rules={rules} onPick={pickRule} />
+      <RuleSelectModal
+        open={ruleOpen}
+        onClose={() => setRuleOpen(false)}
+        rules={rules}
+        keyword={detail?.name_cn || detail?.name || ''}
+        /* 探针判定这条线路要人机验证时，点它就先把验证过了再进搜索（v0.3.7） */
+        onNeedVerify={(rule) => {
+          setRuleOpen(false)
+          setVerify({ rule })
+        }}
+        onPick={pickRule}
+      />
       <RulePlayModal
         open={!!playRule}
         onClose={() => setPlayRule(null)}
@@ -582,6 +594,25 @@ export function SubjectDetailPage() {
         keyword={detail?.name_cn || detail?.name || ''}
         title={detail?.name_cn || detail?.name || '播放'}
         subjectId={detail?.id}
+        /* 搜索结果报「人机验证」时，给用户一个现场过验证的出口（v0.3.7） */
+        onNeedVerify={(rule) => {
+          setPlayRule(null)
+          setVerify({ rule })
+        }}
+      />
+      <VerifyModal
+        open={!!verify}
+        rule={verify?.rule ?? null}
+        keyword={detail?.name_cn || detail?.name || ''}
+        onClose={() => setVerify(null)}
+        onPassed={() => {
+          const r = verify?.rule ?? null
+          setVerify(null)
+          if (r) {
+            toast.success('验证状态已保留，正在用这条线路重新搜索…')
+            setPlayRule(r)
+          }
+        }}
       />
       <MikanSelectModal
         open={mikanOpen}
@@ -597,19 +628,197 @@ export function SubjectDetailPage() {
   )
 }
 
+// ---------------- 人机验证弹窗（v0.3.7） ----------------
+
+/**
+ * 站点要求人机验证时的应用内弹窗。
+ *
+ * 为什么做成"蒙层 + 中间一块洞"：验证本身就是**真实的网页**，只能交给真实的浏览器窗口去渲染。
+ * 所以这里弹一层说明蒙层，把中间那块矩形报给主进程，主进程开一个属于本窗口的子窗口盖在那里
+ * （与播放页把探针网页视图摆在画面区域上是同一个手法）。
+ * 用户过完验证点「继续」，那之后这条线路就带上验证 Cookie 了（主进程用同一个会话）。
+ */
+function VerifyNeedles(): RegExp {
+  return /人机验证|安全验证|验证码|403|forbidden/i
+}
+
+function VerifyModal({
+  open,
+  rule,
+  keyword,
+  onClose,
+  onPassed
+}: {
+  open: boolean
+  rule: PlayRule | null
+  keyword: string
+  onClose: () => void
+  onPassed: () => void
+}) {
+  const holeRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open || !rule) return
+    let alive = true
+    const sendBounds = (): void => {
+      const r = holeRef.current?.getBoundingClientRect()
+      if (!r || r.width < 50) return
+      void api.ruleVerify.setBounds({ x: r.left, y: r.top, width: r.width, height: r.height })
+    }
+    const hole = holeRef.current?.getBoundingClientRect()
+    void api.ruleVerify
+      .open(rule.id, keyword, {
+        x: hole?.left ?? 0,
+        y: hole?.top ?? 0,
+        width: hole?.width ?? 720,
+        height: hole?.height ?? 460
+      })
+      .then((r) => {
+        if (!alive) return
+        if (!r.ok) toast.error(`验证窗口打不开：${r.error}`)
+        else if (!r.data.ok) toast.error(`验证窗口打不开：这条规则的搜索地址不可用`)
+      })
+    // 窗口尺寸/蒙层大小变化时让验证窗口跟着走（节流到 800ms，够用且不刷屏）
+    const timer = window.setInterval(sendBounds, 800)
+    window.addEventListener('resize', sendBounds)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+      window.removeEventListener('resize', sendBounds)
+      void api.ruleVerify.close()
+    }
+  }, [open, rule, keyword])
+
+  if (!open || !rule) return null
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-6">
+      <div className="flex h-[86vh] w-[860px] max-w-full flex-col overflow-hidden rounded-xl border border-border bg-elev1 shadow-2xl">
+        <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-text">需要人机验证 · {rule.name}</div>
+            <div className="mt-0.5 text-[11px] text-faint">
+              这条线路要求先通过人机验证（站点对我们返回了验证页）。请在下面的窗口里完成验证，
+              然后点「我已完成验证」。验证状态保存在本机会话里，之后这条线路可以正常搜索与播放。
+            </div>
+          </div>
+          <button className="rounded-md p-1 text-dim hover:bg-elev2 hover:text-text" onClick={onClose}>
+            <X size={16} />
+          </button>
+        </div>
+        {/* 这块空白处由主进程的验证窗口盖住；边框只是为了让用户知道窗口应该出现在这里 */}
+        <div className="relative min-h-0 flex-1">
+          <div
+            ref={holeRef}
+            className="absolute inset-3 rounded-lg border border-dashed border-border bg-elev2/40"
+          />
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-[11px] text-faint">
+            验证窗口正在这里打开…
+          </div>
+        </div>
+        <div className="flex items-center justify-between gap-2 border-t border-border px-4 py-2.5">
+          <span className="text-[11px] leading-relaxed text-faint">
+            提示：验证过一次之后，本机再访问这条线路就不需要重复验证。
+            若窗口里一直加载不出来，可能是站点本身不可用，换一条线路即可。
+          </span>
+          <div className="flex shrink-0 gap-2">
+            <Button variant="outline" size="sm" onClick={onClose}>
+              取消
+            </Button>
+            <Button size="sm" icon={Play} onClick={onPassed}>
+              我已完成验证
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ---------------- 规则选择弹窗（方案 5.1） ----------------
 
 function RuleSelectModal({
   open,
   onClose,
   rules,
-  onPick
+  keyword,
+  onPick,
+  onNeedVerify
 }: {
   open: boolean
   onClose: () => void
   rules: PlayRule[]
+  /** 用来预嗅探的关键词（番剧名）：弹窗一打开就按它逐条探测各线路有没有资源 */
+  keyword: string
   onPick: (rule: PlayRule) => void
+  /** 探针判定这条线路需要人机验证时，先让用户去验证（v0.3.7） */
+  onNeedVerify: (rule: PlayRule) => void
 }) {
+  /**
+   * 每条规则的探测结果（v0.3.7）。
+   *
+   * 用户要求「在选择播放源页就自动加载所有规则下是否嗅探到资源、嗅探到多少资源」——
+   * 以前这里只有规则的静态元数据（版本/类型/baseUrl），哪条能播全靠用户一条条点进去试，
+   * 试错成本极高（尤其某些线路根本没有这部番，点进去只会得到"未搜索到"）。
+   */
+  const [probe, setProbe] = useState<Record<string, BatchProbeUpdate>>({})
+  /** 本批探测是吃缓存还是真跑；以及缓存时间（界面要如实说明结果有多旧） */
+  const [probeMeta, setProbeMeta] = useState<{ cached: boolean; probedAt?: number; running: boolean }>({
+    cached: false,
+    running: false
+  })
+  useEffect(() => {
+    if (!open || !keyword || rules.length === 0) return
+    let alive = true
+    setProbe({})
+    // 先订阅再启动：批量任务是逐条推的，订阅晚一步就会漏掉第一条的结果
+    const off = api.ruleBatchProbe.onUpdate((ev) => {
+      if (!alive) return
+      setProbe((prev) => ({ ...prev, [ev.ruleId]: ev }))
+    })
+    void runProbe(false)
+    return () => {
+      alive = false
+      off()
+      // 关掉弹窗就停探测：批量探测会开真实窗口访问站点，不该在用户离开后继续跑
+      void api.ruleBatchProbe.stop()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, keyword, rules])
+
+  /**
+   * 发起一批探测（v0.3.7 加缓存）。
+   *
+   * `force=false` 时主进程会先看 30 分钟内的结果缓存 —— 命中就直接回放，
+   * 不开窗口、不打扰站点；用户想拿最新结论时点「重新探测」（force=true）。
+   */
+  const runProbe = async (force: boolean): Promise<void> => {
+    if (force) setProbe({})
+    setProbeMeta({ cached: false, running: true })
+    const r = await api.ruleBatchProbe.start({
+      keyword,
+      rules: rules.map((x) => ({ id: x.id, name: x.name, baseUrl: x.baseUrl })),
+      force
+    })
+    setProbeMeta({
+      cached: r.ok ? r.data.cached : false,
+      probedAt: r.ok ? r.data.probedAt : undefined,
+      running: !(r.ok && r.data.cached)
+    })
+  }
+
+  /** 把一条规则的结果翻成一句人话 + 颜色（三种"没资源"要分得清，见 BatchProbeUpdate 的说明） */
+  const probeBadge = (ruleId: string): React.ReactElement => {
+    const p = probe[ruleId]
+    if (!p) return <Badge tone="neutral">待探测</Badge>
+    if (p.phase === 'search') return <Badge tone="neutral">搜索中…</Badge>
+    if (p.phase === 'sniff') return <Badge tone="neutral">嗅探中…</Badge>
+    if (p.count > 0) return <Badge tone="ok">命中 {p.count} 个资源</Badge>
+    if (p.hit && p.episodes > 0) return <Badge tone="warn">有剧集·未抓到流</Badge>
+    if (p.hit) return <Badge tone="neutral">有番剧·无剧集</Badge>
+    return <Badge tone="neutral">没有这部番</Badge>
+  }
+
   return (
     <Modal open={open} onClose={onClose} title="选择播放源" width={460}>
       {rules.length === 0 ? (
@@ -631,10 +840,18 @@ function RuleSelectModal({
              */
             const recommended = RECOMMENDED_RULES.includes(rule.name.toLowerCase())
             void i
+            const p = probe[rule.id]
+            /*
+             * 探针说这条线路「需要人机验证」时（消息里带 403/验证字样），
+             * 点它就先弹验证窗口 —— 直接进去只会再吃一次 403，用户会以为是"这条线路坏了"（v0.3.7）。
+             */
+            const needVerify = !!p && (p.count === 0 || p.hit) && VerifyNeedles().test(p.message ?? '')
             return (
               <button
                 key={rule.id}
-                onClick={() => onPick(rule)}
+                onClick={() => (needVerify ? onNeedVerify(rule) : onPick(rule))}
+                /* 探测详情挂在 title 上：一句"为什么没资源"比一个灰徽章有用得多 */
+                title={p?.message}
                 className="flex items-center justify-between rounded-xl border border-border bg-elev2/60 px-4 py-3 text-left transition-colors hover:border-accent hover:bg-accent-soft"
               >
                 <div className="min-w-0">
@@ -643,15 +860,32 @@ function RuleSelectModal({
                     <Badge tone="neutral">v{rule.version}</Badge>
                     <Badge tone="accent">{rule.search.type === 'xpath' ? 'XPath' : 'API'}</Badge>
                     {recommended ? <Badge tone="ok">推荐</Badge> : null}
+                    {/* v0.3.7：这条线路有没有资源（自动预嗅探的结果） */}
+                    {probeBadge(rule.id)}
+                    {needVerify ? <Badge tone="warn">需人机验证</Badge> : null}
                   </div>
-                  <div className="mt-0.5 max-w-[320px] truncate text-[11px] text-faint">{rule.baseUrl}</div>
+                  <div className="mt-0.5 max-w-[320px] truncate text-[11px] text-faint">
+                    {p?.phase === 'done' && p.message ? p.message : rule.baseUrl}
+                  </div>
                 </div>
                 <Play size={15} className="shrink-0 text-accent" />
               </button>
             )
           })}
-          <div className="mt-1 text-[10px] leading-relaxed text-faint">
-            提示：推荐的规则实测可正常解析播放；若某个规则搜不到番剧，可换一个规则或使用「手动搜索」。
+          <div className="mt-1 flex items-start justify-between gap-3 text-[10px] leading-relaxed text-faint">
+            <span>
+              提示：打开这张列表时会自动探测各线路有没有资源（「命中 N 个资源」= 抓到 N 个候选视频地址）。
+              {probeMeta.cached && probeMeta.probedAt
+                ? ` 当前显示的是 ${new Date(probeMeta.probedAt).toLocaleTimeString()} 的探测结果（30 分钟内不重复探测）。`
+                : ' 探测只做搜索与嗅探、不会播放。'}
+            </span>
+            <button
+              className="shrink-0 rounded-md border border-border px-2 py-0.5 text-[10px] text-dim transition-colors hover:border-accent hover:text-accent disabled:opacity-50"
+              disabled={probeMeta.running}
+              onClick={() => void runProbe(true)}
+            >
+              {probeMeta.running ? '探测中…' : '重新探测'}
+            </button>
           </div>
         </div>
       )}
@@ -667,7 +901,8 @@ function RulePlayModal({
   rule,
   keyword,
   title,
-  subjectId
+  subjectId,
+  onNeedVerify
 }: {
   open: boolean
   onClose: () => void
@@ -675,6 +910,8 @@ function RulePlayModal({
   keyword: string
   title: string
   subjectId?: number
+  /** 搜索被站点的人机验证挡住时，交给上层弹验证窗口（v0.3.7） */
+  onNeedVerify: (rule: PlayRule) => void
 }) {
   const navigate = useNavigate()
   const [results, setResults] = useState<RuleSearchEntry[]>([])
@@ -852,6 +1089,16 @@ function RulePlayModal({
                   手动搜索
                 </Button>
               </div>
+              {/*
+                人机验证出口（v0.3.7）：站点给非浏览器请求返回验证页时，
+                界面上以前只有一句「403」，用户完全无从下手。
+                这里给一个按钮，把这条线路的搜索页在应用内打开让用户自己过验证。
+              */}
+              {VerifyNeedles().test(searchError) && rule ? (
+                <Button variant="outline" size="sm" icon={Play} onClick={() => onNeedVerify(rule)}>
+                  这条线路需要人机验证 · 点这里去验证
+                </Button>
+              ) : null}
               <div className="text-[10px] leading-relaxed text-faint">
                 提示：部分站点使用不同译名，可尝试日文原名、别名或去掉季数后缀。
               </div>

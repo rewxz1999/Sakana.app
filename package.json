@@ -97,6 +97,9 @@
     }
   },
   "dependencies": {
+    "@capacitor/android": "^8.5.2",
+    "@capacitor/cli": "^8.5.2",
+    "@capacitor/core": "^8.5.2",
     "axios": "^1.20.0",
     "dayjs": "^1.11.23",
     "fast-xml-parser": "^5.11.1",

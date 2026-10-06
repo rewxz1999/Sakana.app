@@ -11,8 +11,19 @@ import { log } from '../log'
  * 而且没有任何日志）。现在统一在这里注册一次，再按需分发给活跃的实现。
  */
 
-type BeforeHandler = (details: { url: string; resourceType: string }) => void
-type CompletedHandler = (details: { url: string; statusCode: number }) => void
+type BeforeHandler = (details: {
+  url: string
+  resourceType: string
+  /**
+   * 发起这个请求的 webContents id（v0.3.7 追加）。
+   *
+   * 为什么需要：批量嗅探（ruleProbeBatch）会同时开好几个窗口，
+   * 每个任务只该收**自己那个窗口**的请求。没有这个字段的话，
+   * 三个窗口的候选会串到同一个任务里，「这条规则命中几个资源」就成了假数据。
+   */
+  webContentsId: number
+}) => void
+type CompletedHandler = (details: { url: string; statusCode: number; webContentsId: number }) => void
 
 const beforeHandlers = new Set<BeforeHandler>()
 const completedHandlers = new Set<CompletedHandler>()
@@ -28,7 +39,8 @@ function install(): void {
         try {
           h({
             url: String((details as { url?: string }).url ?? ''),
-            resourceType: String((details as { resourceType?: string }).resourceType ?? '')
+            resourceType: String((details as { resourceType?: string }).resourceType ?? ''),
+            webContentsId: Number((details as { webContentsId?: number }).webContentsId ?? -1)
           })
         } catch (err) {
           log.append('warn', 'probe', `嗅探请求处理器异常: ${String(err)}`)
@@ -39,7 +51,7 @@ function install(): void {
     ses.webRequest.onCompleted({ urls: ['*://*/*'] }, (details) => {
       for (const h of [...completedHandlers]) {
         try {
-          h(details as unknown as { url: string; statusCode: number })
+          h(details as unknown as { url: string; statusCode: number; webContentsId: number })
         } catch (err) {
           log.append('warn', 'probe', `嗅探完成处理器异常: ${String(err)}`)
         }

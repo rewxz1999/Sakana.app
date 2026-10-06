@@ -89,6 +89,8 @@ export const CH = {
   playerSeek: 'player:seek',
   playerSetVolume: 'player:set-volume',
   playerGetState: 'player:get-state',
+  /** v0.3.7：画面子窗口诊断快照（查「正在播放但没有画面」用） */
+  playerSurfaceDebug: 'player:surface-debug',
   playerSetMute: 'player:set-mute',
   /** v0.2.9 最后更新：播放倍速（0.25–4，变速不变调） */
   playerSetSpeed: 'player:set-speed',
@@ -169,6 +171,8 @@ export const CH = {
   toolRemove: 'tool:remove',
   toolRun: 'tool:run',
   toolExportDocs: 'tool:export-docs',
+  /** v0.3.7：把自制版式（排名表 / 推荐表）导出成高清 PNG 并保存到用户自选位置 */
+  cardExportImage: 'card:export-image',
 
   // 日志
   logList: 'log:list',
@@ -232,6 +236,14 @@ export const CH = {
   ruleWebviewBounds: 'rule:webview-bounds',
   ruleWebviewClose: 'rule:webview-close',
   evRuleProbe: 'ev:rule-probe',
+  /** v0.3.7：播放源列表的批量预嗅探（每条规则命中多少资源） */
+  rulesBatchProbe: 'rules:batch-probe',
+  rulesBatchProbeStop: 'rules:batch-probe-stop',
+  evRuleBatchProbe: 'ev:rule-batch-probe',
+  /** v0.3.7：人机验证窗口（站点要求验证时，在应用内弹窗让用户自己过） */
+  rulesVerifyOpen: 'rules:verify-open',
+  rulesVerifyBounds: 'rules:verify-bounds',
+  rulesVerifyClose: 'rules:verify-close',
 
   // galgame 快捷启动器
   galImport: 'gal:import',

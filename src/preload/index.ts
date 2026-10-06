@@ -51,7 +51,7 @@ const api: SakanaApi = {
     calendar: (force) => call(CH.bgmCalendar, force),
     subject: (id) => call(CH.bgmSubject, id),
     search: (keyword) => call(CH.bgmSearch, keyword),
-    ratings: (ids) => call(CH.bgmRatings, ids),
+    ratings: (ids, force) => call(CH.bgmRatings, ids, force),
     season: (year, month, force) => call(CH.bgmSeason, year, month, force),
     // v0.3.7：「更新到第几集」（番剧表详情页用；取不到返回 null）
     episodeProgress: (id) => call(CH.bgmEpisodeProgress, id),
@@ -117,6 +117,8 @@ const api: SakanaApi = {
     seek: (sec) => call(CH.playerSeek, sec),
     setVolume: (volume) => call(CH.playerSetVolume, volume),
     getState: () => call(CH.playerGetState),
+    // v0.3.7：画面子窗口诊断（「正在播放但没有画面」时取现场）
+    surfaceDebug: () => call(CH.playerSurfaceDebug),
     setMute: (muted) => call(CH.playerSetMute, muted),
     setSpeed: (speed) => call(CH.playerSetSpeed, speed),
     subtitleTracks: () => call(CH.playerSubtitleTracks),
@@ -176,7 +178,9 @@ const api: SakanaApi = {
     list: () => call(CH.toolList),
     remove: (id) => call(CH.toolRemove, id),
     run: (id) => call(CH.toolRun, id),
-    exportDocs: (format) => call(CH.toolExportDocs, format)
+    exportDocs: (format) => call(CH.toolExportDocs, format),
+    // v0.3.7：自制版式导出成高清 PNG（排名表 / 推荐表用同一个入口）
+    exportCardImage: (req) => call(CH.cardExportImage, req)
   },
   logs: {
     list: () => call(CH.logList),
@@ -212,6 +216,18 @@ const api: SakanaApi = {
       subscribe(CH.evRuleProbe, (ev: { type?: string }) => {
         if (ev && ev.type === 'done') cb(ev as never)
       })
+  },
+  // v0.3.7：播放源列表的批量预嗅探（每条规则命中多少资源）
+  ruleBatchProbe: {
+    start: (req) => call(CH.rulesBatchProbe, req),
+    stop: () => call(CH.rulesBatchProbeStop),
+    onUpdate: (cb) => subscribe(CH.evRuleBatchProbe, cb)
+  },
+  // v0.3.7：人机验证窗口（站点要求验证时在应用内弹窗，让用户自己过）
+  ruleVerify: {
+    open: (ruleId, keyword, bounds) => call(CH.rulesVerifyOpen, ruleId, keyword, bounds),
+    setBounds: (bounds) => call(CH.rulesVerifyBounds, bounds),
+    close: () => call(CH.rulesVerifyClose)
   },
   ruleWebview: {
     open: (url, bounds, referer) => call(CH.ruleWebviewOpen, url, bounds, referer),

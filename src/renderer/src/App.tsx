@@ -31,6 +31,9 @@ import { ScheduleSettingsPage } from '@/pages/ScheduleSettingsPage'
 import { CacheSettingsPage } from '@/pages/CacheSettingsPage'
 import { DanmakuSettingsPage } from '@/pages/DanmakuSettingsPage'
 import { AnnouncementModal } from '@/components/AnnouncementModal'
+// v0.3.7：两个新工具（工具页卡片入口，独立小窗口里用）
+import { RecommendTablePage } from '@/pages/RecommendTablePage'
+import { RankingTablePage } from '@/pages/RankingTablePage'
 import { ImportantUpdateModal } from '@/components/ImportantUpdateModal'
 import { UpdatePage } from '@/pages/UpdatePage'
 import { LogsPage } from '@/pages/LogsPage'
@@ -59,6 +62,9 @@ const SMALL_WINDOW_TITLES: Record<string, string> = {
   '/tools/character-grid': '最XX的角色 9宫格',
   // 自建历史表（工具页入口，独立小窗口里用）
   '/tools/custom-history': '自建历史表',
+  // v0.3.7：作品评级排名表 / 番剧推荐表（工具页入口，独立小窗口里用）
+  '/tools/ranking': '作品评级排名表',
+  '/tools/recommend-table': '番剧推荐表',
   // v0.2.12：独立的更新窗口
   '/update': '软件更新'
 }
@@ -97,6 +103,9 @@ function AnimatedRoutes() {
         <Route path="/tools/character-grid" element={<PageTransition><CharacterGridPage /></PageTransition>} />
         {/* 自建历史表（工具页卡片入口指向这里） */}
         <Route path="/tools/custom-history" element={<PageTransition><CustomHistoryPage /></PageTransition>} />
+        {/* v0.3.7：作品评级排名表 / 番剧推荐表 */}
+        <Route path="/tools/ranking" element={<PageTransition><RankingTablePage /></PageTransition>} />
+        <Route path="/tools/recommend-table" element={<PageTransition><RecommendTablePage /></PageTransition>} />
         <Route path="/settings" element={<PageTransition><SettingsPage /></PageTransition>} />
         <Route path="/rules" element={<PageTransition><RulesPage /></PageTransition>} />
         <Route path="/datasource" element={<PageTransition><DataSourcePage /></PageTransition>} />

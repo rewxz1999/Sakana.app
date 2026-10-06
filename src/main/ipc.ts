@@ -5,6 +5,8 @@ import { extname, join } from 'node:path'
 import { CH } from '@shared/channels'
 import type {
   AddDownloadInput,
+  BatchProbeTarget,
+  CardExportImageRequest,
   GalRecentShot,
   GalToolsConfig,
   LocalTargetInput,
@@ -33,7 +35,7 @@ import { clipboardHasImage, copyImageToClipboard, copyScreenshotIfEnabled } from
  * 表现就是「设置页改了音频设置但播放器毫无反应」（而且完全不报错）。
  */
 import { applyAudio } from './services/audioSettings'
-import { ruleEpisodes, rulePlay, ruleSearch, rulesRepoImport, rulesRepoIndex } from './services/rules'
+import { ruleEpisodes, ruleName, rulePlay, ruleSearch, ruleSearchUrl, rulesRepoImport, rulesRepoIndex } from './services/rules'
 import {
   getCachedStreamOrWait,
   prefetchStream,
@@ -41,8 +43,14 @@ import {
   startRuleProbe,
   stopRuleProbe
 } from './services/ruleProbe'
+// v0.3.7：播放源列表的批量预嗅探（每条规则命中多少资源）
+import { startBatchProbe, stopBatchProbe } from './services/ruleProbeBatch'
+// v0.3.7：人机验证窗口
+import { closeVerifyWindow, openVerifyWindow, setVerifyBounds } from './services/ruleVerify'
 import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
 import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested, mpvApplyVideoEnhance, anime4kAvailable, anime4kShaderFiles, mpvRevealUoscUi } from './services/mpv'
+// v0.3.7：画面子窗口诊断（查「正在播放但没有画面」）
+import { mpvDiagnosticBounds, mpvDumpWindows, mpvHitTest, mpvRaiseStats } from './services/mpv'
 import { buildStreamInfo } from './services/playerInfo'
 import {
   checkUpdate,
@@ -115,6 +123,7 @@ import {
 } from './services/galgameTools'
 import { galSearchSites } from './services/galgameSearch'
 import { statExportImage } from './services/statExport'
+import { exportCardImage } from './services/cardExport'
 import { applyStatAction, readStatData, statWatchProgressFor } from './services/statStore'
 import { listStatShots, statShotsDirToOpen } from './services/statShots'
 import { maybeShowSaveHint } from './services/onboarding'
@@ -304,7 +313,7 @@ export function registerIpc(): void {
   ipcMain.handle(CH.bgmCalendar, (_e, force?: boolean) => bangumi.calendar(!!force))
   ipcMain.handle(CH.bgmSubject, (_e, id: number) => bangumi.subject(id))
   ipcMain.handle(CH.bgmSearch, (_e, keyword: string) => bangumi.search(keyword))
-  ipcMain.handle(CH.bgmRatings, (_e, ids: number[]) => bangumi.ratings(ids))
+  ipcMain.handle(CH.bgmRatings, (_e, ids: number[], force?: boolean) => bangumi.ratings(ids, !!force))
   ipcMain.handle(CH.bgmSeason, (_e, year: number, month: number, force?: boolean) =>
     bangumi.season(Number(year), Number(month), !!force)
   )
@@ -526,6 +535,72 @@ export function registerIpc(): void {
     stopRuleProbe()
     return true
   })
+  /*
+   * 播放源列表的批量预嗅探（v0.3.7）：只探测、不播放。
+   * 结果按规则逐条推事件回去，界面上的徽章随到随更新。
+   */
+  ipcMain.handle(
+    CH.rulesBatchProbe,
+    (e, req: { keyword: string; rules: BatchProbeTarget[]; force?: boolean }) => {
+      const w = BrowserWindow.fromWebContents(e.sender) ?? focused()
+      if (!w) return { jobId: '', total: 0, cached: false }
+      return startBatchProbe(w, {
+        keyword: String(req?.keyword ?? ''),
+        rules: req?.rules ?? [],
+        force: req?.force === true
+      })
+    }
+  )
+  ipcMain.handle(CH.rulesBatchProbeStop, () => {
+    stopBatchProbe()
+    return true
+  })
+  /*
+   * 人机验证窗口（v0.3.7）：把这条规则的搜索页摆在用户点出来的那块"洞"里，
+   * 用户过完验证后 Cookie 留在同一个会话，后续网页内搜索/嗅探直接就是已验证状态。
+   */
+  ipcMain.handle(
+    CH.rulesVerifyOpen,
+    (
+      e,
+      ruleId: string,
+      keyword: string,
+      bounds: { x: number; y: number; width: number; height: number }
+    ) => {
+      const w = BrowserWindow.fromWebContents(e.sender) ?? focused()
+      const url = ruleSearchUrl(String(ruleId ?? ''), String(keyword ?? ''))
+      const name = ruleName(String(ruleId ?? ''))
+      if (!w || !url) return { ok: false, ruleName: name, url: '' }
+      const ok = openVerifyWindow(
+        w,
+        url,
+        {
+          x: Number(bounds?.x) || 0,
+          y: Number(bounds?.y) || 0,
+          width: Number(bounds?.width) || 720,
+          height: Number(bounds?.height) || 480
+        },
+        name
+      )
+      return { ok, ruleName: name, url }
+    }
+  )
+  ipcMain.handle(
+    CH.rulesVerifyBounds,
+    (_e, bounds: { x: number; y: number; width: number; height: number }) => {
+      setVerifyBounds({
+        x: Number(bounds?.x) || 0,
+        y: Number(bounds?.y) || 0,
+        width: Number(bounds?.width) || 720,
+        height: Number(bounds?.height) || 480
+      })
+      return true
+    }
+  )
+  ipcMain.handle(CH.rulesVerifyClose, () => {
+    closeVerifyWindow()
+    return true
+  })
   // Kazumi 式在线播放：可见网页视图嗅探
   ipcMain.handle(
     CH.ruleWebviewOpen,
@@ -620,6 +695,34 @@ export function registerIpc(): void {
     } catch {
       return { time: 0, length: 0, playing: false, volume: 100, muted: false }
     }
+  })
+  /*
+   * 画面子窗口诊断（v0.3.7）：把原生子窗口的现场整体交给渲染层。
+   * 「正在播放但没有画面」的判据只能从窗口层拿 —— 子窗口在不在、多大、那个点上谁在最上面。
+   */
+  ipcMain.handle(CH.playerSurfaceDebug, () => {
+    const bounds = mpvDiagnosticBounds()
+    const cx = bounds ? bounds.x + bounds.width / 2 : 0
+    const cy = bounds ? bounds.y + bounds.height / 2 : 0
+    let hit: unknown = null
+    try {
+      hit = mpvHitTest(cx, cy)
+    } catch {
+      hit = null
+    }
+    let windows: unknown = null
+    try {
+      windows = mpvDumpWindows()
+    } catch {
+      windows = null
+    }
+    let state: unknown = null
+    try {
+      state = engineGetState()
+    } catch {
+      state = null
+    }
+    return { bounds, state, hit, windows, raiseStats: mpvRaiseStats() }
   })
   // v0.2.9 最后更新：播放倍速（0.25–4）
   ipcMain.handle(CH.playerSetSpeed, (_e, speed: number) => {
@@ -777,6 +880,12 @@ export function registerIpc(): void {
   ipcMain.handle(CH.toolRemove, (_e, id: string) => toolService.remove(id))
   ipcMain.handle(CH.toolRun, (_e, id: string) => toolService.run(id))
   ipcMain.handle(CH.toolExportDocs, (_e, format: 'md' | 'txt') => toolService.exportDocs(format))
+  /*
+   * 自制版式导出成高清 PNG（v0.3.7）。
+   * 走主进程的原因见 cardExport.ts 的注释：封面取图链路在这里、离屏窗口能按倍率放大、
+   * 而且只有主进程能弹「自选文件夹」的保存对话框。
+   */
+  ipcMain.handle(CH.cardExportImage, (_e, req: CardExportImageRequest) => exportCardImage(req))
 
   // ---------- 日志 ----------
   ipcMain.handle(CH.logList, () => log.list())

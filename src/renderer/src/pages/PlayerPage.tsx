@@ -346,6 +346,16 @@ export function PlayerPage() {
   /** 重嗅探的兜底计时器（超时就改走中转，并随卸载清理） */
   const probeFallbackTimerRef = useRef<number | undefined>(undefined)
   /**
+   * 直连看门狗（15 秒未开播 → 重嗅探/中转）的**当前**计时器（v0.3.7）。
+   *
+   * 为什么必须只留一个：`onFound` 每收到一个候选就起一个 15 秒计时器，
+   * 而一次嗅探常常连着推好几个候选（先广告短片、后正片，或多码率变体），
+   * 旧写法让这些计时器各活各的 —— 它们虽然都自守 `playingRef`，
+   * 但「切集之后上一集残留的计时器」仍可能在 15 秒后触发「视频流可能已过期，正在重新解析…」，
+   * 把正在播的这一集重新嗅一遍（甚至顶掉当前流）。现在换成新的候选来了就取消上一个。
+   */
+  const streamWatchdogRef = useRef<number | undefined>(undefined)
+  /**
    * 「嗅探窗口该关，但要等确认开播再关」（v0.3.5）。
    *
    * 以前一抓到候选就立刻销毁网页视图，于是：万一这个候选是广告短片 / 失效地址，
@@ -353,6 +363,11 @@ export function PlayerPage() {
    * 现在改为命中后置位，真正开播时（playing 事件或状态轮询确认）再关。
    */
   const pendingCloseWebviewRef = useRef(false)
+  /**
+   * 本集是否已经做过一次「开播后重新校准画面区域」（v0.3.7）。
+   * 每次换媒体都要能再校准一次，所以在新一次 play 成功时复位。
+   */
+  const layoutResyncRef = useRef(false)
 
   /** 直连播放失败时：用内置 FFmpeg 带站点会话去取流并 remux，再交给播放器 */
   const startFfmpegRelay = async (url: string, referer?: string, cookies?: string) => {
@@ -435,6 +450,12 @@ export function PlayerPage() {
   // 尝试嵌入 libmpv 播放内核；失败回退 HTML5 + FFmpeg 管线
   useEffect(() => {
     let alive = true
+    /*
+     * 进播放页先把可能残留的探针网页视图关掉（v0.3.7）。
+     * 那个窗口是**盖在画面区域上的独立窗口**：万一上一轮退出时它没被销毁干净，
+     * 这一轮就会挡住画面 —— 表现正好是「正在播放但没有画面」。这里补一道保险。
+     */
+    void api.ruleWebview.close()
     void (async () => {
       // 视频区域矩形：libmpv 用它定位画面子窗口
       const hostRect = (): { x: number; y: number; width: number; height: number } => {
@@ -565,7 +586,21 @@ export function PlayerPage() {
        * 已开播：只有 m3u8（真正的列表地址）才值得换，避免播放中被打断；
        * 未开播：后到的候选一律可以顶掉先到的（先到的很可能是广告/失效地址）。
        */
-      if (current && started && ev.kind !== 'm3u8') return
+      if (current && started) {
+        /*
+         * 已经在放，而且**已经看进去一段了**（v0.3.7）：一律忽略新候选。
+         *
+         * 换流实现上是给内核 `loadfile replace`，进度必然回 0。开播头 75 秒内出现新候选
+         * 是常见且值得换的（先抓到广告短片 / 占位流，真流随后才请求），
+         * 但用户看了两分钟之后再来一个候选就换，就是「看着看着跳回开头」——
+         * 那比多看一段广告难受得多。所以只在前 75 秒允许换。
+         */
+        if (Date.now() - playStartedAtRef.current > 75_000) {
+          console.log('[player] 已开播较久，忽略后到的候选（避免把进度打回 0）')
+          return
+        }
+        if (ev.kind !== 'm3u8') return
+      }
       {
         ruleStreamRef.current = ev.url
         setRuleStreamUrl(ev.url)
@@ -587,6 +622,8 @@ export function PlayerPage() {
         const playWithRetry = async (attempt = 0): Promise<void> => {
           const r = await api.player.play(ev.url, refForPlay, ev.cookies)
           if (r.ok) {
+            // 新一次交给内核播放：允许开播后再校准一次画面区域（见 layoutResyncRef 的说明）
+            layoutResyncRef.current = false
             /*
              * v0.2.8 附加七：把**播放页地址**告知 mpv 的 B 站弹幕脚本。
              * 交给内核的是直链，脚本无法据此反推 B 站页面（也就取不到弹幕），
@@ -596,7 +633,16 @@ export function PlayerPage() {
             return
           }
           console.warn(`[player] 交给内核播放失败（第 ${attempt + 1} 次）：${r.error}`)
-          if (attempt < 2) {
+          /*
+           * 「内核还没 attach」是**过程态**而不是失败（v0.3.7）：
+           * 命中直链缓存时这一步会跑在拿缓存的同时，而 attach 可能还在路上；
+           * 旧代码只重试 3 次（2.7 秒）就放弃并弹一句红字，而那时内核刚刚就绪 ——
+           * 用户看到的就是「明明抓到了流却提示内核不接受」。
+           * 所以这一种错误给足等待窗口（约 9 秒），其它错误仍旧只重试 3 次。
+           */
+          const transient = /还没\s*attach|未就绪|not\s*attached/i.test(r.error ?? '')
+          const maxAttempt = transient ? 9 : 2
+          if (attempt < maxAttempt) {
             await new Promise((res) => window.setTimeout(res, 900))
             if (cancelled) return
             return playWithRetry(attempt + 1)
@@ -609,8 +655,14 @@ export function PlayerPage() {
          * 都能跳过整轮嗅探。缓存有 6 分钟 TTL，过期或一次性令牌失效时看门狗会重新嗅探。
          */
         void api.rules.rememberStream(pageUrl, ev.url, refForPlay)
+        /*
+         * 换新候选之前先取消上一个看门狗（v0.3.7）：见 streamWatchdogRef 的说明 ——
+         * 一次嗅探会推多个候选，旧计时器不该在新候选已经接手之后继续倒计时。
+         */
+        if (streamWatchdogRef.current !== undefined) window.clearTimeout(streamWatchdogRef.current)
         // 直连 15 秒仍未开播 → 先用新地址重试（对付短时效直链），再不行才切 FFmpeg 中转
-        window.setTimeout(() => {
+        streamWatchdogRef.current = window.setTimeout(() => {
+          streamWatchdogRef.current = undefined
           if (cancelled || playingRef.current || relayTriedRef.current) return
           if (!retriedCaptureRef.current) {
             retriedCaptureRef.current = true
@@ -696,6 +748,11 @@ export function PlayerPage() {
       if (probeCancelRef.current) probeCancelRef.current()
       probeCancelRef.current = null
       if (probeFallbackTimerRef.current) window.clearTimeout(probeFallbackTimerRef.current)
+      // 直连看门狗也要随卸载清掉：否则退出播放页后它还会去重嗅探一次（v0.3.7）
+      if (streamWatchdogRef.current !== undefined) {
+        window.clearTimeout(streamWatchdogRef.current)
+        streamWatchdogRef.current = undefined
+      }
       void cacheHit
     }
   }
@@ -1088,6 +1145,30 @@ export function PlayerPage() {
           if (pendingCloseWebviewRef.current) {
             pendingCloseWebviewRef.current = false
             void api.ruleWebview.close()
+          }
+          /*
+           * ★ 开播后重新校准画面区域（v0.3.7 修「换播放源后正在播放但没有画面」）★
+           *
+           * 画面是主窗口里的**原生子窗口**，它只认我们上报的那个矩形。
+           * 从「详情页 → 播放源列表 → 再进播放器」这条路上，页面刚挂载时量到的
+           * `#player-host` 有可能还在入场动画/布局未稳的状态（量早了一步），
+           * 于是子窗口被摆到了错误的位置或尺寸上，声音照常、画面却看不到 ——
+           * 用户看到的就是「正在播放但没有任何画面」。
+           *
+           * 所以真正开播后再补报几次矩形（300/1000/2200ms）：这时布局一定稳了，
+           * 报一次就能把窗口摆正。补报是幂等的，对正常情况零副作用。
+           */
+          if (!layoutResyncRef.current) {
+            layoutResyncRef.current = true
+            for (const delay of [300, 1000, 2200]) {
+              window.setTimeout(() => {
+                const el = document.getElementById('player-host')
+                const r = el?.getBoundingClientRect()
+                if (r && r.width > 0 && r.height > 0) {
+                  void api.player.notifyLayout({ x: r.left, y: r.top, width: r.width, height: r.height })
+                }
+              }, delay)
+            }
           }
           // 本集真正开播了：这之后的时间/结束事件才算数
           awaitingStartRef.current = false

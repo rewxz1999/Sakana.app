@@ -325,6 +325,20 @@ if (!gotLock) {
                     console.log(
                       `[online-test] ${rule.name}: 会话信息 referer=${stream.referer ? '有' : '无'} cookies=${stream.cookies ? `${stream.cookies.length} 字符` : '无'}`
                     )
+                    /*
+                     * 广告分片结构诊断（SAKANA_ONLINE_AD_DIAG=1，v0.3.7）。
+                     * 为什么挂在这里：广告是**站点与 CDN 的属性**，只有拿到真实播放列表才看得出结构，
+                     * 而在线测试刚好已经把所有规则的真实地址抓在手里 —— 顺手诊断一遍，
+                     * 比事后拿着可能已经过期的签名地址再去取流靠谱得多。
+                     */
+                    if (process.env.SAKANA_ONLINE_AD_DIAG === '1') {
+                      const { diagnoseAdStructure } = await import('./services/adDiag')
+                      const lines = await diagnoseAdStructure(
+                        stream.url,
+                        stream.referer !== undefined ? stream.referer || undefined : rule.baseUrl
+                      )
+                      for (const l of lines) console.log(`[online-test] ${rule.name}: [广告结构] ${l}`)
+                    }
                     // 端到端验证：先直连（带 Cookie），失败则改走 FFmpeg 中转
                     try {
                       const { startLiveUrl, stopLive } = await import('./services/transcode')
@@ -3212,6 +3226,162 @@ if (!gotLock) {
           }, 12000)
         })()
       }, 2000)
+    }
+
+    /*
+     * HLS 广告分片诊断（SAKANA_AD_DIAG=<m3u8 地址>，v0.3.7）。
+     *
+     * 为什么要单独一个自检：广告过滤（adFilter + hlsAdFilterCore）是一条**宁放过不误删**的判定链，
+     * 它只在「判据齐全」时才改写播放列表，判据不齐时静默回源（用户只看到广告照播）。
+     * 光看日志里那句「未发现可安全剔除的贴片广告分片」不知道是哪一道闸门挡住的，
+     * 所以这里把结构（分片数、DISCONTINUITY 位置、各连续区段时长）与每一道闸门的实际值全打出来，
+     * 对着真实站点调判据时才有的放矢。
+     *
+     * 可选 SAKANA_AD_DIAG_REFERER=<referer>。
+     */
+    if (process.env.SAKANA_AD_DIAG) {
+      setTimeout(() => {
+        void (async () => {
+          const url = String(process.env.SAKANA_AD_DIAG)
+          const referer = process.env.SAKANA_AD_DIAG_REFERER
+          // 诊断本体抽到 services/adDiag.ts：在线测试那边（SAKANA_ONLINE_AD_DIAG=1）复用同一份
+          const { diagnoseAdStructure } = await import('./services/adDiag')
+          const lines = await diagnoseAdStructure(url, referer)
+          for (const l of lines) console.log(`[ad-diag] ${l}`)
+          markQuitting()
+          app.quit()
+        })()
+      }, 2000)
+    }
+
+    /*
+     * 换源复现自检（SAKANA_SWITCH_TEST='关键词'，v0.3.7）。
+     *
+     * 用户报的现象：「选一个播放源播放后退出，再选其它播放源播放，会出现『正在播放但没有任何画面』」。
+     *
+     * 为什么必须专门复现：视频不是网页画的，而是**主窗口的一个原生 WS_CHILD 子窗口**
+     * （见 native/mpv/src/addon.cc），"有没有画面"取决于这个子窗口
+     * 在不在、尺寸对不对、有没有被 Chromium 的合成层盖住 —— 这些在渲染层完全看不出来。
+     * 所以这里按真实顺序做两轮（搜索→剧集→播放页→嗅探→attach→play→**诊断**→detach），
+     * 每轮把子窗口的 bounds / 父窗口的子窗口清单 / 画面中心点的命中测试全打出来对比。
+     * 只要第二轮这几个值不一样，就能一眼看出是「窗口没重建」「尺寸为 0」还是「被盖住」。
+     *
+     * 可选 SAKANA_SWITCH_RULES='规则A,规则B'（默认 aafun,MXdm）。
+     */
+    if (process.env.SAKANA_SWITCH_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const kw = String(process.env.SAKANA_SWITCH_TEST) || '败犬女主太多了'
+          const wanted = String(process.env.SAKANA_SWITCH_RULES ?? 'aafun,MXdm')
+            .split(',')
+            .map((s) => s.trim().toLowerCase())
+            .filter(Boolean)
+          const { ruleSearch, ruleEpisodes, rulePlay } = await import('./services/rules')
+          const { startRuleProbe, setProbeHook, stopRuleProbe } = await import('./services/ruleProbe')
+          const { openRuleWebview, closeRuleWebview } = await import('./services/ruleWebview')
+          const eng = await import('./services/playerEngine')
+          const mpv = await import('./services/mpv')
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
+          if (!win) {
+            console.log('[switch-test] 没有主窗口')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const rules = store
+            .get<import('@shared/types').PlayRule[]>('rules', [])
+            .filter((r) => r.enabled && wanted.includes(r.name.toLowerCase()))
+          const diag = (tag: string): void => {
+            const b = mpv.mpvDiagnosticBounds()
+            const cx = b ? b.x + b.width / 2 : 0
+            const cy = b ? b.y + b.height / 2 : 0
+            const hit = mpv.mpvHitTest(cx, cy)
+            const wins = mpv.mpvDumpWindows()
+            const stats = mpv.mpvRaiseStats()
+            const st = eng.engineGetState()
+            console.log(
+              `[switch-test] ${tag} bounds=${JSON.stringify(b)} state=${JSON.stringify(st)} hit=${JSON.stringify(hit)}`
+            )
+            console.log(
+              `[switch-test] ${tag} 父窗口子窗口=${JSON.stringify(wins?.parentChildren?.slice(0, 6) ?? null)} raise统计=${JSON.stringify(stats)}`
+            )
+          }
+          const waitPlaying = async (tag: string, rounds = 8, step = 2500): Promise<boolean> => {
+            for (let i = 0; i < rounds; i++) {
+              await new Promise((r) => setTimeout(r, step))
+              const st = eng.engineGetState()
+              console.log(`[switch-test] ${tag} 第 ${i + 1} 次状态 ${JSON.stringify(st)}`)
+              if (st?.playing && st.length > 0) return true
+            }
+            return false
+          }
+          for (const [idx, rule] of rules.entries()) {
+            const tag = `第${idx + 1}轮 ${rule.name}`
+            try {
+              const s = await ruleSearch(rule.id, kw)
+              if (!s.items.length) {
+                console.log(`[switch-test] ${tag}: 搜索无结果，跳过`)
+                continue
+              }
+              const ep = await ruleEpisodes(rule.id, s.items[0])
+              const g = ep.groups[0]
+              if (!g?.episodes?.length) {
+                console.log(`[switch-test] ${tag}: 无剧集，跳过`)
+                continue
+              }
+              const play = await rulePlay(rule.id, s.items[0], 0, 0, g.episodes[0].link, ep.vars)
+              const stream = await new Promise<{ url: string; referer?: string; cookies?: string } | null>(
+                (resolve) => {
+                  const timer = setTimeout(() => resolve(null), 40000)
+                  setProbeHook((payload) => {
+                    if (payload.type === 'found' && typeof payload.url === 'string') {
+                      clearTimeout(timer)
+                      resolve({
+                        url: payload.url,
+                        referer: typeof payload.referer === 'string' ? payload.referer : undefined,
+                        cookies: typeof payload.cookies === 'string' ? payload.cookies : undefined
+                      })
+                    }
+                  })
+                  // 与真实播放一致：优先可见网页视图（同步返回布尔），失败再退回离屏隐藏窗口
+                  const okView = openRuleWebview(
+                    win,
+                    play.url,
+                    { x: 0, y: 60, width: 960, height: 480 },
+                    rule.baseUrl
+                  )
+                  if (!okView) startRuleProbe(win, play.url, rule.baseUrl)
+                }
+              )
+              closeRuleWebview()
+              setProbeHook(null)
+              stopRuleProbe()
+              if (!stream) {
+                console.log(`[switch-test] ${tag}: 未捕获到流，跳过`)
+                continue
+              }
+              console.log(`[switch-test] ${tag}: 捕获流成功，开始挂内核`)
+              // 真实顺序：attach → play
+              const att = await eng.engineAttach(win, { x: 0, y: 60, width: 960, height: 480 })
+              console.log(`[switch-test] ${tag}: attach=${JSON.stringify(att)}`)
+              diag(`${tag} 刚 attach`)
+              eng.enginePlay(stream.url, stream.referer ?? rule.baseUrl, stream.cookies)
+              const okPlay = await waitPlaying(tag)
+              diag(`${tag} 开播后`)
+              console.log(`[switch-test] ${tag}: 播放成功=${okPlay}`)
+              // 模拟用户退出播放器
+              eng.engineDetach()
+              await new Promise((r) => setTimeout(r, 1500))
+              console.log(`[switch-test] ${tag}: 已 detach（模拟退出播放器）`)
+            } catch (err) {
+              console.log(`[switch-test] ${tag}: 异常 ${String((err as Error)?.message ?? err).slice(0, 160)}`)
+            }
+          }
+          console.log('[switch-test] 完成')
+          markQuitting()
+          app.quit()
+        })()
+      }, 3000)
     }
 
     // 媒体扫描自检（SAKANA_MEDIA_TEST=文件夹路径）：递归扫描视频与字幕后退出

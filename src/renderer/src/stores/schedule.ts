@@ -26,11 +26,22 @@ interface ScheduleState {
   selectedDay: number // 1-7
   weekOffset: number
   ratings: Record<number, { score: number | null; total: number }>
+  /**
+   * 上一次拿到评分的时间（v0.3.7）。
+   *
+   * 为什么需要：`ratings` 是**会话级内存缓存**，过去一旦写入就永不失效 ——
+   * 用户开着 App 一整天，番剧表的评分就一直是当天第一次取回的那份，
+   * 这是「评分、评分人数更新不及时」的最后一层原因。现在按主进程同一个节奏（6 小时）判断新鲜度。
+   */
+  ratingsAt: number
   load: (force?: boolean) => Promise<void>
-  loadRatings: (ids: number[]) => Promise<void>
+  loadRatings: (ids: number[], force?: boolean) => Promise<void>
   selectDay: (day: number) => void
   shiftWeek: (delta: number) => void
 }
+
+/** 与主进程 bangumi.ts 的 TTL_RATING 保持一致：评分每 6 小时算过期 */
+const RATING_TTL_MS = 6 * 3600 * 1000
 
 export const useSchedule = create<ScheduleState>((set, get) => ({
   days: [],
@@ -41,6 +52,7 @@ export const useSchedule = create<ScheduleState>((set, get) => ({
   stale: false,
   fallbackSource: null,
   ratings: {},
+  ratingsAt: 0,
   selectedDay: (() => {
     const d = new Date().getDay()
     return d === 0 ? 7 : d
@@ -81,13 +93,20 @@ export const useSchedule = create<ScheduleState>((set, get) => ({
     }
   },
   selectDay: (day) => set({ selectedDay: day }),
-  loadRatings: async (ids) => {
-    const { ratings } = get()
-    const missing = ids.filter((id) => !(id in ratings))
+  loadRatings: async (ids, force = false) => {
+    const { ratings, ratingsAt } = get()
+    /*
+     * 判断哪些 id 需要真的去问一遍（v0.3.7）：
+     *   · force（用户点了刷新）→ 全部重问，并且让主进程也绕开它那层 6 小时缓存；
+     *   · 否则只问「内存里没有」或「内存里这份已经超过 6 小时」的。
+     */
+    const stale = Date.now() - ratingsAt > RATING_TTL_MS
+    const target = force || stale ? ids : ids.filter((id) => !(id in ratings))
+    const missing = [...new Set(target)]
     if (missing.length === 0) return
-    const r = await api.bangumi.ratings(missing)
+    const r = await api.bangumi.ratings(missing, force)
     if (r.ok) {
-      set((s) => ({ ratings: { ...s.ratings, ...r.data } }))
+      set((s) => ({ ratings: { ...s.ratings, ...r.data }, ratingsAt: Date.now() }))
     }
   },
   shiftWeek: (delta) => set((s) => ({ weekOffset: Math.max(-4, Math.min(4, s.weekOffset + delta)) }))

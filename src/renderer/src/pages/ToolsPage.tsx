@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { motion } from 'framer-motion'
-import { BarChart3, FileDown, FileText, History, LayoutGrid, Play, Puzzle, SquareTerminal, Trash2 } from 'lucide-react'
+import { BarChart3, FileDown, FileText, History, LayoutGrid, Play, Puzzle, SquareTerminal, Star, Trash2, Trophy } from 'lucide-react'
 import { useTools } from '@/stores/tools'
 import { timeAgo } from '@/lib/format'
 import { api } from '@/lib/api'
@@ -45,6 +45,39 @@ const BUILTIN_CUSTOM_HISTORY_TOOL = {
     '选年份挑番剧（或搜索添加，放送年份对不上会自动提示）→ 用「简易显示 / 清晰显示」两种版式查看 → 导出 PNG（导出时可选版式与清晰度）。',
   icon: History,
   hash: '/tools/custom-history'
+}
+
+/**
+ * 内置「作品评级排名表」（v0.3.7，用户要求）。
+ *
+ * 自建一张排名表：左侧等级标签（内置三套模板或自定义），中间是排名区，
+ * 底下是作品池（收藏 / 书签 / galgame 都能导入，也能搜番剧与 galgame 现加）。
+ * 作品封面+名字，可拖到任意等级、也可放在两个相邻等级之间，右键移除或改等级。
+ * 整表可导出为高清 PNG（可填排名人、自选保存位置）。
+ */
+const BUILTIN_RANKING_TOOL = {
+  id: '__ranking',
+  name: '作品评级排名表',
+  description:
+    '建一张自己的排名表（表名自定，等级标签可选内置三套模板或自定义）→ 从收藏 / 书签 / galgame 导入或搜索添加作品到作品池 → 拖拽排到各等级（也能放在两个等级之间）→ 导出高清 PNG（可写排名人，自选保存位置）。',
+  icon: Trophy,
+  hash: '/tools/ranking'
+}
+
+/**
+ * 内置「番剧推荐表」（v0.3.7，用户要求）。
+ *
+ * 一页一部番剧的翻页式推荐卡：左封面、右上名称/评分/推荐人评分/推荐指数/播出时间/类型标签、
+ * 右下推荐理由（≤300 字）与剧照。可导出当前页或把多页拼成长图（最多 5 页）；
+ * 右键当前页可以改推荐人评分 / 推荐指数 / 推荐理由 / 剧照。
+ */
+const BUILTIN_RECOMMEND_TOOL = {
+  id: '__recommend-table',
+  name: '番剧推荐表',
+  description:
+    '搜索或从当季番剧里挑作品，一页一部做成推荐卡（封面 / bangumi 评分 / 你的评分 / 推荐指数 / 播出时间 / 类型标签 / 推荐理由 / 剧照）→ 翻页阅览 → 导出当前页或拼成长图（最多 5 页，可写推荐人，自选保存位置）。',
+  icon: Star,
+  hash: '/tools/recommend-table'
 }
 
 export function ToolsPage() {
@@ -195,6 +228,84 @@ export function ToolsPage() {
               width: 1320,
               height: 880,
               title: BUILTIN_CUSTOM_HISTORY_TOOL.name
+            })
+          }}>
+            启动
+          </Button>
+        </div>
+      </motion.div>
+
+      {/* 内置「作品评级排名表」（v0.3.7，用户要求；同样是画布式版面，在新窗口里打开） */}
+      <motion.div
+        layout
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        onClick={() =>
+          void api.window.openSmall(BUILTIN_RANKING_TOOL.hash, {
+            width: 1360,
+            height: 900,
+            title: BUILTIN_RANKING_TOOL.name
+          })
+        }
+        whileHover={{ y: -3 }}
+        className="mt-4 flex cursor-pointer flex-col overflow-hidden rounded-xl border border-accent/40 bg-elev1 transition-colors hover:border-accent"
+      >
+        <div className="flex items-center gap-4 p-4">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-accent/15 text-accent">
+            <BUILTIN_RANKING_TOOL.icon size={24} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold">{BUILTIN_RANKING_TOOL.name}</span>
+              <span className="rounded-full bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent whitespace-nowrap">内置</span>
+            </div>
+            <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-dim">{BUILTIN_RANKING_TOOL.description}</p>
+          </div>
+          <Button size="sm" icon={Play} onClick={(e) => {
+            e.stopPropagation()
+            void api.window.openSmall(BUILTIN_RANKING_TOOL.hash, {
+              width: 1360,
+              height: 900,
+              title: BUILTIN_RANKING_TOOL.name
+            })
+          }}>
+            启动
+          </Button>
+        </div>
+      </motion.div>
+
+      {/* 内置「番剧推荐表」（v0.3.7，用户要求） */}
+      <motion.div
+        layout
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        onClick={() =>
+          void api.window.openSmall(BUILTIN_RECOMMEND_TOOL.hash, {
+            width: 1200,
+            height: 860,
+            title: BUILTIN_RECOMMEND_TOOL.name
+          })
+        }
+        whileHover={{ y: -3 }}
+        className="mt-4 flex cursor-pointer flex-col overflow-hidden rounded-xl border border-accent/40 bg-elev1 transition-colors hover:border-accent"
+      >
+        <div className="flex items-center gap-4 p-4">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-accent/15 text-accent">
+            <BUILTIN_RECOMMEND_TOOL.icon size={24} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold">{BUILTIN_RECOMMEND_TOOL.name}</span>
+              <span className="rounded-full bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent whitespace-nowrap">内置</span>
+            </div>
+            <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-dim">{BUILTIN_RECOMMEND_TOOL.description}</p>
+          </div>
+          <Button size="sm" icon={Play} onClick={(e) => {
+            e.stopPropagation()
+            void api.window.openSmall(BUILTIN_RECOMMEND_TOOL.hash, {
+              width: 1200,
+              height: 860,
+              title: BUILTIN_RECOMMEND_TOOL.name
             })
           }}>
             启动

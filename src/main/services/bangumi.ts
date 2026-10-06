@@ -74,6 +74,15 @@ const TTL_SEARCH = 30 * 60 * 1000
  */
 const TTL_RATING = 6 * 3600 * 1000
 /**
+ * 进详情页时，「顺手补一次评分」最多等多久（v0.3.7）。
+ *
+ * 为什么要有上限：详情正文可以立刻用 30 天缓存渲染，但评分要新鲜 ——
+ * 如果无脑 await 一次评分请求，反代慢的时候整个详情页就会被拖住（用户会觉得"页面卡"）。
+ * 1.5 秒是个折中：绝大多数请求在这个时间内回来（本地反代 200~400ms），
+ * 超时就先按旧值渲染，请求仍在后台跑完并落缓存（下次进详情页就是新的）。
+ */
+const RATING_WAIT_MS = 1500
+/**
  * 分集进度缓存（「更新到第几集」）。
  *
  * 集数一周才动一次，理论上可以缓存很久；但用户点进详情页时最想看到的就是
@@ -1206,7 +1215,15 @@ class BangumiService {
     const key = `subject3-${id}`
     const cache = this.readCache<SubjectDetail>(key)
     if (cache && Date.now() - cache.fetchedAt < TTL_SUBJECT) {
-      return { fromCache: true, data: cache.data }
+      /*
+       * v0.3.7：详情正文与评分的**时效要求不一样**，不能共用同一个 TTL。
+       *
+       * 详情正文（简介 / 标签 / 制作信息）一个月不变也没关系，所以正文继续用 30 天缓存；
+       * 但评分与评分人数每天都在动 —— 过去它们被一起冻在 30 天里，
+       * 于是用户看到的就是「番剧的评分、评分人数更新不及时」（实测：详情页评分能旧到一个月）。
+       * 这里把评分单独交给 6 小时的 `rating-*` 缓存（见 mergeFreshRating 的说明）。
+       */
+      return { fromCache: true, data: await this.mergeFreshRating(id, cache.data) }
     }
     /*
      * v0.2.7 附加：过期缓存**先照常返回全部详情**，刷新放到后台静默做。
@@ -1217,13 +1234,18 @@ class BangumiService {
      */
     if (cache) {
       void this.fetchSubject(id)
-        .then((fresh) => this.writeCache(key, fresh))
+        .then((fresh) => {
+          this.writeCache(key, fresh)
+          this.noteRating(id, fresh.rating)
+        })
         .catch((err) => log.append('warn', 'bangumi', `后台刷新详情失败 (#${id})，继续用缓存: ${String(err)}`))
-      return { fromCache: true, stale: true, data: cache.data }
+      return { fromCache: true, stale: true, data: await this.mergeFreshRating(id, cache.data) }
     }
     try {
       const detail = await this.fetchSubject(id)
       this.writeCache(key, detail)
+      // 刚拿到的详情里就带着评分：顺手写进 6 小时那份缓存，避免下次再为评分多打一次请求
+      this.noteRating(id, detail.rating)
       return { fromCache: false, data: detail }
     } catch (err) {
       const error: SourceError =
@@ -1233,6 +1255,70 @@ class BangumiService {
       log.append('warn', 'bangumi', `获取详情失败 (#${id}): ${error.message}`)
       return { fromCache: false, data: null, error }
     }
+  }
+
+  /**
+   * 把一份详情里的评分同步进 `rating-{id}` 缓存（6 小时 TTL 的那一份）。
+   *
+   * 为什么两个缓存要互相写：详情接口本来就带评分，直接落进评分缓存就等于白拿一次刷新；
+   * 不写的话，详情 30 天内不再联网、评分却仍是启动时那份，两处显示会长期不一致。
+   */
+  private noteRating(id: number, rating: Rating | null | undefined): void {
+    if (id <= 0 || !rating) return
+    const score = typeof rating.score === 'number' && rating.score > 0 ? rating.score : null
+    if (score == null && !rating.total) return
+    this.writeCache(`rating-${id}`, { score, total: Number(rating.total ?? 0) })
+  }
+
+  /**
+   * 返回一份「评分部分尽量新鲜」的详情副本（v0.3.7 修「评分/评分人数更新不及时」）。
+   *
+   * 规则：
+   *   · `rating-{id}` 缓存还在 6 小时内 → 直接用它的 score/total 覆盖详情里的旧值（零请求）；
+   *   · 已过期 → 补一次评分请求，但**最多等 1.5 秒**：等到了就用新值，
+   *     等不到就先按旧值渲染（请求仍在后台跑完并落缓存，下次进详情页就是新的）。
+   *     这样既不会把详情页拖慢，也不会像过去那样一旧就是 30 天。
+   */
+  private async mergeFreshRating(id: number, detail: SubjectDetail): Promise<SubjectDetail> {
+    if (id <= 0) return detail
+    const apply = (score: number | null, total: number): SubjectDetail => ({
+      ...detail,
+      rating: {
+        score: score ?? detail.rating?.score ?? null,
+        total,
+        rank: detail.rating?.rank
+      }
+    })
+    const cached = this.readCache<{ score: number | null; total: number }>(`rating-${id}`)
+    if (cached && Date.now() - cached.fetchedAt < TTL_RATING) {
+      if (cached.data && (cached.data.score != null || cached.data.total > 0)) {
+        return apply(cached.data.score, cached.data.total)
+      }
+      return detail
+    }
+    const fresh = await Promise.race([
+      this.fetchRating(id).catch(() => null),
+      new Promise<null>((r) => setTimeout(() => r(null), RATING_WAIT_MS))
+    ])
+    if (fresh) {
+      this.writeCache(`rating-${id}`, fresh)
+      return apply(fresh.score, fresh.total)
+    }
+    return detail
+  }
+
+  /** 只取一部番剧的评分（评分的单条实现，ratings() 的批量循环与 mergeFreshRating 共用一份口径） */
+  private async fetchRating(id: number): Promise<{ score: number | null; total: number }> {
+    const { text, mirror } = await this.requestBest({
+      api: `/v0/subjects/${id}`,
+      web: `/subject/${id}`,
+      // 同 subject()：自建反代必须走 /v0/，否则拿到的是缺字段的旧版 API 形态
+      customApi: `/v0/subjects/${id}`
+    })
+    if (!isApiMirror(mirror)) return parseRatingOnly(text)
+    const s = JSON.parse(text) as { rating?: { score?: number; total?: number } }
+    const score = Number(s.rating?.score ?? 0)
+    return { score: score > 0 ? score : null, total: Number(s.rating?.total ?? 0) }
   }
 
   /** 拉取并归一化一部番剧的完整详情（v0 走 JSON，网页镜像走 HTML 解析） */
@@ -1301,8 +1387,17 @@ class BangumiService {
       }
   }
 
-  /** 补全番剧评分（日历页不含评分，从详情页提取，7 天缓存，并发 4） */
-  async ratings(ids: number[]): Promise<Record<number, { score: number | null; total: number }>> {
+  /**
+   * 补全番剧评分（日历页不含评分，从详情页提取，6 小时缓存，并发 2）。
+   *
+   * v0.3.7 追加：`force = true` 时**忽略缓存**，把传进来的 id 全部重新拉一遍。
+   * 用户的「刷新」按钮应当真的刷新到评分，而不是读一份最多 6 小时前的缓存
+   * （番剧表的刷新以前只刷放送数据，评分还是会话内内存缓存里的旧值）。
+   */
+  async ratings(
+    ids: number[],
+    force = false
+  ): Promise<Record<number, { score: number | null; total: number }>> {
     const out: Record<number, { score: number | null; total: number }> = {}
     const missing: number[] = []
     for (const id of [...new Set(ids)]) {
@@ -1314,7 +1409,7 @@ class BangumiService {
        */
       if (id <= 0) continue
       const cache = this.readCache<{ score: number | null; total: number }>(`rating-${id}`)
-      if (cache && Date.now() - cache.fetchedAt < TTL_RATING) {
+      if (!force && cache && Date.now() - cache.fetchedAt < TTL_RATING) {
         out[id] = cache.data
       } else {
         missing.push(id)
@@ -1333,19 +1428,8 @@ class BangumiService {
         const id = missing[i++]
         await new Promise((r) => setTimeout(r, 120))
         try {
-          const { text, mirror } = await this.requestBest({
-            api: `/v0/subjects/${id}`,
-            web: `/subject/${id}`,
-            // 同 subject()：自建反代必须走 /v0/，否则拿到的是缺字段的旧版 API 形态
-            customApi: `/v0/subjects/${id}`
-          })
-          const data = isApiMirror(mirror)
-            ? (() => {
-                const s = JSON.parse(text) as { rating?: { score?: number; total?: number } }
-                const score = Number(s.rating?.score ?? 0)
-                return { score: score > 0 ? score : null, total: Number(s.rating?.total ?? 0) }
-              })()
-            : parseRatingOnly(text)
+          // 与 mergeFreshRating 共用同一份取值口径（fetchRating）
+          const data = await this.fetchRating(id)
           this.writeCache(`rating-${id}`, data)
           out[id] = data
         } catch {

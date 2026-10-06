@@ -51,6 +51,8 @@ interface LibraryState {
   toggleWatched: (subjectId: number) => void
   setWatchedAt: (subjectId: number, watchedAt: number | null) => void
   enrichFavorites: () => Promise<void>
+  /** v0.3.7：只刷新收藏条目的评分/评分人数（评分每天在动，收藏卡上的分数不能一年不动） */
+  refreshFavoriteRatings: () => Promise<void>
 }
 
 /** 已看完判定：手动标记过，或观看记录覆盖全部集数 */
@@ -94,6 +96,11 @@ export const useLibrary = create<LibraryState>((set, get) => ({
     if (get().enriched) return
     set({ enriched: true })
     const favorites = get().favorites
+    /*
+     * 先把评分这条**独立**的活干完（v0.3.7）：它面对所有收藏，不受下面「只补缺字段」的限制。
+     * 放在前面是因为它更便宜（主进程 6 小时缓存，通常一次网络都不发）。
+     */
+    void get().refreshFavoriteRatings()
     const missing = favorites.filter((f) => !f.airDate || f.eps == null)
     if (missing.length === 0) return
     const update = async (fav: FavoriteItem): Promise<void> => {
@@ -122,6 +129,33 @@ export const useLibrary = create<LibraryState>((set, get) => ({
       }
     })
     await Promise.all(workers)
+  },
+  /**
+   * 只刷新收藏条目的评分（v0.3.7）。
+   *
+   * 为什么单独做一件事：原来的补全逻辑只处理「缺字段」的条目
+   * （`next.rating == null` 才写入），于是一条**已经有评分**的收藏永远不会再更新 ——
+   * 用户看着收藏列表里半年前的分数，就是「评分更新不及时」。
+   * 这里走 `api.bangumi.ratings`（主进程 6 小时 TTL，命中缓存时零请求），
+   * 只有在分数真的变了才写回 store，避免无意义的状态刷新与写盘。
+   */
+  refreshFavoriteRatings: async () => {
+    const favorites = get().favorites
+    const ids = favorites.map((f) => f.subjectId).filter((id) => id > 0)
+    if (ids.length === 0) return
+    const r = await api.bangumi.ratings(ids)
+    if (!r.ok) return
+    const byId = r.data
+    let changed = false
+    const next = favorites.map((f) => {
+      const score = byId[f.subjectId]?.score
+      if (score == null || score === f.rating) return f
+      changed = true
+      return { ...f, rating: score }
+    })
+    if (!changed) return
+    set({ favorites: next })
+    void api.store.set('favorites', next)
   },
   toggleFavorite: (subject) => {
     const { favorites } = get()

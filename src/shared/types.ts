@@ -1798,6 +1798,41 @@ export type GalEvent =
 export const RECOMMENDED_RULES = ['aafun', 'sorani']
 
 /**
+ * 置顶规则（v0.3.7，用户要求：「将 aafun、AGE、sorani 规则置顶」）。
+ *
+ * 与 RECOMMENDED_RULES 的区别：
+ *   · RECOMMENDED_RULES 决定**角标**（哪几条值得推荐）；
+ *   · 这一份决定**顺序**（列表里排在最前面，用户不用往下翻就能点到）。
+ * 为什么要有单独一份而不是复用推荐名单：推荐是「产品觉得好用」，
+ * 置顶是「实测最快/最稳、优先试这几条」，两者的名单本来就可能不一样。
+ *
+ * 名单按**规则名**匹配（忽略大小写）。用户点名的是这三条，就只放这三条 ——
+ * 不顺手把「樱之空」也塞进来：置顶是用户对顺序的明确要求，多放一条就等于替他做了决定。
+ */
+export const PINNED_RULES = ['aafun', 'age', 'sorani']
+
+/**
+ * 这条规则是否属于置顶名单（按名字匹配，忽略大小写与首尾空格）。
+ */
+export function isPinnedRule(name: string): boolean {
+  const n = (name ?? '').trim().toLowerCase()
+  if (!n) return false
+  return PINNED_RULES.some((p) => p.toLowerCase() === n)
+}
+
+/**
+ * 按置顶名单排序（置顶的排前面，各自保持原有相对顺序）。
+ *
+ * 放在 shared 里而不是某个页面里：来源选择弹窗与规则管理页都要用同一套顺序，
+ * 两处各写一份迟早会分叉（一处置顶了、另一处没置顶，用户会以为置顶失效了）。
+ */
+export function sortRulesPinnedFirst<T extends { name: string }>(rules: T[]): T[] {
+  const pinned = rules.filter((r) => isPinnedRule(r.name))
+  const rest = rules.filter((r) => !isPinnedRule(r.name))
+  return [...pinned, ...rest]
+}
+
+/**
  * 规则仓库自动更新状态（store 命名空间 `rulesRepoMeta`，规则页读它展示「上次自动检测」）。
  * 网络失败只落到这里的 'failed'，不会弹错误框。
  */
@@ -1873,3 +1908,110 @@ export const RECOMMEND_PICK = 5
 
 /** 候选不足 5 部时组末尾的文案（用户指定的原话） */
 export const RECOMMEND_EMPTY_TEXT = '真的没有了'
+
+// ============================================================
+// 播放源列表的批量预嗅探（v0.3.7）
+// ============================================================
+
+/** 要探测的一条规则（只带探测需要的最小信息） */
+export interface BatchProbeTarget {
+  id: string
+  name: string
+  baseUrl: string
+}
+
+/**
+ * 一条规则的探测进度/结果。
+ *
+ * 字段刻意分成「能不能找到这部番」与「找到后能不能抓到流」两件事：
+ * 用户看到的「没有资源」其实有三种完全不同的原因（这条线路没有这部番 /
+ * 有番但播放页拿不到地址 / 拿到了地址但没有可识别的视频请求），
+ * 混成一个布尔值会让用户无法判断该换线路还是该换番剧。
+ */
+export interface BatchProbeUpdate {
+  jobId: string
+  ruleId: string
+  ruleName: string
+  /** search=正在搜番剧 / sniff=已进播放页正在嗅探 / done=这条规则出结果了 */
+  phase: 'search' | 'sniff' | 'done'
+  /** 这条规则里有没有这部番剧 */
+  hit: boolean
+  /** 解析到的总集数（0 = 没解析到剧集） */
+  episodes: number
+  /** 嗅探到的候选流数量（用户要的"嗅探到多少资源"） */
+  count: number
+  /** 最佳候选地址：只用于日志与内部判断，界面不展示完整地址 */
+  url?: string
+  ok: boolean
+  /** 给用户看的一句话说明（中文，直接显示在规则条目上） */
+  message?: string
+  /** 这条规则已经花掉的毫秒数（界面可显示"12s"让人知道探测有多慢） */
+  ms: number
+  /**
+   * 这条结果是**缓存**里捞出来的（v0.3.7）。
+   *
+   * 用户要求「批量预嗅探的结果要做一个缓存，再进播放源界面不要重新嗅探，
+   * 只有点刷新时才重新嗅探」——一次探测要开窗口访问站点、十几秒起步，
+   * 每次进播放源列表都重跑一遍既慢又打扰站点。缓存命中时界面直接显示上次结果，
+   * 并在标题上说明是"上次探测于 hh:mm"，让用户知道什么时候该点刷新。
+   */
+  cached?: boolean
+  /** 这份缓存的探测时间（毫秒时间戳）；仅 cached=true 时有值 */
+  probedAt?: number
+}
+
+// ============================================================
+// 自制版式导出为高清图片（v0.3.7：作品评级排名表 / 番剧推荐表）
+// ============================================================
+/*
+ * 为什么导出走「渲染层拼 HTML → 主进程渲染截图」这条路，而不是在渲染进程用 canvas 画：
+ *   · 版式复杂（等级标签、封面墙、评分星级、长文本换行）用 HTML/CSS 写一遍就够了，
+ *     canvas 手绘等于把同样的版式再实现一次，改一次样式要改两处；
+ *   · 渲染进程的 canvas 只能落到浏览器默认下载目录，**没法让用户自选文件夹**（用户明确要求）；
+ *   · 主进程的离屏窗口可以按倍率放大渲染（清晰度），还能复用主进程已有的封面取图链路。
+ *
+ * 协议很薄：渲染层给出完整 HTML（图片位置写成 `{{img:key}}` 占位符）+ 需要预取的图片清单，
+ * 主进程负责取图、替换、渲染、放大、弹保存框、落盘，并把「缺了哪几张图」如实报回来。
+ */
+
+/** 一张需要主进程预取的图片（封面 / 剧照） */
+export interface CardExportImageEntry {
+  /** 与 HTML 里 `{{img:key}}` 对应的键 */
+  key: string
+  /** 远程地址（http/https）或本地绝对路径；空串表示本来就没有图 */
+  url: string
+  /** 出错时给用户看是哪一条（一般填番剧名） */
+  label?: string
+}
+
+export interface CardExportImageRequest {
+  /** 保存对话框标题，例如「导出排名表为图片」 */
+  title: string
+  /** 版式宽度（CSS 像素）；导出的实际像素宽 = width × scale */
+  width: number
+  /** 完整 HTML 文档（含 <style>），图片位置写 `{{img:key}}` */
+  html: string
+  /** 需要预取的图片清单 */
+  images?: CardExportImageEntry[]
+  /** 默认文件名（不含目录，可不带 .png 后缀） */
+  defaultName: string
+  /** 放大倍率，默认 2，上限 3 */
+  scale?: number
+}
+
+export interface CardExportImageResult {
+  /** 实际保存到的路径；用户取消时为空串 */
+  path: string
+  /** 是否被用户取消 */
+  canceled: boolean
+  /** 图片取图报告（缺图时界面要提示，不能让用户以为都导进去了） */
+  images: {
+    /** 需要联网取图的张数（本地图与空地址不计入） */
+    total: number
+    ok: number
+    missing: { label: string; reason: string }[]
+  }
+  /** 导出图的像素尺寸 */
+  width: number
+  height: number
+}

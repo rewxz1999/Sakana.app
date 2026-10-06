@@ -25,6 +25,8 @@ let last: CapturedStream | null = null
 
 export function noteCapturedStream(s: CapturedStream): void {
   last = s
+  // 换流了：播放列表文本缓存必须一起作废，否则详情面板会继续显示上一条流的列表
+  if (playlistCache && playlistCache.url !== s.url) playlistCache = null
 }
 
 export function lastCapturedStream(): CapturedStream | null {
@@ -33,6 +35,29 @@ export function lastCapturedStream(): CapturedStream | null {
 
 export function clearCapturedStream(): void {
   last = null
+  playlistCache = null
+}
+
+/**
+ * 播放列表文本的短缓存（v0.3.7）。
+ *
+ * 为什么需要：播放状态详情面板现在是**实时刷新**的（用户反馈「更新不及时」），
+ * 而 `buildStreamInfo()` 每次都会去源站拉一遍 m3u8。按秒级刷新就会变成对源站的持续小请求 ——
+ * 既没必要（列表本身几秒内不会变），也可能被站点当成异常流量。
+ * 10 秒是个折中：面板看着是活的，网络请求量却与「手动点刷新」同一量级。
+ * 内核属性（分辨率/帧率/码率）不缓存，每次都读实时值。
+ */
+let playlistCache: { url: string; at: number; text: string } | null = null
+const PLAYLIST_TTL_MS = 10_000
+
+async function getPlaylistText(url: string, referer?: string): Promise<string> {
+  const now = Date.now()
+  if (playlistCache && playlistCache.url === url && now - playlistCache.at < PLAYLIST_TTL_MS) {
+    return playlistCache.text
+  }
+  const text = await httpGetText(url, 8000, { headers: referer ? { Referer: referer } : {} })
+  playlistCache = { url, at: now, text }
+  return text
 }
 
 /** 解析 m3u8：主列表取首个变体的分辨率/带宽/编码，媒体列表累加时长 */
@@ -100,9 +125,8 @@ export async function buildStreamInfo(): Promise<StreamInfo> {
   // 播放列表文本 + 分辨率/码率（HLS 主列表里带着这些信息，两个内核都通用）
   if (/\.m3u8(\?|$)/i.test(cur.url) || cur.kind === 'm3u8') {
     try {
-      const text = await httpGetText(cur.url, 8000, {
-        headers: cur.referer ? { Referer: cur.referer } : {}
-      })
+      // 走 10 秒短缓存：面板实时刷新时不该每次都去源站拉一遍（见 getPlaylistText 的说明）
+      const text = await getPlaylistText(cur.url, cur.referer)
       info.playlist = text.slice(0, 4000)
       const parsed = parseM3u8(text)
       if (parsed.width) info.width = parsed.width

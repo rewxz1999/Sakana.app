@@ -305,6 +305,49 @@ async function httpRequest(
 
 // ---------------- 搜索 ----------------
 
+/**
+ * 规则的搜索地址（人机验证窗口直接打开它，v0.3.7）。
+ *
+ * 为什么让用户验证时不是打开站点首页、而是打开**这条规则的搜索地址**：
+ * 用户过完验证就地看到《番剧名》的搜索结果，验证完直接就能点进去 ——
+ * 打开首页的话用户还要自己在站点里搜一次，多一步且容易搜错。
+ */
+export function ruleSearchUrl(ruleId: string, keyword: string): string | null {
+  const rule = getRule(ruleId)
+  if (!rule) return null
+  try {
+    return fillTemplate(rule.search.url, { keyword })
+  } catch {
+    return null
+  }
+}
+
+/** 规则名（界面提示用；找不到返回空串） */
+export function ruleName(ruleId: string): string {
+  return getRule(ruleId)?.name ?? ''
+}
+
+/**
+ * 这页是不是「验证墙」而不是搜索结果（v0.3.7）。
+ *
+ * 为什么必须按**内容**判断：实测 dalvdm（`sbdl.cc`）、mutefun（`2kdm.com`）、LMM（`lmm85.com`）
+ * 以及樱之空（`skr.skrcc.cc:666`）都会把验证页以 **HTTP 200** 返回 ——
+ * axios 不抛错、XPath 解析出 0 条，于是过去只会得到一句「搜索无结果」，
+ * 用户以为"这条线路没有这部番"，其实是站点要求先过人机验证。
+ * 这几家的页面标题/正文里带着下面这些词，据此把它们和"真的没有这部番"区分开。
+ */
+export function looksLikeVerificationWall(text: string): boolean {
+  if (!text) return false
+  const head = text.slice(0, 4000)
+  return /系统安全验证|身份验证|人机验证|安全验证|请完成验证|验证码|访问验证|Just a moment|Attention Required|cf-browser-verification|Checking your browser/i.test(
+    head
+  )
+}
+
+/** 验证墙的统一说法：界面据此显示「需人机验证」并给出验证入口 */
+export const VERIFY_WALL_MESSAGE = '需要人机验证：站点要求先通过验证（在播放源列表里点这条线路即可弹窗验证）'
+
+
 export async function ruleSearch(ruleId: string, keyword: string): Promise<RuleSearchResult> {
   const rule = getRule(ruleId)
   if (!rule) return { items: [], error: '规则不存在' }
@@ -338,10 +381,12 @@ export async function ruleSearch(ruleId: string, keyword: string): Promise<RuleS
     }
     // 纯 HTTP 抓不到（结果由 JS 渲染的站点，或站点偶发返回"加载中/安全验证"拦截页）
     // → 先重试一次 HTTP，再用真实浏览器窗口在页面内搜索
+    let sawWall = looksLikeVerificationWall(text)
     if (items.length === 0) {
       await new Promise((r) => setTimeout(r, 800))
       try {
         const retryText = await httpRequest(url, def.method, headers, query, def.bodyType)
+        sawWall = sawWall || looksLikeVerificationWall(retryText)
         const doc2 = toDoc(retryText)
         for (const node of evalNodes(doc2, def.listXPath)) {
           const name = extractName(doc2, itemXPath(def.itemNameXPath || def.itemLinkXPath), node)
@@ -358,11 +403,51 @@ export async function ruleSearch(ruleId: string, keyword: string): Promise<RuleS
       const viaWebview = await searchViaWebview(rule, keyword)
       if (viaWebview.length > 0) return { items: viaWebview }
     }
+    /*
+     * 站点给的是验证页而不是搜索结果（HTTP 200 的"软"拦截）：
+     * 这时必须如实说是**验证问题**，而不是让用户以为这条线路里没有这部番（v0.3.7）。
+     * 界面据此显示「需人机验证」并给出"点这条线路去弹窗验证"的出口。
+     */
+    if (items.length === 0 && sawWall) {
+      log.append('warn', 'rules', `搜索被站点的验证页挡住（${rule.name}），需要用户在人机验证窗口里过一次`)
+      return { items: [], error: VERIFY_WALL_MESSAGE }
+    }
     return { items }
   } catch (err) {
     const e = err as { message?: string }
     const msg = `搜索失败 (${rule.name}): ${e?.message ?? String(err)}`
     log.append('warn', 'rules', msg)
+    /*
+     * ★ 纯 HTTP 被站点挡下（403 / 人机验证页）时，仍然用真实浏览器窗口再试一次（v0.3.7）★
+     *
+     * 实测：樱之空（`skr.skrcc.cc:666`）的搜索接口现在直接返回 403，页面正文是「人机验证」——
+     * axios 抛错后旧代码立刻把这次搜索判为失败返回，**根本没走到**网页内搜索那条路
+     * （那条路只在「HTTP 成功但解析出 0 条」时才走）。
+     *
+     * 而网页内搜索用的是真实浏览器窗口：Cookie、JS、人机验证的后续跳转都会正常发生，
+     * 用户在窗口里过一次验证之后，这条规则就又能用了 —— 这正是这条路存在的意义。
+     */
+    try {
+      const viaWebview = await searchViaWebview(rule, keyword)
+      if (viaWebview.length > 0) {
+        log.append('info', 'rules', `HTTP 被拦后改用网页内搜索，命中 ${viaWebview.length} 条（${rule.name}）`)
+        return { items: viaWebview }
+      }
+    } catch (err2) {
+      log.append(
+        'warn',
+        'rules',
+        `网页内搜索也失败（${rule.name}）: ${String((err2 as Error)?.message ?? err2).slice(0, 140)}`
+      )
+    }
+    /*
+     * 403 这类"硬"拦截同样归到"需要人机验证"上（v0.3.7）：
+     * 只报「Request failed with status code 403」用户完全无从下手，
+     * 而这两个问题的解法是同一个 —— 让用户在验证窗口里自己过一次。
+     */
+    if (/403|forbidden|人机验证|安全验证/i.test(msg)) {
+      return { items: [], error: VERIFY_WALL_MESSAGE }
+    }
     return { items: [], error: msg }
   }
 }

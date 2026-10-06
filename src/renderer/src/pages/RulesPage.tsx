@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { ArrowLeft, CirclePlus, CloudDownload, RotateCcw, Save, Search, Trash2 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import type { PlayRule, RuleEpisodesDef, RuleSearchDef, RulesRepoMeta } from '@shared/types'
-import { DEFAULT_RULES, emptyRule } from '@shared/types'
+import { DEFAULT_RULES, emptyRule, isPinnedRule, sortRulesPinnedFirst } from '@shared/types'
 import { api } from '@/lib/api'
 import { toast } from '@/stores/app'
 import { Badge, Button, Input, Modal, Select, Spinner, Switch, Textarea } from '@/components/ui'
@@ -214,9 +214,9 @@ export function RulesPage() {
       </div>
 
       <div className="flex min-h-0 flex-1">
-        {/* 左侧：规则列表 */}
+        {/* 左侧：规则列表（置顶规则（aafun / AGE / sorani…）排在最前，见 shared 的 PINNED_RULES） */}
         <div className="flex w-60 shrink-0 flex-col overflow-y-auto border-r border-border p-2.5">
-          {rules.map((rule) => (
+          {sortRulesPinnedFirst(rules).map((rule) => (
             <div
               key={rule.id}
               role="button"
@@ -233,7 +233,13 @@ export function RulesPage() {
               }`}
             >
               <div className="flex items-center justify-between gap-2">
-                <span className="line-clamp-1 min-w-0 text-[13px] font-medium">{rule.name || '未命名规则'}</span>
+                <span className="line-clamp-1 min-w-0 text-[13px] font-medium">
+                  {rule.name || '未命名规则'}
+                  {/* 置顶规则标出来：顺序变了但没有任何提示的话，用户会以为是自己记错了 */}
+                  {isPinnedRule(rule.name) ? (
+                    <span className="ml-1 align-middle text-[10px] text-accent">置顶</span>
+                  ) : null}
+                </span>
                 <button
                   className="text-faint hover:text-danger"
                   onClick={(e) => {
