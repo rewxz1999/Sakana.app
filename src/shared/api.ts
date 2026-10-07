@@ -7,6 +7,9 @@ import type {
   CardExportImageResult,
   BatchProbeTarget,
   BatchProbeUpdate,
+  CastDevice,
+  CastMediaInput,
+  CastReceiverInfo,
   CharactersResult,
   CharacterItem,
   DanmakuComment,
@@ -110,6 +113,24 @@ export interface OverlayState {
    * 「uosc 给不了」的部分；控件本身全部由 uosc 画在视频画面上。
    */
   uoscBar?: boolean
+  /**
+   * v0.3.8：投屏用的当前媒体信息。
+   *
+   * 为什么由播放页推过来：投屏面板画在**悬浮窗**里（画面是原生子窗口、盖在主窗口网页之上，
+   * 面板画在播放页会被画面挡住），而"这一集的地址 / Referer / Cookie / 播放列表"
+   * 只有播放页知道。字段刻意精简成投屏真正需要的那几项。
+   */
+  castMedia?: {
+    url: string
+    title?: string
+    referer?: string
+    cookies?: string
+    /** 当前进度（毫秒），投屏时接上 */
+    positionMs?: number
+    index?: number
+    /** 选集列表（接收端/电视上能选集） */
+    playlist?: { url: string; title: string }[]
+  } | null
 }
 
 /**
@@ -232,6 +253,14 @@ export type OverlayAction =
   /** 断点续播提示上的两个按钮 */
   | { type: 'undoResume' }
   | { type: 'dismissResume' }
+  /**
+   * v0.3.8 投屏：悬浮窗发出、播放页执行（投屏面板与设备列表都在悬浮窗里，
+   * 但"这一集是什么"只有播放页知道，所以动作要回到播放页再调主进程）。
+   * 注意 `castPlay` 只带设备号：媒体信息由播放页自己组装（它手上才有最新的流地址与进度）。
+   */
+  | { type: 'castPlay'; deviceId: string }
+  | { type: 'castControl'; action: 'pause' | 'resume' | 'stop' | 'seek' | 'volume' }
+  | { type: 'castStop' }
 
 /** 渲染层通过 window.sakana 访问的完整 API 契约（preload 实现） */
 export interface SakanaApi {
@@ -253,6 +282,8 @@ export interface SakanaApi {
   store: {
     get(ns: string): Promise<ApiResult<unknown>>
     set(ns: string, data: unknown): Promise<ApiResult<boolean>>
+    /** 主进程改了库数据（收藏/历史，v0.3.8 起含手机端同步回来的历史）→ 重新读一遍 */
+    onChanged(cb: () => void): () => void
   }
   bangumi: {
     calendar(force?: boolean): Promise<ApiResult<CalendarResult>>
@@ -616,6 +647,38 @@ export interface SakanaApi {
     /** 蒙层尺寸变化时重新摆放窗口 */
     setBounds(bounds: { x: number; y: number; width: number; height: number }): Promise<ApiResult<boolean>>
     close(): Promise<ApiResult<boolean>>
+  }
+  /**
+   * 投屏（v0.3.8）。
+   *
+   * 发现方式见 `CastDevice` 的注释：DLNA 电视走 SSDP，本仓库的安卓接收端走 UDP 广播；
+   * 广播到不了的场景（USB 共享网络 / 跨网段）用 `addManual` 手填地址。
+   */
+  cast: {
+    /** 开始发现并返回当前已知设备（之后设备变化通过 `onDevices` 推） */
+    discover(): Promise<ApiResult<CastDevice[]>>
+    stopDiscover(): Promise<ApiResult<boolean>>
+    /** 手动登记设备：`192.168.1.20` 或 `192.168.1.20:52889` */
+    addManual(addr: string): Promise<ApiResult<CastDevice | null>>
+    /** 把一路媒体投到设备上（是否走本机中转由主进程按「投屏策略」决定） */
+    play(
+      deviceId: string,
+      media: CastMediaInput
+    ): Promise<ApiResult<{ ok: boolean; message: string; usedRelay: boolean }>>
+    control(
+      deviceId: string,
+      action: 'pause' | 'resume' | 'toggle' | 'stop' | 'seek' | 'volume' | 'mute',
+      value?: number
+    ): Promise<ApiResult<{ ok: boolean; message?: string }>>
+    /** 读接收端状态（DLNA 电视不支持查询，返回 null） */
+    info(deviceId: string): Promise<ApiResult<CastReceiverInfo | null>>
+    stop(deviceId: string): Promise<ApiResult<boolean>>
+    /** 电脑端同步服务的局域网地址（形如 `http://192.168.1.8:52890`；空串=没起来） */
+    syncUrl(): Promise<ApiResult<string>>
+    /** 记住默认投屏设备（在设置页里手动连接之后写它） */
+    setTarget(deviceId: string): Promise<ApiResult<boolean>>
+    /** 设备列表变化 */
+    onDevices(cb: (list: CastDevice[]) => void): () => void
   }
   ruleWebview: {
     /** Kazumi 式在线播放：用可见网页视图打开播放页并嗅探流地址 */

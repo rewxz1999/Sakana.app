@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
-import { ArrowLeft, Check, Hash, ImageDown, Layers, Pencil, Trash2 } from 'lucide-react'
-import { Button, ConfirmModal, Input, Modal } from '@/components/ui'
+import { ArrowLeft, Check, Hash, ImageDown, Layers, Palette, Pencil, Trash2 } from 'lucide-react'
+import { Button, ConfirmModal, IconButton, Input, Modal } from '@/components/ui'
 import { ContextMenu, type ContextMenuItem } from '@/components/stat/ContextMenu'
 import { TierBoard, type DropTarget } from '@/components/ranking/TierBoard'
 import { PoolPanel, PoolRail } from '@/components/ranking/PoolPanel'
@@ -11,7 +11,9 @@ import { toast } from '@/stores/app'
 import {
   BACKGROUND_PRESETS,
   MAX_POOLS,
+  TIER_COLOR_PRESETS,
   displayName,
+  readableTextOn,
   usedWorkIds,
   useRankingTable,
   type RankingPool,
@@ -41,6 +43,7 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
   const renameTable = useRankingTable((s) => s.renameTable)
   const setTiersAction = useRankingTable((s) => s.setTiers)
   const setTierColor = useRankingTable((s) => s.setTierColor)
+  const setTierName = useRankingTable((s) => s.setTierName)
   const setBackground = useRankingTable((s) => s.setBackground)
   const addPoolAction = useRankingTable((s) => s.addPool)
   const renamePool = useRankingTable((s) => s.renamePool)
@@ -59,6 +62,12 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null)
   const [menu, setMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null)
   const [colorPickTier, setColorPickTier] = useState<number | null>(null)
+  /** 导出背景色的浮层是否打开 */
+  const [bgPickOpen, setBgPickOpen] = useState(false)
+  /** 右键标签改内容：正在编辑哪一档 + 草稿 */
+  const [tierNameEdit, setTierNameEdit] = useState<{ index: number; draft: string } | null>(null)
+  /** 右键标签 → 自定义颜色：正在挑哪一档的色 */
+  const [tierColorEdit, setTierColorEdit] = useState<{ index: number; draft: string } | null>(null)
 
   const [setupOpen, setSetupOpen] = useState(false)
   const [pendingSetup, setPendingSetup] = useState<{ name: string; tiers: TierDef[]; moved: number } | null>(null)
@@ -153,6 +162,57 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
       }
     ]
     setMenu({ x: e.clientX, y: e.clientY, items })
+  }
+
+  /**
+   * 等级标签的右键菜单（用户明确要求：**右键标签就能改内容与颜色**）。
+   *
+   * 颜色做二级菜单（色点直接就是选项，选完即改），"自定义颜色…"再开一个小弹窗用系统取色器；
+   * 标签右上角的小色板入口保留（两条路都能走，右键是用户点名要的那条）。
+   */
+  function openTierMenu(e: React.MouseEvent, tierIndex: number): void {
+    e.preventDefault()
+    e.stopPropagation()
+    const tier = table.tiers[tierIndex]
+    if (!tier) return
+    const colorItems: ContextMenuItem[] = TIER_COLOR_PRESETS.map((c) => ({
+      key: `tier-color-${c}`,
+      label: c.toLowerCase() === tier.color.toLowerCase() ? `${c}（当前）` : c,
+      icon: (
+        <span
+          className="inline-block h-3 w-3 shrink-0 rounded-sm border border-border"
+          style={{ background: c }}
+        />
+      ),
+      onSelect: () => {
+        setTierColor(table.id, tierIndex, c)
+        toast.success(`「${tier.name}」的颜色已更新`)
+      }
+    }))
+    colorItems.push({
+      key: 'tier-color-custom',
+      label: '自定义颜色…',
+      divider: true,
+      onSelect: () => setTierColorEdit({ index: tierIndex, draft: tier.color })
+    })
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        {
+          key: 'tier-name',
+          label: '改标签内容…',
+          icon: <Pencil size={13} />,
+          onSelect: () => setTierNameEdit({ index: tierIndex, draft: tier.name })
+        },
+        {
+          key: 'tier-color',
+          label: '改标签颜色',
+          icon: <Palette size={13} />,
+          onSelect: () => setMenu({ x: e.clientX, y: e.clientY, items: colorItems })
+        }
+      ]
+    })
   }
 
   /** 池子里作品的右键菜单 */
@@ -252,6 +312,26 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
     else toast.success(`已把「${displayName(work)}」加进作品池`)
   }
 
+  /** 提交标签改名（重名/空名由 store 拒绝，这里把原因如实告诉用户） */
+  function submitTierName(): void {
+    if (!tierNameEdit) return
+    const r = setTierName(table.id, tierNameEdit.index, tierNameEdit.draft)
+    if (!r.ok) {
+      toast.warn(r.message)
+      return
+    }
+    toast.success('标签已更新')
+    setTierNameEdit(null)
+  }
+
+  /** 提交标签自定义颜色 */
+  function submitTierColor(): void {
+    if (!tierColorEdit) return
+    setTierColor(table.id, tierColorEdit.index, tierColorEdit.draft)
+    toast.success('标签颜色已更新')
+    setTierColorEdit(null)
+  }
+
   const poolDialogPool = poolDialog?.poolId ? table.pools.find((p) => p.id === poolDialog.poolId) : null
 
   /** 作品池弹窗的提交（新建 / 重命名共用，靠 poolDialog.mode 区分） */
@@ -278,54 +358,67 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* 顶部栏（不写死高度：小窗口下按钮会换行，写死高度会被裁掉） */}
+      {/* 顶部栏（不写死高度：小窗口下按钮会换行，写死高度会被裁掉）；
+          按钮统一用 @/components/ui 的 Button / IconButton，与应用其它页面一致 */}
       <div className="flex min-h-11 shrink-0 flex-wrap items-center gap-2 border-b border-border bg-elev1/60 px-4 py-1.5">
-        <button
-          type="button"
-          onClick={onBack}
-          title="返回排名表列表"
-          className="flex h-7 items-center gap-1 rounded-lg border border-border bg-elev1 px-2.5 text-xs text-dim transition-colors hover:border-accent hover:text-accent"
-        >
-          <ArrowLeft size={13} /> 列表
-        </button>
+        <Button size="sm" variant="outline" icon={ArrowLeft} onClick={onBack}>
+          列表
+        </Button>
         <div className="flex min-w-0 items-center gap-1.5">
           <span className="max-w-[260px] truncate text-sm font-semibold" title={table.name}>
             {table.name}
           </span>
-          <button
-            type="button"
-            title="修改表名与等级标签"
-            onClick={() => setSetupOpen(true)}
-            className="text-faint transition-colors hover:text-accent"
-          >
+          <IconButton title="修改表名与等级标签" onClick={() => setSetupOpen(true)}>
             <Pencil size={12} />
-          </button>
+          </IconButton>
         </div>
         <Button size="sm" variant="outline" icon={Hash} onClick={() => setSetupOpen(true)}>
           等级标签
         </Button>
 
-        {/* 背景色：默认白色，改色只影响这张表（导出图也跟着走） */}
-        <div className="flex items-center gap-1" title="表背景（默认白色；导出图与它一致）">
-          {BACKGROUND_PRESETS.map((p) => (
-            <button
-              key={p.value}
-              type="button"
-              title={`背景：${p.label}`}
-              onClick={() => setBackground(table.id, p.value)}
-              className={`h-5 w-5 rounded-md border transition-transform ${
-                table.background.toLowerCase() === p.value.toLowerCase()
-                  ? 'border-accent ring-2 ring-accent/40'
-                  : 'border-border hover:scale-110'
-              }`}
-              style={{ background: p.value }}
-            />
-          ))}
+        {/* 导出背景：决定导出图片的底色（界面本身跟随应用主题，不再用这张表的背景色画） */}
+        <div className="relative">
+          <Button
+            size="sm"
+            variant={bgPickOpen ? 'soft' : 'outline'}
+            icon={Palette}
+            title="导出图片的背景色（默认白色；只影响导出图）"
+            onClick={() => setBgPickOpen((v) => !v)}
+          >
+            导出背景
+          </Button>
+          {bgPickOpen ? (
+            <div className="absolute left-0 top-full z-40 mt-1 w-[188px] rounded-xl border border-border bg-elev1 p-2 shadow-2xl">
+              <div className="mb-1 text-[10px] text-faint">导出图片的背景色</div>
+              <div className="grid grid-cols-5 gap-1">
+                {BACKGROUND_PRESETS.map((p) => (
+                  <button
+                    key={p.value}
+                    type="button"
+                    title={p.label}
+                    onClick={() => {
+                      setBackground(table.id, p.value)
+                      setBgPickOpen(false)
+                    }}
+                    className={`h-6 w-6 rounded-md border transition-transform hover:scale-110 ${
+                      table.background.toLowerCase() === p.value.toLowerCase()
+                        ? 'border-accent ring-2 ring-accent/40'
+                        : 'border-border'
+                    }`}
+                    style={{ background: p.value }}
+                  />
+                ))}
+              </div>
+              <div className="mt-1.5 text-[10px] leading-relaxed text-faint">
+                界面按应用主题绘制，这个底色只写进导出图片。
+              </div>
+            </div>
+          ) : null}
         </div>
 
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <span className="hidden text-[11px] text-faint lg:inline">
-            拖卡片进任意档；拖到两档的分界线上会骑缝（同时计入上下两档）· 右键卡片可移出
+            拖卡片进任意一档（整行都能放）；拖到两档分界线上会骑缝 · 右键卡片或标签打开菜单
           </span>
           <Button
             size="sm"
@@ -394,6 +487,7 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
             onDragStartWork={(workId) => setDrag({ workId, poolId: null })}
             onDragEnd={endDrag}
             onItemContextMenu={(e, item) => openRankedMenu(e, item.work.id)}
+            onTierContextMenu={openTierMenu}
             colorPickTier={colorPickTier}
             onToggleColorPick={(i) => setColorPickTier((cur) => (cur === i ? null : i))}
             onPickColor={(i, color) => setTierColor(table.id, i, color)}
@@ -449,6 +543,84 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
         }}
         onClose={() => setConfirmRemovePool(null)}
       />
+
+      {/* 右键标签 → 改标签内容 */}
+      <Modal open={tierNameEdit !== null} onClose={() => setTierNameEdit(null)} title="改标签内容" width={420}>
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-dim">
+            <Pencil size={13} className="text-accent" /> 第 {(tierNameEdit?.index ?? 0) + 1} 档的标签
+          </div>
+          <Input
+            value={tierNameEdit?.draft ?? ''}
+            autoFocus
+            maxLength={12}
+            placeholder="例如：人上人"
+            onChange={(e) => setTierNameEdit((cur) => (cur ? { ...cur, draft: e.target.value } : cur))}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') submitTierName()
+            }}
+          />
+          <div className="text-[11px] text-faint">改名不会影响这一档里已经排好的作品。</div>
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => setTierNameEdit(null)}>
+              取消
+            </Button>
+            <Button icon={Check} disabled={(tierNameEdit?.draft ?? '').trim().length === 0} onClick={submitTierName}>
+              保存
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* 右键标签 → 自定义颜色 */}
+      <Modal open={tierColorEdit !== null} onClose={() => setTierColorEdit(null)} title="自定义标签颜色" width={420}>
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center gap-3">
+            <input
+              type="color"
+              value={tierColorEdit?.draft ?? '#ffffff'}
+              onChange={(e) => setTierColorEdit((cur) => (cur ? { ...cur, draft: e.target.value } : cur))}
+              className="h-9 w-16 cursor-pointer rounded-lg border border-border bg-elev1 p-1"
+            />
+            <Input
+              value={tierColorEdit?.draft ?? ''}
+              maxLength={7}
+              onChange={(e) => setTierColorEdit((cur) => (cur ? { ...cur, draft: e.target.value } : cur))}
+              className="w-[140px] font-mono"
+            />
+            <span
+              className="flex h-9 flex-1 items-center justify-center rounded-lg border text-sm font-bold"
+              style={{
+                background: tierColorEdit?.draft ?? '#ffffff',
+                color: readableTextOn(tierColorEdit?.draft ?? '#ffffff'),
+                borderColor: 'rgba(0,0,0,0.14)'
+              }}
+            >
+              {table.tiers[tierColorEdit?.index ?? 0]?.name ?? ''}
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {TIER_COLOR_PRESETS.map((c) => (
+              <button
+                key={c}
+                type="button"
+                title={c}
+                onClick={() => setTierColorEdit((cur) => (cur ? { ...cur, draft: c } : cur))}
+                className="h-6 w-6 rounded-md border border-border transition-transform hover:scale-110"
+                style={{ background: c }}
+              />
+            ))}
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => setTierColorEdit(null)}>
+              取消
+            </Button>
+            <Button icon={Check} onClick={submitTierColor}>
+              保存
+            </Button>
+          </div>
+        </div>
+      </Modal>
 
       {/* 作品池的新建 / 重命名 */}
       <Modal

@@ -1,0 +1,34 @@
+# 构建产物：一律不入库
+build/
+.gradle/
+.kotlin/
+
+# 沙箱/CI 里把 GRADLE_USER_HOME 等环境目录指到工程内时产生的产物（见 README 1.4 节）
+.gradle-home/
+.localappdata/
+.android-home/
+
+# 本机 SDK 路径（各人不同）
+local.properties
+
+# IDE
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 打包产物
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# ---- 例外：接收端的安装包**要**入库（v0.3.8） ----
+# 用户要求「移动端投屏应用也上传到 git，并且在投屏设置中增加下载的地址」：
+# 电脑端设置页那条下载地址指向的正是 dist/SakanaReceiver-<版本>-debug.apk，
+# 所以这一个目录与这个 APK 必须被提交（其余构建产物照旧不入库，源码全在 app/src 下）。
+# ⚠️ 两条规则缺一不可，而且顺序不能反：`.gitignore` 里**最后一条匹配的规则生效**，
+#    且 git 不会进入被忽略的目录 —— 只写 `!dist/*.apk` 而父目录仍被排除时，例外不会生效。
+!dist/
+!dist/*.apk

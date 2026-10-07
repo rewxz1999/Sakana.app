@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色配色：投屏时画面以外的地方越暗越好，避免亮色边框影响观感。 -->
+
+    <!-- 主色调，和启动图标里的播放三角一致 -->
+    <color name="accent">#4DD0E1</color>
+
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#B0BEC5</color>
+    <color name="text_muted">#78909C</color>
+
+    <!-- 页面底色（近黑，但比纯黑柔和一点，和视频画面之间能看出边界） -->
+    <color name="surface">#0F1B22</color>
+
+    <!-- 顶部状态区的底色：比页面底色稍微亮一点点，让"信息区"和"画面区"分得开 -->
+    <color name="surface_header">#16262F</color>
+
+    <!-- 设置页里卡片/分组的底色 -->
+    <color name="surface_card">#182A34</color>
+
+    <!-- 分割线 -->
+    <color name="divider">#1F3742</color>
+
+    <!-- 警告色（播放失败、广播可能不通这类提示） -->
+    <color name="warn">#FFB74D</color>
+</resources>

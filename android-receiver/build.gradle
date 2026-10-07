@@ -1,0 +1,28 @@
+// 顶层构建脚本。
+//
+// 这里用 buildscript + classpath 的"老写法"，而不是 plugins {} 版本块，原因是：
+// plugins {} 需要先从仓库解析**插件标记**（例如
+// com.android.application:com.android.application.gradle.plugin），
+// 而本机 Gradle 缓存里不一定有该标记（离线构建时就会直接失败）；
+// buildscript classpath 只要 AGP / KGP 的主构件在缓存里就能用。
+//
+// 版本选择依据（改之前先确认本机缓存里有什么，否则离线会构建不了）：
+//  · AGP 必须是 8.13.0：AGP 会按自己的版本号去取
+//    com.android.tools.build:aapt2:<agp 版本>-<内部 build 号>，
+//    本机只缓存了 aapt2 的 8.13.0-13719691 那一个。
+//  · Kotlin 插件用 2.2.20：这个版本在本机依赖缓存里是完整的（能离线解析）。
+//    注意 app/build.gradle 里把 kotlin-stdlib 单独抬到了 2.2.21 —— 原因写在那边。
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.13.0'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.20'
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.layout.buildDirectory
+}

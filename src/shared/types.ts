@@ -658,6 +658,13 @@ export interface DanmakuSettings {
   showBottom: boolean
   /** 加粗描边（提升复杂画面下的可读性） */
   bold: boolean
+  /**
+   * 是否画描边（v0.3.8）。
+   * 关掉之后是"纯色文字"（配阴影更清爽），适合深色画面；复杂画面上建议保持开启。
+   */
+  outline?: boolean
+  /** 是否加文字阴影（v0.3.8）：浅色画面上比描边更自然 */
+  shadow?: boolean
   /** 屏蔽词（逗号 / 换行分隔，命中即不显示） */
   blockWords: string
   /**
@@ -681,6 +688,8 @@ export const DEFAULT_DANMAKU_SETTINGS: DanmakuSettings = {
   showTop: true,
   showBottom: true,
   bold: true,
+  outline: true,
+  shadow: false,
   blockWords: ''
 }
 
@@ -702,6 +711,8 @@ export function resolveDanmakuSettings(raw: Partial<DanmakuSettings> | undefined
     showTop: raw.showTop !== false,
     showBottom: raw.showBottom !== false,
     bold: raw.bold !== false,
+    outline: raw.outline !== false,
+    shadow: raw.shadow === true,
     blockWords: typeof raw.blockWords === 'string' ? raw.blockWords : d.blockWords
   }
 }
@@ -1257,6 +1268,16 @@ export interface AppSettings {
    * 内置 uosc 缺失（安装目录不完整）时也会自动回落，不需要用户去改这个开关。
    */
   uoscControlBar?: boolean
+  /**
+   * 投屏策略（v0.3.8，用户要求「投屏相关设置记得添加到设置中」）。
+   *
+   * 影响"怎么把这一路流交给电视/接收端"，直接决定流畅度：
+   *   · `auto`（默认）：需要鉴权的片源走本机中转，不需要鉴权的直连；Sakana 接收端一律直连（它自己能带会话）；
+   *   · `direct`：一律直连（最流畅，但需要 Referer 的站点可能放不出来）；
+   *   · `relay`：一律经本机中转（**不重编码**，只转发字节；适合电视取不到流的情况）；
+   *   · `transcode`：交给 FFmpeg 转码后中转（电视解不了 HEVC 时才用，会明显增加延迟与画质损失）。
+   */
+  castStrategy?: 'auto' | 'direct' | 'relay' | 'transcode'
   /**
    * 搜索页空态轮播图（展示位）的自动切换间隔，单位秒（v0.3.0 附加）。
    *
@@ -2014,4 +2035,62 @@ export interface CardExportImageResult {
   /** 导出图的像素尺寸 */
   width: number
   height: number
+}
+
+// ============================================================
+// 投屏（v0.3.8）
+// ============================================================
+
+/**
+ * 一台可投屏的设备。
+ *
+ * 两种来源（`kind`）：
+ *   · `dlna`  —— 标准 DLNA 电视/盒子（SSDP 发现，SOAP 控制）。**不能带 Referer/Cookie**，
+ *                需要鉴权的片源要经本机中转；
+ *   · `sakana` —— 本仓库 `android-receiver/` 那个小应用（UDP 发现，HTTP JSON 控制）。
+ *                可以把 Referer/Cookie 直接交给它，电脑完全不参与传输，最流畅。
+ */
+export interface CastDevice {
+  /** 稳定标识：DLNA 用 UDN，Sakana 接收端用 `ip:port` */
+  id: string
+  name: string
+  kind: 'dlna' | 'sakana'
+  host: string
+  port: number
+  /** DLNA 的 AVTransport 控制地址（Sakana 接收端为空） */
+  controlUrl?: string
+  /** DLNA 的音量控制地址（RenderingControl） */
+  volumeUrl?: string
+  /** 设备自报的能力（界面据此决定显示哪些按钮） */
+  caps: string[]
+  lastSeen: number
+}
+
+/** 投给设备的一路媒体（播放页把当前这一集的相关信息打包过来） */
+export interface CastMediaInput {
+  url: string
+  title?: string
+  referer?: string
+  cookies?: string
+  userAgent?: string
+  /** 从第几毫秒开始播（投屏时接上电脑这边的进度） */
+  startMs?: number
+  /** 当前是播放列表里的第几项（接收端选集用） */
+  index?: number
+  /** 播放列表（接收端能在电视上选集） */
+  playlist?: { url: string; title: string }[]
+}
+
+/** 接收端当前状态（Sakana 接收端有完整状态；DLNA 电视没有查询接口，返回 null） */
+export interface CastReceiverInfo {
+  name?: string
+  playing?: boolean
+  positionMs?: number
+  durationMs?: number
+  volume?: number
+  muted?: boolean
+  index?: number
+  total?: number
+  titles?: string[]
+  state?: string
 }

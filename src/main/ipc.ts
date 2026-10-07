@@ -7,6 +7,7 @@ import type {
   AddDownloadInput,
   BatchProbeTarget,
   CardExportImageRequest,
+  CastMediaInput,
   GalRecentShot,
   GalToolsConfig,
   LocalTargetInput,
@@ -47,6 +48,17 @@ import {
 import { startBatchProbe, stopBatchProbe } from './services/ruleProbeBatch'
 // v0.3.7：人机验证窗口
 import { closeVerifyWindow, openVerifyWindow, setVerifyBounds } from './services/ruleVerify'
+// v0.3.8：投屏（发现设备 + DLNA/Sakana 控制）
+import {
+  addCastDevice,
+  castControl,
+  castInfo,
+  castPlay,
+  castStopRemote,
+  startCastDiscovery,
+  stopCastDiscovery,
+  type CastAction
+} from './services/cast'
 import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
 import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested, mpvApplyVideoEnhance, anime4kAvailable, anime4kShaderFiles, mpvRevealUoscUi } from './services/mpv'
 // v0.3.7：画面子窗口诊断（查「正在播放但没有画面」）
@@ -633,6 +645,48 @@ export function registerIpc(): void {
      */
     const gen = currentRuleWebviewGen()
     setImmediate(() => closeRuleWebview(gen))
+    return true
+  })
+
+  // ---------- 投屏（v0.3.8） ----------
+  ipcMain.handle(CH.castDiscover, (e) => {
+    const w = BrowserWindow.fromWebContents(e.sender) ?? focused()
+    if (!w) return []
+    return startCastDiscovery(w)
+  })
+  ipcMain.handle(CH.castStopDiscover, () => {
+    stopCastDiscovery()
+    return true
+  })
+  ipcMain.handle(CH.castAddManual, (_e, addr: string) => addCastDevice(String(addr ?? '')))
+  ipcMain.handle(CH.castPlay, (_e, deviceId: string, media: CastMediaInput) =>
+    castPlay(String(deviceId ?? ''), media)
+  )
+  ipcMain.handle(
+    CH.castControl,
+    (_e, deviceId: string, action: string, value?: number) =>
+      castControl(String(deviceId ?? ''), action as CastAction, value)
+  )
+  ipcMain.handle(CH.castInfo, (_e, deviceId: string) => castInfo(String(deviceId ?? '')))
+  ipcMain.handle(CH.castStop, async (_e, deviceId: string) => {
+    await castStopRemote(String(deviceId ?? ''))
+    return true
+  })
+  /** 投屏/同步服务的局域网地址：设置页把它显示出来，手机端手填这个地址即可互通 */
+  ipcMain.handle(CH.castSyncUrl, async () => {
+    const { ensureCastServer } = await import('./services/castRelay')
+    await ensureCastServer().catch(() => 0)
+    const { castSyncUrl } = await import('./services/castSync')
+    return castSyncUrl()
+  })
+  /** 记住默认投屏设备（设置页里"手动连接"成功之后写它） */
+  ipcMain.handle(CH.castSetTarget, (_e, deviceId: string) => {
+    /*
+     * 走 store 直接写 settings：这里只是记一个"默认投给谁"的偏好，
+     * 不需要触发设置变更的那些副作用钩子（画质/音频重应用）。
+     */
+    const cur = store.get<Record<string, unknown>>('settings', {})
+    store.set('settings', { ...cur, castTargetId: String(deviceId ?? '') })
     return true
   })
 

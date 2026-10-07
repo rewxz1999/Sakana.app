@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 音量加：喇叭 + 加号。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M3,9.5h3.4L11,5.6v12.8L6.4,14.5H3z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M13.6,10.9h7.4v2.2h-7.4z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M16.2,8.3h2.2v7.4h-2.2z" />
+</vector>

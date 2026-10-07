@@ -1,0 +1,112 @@
+// app 模块。整个工程只有这一个模块。
+apply plugin: 'com.android.application'
+apply plugin: 'kotlin-android'
+
+android {
+    // 下面全部用 "propName = value" 的赋值写法。
+    // Groovy DSL 里省略等号的老写法（namespace 'x'）在 Gradle 8 已经废弃、Gradle 10 会移除，
+    // 加了等号就不会再有 "Properties should be assigned using the 'propName = value' syntax" 警告。
+    namespace = 'app.sakana.receiver'
+
+    // compileSdk 必须写本机 E:\environment\Android SDK\platforms 里**确实存在**的版本，
+    // 否则构建会因为找不到平台直接失败。本机装的是 android-35 / android-36 / android-37.0，
+    // 这里取 36（Media3 1.11 的 AAR 元数据要求 compileSdk >= 36）。
+    compileSdk = 36
+
+    defaultConfig {
+        applicationId = 'app.sakana.receiver'
+        minSdk = 24
+        // targetSdk 定 34（协议要求），不用 35：从 targetSdk 35 开始系统会强制
+        // edge-to-edge（内容铺到状态栏/导航栏底下），而本工程刻意不引 AppCompat/insets 那套，
+        // 定 34 可以让全屏视频界面在绝大多数设备上保持"内容区自动避开系统栏"，少一堆适配工作。
+        targetSdk = 34
+        versionCode = 1
+        versionName = '1.0.0'
+    }
+
+    // 用 JDK 21 跑 Gradle，但字节码目标锁在 17：
+    // AGP 8.x + Kotlin 2.2 对 Java 17 的支持最成熟，定 21 反而要额外确认 desugar 行为。
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    buildFeatures {
+        // 不需要 BuildConfig（没有任何按变体区分的常量），关掉少生成一个类
+        buildConfig = false
+    }
+
+    buildTypes {
+        release {
+            // 目标体积最小：这个 App 只 sideload 到自家设备上，不需要为调试保留可读性。
+            // Media3 的混淆规则（consumer rules）会随 AAR 自动应用，见 proguard-rules.pro。
+            minifyEnabled = true
+            shrinkResources = true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            // debug 包不混淆：排错时堆栈可读，构建也快
+            minifyEnabled = false
+        }
+    }
+
+    lint {
+        // release 包是自己 sideload 的，不需要 lintVital 卡住构建
+        checkReleaseBuilds = false
+        abortOnError = false
+    }
+}
+
+dependencies {
+    // 依赖一共就这三个，全是 Media3：
+    //  · media3-exoplayer      —— 播放器核心
+    //  · media3-exoplayer-hls  —— HLS(m3u8) 支持，番剧源基本都是 HLS
+    //  · media3-ui             —— 提供 PlayerView（画面渲染 + 比例适配）
+    // 刻意不引的：
+    //  · media3-session —— 给后台播放/媒体通知/耳机按键用的，接收端是前台全屏播放，用不上
+    //  · Media3 DASH / SmoothStreaming —— 协议 caps 里只承诺 hls/mp4
+    //  · Compose / AppCompat / ConstraintLayout —— 界面用最朴素的 View + XML
+    //  · OkHttp / NanoHTTPD / Gson 等 —— HTTP 服务与 JSON 都是手写的（见 Http.kt / Json.kt）
+    implementation 'androidx.media3:media3-exoplayer:1.11.1'
+    implementation 'androidx.media3:media3-exoplayer-hls:1.11.1'
+    implementation 'androidx.media3:media3-ui:1.11.1'
+
+    // 收藏网格需要 RecyclerView（media3-ui 本来就把它作为运行时依赖带进来了，
+    // 所以这里显式声明**不会增加任何体积**，只是把它从"仅运行时"提到编译期，
+    // 让我们能直接 import）。版本对齐到已经被解析进来的 1.3.0。
+    implementation 'androidx.recyclerview:recyclerview:1.3.0'
+
+    // ---- 传递依赖的版本对齐（不是新增依赖，只是把已有的抬到新版本） ----
+    // media3-ui 会带进 androidx.recyclerview:1.3.0，而 recyclerview 1.3.0 声明了一批
+    // **很旧**的 androidx 版本：core 1.7.0 / core-ktx 1.5.0 / annotation-experimental 1.3.1。
+    // 之所以要显式抬版本，有两个理由：
+    //   ① 同一个 androidx 库同时存在新旧版本容易出现"NoSuchMethodError"这类运行时崩溃，
+    //      官方推荐的做法就是把它们对齐到同一条版本线上；
+    //   ② 这些老版本在离线环境的依赖缓存里不存在，不抬版本就没法离线构建。
+    // 1.13.1 这条线要求 compileSdk >= 34（我们是 36）、minSdk >= 19（我们是 24），完全兼容。
+    implementation 'androidx.annotation:annotation-experimental:1.4.1'
+    implementation 'androidx.core:core:1.13.1'
+    implementation 'androidx.core:core-ktx:1.13.1'
+
+    // Kotlin 标准库也显式指定 2.2.21。
+    // Kotlin 插件（2.2.20）默认会带上同版本的 stdlib，而 stdlib 的 Gradle 元数据里有一条
+    // 指向 kotlin-stdlib-common 同版本的约束；2.2.20 的 kotlin-stdlib-common 在本机缓存里
+    // 完全不存在（只有 2.2.21 / 2.4.0），离线解析会因此失败。
+    // 抬到 2.2.21 后约束目标存在、且与编译器的 2.2.20 是同一条补丁线，二进制兼容。
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.2.21'
+
+    // 同样是"抬到有完整构件的版本"：1.3.0 在离线缓存里只有元数据没有 .aar。
+    // 这个库只负责安装 baseline profile（一种启动优化），和我们的功能无关，
+    // 但它是 emoji2/core 那条链路的传递依赖，直接排除有运行时风险，所以抬版本而不是删掉。
+    implementation 'androidx.profileinstaller:profileinstaller:1.3.1'
+
+    // 这两个是 Kotlin 多平台（KMP）库：根模块本身没有 jar，真正的 class 在 -jvm 变体里
+    // （androidx.annotation:annotation-jvm / androidx.collection:collection-jvm）。
+    // 图上被选中的还是 1.6.0 / 1.0.0 这些老版本，而它们的 -jvm 构件在本机缓存里缺失，
+    // 所以显式抬到缓存里完整的版本。
+    implementation 'androidx.annotation:annotation:1.8.1'
+    implementation 'androidx.collection:collection:1.4.2'
+}

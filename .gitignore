@@ -3,6 +3,12 @@ node_modules/
 out/
 dist/
 release/
+# 例外：安卓接收端的安装包要入库（v0.3.8）。
+# 用户要求「移动端投屏应用也上传到 git，并且在投屏设置中增加下载的地址」——
+# 电脑端「设置 → 投屏」里那条下载地址指向的就是这个 APK。
+# ⚠️ 父目录必须显式重新包含：git 不会进入被忽略的目录，只写文件级的 `!` 是无效的。
+!android-receiver/dist/
+!android-receiver/dist/*.apk
 *.tsbuildinfo
 # 本地依赖缓存（含 electron 压缩包、libmpv dll 等，体积巨大且可重新下载）
 .npm-cache/

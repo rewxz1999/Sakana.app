@@ -86,28 +86,85 @@ export const MAX_GENRES = 8
 // ------------------------------------------------------------------
 
 /**
- * 一页的背景。
+ * 一页的背景（v0.3.7 引入，v0.3.8 扩成**扁平结构**）。
  *
- * 三种形态（用户要求的三种）：
- * - `color`：纯色；
- * - `gradient`：线性渐变，至少两个色标 + 角度（可自由调）；
- * - `image`：本地图片（经 `api.showcase.importImages` 复制进应用数据目录后的绝对路径）。
+ * 三种形态（`kind`）：
+ * - `color`：纯色，用 `color`；
+ * - `gradient`：线性渐变，用 `angle` + `stops`；
+ * - `image`：本地图片（经 `api.showcase.importImages` 复制进应用数据目录），用 `path`；
+ *   并额外记 `imgW/imgH`（**原图像素尺寸**）—— 用户要求「设了背景图就让页面大小等于背景图大小」，
+ *   而离屏导出窗口不会自己去量一张图，所以尺寸必须在选图那一刻量好存下来（见 BackgroundDialog）。
  *
  * `undefined` = 不加背景，就是原来的白底。
+ *
+ * 两个全局可调项（v0.3.8 追加，三种背景通吃）：
+ * - `blur`：背景模糊（px，0 = 不模糊）——**只模糊背景层**，内容完全不受影响；
+ * - `overlay`：叠在背景之上、内容之下的**渐变层**（角度 + 色标，色标带 alpha），
+ *   用来压暗 / 染色，让白板上的字在任何背景上都清楚。
+ *
+ * 为什么是扁平结构（三个 kind 共用一套字段）而不是判别联合：
+ * 收窄、打补丁、弹窗草稿、渲染都要处理「部分字段」，判别联合在每一处都得写分支；
+ * 扁平结构由 `normalizeBackground` 统一补默认值，读的地方只认字段不认 kind，出错面小得多。
  *
  * 为什么**按页**存而不是按表统一：一页就是一部番剧的推荐卡，
  * 每部的色调/截图风格不一样（治愈番配暖色、悬疑番配深色），按页存才能真正用起来；
  * 而「整张表统一」这种需求用一个「应用到所有页」按钮就等价实现了（见 applyBackground），
  * 反过来（存表级、想给某一页单独换）就没法用按钮补上。
  */
-export type RecommendBackground =
-  | { kind: 'color'; color: string }
-  | { kind: 'gradient'; angle: number; stops: { color: string; pos: number }[] }
-  | { kind: 'image'; path: string }
+export interface RecommendBackground {
+  kind: 'color' | 'gradient' | 'image'
+  /** kind=color：背景色 */
+  color: string
+  /** kind=gradient：渐变角度（0–360） */
+  angle: number
+  /** kind=gradient：渐变色标（2–4 个） */
+  stops: GradientStop[]
+  /** kind=image：图片路径（应用数据目录内的绝对路径） */
+  path: string
+  /** kind=image：原图宽（0 = 未知，此时页面沿用默认高度） */
+  imgW: number
+  /** kind=image：原图高 */
+  imgH: number
+  /**
+   * kind=image：背景图放在页面的哪一侧（左 / 右 / 上）。
+   * v0.3.8 第二轮起，图片**不再铺满整页**，而是只占页面的一部分（图区）：
+   * 图区与内容区的比例固定 1.5 : 1（见 styles.ts 的 IMAGE_CONTENT_RATIO），
+   * 图区靠内容区的那一侧用一条渐隐到页面底色的交融渐变接上（没有硬边）。
+   */
+  imagePos: ImagePos
+  /** 背景模糊 px（0–40）；只作用于图区那一层 */
+  blur: number
+}
 
-/** 渐变色的色标数量范围：1 个不成渐变，超过 4 个在 30px 的预览条上也没法调 */
+/** 背景图的位置：左 / 右 / 上（用户只提了这三个，没有"下"） */
+export type ImagePos = 'left' | 'right' | 'top'
+
+/** 位置选项（界面与校验共用一份） */
+export const IMAGE_POS_NAMES: { key: ImagePos; label: string }[] = [
+  { key: 'left', label: '左侧' },
+  { key: 'right', label: '右侧' },
+  { key: 'top', label: '上方' }
+]
+
+/** 渐变色标：色值 + 位置（0–100%）+ 不透明度（0–1） */
+export interface GradientStop {
+  color: string
+  pos: number
+  alpha: number
+}
+
+/** 一个渐变层（背景渐变用） */
+export interface GradientLayer {
+  angle: number
+  stops: GradientStop[]
+}
+
+/** 渐变色的色标数量范围：1 个不成渐变，超过 4 个在弹窗的预览条上也没法调 */
 export const MIN_GRADIENT_STOPS = 2
 export const MAX_GRADIENT_STOPS = 4
+
+/** 背景模糊上限（px）：再高整张背景就糊成一团纯色，而且离屏渲染明显变慢 */
+export const MAX_BLUR = 40
 
 /** 纯色背景的预设（界面上的色板；用户也可以自己调色或填十六进制） */
 export const BG_PRESET_COLORS: { name: string; color: string }[] = [
@@ -122,12 +179,39 @@ export const BG_PRESET_COLORS: { name: string; color: string }[] = [
 ]
 
 /** 渐变的预设（起手就有个能看的东西，用户再自己调角度与色标） */
-export const BG_PRESET_GRADIENTS: { name: string; angle: number; stops: { color: string; pos: number }[] }[] = [
-  { name: '樱', angle: 135, stops: [{ color: '#fde7ef', pos: 0 }, { color: '#e8f0fb', pos: 100 }] },
-  { name: '黄昏', angle: 160, stops: [{ color: '#ffe8cc', pos: 0 }, { color: '#f6c6d0', pos: 100 }] },
-  { name: '深海', angle: 135, stops: [{ color: '#dfeaf7', pos: 0 }, { color: '#c9d8ea', pos: 100 }] },
-  { name: '抹茶', angle: 120, stops: [{ color: '#eaf5e2', pos: 0 }, { color: '#d7ead0', pos: 100 }] },
-  { name: '暮色', angle: 150, stops: [{ color: '#4b4f63', pos: 0 }, { color: '#8e7d9a', pos: 100 }] }
+export const BG_PRESET_GRADIENTS: { name: string; layer: GradientLayer }[] = [
+  { name: '樱', layer: { angle: 135, stops: [{ color: '#fde7ef', pos: 0, alpha: 1 }, { color: '#e8f0fb', pos: 100, alpha: 1 }] } },
+  { name: '黄昏', layer: { angle: 160, stops: [{ color: '#ffe8cc', pos: 0, alpha: 1 }, { color: '#f6c6d0', pos: 100, alpha: 1 }] } },
+  { name: '深海', layer: { angle: 135, stops: [{ color: '#dfeaf7', pos: 0, alpha: 1 }, { color: '#c9d8ea', pos: 100, alpha: 1 }] } },
+  { name: '抹茶', layer: { angle: 120, stops: [{ color: '#eaf5e2', pos: 0, alpha: 1 }, { color: '#d7ead0', pos: 100, alpha: 1 }] } },
+  { name: '暮色', layer: { angle: 150, stops: [{ color: '#4b4f63', pos: 0, alpha: 1 }, { color: '#8e7d9a', pos: 100, alpha: 1 }] } }
+]
+
+/**
+ * 叠加渐变层的预设（盖在图片/纯色背景之上）。
+ *
+ * ⚠️ v0.3.8 第二轮**已停用**：图片背景改成"图区 + 交融渐变"之后，
+ * 「图区靠内容区那一侧渐隐到页面底色」这条渐变已经由渲染层按位置自动画好（见 styles.ts 的
+ * `blendStyle`），再给用户一个"叠加渐变"控件就是两套相似的旋钮。
+ * 常量先留着（其它地方若还引用不至于崩），但界面上不再提供入口。
+ */
+export const BG_PRESET_OVERLAYS: { name: string; layer: GradientLayer }[] = [
+  {
+    name: '底部压暗',
+    layer: { angle: 180, stops: [{ color: '#000000', pos: 0, alpha: 0 }, { color: '#000000', pos: 100, alpha: 0.55 }] }
+  },
+  {
+    name: '顶部压暗',
+    layer: { angle: 0, stops: [{ color: '#000000', pos: 0, alpha: 0.5 }, { color: '#000000', pos: 100, alpha: 0 }] }
+  },
+  {
+    name: '白纱提亮',
+    layer: { angle: 135, stops: [{ color: '#ffffff', pos: 0, alpha: 0.55 }, { color: '#ffffff', pos: 100, alpha: 0.15 }] }
+  },
+  {
+    name: '粉色染色',
+    layer: { angle: 135, stops: [{ color: '#e0577f', pos: 0, alpha: 0.35 }, { color: '#ffffff', pos: 100, alpha: 0.1 }] }
+  }
 ]
 
 /** `#rgb` / `#rrggbb` / `#rrggbbaa` → `#rrggbb`；非法返回空串（不猜颜色） */
@@ -140,6 +224,40 @@ export function normalizeHexColor(v: unknown): string {
   return ''
 }
 
+/** 0–1 的不透明度（叠加层用）；非法值给 1（完全不透明） */
+export function clampAlpha(v: unknown): number {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return 1
+  return Math.min(1, Math.max(0, Math.round(v * 100) / 100))
+}
+
+/** 色标收窄：去非法、限个数、位置夹到 0–100（排序交给渲染那边的 CSS，它自己会按顺序画） */
+export function normalizeStops(raw: unknown, max = MAX_GRADIENT_STOPS): GradientStop[] {
+  const list = Array.isArray(raw) ? raw : []
+  const out: GradientStop[] = []
+  for (const s of list) {
+    if (!s || typeof s !== 'object') continue
+    const o = s as Record<string, unknown>
+    const color = normalizeHexColor(o.color)
+    if (!color) continue
+    const pos =
+      typeof o.pos === 'number' && Number.isFinite(o.pos) ? Math.min(100, Math.max(0, Math.round(o.pos))) : 0
+    out.push({ color, pos, alpha: clampAlpha(o.alpha) })
+    if (out.length >= max) break
+  }
+  return out
+}
+
+/** 一个渐变层（背景渐变 / 叠加渐变）收窄：色标不足 2 个算非法 → null */
+export function normalizeLayer(raw: unknown): GradientLayer | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  const stops = normalizeStops(o.stops)
+  if (stops.length < MIN_GRADIENT_STOPS) return null
+  const angle =
+    typeof o.angle === 'number' && Number.isFinite(o.angle) ? ((Math.round(o.angle) % 360) + 360) % 360 : 135
+  return { angle, stops }
+}
+
 /**
  * 背景收窄。
  *
@@ -150,34 +268,207 @@ export function normalizeHexColor(v: unknown): string {
 export function normalizeBackground(raw: unknown): RecommendBackground | undefined {
   if (!raw || typeof raw !== 'object') return undefined
   const r = raw as Record<string, unknown>
-  if (r.kind === 'color') {
+  const kind = r.kind === 'color' || r.kind === 'gradient' || r.kind === 'image' ? r.kind : null
+  if (!kind) return undefined
+  const blurRaw = typeof r.blur === 'number' && Number.isFinite(r.blur) ? Math.round(r.blur) : 0
+  const blur = Math.min(MAX_BLUR, Math.max(0, blurRaw))
+  // 图片位置：老数据（第一轮做的背景）没有这个字段 → 默认「左侧」
+  const imagePos: ImagePos =
+    r.imagePos === 'right' || r.imagePos === 'top' || r.imagePos === 'left' ? r.imagePos : 'left'
+  /*
+   * 注意：第一轮存过的 `overlay`（叠加渐变层）在这里被**有意丢弃** ——
+   * 它的作用已经由「图区 → 内容区」的交融渐变承担（见文件头的说明与 styles.ts 的 blendStyle）。
+   * 留着字段但不渲染会让数据里塞着一份永远不生效的配置，更容易让人误会"设置了没反应"。
+   */
+  if (kind === 'color') {
     const color = normalizeHexColor(r.color)
-    return color ? { kind: 'color', color } : undefined
+    return color
+      ? { kind, color, angle: 135, stops: [], path: '', imgW: 0, imgH: 0, imagePos, blur }
+      : undefined
   }
-  if (r.kind === 'image') {
+  if (kind === 'image') {
     const path = typeof r.path === 'string' ? r.path.trim() : ''
     // 图片背景必须有路径：空路径会让导出图变成一块灰底，不如直接回成白底
-    return path ? { kind: 'image', path } : undefined
+    if (!path) return undefined
+    const imgW = typeof r.imgW === 'number' && Number.isFinite(r.imgW) && r.imgW > 0 ? Math.round(r.imgW) : 0
+    const imgH = typeof r.imgH === 'number' && Number.isFinite(r.imgH) && r.imgH > 0 ? Math.round(r.imgH) : 0
+    return { kind, color: '#ffffff', angle: 135, stops: [], path, imgW, imgH, imagePos, blur }
   }
-  if (r.kind === 'gradient') {
-    const rawStops = Array.isArray(r.stops) ? r.stops : []
-    const stops: { color: string; pos: number }[] = []
-    for (const s of rawStops) {
-      if (!s || typeof s !== 'object') continue
-      const o = s as Record<string, unknown>
-      const color = normalizeHexColor(o.color)
-      if (!color) continue
-      const pos = typeof o.pos === 'number' && Number.isFinite(o.pos) ? Math.min(100, Math.max(0, Math.round(o.pos))) : 0
-      stops.push({ color, pos })
-      if (stops.length >= MAX_GRADIENT_STOPS) break
-    }
-    if (stops.length < MIN_GRADIENT_STOPS) return undefined
-    const angle = typeof r.angle === 'number' && Number.isFinite(r.angle) ? ((Math.round(r.angle) % 360) + 360) % 360 : 135
-    return { kind: 'gradient', angle, stops }
+  const layer = normalizeLayer({ angle: r.angle, stops: r.stops })
+  if (!layer) return undefined
+  return {
+    kind: 'gradient',
+    color: '#ffffff',
+    angle: layer.angle,
+    stops: layer.stops,
+    path: '',
+    imgW: 0,
+    imgH: 0,
+    imagePos,
+    blur
   }
-  return undefined
 }
 
+// ------------------------------------------------------------------
+// 模块（v0.3.8：用户方向调整后**只保留显示 / 隐藏**）
+// ------------------------------------------------------------------
+
+/**
+ * 页面上的模块。用户点名要做成模块的是「封面 / 评分 / 推荐指数 / 推荐理由 / 剧照」，
+ * 这里把它们拆成 5 个，再补上**番剧名（标题）**、**播出时间与标签**、**页脚**：
+ * 标题是页面上最大的信息，页脚（表名 + 页码）同理；拆出来也正好支持用户举的例子
+ * 「只导封面 + 评分 + 理由」。
+ */
+export type ModuleKind =
+  | 'title'
+  | 'cover'
+  | 'ratings'
+  | 'level'
+  | 'meta'
+  | 'reason'
+  | 'photos'
+  | 'foot'
+
+/** 模块的中文名（界面列表、导出勾选、弹窗共用一份） */
+export const MODULE_NAMES: Record<ModuleKind, string> = {
+  title: '番剧名',
+  cover: '封面',
+  ratings: '评分',
+  level: '推荐指数',
+  meta: '播出时间与标签',
+  reason: '推荐理由',
+  photos: '剧照',
+  foot: '页脚（表名 / 页码）'
+}
+
+/** 模块顺序 = 界面列表顺序 = 绘制顺序（同一层的模块按这个顺序画，后面的盖前面的） */
+export const MODULE_KINDS: ModuleKind[] = [
+  'title',
+  'cover',
+  'ratings',
+  'level',
+  'meta',
+  'reason',
+  'photos',
+  'foot'
+]
+
+/** 一个模块的位置与尺寸（**只由版式算出来**，用户不可改；见 styles.ts 的 moduleRectsOf） */
+export interface ModuleRect {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+/**
+ * 一个模块在一页上的状态。
+ *
+ * v0.3.8 第二轮（用户方向调整）之后**只剩显示 / 隐藏**：
+ * 原来那套 `x/y/w/h/z/scale`（自由拖动 + 缩放）已经整条撤掉，位置一律由版式决定。
+ * 好处是"界面看到的就是导出的"这件事再也不依赖两份坐标同步 —— 两边都从
+ * `styles.moduleRectsOf(frame)` 现算同一份矩形。
+ */
+export interface ModuleLayout {
+  id: ModuleKind
+  visible: boolean
+}
+
+/**
+ * **默认摆放**（px，坐标系是 1200 × 920 的"整页无图"版式）。
+ *
+ * 这些数字就是改造前那套固定版式的内容坐标：页边距 34、封面 300×426、
+ * 右列从 360 起宽 804、信息行 26 高 + 12 间距、理由区 30 + 244、剧照 30 + 92、页脚贴底。
+ * 因为模块**不再有自己的白板**（v0.3.8 第二轮去掉的），矩形直接就是内容框 ——
+ * 所以这里不再需要"内容坐标 − 白板内边距"的换算。
+ *
+ * 有图片背景时（图区 + 内容区）模块会按 `styles.moduleRectsOf` 在内容区里重排：
+ *   · 上图：内容区仍是 1200 宽 → 用这份摆放，整体下移一个图区高度；
+ *   · 左/右图：内容区只有 480 宽 → 改为纵向一列（见 styles.ts 的 SIDE_STACK）。
+ *
+ * ⚠️ 不要随手改这里的数字：默认版式是所有人的共同起点。
+ */
+export const DEFAULT_MODULES: Record<ModuleKind, ModuleRect> = {
+  title: { x: 34, y: 34, w: 1132, h: 96 },
+  cover: { x: 34, y: 166, w: 300, h: 426 },
+  ratings: { x: 360, y: 166, w: 804, h: 78 },
+  level: { x: 360, y: 256, w: 804, h: 40 },
+  meta: { x: 360, y: 308, w: 804, h: 116 },
+  reason: { x: 360, y: 436, w: 804, h: 274 },
+  photos: { x: 360, y: 722, w: 804, h: 122 },
+  foot: { x: 34, y: 858, w: 1132, h: 30 }
+}
+
+/**
+ * 布局收窄：**只留下 `id` 与 `visible`**，坐标一类字段一律丢掉。
+ *
+ * ## 老数据兼容的做法（二选一里选了"丢掉坐标"）
+ *
+ * 上一版允许用户自由拖动模块，磁盘上已经存在带 `x/y/w/h/z/scale` 的布局。
+ * 两种兼容方式：① 留着字段但渲染时无视；② 收窄时直接丢掉。
+ * 这里选 **②**，理由是：留着不生效的坐标会让人误以为"拖动还在、只是没显示"，
+ * 以后维护者也可能不小心又把它们接回渲染（`resolveModules` 那种"以为是缺失就补默认"的坑刚踩过）。
+ * 丢掉之后数据里只剩下真正生效的东西（显隐），语义干净；而**用户自定义过的位置本来就要清掉**
+ * （这次方向调整就是"取消自定义移动模块"），所以丢掉也不算信息损失。
+ */
+export function normalizeModules(raw: unknown): ModuleLayout[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const seen = new Set<ModuleKind>()
+  const out: ModuleLayout[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const o = item as Record<string, unknown>
+    const id = MODULE_KINDS.includes(o.id as ModuleKind) ? (o.id as ModuleKind) : null
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    // visible 缺省 = 显示（只有显式 false 才算隐藏；老数据里可能根本没有这个字段）
+    out.push({ id, visible: o.visible !== false })
+  }
+  return out.length > 0 ? out : undefined
+}
+
+/**
+ * 把一页的模块补成**完整**的 8 项（缺的当"没动过"）。
+ *
+ * ## 「显式隐藏」与「没这一项」是两件完全不同的事（上一轮修 bug 的关键，别退化）
+ *
+ *   · `page.layout` 里**有**这一项且 `visible === false` → 用户**主动隐藏**了它，原样返回；
+ *   · `page.layout` 里**没有**这一项 → 从没动过它，才用默认（显示）。
+ * 判据写成 `stored.has(id)`（看**存在性**），不能拿 `stored.get(id)` 的真假判断
+ * —— 把"存在的对象"当假值处理，隐藏就会失效。
+ *
+ * 位置不再来自数据（用户不能自定义移动了）：要画在哪由 `styles.moduleRectsOf(frame)` 算，
+ * 这里只回答"这一页哪些模块开着"。
+ */
+export function resolveModules(page: { layout?: ModuleLayout[] }): ModuleLayout[] {
+  const stored = new Map<ModuleKind, ModuleLayout>()
+  for (const m of page.layout ?? []) stored.set(m.id, m)
+  return MODULE_KINDS.map((id) => {
+    const saved = stored.get(id)
+    if (stored.has(id) && saved) return saved
+    return { id, visible: true }
+  })
+}
+
+/**
+ * 一页上**真正要画出来**的模块：补全 → 丢掉隐藏的（可再按导出勾选过滤）。
+ *
+ * ⚠️ 这是**界面预览与导出图唯一的取模块入口**（`RecommendPageCard` 与 `exportHtml` 都只调它）。
+ * 加它就是因为踩过一次坑：两个渲染器各自写一遍，导出那边记得 `.filter(m => m.visible)`、
+ * 卡片那边忘了 —— 于是「模块隐藏了，预览里还在显示」。
+ *
+ * `only` 是**导出弹窗**勾选的白名单（不传 / 空 = 全都画）。
+ * 它只能**进一步**减少模块：页面自己隐藏的模块，即使被勾上也画不出来（两者取交集）。
+ */
+export function renderModules(
+  page: { layout?: ModuleLayout[] },
+  only?: ModuleKind[] | null
+): ModuleLayout[] {
+  const allow = only && only.length > 0 ? new Set(only) : null
+  return resolveModules(page)
+    .filter((m) => m.visible)
+    .filter((m) => !allow || allow.has(m.id))
+}
 
 /** 推荐表里的一页 = 一部番剧的推荐数据 */
 export interface RecommendPage {
@@ -212,6 +503,14 @@ export interface RecommendPage {
   photos: string[]
   /** 这一页的背景（undefined = 白底；按页保存的原因见 RecommendBackground 的注释） */
   background?: RecommendBackground
+  /**
+   * 这一页的模块布局（v0.3.8）。
+   *
+   * `undefined` / 缺模块 = **默认摆放**（见 resolveModules）：老数据（v0.3.7 存的表）
+   * 没有这个字段，读出来照样是那套固定版式，不会崩也不会变形。
+   * 只有用户真的拖过或改过的模块才会出现在这里。
+   */
+  layout?: ModuleLayout[]
 }
 
 /** 一张推荐表 */
@@ -258,7 +557,7 @@ export interface RecommendPageInput {
 export type RecommendPagePatch = Partial<
   Pick<
     RecommendPage,
-    'myRating' | 'recommendLevel' | 'reason' | 'photos' | 'genres' | 'airDate' | 'background'
+    'myRating' | 'recommendLevel' | 'reason' | 'photos' | 'genres' | 'airDate' | 'background' | 'layout'
   >
 >
 
@@ -349,7 +648,9 @@ export function normalizePage(raw: unknown, index: number): RecommendPage | null
     reason: clampReason(r.reason),
     photos: toStringList(r.photos, MAX_PHOTOS),
     // 背景非法就当没设过（白底），见 normalizeBackground 的说明
-    background: normalizeBackground(r.background)
+    background: normalizeBackground(r.background),
+    // 布局：只有合法的条目会留下，缺的模块渲染时补默认摆放（见 resolveModules）
+    layout: normalizeModules(r.layout)
   }
 }
 
@@ -489,6 +790,15 @@ interface RecommendState extends RecommendStoreData {
   addPages: (tableId: string, inputs: RecommendPageInput[]) => AddPagesResult
   updatePage: (tableId: string, pageId: string, patch: RecommendPagePatch) => void
   removePage: (tableId: string, pageId: string) => void
+  /**
+   * 显示 / 隐藏一个模块（v0.3.8 第二轮之后，模块**只剩这一个可调项**）。
+   *
+   * 实现上先 `resolveModules` 把整页补全再改这一项：用户第一次关某一块时，
+   * 另外 7 块还没进过 layout，补全后整体写回 —— 落盘的就是一份完整的显隐表。
+   */
+  setModuleVisible: (tableId: string, pageId: string, moduleId: ModuleKind, visible: boolean) => void
+  /** 全部显示（= 清掉 layout，回到默认） */
+  resetModules: (tableId: string, pageId: string) => void
   /** 把同一个背景应用到这张表的**所有页**（右键菜单里的背景弹窗用；null = 全部恢复白底） */
   applyBackground: (tableId: string, background: RecommendBackground | null) => number
   /** 用 bangumi 详情补齐缺少类型标签 / 播出时间的页，返回补齐的页数 */
@@ -671,6 +981,8 @@ export const useRecommendTable = create<RecommendState>((set, get) => {
             }
             // background 允许为 null/undefined（= 清掉背景回白底），所以这里先收窄再赋值
             if ('background' in patch) next.background = normalizeBackground(patch.background)
+            // layout 同理：undefined = 整页回默认摆放
+            if ('layout' in patch) next.layout = normalizeModules(patch.layout)
             return next
           })
         }))
@@ -683,6 +995,40 @@ export const useRecommendTable = create<RecommendState>((set, get) => {
       if (!table || !table.pages.some((p) => p.id === pageId)) return
       set({
         tables: patchTable(tableId, (t) => ({ ...t, pages: t.pages.filter((p) => p.id !== pageId) }))
+      })
+      persist()
+    },
+
+    setModuleVisible: (tableId, pageId, moduleId, visible) => {
+      const table = get().tables.find((t) => t.id === tableId)
+      const page = table?.pages.find((p) => p.id === pageId)
+      if (!table || !page) return
+      // 先补全再改一项：用户第一次关某一块时，其余 7 块还没进过 layout
+      const next: ModuleLayout[] = resolveModules(page).map((m) =>
+        m.id === moduleId ? { id: m.id, visible } : m
+      )
+      /*
+       * 全部显示时写成 `undefined`（= "从没动过"）而不是一份全是 visible:true 的数组：
+       * 这样默认状态永远干净，也不会因为多了一层记录而影响以后改默认行为。
+       */
+      const allVisible = next.every((m) => m.visible)
+      set({
+        tables: patchTable(tableId, (t) => ({
+          ...t,
+          pages: t.pages.map((p) => (p.id === pageId ? { ...p, layout: allVisible ? undefined : next } : p))
+        }))
+      })
+      persist()
+    },
+
+    resetModules: (tableId, pageId) => {
+      const table = get().tables.find((t) => t.id === tableId)
+      if (!table || !table.pages.some((p) => p.id === pageId)) return
+      set({
+        tables: patchTable(tableId, (t) => ({
+          ...t,
+          pages: t.pages.map((p) => (p.id === pageId ? { ...p, layout: undefined } : p))
+        }))
       })
       persist()
     },

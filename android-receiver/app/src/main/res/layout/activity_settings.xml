@@ -1,0 +1,392 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  设置页。
+
+  为什么整个页面是"一个 ScrollView + 一堆 LinearLayout"：
+  设置项是按分组排列的表单，用 LinearLayout 从上往下码最直观，也不需要引 ConstraintLayout。
+  唯一要注意的是**不能**在 ScrollView 里放 ListView（高度算不准），所以"最近地址"那一栏
+  用一个空的 LinearLayout 容器，由代码按 item_recent_host.xml 逐行填进去。
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/surface"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingBottom="24dp">
+
+        <!-- ============ 顶栏 ============ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@color/surface_header"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="4dp"
+            android:paddingTop="8dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="8dp">
+
+            <ImageButton
+                android:id="@+id/btn_back"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/cd_back"
+                android:padding="12dp"
+                android:scaleType="centerInside"
+                android:src="@drawable/ic_back"
+                android:tint="@color/icon_tint" />
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:paddingStart="8dp"
+                android:text="@string/settings_title"
+                android:textColor="@color/text_primary"
+                android:textSize="19sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <!-- ============ 设备 ============ -->
+        <TextView style="@style/SectionTitle" android:text="@string/set_section_device" />
+
+        <TextView style="@style/FieldLabel" android:text="@string/set_name_label" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingTop="4dp"
+            android:paddingEnd="16dp">
+
+            <EditText
+                android:id="@+id/et_name"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="@string/default_name"
+                android:inputType="text"
+                android:maxLines="1"
+                android:textColor="@color/text_primary"
+                android:textColorHint="@color/text_muted"
+                android:textSize="15sp" />
+
+            <Button
+                android:id="@+id/btn_name_save"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:text="@string/set_save"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <TextView style="@style/FieldHint" android:text="@string/set_name_hint" />
+
+        <TextView
+            style="@style/FieldLabel"
+            android:layout_marginTop="8dp"
+            android:text="@string/set_port_label" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingTop="4dp"
+            android:paddingEnd="16dp">
+
+            <EditText
+                android:id="@+id/et_port"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="@string/set_port_label"
+                android:inputType="number"
+                android:maxLength="5"
+                android:maxLines="1"
+                android:textColor="@color/text_primary"
+                android:textColorHint="@color/text_muted"
+                android:textSize="15sp" />
+
+            <Button
+                android:id="@+id/btn_port_save"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:text="@string/set_save"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <TextView style="@style/FieldHint" android:text="@string/set_port_hint" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="16dp"
+            android:background="@color/divider" />
+
+        <!-- ============ 网络 ============ -->
+        <TextView style="@style/SectionTitle" android:text="@string/set_section_network" />
+
+        <TextView style="@style/FieldLabel" android:text="@string/set_face_label" />
+
+        <LinearLayout
+            android:id="@+id/row_face"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="?android:attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:orientation="vertical"
+            android:paddingStart="16dp"
+            android:paddingTop="6dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="6dp">
+
+            <TextView
+                android:id="@+id/tv_face"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/set_face_auto"
+                android:textColor="@color/accent"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <TextView style="@style/FieldHint" android:text="@string/set_face_hint" />
+
+        <TextView
+            style="@style/FieldLabel"
+            android:layout_marginTop="12dp"
+            android:text="@string/set_peer_label" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingTop="4dp"
+            android:paddingEnd="16dp">
+
+            <EditText
+                android:id="@+id/et_peer"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="@string/set_peer_label"
+                android:inputType="text"
+                android:maxLines="1"
+                android:textColor="@color/text_primary"
+                android:textColorHint="@color/text_muted"
+                android:textSize="15sp" />
+
+            <Button
+                android:id="@+id/btn_peer"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:text="@string/set_peer_button"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <TextView style="@style/FieldHint" android:text="@string/set_peer_hint" />
+
+        <TextView
+            style="@style/FieldLabel"
+            android:layout_marginTop="8dp"
+            android:text="@string/set_peer_recent"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <!-- 最近地址：由 SettingsActivity 按 item_recent_host.xml 逐行填进来 -->
+        <LinearLayout
+            android:id="@+id/layout_recent"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingTop="4dp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="16dp"
+            android:background="@color/divider" />
+
+        <!-- ============ 行为 ============ -->
+        <TextView style="@style/SectionTitle" android:text="@string/set_section_behavior" />
+
+        <Switch
+            android:id="@+id/sw_keep_on"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingStart="16dp"
+            android:paddingTop="8dp"
+            android:paddingEnd="16dp"
+            android:text="@string/set_keep_on"
+            android:textColor="@color/text_primary"
+            android:textSize="15sp" />
+
+        <TextView style="@style/FieldHint" android:text="@string/set_keep_on_hint" />
+
+        <Switch
+            android:id="@+id/sw_autoplay"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingStart="16dp"
+            android:paddingTop="12dp"
+            android:paddingEnd="16dp"
+            android:text="@string/set_autoplay"
+            android:textColor="@color/text_primary"
+            android:textSize="15sp" />
+
+        <TextView style="@style/FieldHint" android:text="@string/set_autoplay_hint" />
+
+        <Switch
+            android:id="@+id/sw_boot"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingStart="16dp"
+            android:paddingTop="12dp"
+            android:paddingEnd="16dp"
+            android:text="@string/set_boot"
+            android:textColor="@color/text_primary"
+            android:textSize="15sp" />
+
+        <TextView style="@style/FieldHint" android:text="@string/set_boot_hint" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="16dp"
+            android:background="@color/divider" />
+
+        <!-- ============ 同步（与电脑） ============ -->
+        <TextView style="@style/SectionTitle" android:text="@string/set_section_sync" />
+
+        <TextView style="@style/FieldLabel" android:text="@string/set_sync_state" />
+
+        <TextView
+            android:id="@+id/tv_sync_state"
+            style="@style/FieldHint"
+            android:paddingTop="2dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tv_sync_url"
+            style="@style/FieldHint"
+            android:paddingTop="6dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tv_sync_counts"
+            style="@style/FieldHint"
+            android:paddingTop="6dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/btn_sync_now_settings"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginTop="6dp"
+            android:layout_marginEnd="16dp"
+            android:text="@string/set_sync_now"
+            android:textSize="14sp" />
+
+        <TextView style="@style/FieldHint" android:text="@string/set_sync_help" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="16dp"
+            android:background="@color/divider" />
+
+        <!-- ============ 下载 / 构建 ============ -->
+        <TextView style="@style/SectionTitle" android:text="@string/set_section_download" />
+
+        <TextView
+            android:id="@+id/tv_download"
+            style="@style/FieldHint"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp"
+            android:lineSpacingExtra="4dp"
+            android:text="@string/set_download_body"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="16dp"
+            android:background="@color/divider" />
+
+        <!-- ============ 关于 ============ -->
+        <TextView style="@style/SectionTitle" android:text="@string/set_section_about" />
+
+        <TextView
+            android:id="@+id/tv_about_version"
+            style="@style/FieldHint"
+            android:paddingTop="6dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tv_about_port"
+            style="@style/FieldHint"
+            android:paddingTop="6dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tv_about_face"
+            style="@style/FieldHint"
+            android:paddingTop="6dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tv_about_broadcast"
+            style="@style/FieldHint"
+            android:paddingTop="6dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tv_about_requests"
+            style="@style/FieldHint"
+            android:paddingTop="6dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tv_about_status"
+            style="@style/FieldHint"
+            android:paddingTop="6dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <!-- 蓝牙：本期不做，但要说清楚，不留一个点不动的假按钮 -->
+        <TextView
+            android:id="@+id/tv_about_bluetooth"
+            style="@style/FieldHint"
+            android:layout_marginTop="14dp"
+            android:paddingTop="10dp"
+            android:paddingBottom="10dp"
+            android:text="@string/about_bluetooth"
+            android:textColor="@color/warn"
+            android:textSize="13sp"
+            android:background="@color/surface_card" />
+    </LinearLayout>
+</ScrollView>

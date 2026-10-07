@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Sakana 投屏接收端的清单。
+
+  权限一共五个，全部是普通权限（安装时不弹授权框）：
+    INTERNET                     —— 拉流 + 起 HTTP 控制服务
+    ACCESS_NETWORK_STATE         —— 判断网络是否可用
+    ACCESS_WIFI_STATE            —— 拿 WifiManager 来申请 MulticastLock
+    CHANGE_WIFI_MULTICAST_STATE  —— 配合上一条，见 DiscoveryService 的注释
+    RECEIVE_BOOT_COMPLETED       —— 设置里"开机后尝试自动打开接收端"要用（默认关）
+  刻意**不**申请的：存储（不读本地视频）、定位（不扫描周围设备）、
+  WAKE_LOCK / FOREGROUND_SERVICE（保持常亮用 window flag 就够了，见 MainActivity）。
+
+  uses-feature 声明成 required="false" 是为了让电视盒子/平板这类
+  "没有触摸屏 / 不是手机"的设备也能装上。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!--
+      显式剔除 Media3 自带的 WAKE_LOCK 权限。
+
+      AndroidX Media3 的 AAR 清单里声明了 WAKE_LOCK（给 ExoPlayer.setWakeMode 用，
+      作用是在息屏时持有 CPU 锁继续解码）。本接收端靠 window 的 KEEP_SCREEN_ON 保持屏幕常亮，
+      从头到尾不会调用 setWakeMode，留着这个权限只会让安装时的权限提示变长。
+      tools:node="remove" 是清单合并期删除的官方做法。
+    -->
+    <uses-permission
+        android:name="android.permission.WAKE_LOCK"
+        tools:node="remove" />
+
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+
+    <application
+        android:name=".ReceiverApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="true">
+        <!--
+          usesCleartextTraffic="true" 的理由：番剧 CDN 里现在仍有相当一部分是纯 http
+          （尤其是老的 m3u8 直链），targetSdk 28 以后系统默认禁止明文流量，
+          不开这个开关的表现是"投屏后一直缓冲、日志里是 CLEARTEXT_NOT_PERMITTED"。
+          这是个接收端，只播放电脑端指定的地址，开明文不额外扩大攻击面。
+        -->
+
+        <!--
+          接收端主界面：全屏、横竖屏都不锁（fullSensor），旋转时不重建 Activity
+          （configChanges 里带上了 orientation|screenSize），
+          否则一转屏播放器就被拆掉重来、画面会中断。
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="fullSensor">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <!-- 电视盒子上也能出现在 Leanback 启动器里 -->
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          设置页：用非全屏主题（见 themes.xml 的说明），
+          键盘弹起时表单不会被顶乱；它只在应用内部跳转，所以 exported="false"。
+        -->
+        <activity
+            android:name=".SettingsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation"
+            android:exported="false"
+            android:label="@string/settings_title"
+            android:theme="@style/SettingsTheme"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!--
+          开机自启：只有用户在设置里打开了开关才会真的做点什么，
+          而且 Android 10+ 会拦下后台启动界面（见 BootReceiver 的注释）。
+        -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

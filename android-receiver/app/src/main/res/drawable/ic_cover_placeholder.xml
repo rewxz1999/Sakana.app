@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 封面占位图：一个"图片"图标。没封面或还没加载完时显示，避免留白洞。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <path
+        android:fillColor="#1F3742"
+        android:pathData="M8,10h32v28h-32z" />
+    <path
+        android:fillColor="#4A6B7A"
+        android:pathData="M14,32l7,-9l5,6l4,-5l6,8z" />
+    <path
+        android:fillColor="#4A6B7A"
+        android:pathData="M17,17a3,3 0 1,0 0,6a3,3 0 1,0 0,-6z" />
+</vector>

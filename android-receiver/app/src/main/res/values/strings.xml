@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 界面文案。全部走资源而不是写死在 Kotlin 里：以后要加语言只用加一个 values-xx 目录。
+         %1$s / %1$d 是格式化占位符，Kotlin 侧用 getString(id, 参数) 填充。 -->
+
+    <string name="app_name">Sakana 投屏接收端</string>
+    <string name="default_name">Android 接收端</string>
+
+    <!-- ================= 接收端主界面 ================= -->
+
+    <!-- 大字状态：一眼能看出"现在在干什么" -->
+    <string name="state_idle">等待投屏…</string>
+    <string name="state_playing">正在播放：%1$s</string>
+    <string name="state_paused">已暂停：%1$s</string>
+    <string name="state_buffering">缓冲中… %1$s</string>
+    <string name="state_ended">已播完：%1$s</string>
+    <string name="state_error">播放失败</string>
+    <string name="state_playing_no_title">正在播放</string>
+
+    <!-- 副状态：谁在连我 / 我现在该干什么 -->
+    <string name="detail_waiting">请让电脑搜索本设备</string>
+    <string name="detail_connected">已被 %1$s 连接</string>
+    <string name="detail_searching">电脑 %1$s 正在搜索本设备…</string>
+    <string name="detail_connected_before">上次连接：%1$s</string>
+    <string name="detail_usb">USB 共享网络（%1$s）：广播可能不通，可在设置里主动连接电脑</string>
+    <string name="detail_error">%1$s</string>
+    <string name="detail_notice">%1$s</string>
+
+    <!-- 地址行 -->
+    <string name="addr_label">本机地址</string>
+    <string name="addr_tap_to_copy">点一下复制</string>
+    <string name="addr_unavailable">控制服务未启动</string>
+
+    <!-- 空态 -->
+    <string name="empty_title">还没有开始投屏</string>
+    <string name="empty_hint">在电脑端 Sakana 播放器里点「投屏」，选择本设备\n也可以先在设置里让接收端主动连电脑</string>
+    <string name="open_settings">打开设置</string>
+
+    <!-- 控制栏的无障碍描述（也是电视遥控器聚焦时的朗读内容） -->
+    <string name="cd_prev">上一集</string>
+    <string name="cd_play">播放</string>
+    <string name="cd_pause">暂停</string>
+    <string name="cd_next">下一集</string>
+    <string name="cd_vol_down">音量减</string>
+    <string name="cd_vol_up">音量加</string>
+    <string name="cd_playlist">选集</string>
+    <string name="cd_settings">设置</string>
+    <string name="cd_back">返回</string>
+
+    <!-- 提示 -->
+    <string name="time_unknown">--:--</string>
+    <string name="toast_copied">已复制 %1$s</string>
+    <string name="toast_no_playlist">还没有播放列表</string>
+    <string name="toast_rule_mode">「%1$s」在规则模式下没有播放地址，请在电脑上切集</string>
+
+    <!-- 选集弹窗 -->
+    <string name="playlist_title">选集（共 %1$d 集）</string>
+    <string name="playlist_current">当前播放</string>
+    <string name="playlist_no_url">规则模式 · 请在电脑上切集</string>
+    <string name="close">关闭</string>
+
+    <!-- ================= 设置页 ================= -->
+
+    <string name="settings_title">投屏设置</string>
+    <string name="set_section_device">设备</string>
+    <string name="set_name_label">设备名</string>
+    <string name="set_name_hint">电脑端发现列表里显示的就是这个名字。改完最多 5 秒（下一次广播）电脑端就能看到。</string>
+    <string name="set_port_label">控制端口</string>
+    <string name="set_port_hint">默认 52889。被占用时接收端会自动顺延到下一个可用端口；真正在用的端口见下面「关于」。</string>
+    <string name="set_save">保存</string>
+
+    <string name="set_section_network">网络</string>
+    <string name="set_face_label">首选网络接口</string>
+    <string name="set_face_auto">自动选择（推荐）</string>
+    <string name="set_face_hint">设备有多块网卡时（Wi-Fi / USB 共享 / 蓝牙共享），请选「电脑能到达」的那一块。USB 网络共享通常是 rndis0、地址 192.168.42.x。选错的表现是：界面显示了一个电脑连不上的地址。</string>
+    <string name="set_face_none">没有检测到可用的网络接口</string>
+    <string name="set_peer_label">主动连接电脑（填电脑的局域网 IP）</string>
+    <string name="set_peer_hint">广播在 USB 网络共享 / 跨网段 / 开了 AP 隔离的 Wi-Fi 上常常不通。填上电脑 IP 后，接收端会每 5 秒直接向它发一次宣告，电脑就能发现本设备。\n端口可写可不写：宣告固定发到 52888，那是电脑监听宣告的端口。</string>
+    <string name="set_peer_button">连接电脑</string>
+    <string name="set_peer_recent">最近用过</string>
+    <string name="set_peer_empty">（还没有记录）</string>
+    <string name="set_peer_sent">已向 %1$s 发送宣告，请到电脑端的投屏列表里看看</string>
+    <string name="set_peer_bad">地址格式不对，正确示例：192.168.1.20</string>
+
+    <string name="set_section_behavior">行为</string>
+    <string name="set_keep_on">保持屏幕常亮</string>
+    <string name="set_keep_on_hint">屏幕一黑，Wi-Fi 会进省电，发现与控制都可能变得不稳。</string>
+    <string name="set_autoplay">收到投屏后自动播放</string>
+    <string name="set_autoplay_hint">关掉时只加载不播放，等电脑端按下播放。</string>
+    <string name="set_boot">开机后尝试自动打开接收端</string>
+    <string name="set_boot_hint">Android 10 及以上不允许应用在开机时自动弹出界面，所以这个开关在现代系统上不一定生效（开关本身会被保存）。</string>
+
+    <string name="set_section_about">关于</string>
+    <string name="about_version">版本</string>
+    <string name="about_protocol">协议</string>
+    <string name="about_port">当前监听端口</string>
+    <string name="about_face">当前网卡</string>
+    <string name="about_broadcast">当前广播地址</string>
+    <string name="about_requests">已响应请求数</string>
+    <string name="about_status">服务状态</string>
+    <string name="about_running">运行中</string>
+    <string name="about_stopped">未启动</string>
+    <string name="about_port_shifted">%1$d 被占用，已顺延到 %2$d</string>
+    <string name="about_bluetooth">蓝牙连接暂未支持，请用同一局域网或 USB 网络共享。</string>
+    <string name="about_protocol_line">Sakana 投屏协议 v%1$d（发现 UDP 52888 / 控制 HTTP）</string>
+
+    <!-- 设置保存后的提示 -->
+    <string name="toast_name_saved">设备名已改为「%1$s」，最多 5 秒后电脑端可见</string>
+    <string name="toast_port_saved">端口已保存为 %1$d，服务已重启</string>
+    <string name="toast_port_invalid">端口要在 1024–65535 之间</string>
+    <string name="toast_saved">已保存</string>
+    <string name="back">返回</string>
+
+    <!-- ================= 首页：收藏 / 历史 / 同步 ================= -->
+
+    <string name="section_favorites">收藏</string>
+    <string name="section_history">观看历史</string>
+    <string name="settings">设置</string>
+    <string name="sync_now">立即同步</string>
+
+    <string name="fav_empty">还没有从电脑同步收藏。\n连上电脑后会自动同步 —— 投屏一次，或在设置里「主动连接电脑」。</string>
+    <string name="hist_empty">还没有观看记录。\n投屏播放后会自动记在本机，并在下次同步时交给电脑。</string>
+
+    <string name="cd_cover">封面</string>
+    <string name="cd_exit_fs">退出全屏</string>
+
+    <!-- 同步状态行 -->
+    <string name="sync_status_offline">未连接电脑 · 投屏一次或让电脑搜索本设备后自动同步</string>
+    <string name="sync_status_syncing">正在同步…</string>
+    <string name="sync_status_connected">已连接 %1$s · %2$s · 收藏 %3$d · 历史 %4$d</string>
+    <string name="sync_pc_unknown">电脑</string>
+    <string name="sync_never">还没同步过</string>
+    <string name="sync_ago">%1$s 前同步</string>
+    <string name="sync_need_connection">还没有连上电脑，无法点播。请先投屏一次，或在设置里主动连接电脑。</string>
+    <string name="sync_command_ok">%1$s</string>
+
+    <!-- 收藏详情（长按） -->
+    <string name="fav_detail_name">原名：%1$s</string>
+    <string name="fav_detail_rating">评分：%1$s</string>
+    <string name="fav_detail_eps">集数：%1$d</string>
+    <string name="fav_detail_air">放送：%1$s</string>
+    <string name="fav_detail_genres">类型：%1$s</string>
+    <string name="fav_detail_id">Bangumi 条目 id：%1$d\n点一下即可让电脑解析播放源</string>
+    <string name="fav_detail_no_id">电脑端没有提供条目 id，接收端无法定位这部番 —— 请回到电脑上点播。</string>
+
+    <!-- 设置页：同步区 -->
+    <string name="set_section_sync">同步（与电脑）</string>
+    <string name="set_sync_state">同步状态</string>
+    <string name="set_sync_url">同步地址</string>
+    <string name="set_sync_counts">收藏 %1$d 条 · 历史 %2$d 条</string>
+    <string name="set_sync_now">立即同步</string>
+    <string name="set_sync_help">接收端会把收藏与观看历史缓存到本机（断网也能看），并在连上电脑后自动双向同步。\n点收藏里的番剧可以让**电脑**去解析播放源并投回本机 —— 接收端自己不取流。</string>
+
+    <!-- 设置页：下载电脑端 -->
+    <string name="set_section_download">下载 / 构建</string>
+    <string name="set_download_body">本 App 是电脑端 Sakana 播放器的配套接收端，随仓库一起分发，没有单独的应用商店版本。\n\n源码与说明：仓库的 android-receiver 目录（含 README 的构建步骤）。\n命令行构建：\n  cd android-receiver\n  .\\gradlew.bat assembleDebug\n产物：app\\build\\outputs\\apk\\debug\\app-debug.apk\n\n电脑端 Sakana 播放器：见项目主页的发布页 / 构建说明。</string>
+</resources>

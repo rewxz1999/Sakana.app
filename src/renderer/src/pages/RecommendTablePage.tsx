@@ -6,6 +6,8 @@ import {
   ChevronLeft,
   ChevronRight,
   ImageDown,
+  LayoutGrid,
+  Move,
   Palette,
   PanelLeftClose,
   PanelLeftOpen,
@@ -21,6 +23,7 @@ import { toast } from '@/stores/app'
 import {
   MAX_LONG_PAGES,
   useRecommendTable,
+  type ModuleKind,
   type RecommendPage,
   type RecommendPageInput,
   type RecommendPagePatch,
@@ -33,9 +36,10 @@ import { FittedRecommendCard } from '@/components/recommend/RecommendPageCard'
 import { SubjectPicker } from '@/components/recommend/SubjectPicker'
 import { PageEditDialog } from '@/components/recommend/PageEditDialog'
 import { BackgroundDialog } from '@/components/recommend/BackgroundDialog'
+import { ModuleLayoutDialog } from '@/components/recommend/ModuleLayoutDialog'
 import { ExportDialog } from '@/components/recommend/ExportDialog'
 import { buildExportDocument } from '@/components/recommend/exportHtml'
-import { cardWidthOfAll, displayName, sheetStyle } from '@/components/recommend/styles'
+import { backgroundKindText, displayName, sheetStyle } from '@/components/recommend/styles'
 
 /**
  * 「番剧推荐表」工具页（路由 `/tools/recommend-table`，v0.3.7 用户需求）。
@@ -64,19 +68,18 @@ import { cardWidthOfAll, displayName, sheetStyle } from '@/components/recommend/
  * 所以用户看到的卡片就是导出图上的卡片 —— 预览按容器**等比缩放**（宽高都塞得下，
  * 见 FittedRecommendCard），而不是自适应重排（重排会让小窗口里的版式和导出图不一样）。
  *
- * ============================ v0.3.7 追加的四条（用户实测后提的） ============================
+ * ============================ v0.3.8「推荐页自由布局」（用户实测后又提的一轮） ============================
  *
- * ① **整页不滚动**：预览按「容器宽高」两个比例里更小的那个缩放，卡片永远完整落在可视区里
- *    （`FittedRecommendCard` 量容器、不量自己）；缩放只影响屏幕呈现，导出像素与它无关。
- * ② **左侧「添加作品」可收起**（状态存 store 的 `panelHidden`），并新增「收藏」入口：
- *    收藏自带封面/评分/放送日期/类型标签，所以那条路连 backfill 都省了，
- *    还能勾选多部一次加入（store 的 `addPages` 只写一次盘）。
- * ③ **每页背景**：右键菜单 →「背景」，可选纯色 / 渐变 / 图片（见 `BackgroundDialog`）；
- *    背景按页存（理由见 store 的 RecommendBackground 注释），弹窗里另有「应用到所有页」；
- *    长图里每页各自的背景都会带出来（背景图走 `{{img:bgN}}` 预取）。
- * ④ **导出宽度按内容收紧**：`width` 不再是写死的 1200，而是 `doc.width`
- *    （= `cardWidthOfAll(选中页)`，见 styles.ts 文件头），所以导出图右边不会留一大块空白。
- */
+ * ① **背景图决定页面尺寸**：设了图片背景后，页面比例 = 背景图比例（宽仍固定 1200，
+ *    高按比例算，见 `styles.pageHeightOf`），预览继续等比缩放把整页塞进窗口。
+ * ② **模块化 + 自由拖动**：页面拆成 8 个模块（`MODULE_KINDS`），各有默认摆放（不改就是原来那套版式），
+ *    可以拖到任意位置、右下角把手改大小；坐标按页存（`page.layout`），老数据靠 `resolveModules` 回落。
+ * ③ **背景模糊 + 叠加渐变**：背景层可 `blur()`，其上可再叠一层带透明度的渐变（`background.blur/overlay`）。
+ * ④ **导出可勾选模块**：导出弹窗里逐块勾选；导出宽度固定 = 页面宽度（不再按内容收窄）。
+ *
+ * 模块名与坐标系的说明在 store 的 `ModuleRect` / `ModuleKind` 注释里，
+ * 「拖动坐标在缩放预览下为什么不会错位」在 `RecommendPageCard` 文件头与 `styles.toPagePx` 上。
+ *
 
 /** 导出保存对话框的标题（主进程直接显示它，所以写死一处，别在几个地方各拼一遍） */
 const EXPORT_TITLE = '导出推荐表为图片'
@@ -97,6 +100,8 @@ export function RecommendTablePage() {
   const addPages = useRecommendTable((s) => s.addPages)
   const updatePage = useRecommendTable((s) => s.updatePage)
   const removePage = useRecommendTable((s) => s.removePage)
+  const setModuleVisible = useRecommendTable((s) => s.setModuleVisible)
+  const resetModules = useRecommendTable((s) => s.resetModules)
   const applyBackground = useRecommendTable((s) => s.applyBackground)
   const backfill = useRecommendTable((s) => s.backfill)
   /** 左侧「添加作品」面板是否收起（偏好，落盘记住；用户要能隐藏它把窗口让给推荐卡） */
@@ -134,16 +139,17 @@ export function RecommendTablePage() {
 
   const currentPage: RecommendPage | null = pages[pageIndex] ?? null
 
-  /**
-   * 预览用的版式宽度：**整张表**取同一个值（各页需要宽度的最大值）。
-   *
-   * 为什么不用当前页自己的宽度：翻页时卡片宽度会一跳一跳（每部番的剧照数/理由长短不同），
-   * 看着很乱；而且长图导出用的正是「全部选中页的最大值」，预览用同一个口径才叫所见即所得。
-   * 空表时 cardWidthOfAll 给满宽（这时还没有内容可看）。
-   * 已知的一处细微差别：**只导当前页**时宽度会按这一页再收紧一点（≤ 预览宽度），
-   * 也就是单页导出图可能比预览略窄 —— 方向与用户要的「不留空白」一致，不会更差。
+  /*
+   * 版式宽度是**固定值**（`styles.RL.width` = 1200），不再"按内容收紧"：
+   * v0.3.8 用户明确要求「导出图片的最大宽度 = 推荐页宽度，不要再按内容另外收窄」。
+   * 页面高度由背景图的比例决定（`styles.pageHeightOf`），卡片自己会算，页面这边不用管。
    */
-  const previewWidth = useMemo(() => cardWidthOfAll(pages), [pages])
+
+  /**
+   * v0.3.8 第三轮：模块**只剩显示 / 隐藏**（用户取消了自定义移动），
+   * 所以这里只要一个「显示哪些模块」面板的开关 —— 拖动模式与选中态整条撤掉。
+   */
+  const [layoutOpen, setLayoutOpen] = useState(false)
 
   // ---------------- 添加作品 ----------------
 
@@ -257,7 +263,6 @@ export function RecommendTablePage() {
 
   const menuItems = useMemo<ContextMenuItem[]>(() => {
     if (!menu || !table || !currentPage) return []
-    const bg = currentPage.background
     return [
       {
         key: 'edit',
@@ -266,11 +271,15 @@ export function RecommendTablePage() {
         onSelect: () => setEditOpen(true)
       },
       {
-        // 标签直接写出当前状态（「背景：渐变」/「背景：无」）：右键菜单里最省事的确认方式
+        key: 'modules',
+        label: '显示哪些模块（隐藏 / 恢复）',
+        icon: <LayoutGrid size={13} />,
+        onSelect: () => setLayoutOpen(true)
+      },
+      {
+        // 标签直接写出当前状态（「背景：图片（左侧图区 · 模糊 8px）」）
         key: 'background',
-        label: `背景：${
-          !bg ? '无' : bg.kind === 'color' ? '纯色' : bg.kind === 'gradient' ? '渐变' : '图片'
-        }（点这里改）`,
+        label: `背景：${backgroundKindText(currentPage.background)}（点这里改）`,
         icon: <Palette size={13} />,
         onSelect: () => setBgOpen(true)
       },
@@ -291,6 +300,15 @@ export function RecommendTablePage() {
     ]
   }, [menu, table, currentPage, runBackfill])
 
+  /** 显示 / 隐藏一块（v0.3.8 第三轮之后，模块面板唯一的写操作） */
+  const handleModuleToggle = useCallback(
+    (id: ModuleKind, visible: boolean): void => {
+      if (!table || !currentPage) return
+      setModuleVisible(table.id, currentPage.id, id, visible)
+    },
+    [currentPage, table, setModuleVisible]
+  )
+
   const handleSavePage = useCallback(
     (patch: RecommendPagePatch): void => {
       if (!table || !currentPage) return
@@ -307,10 +325,14 @@ export function RecommendTablePage() {
   const [exporting, setExporting] = useState(false)
 
   const runExport = useCallback(
-    async (exportPages: RecommendPage[], scale: number): Promise<void> => {
+    async (exportPages: RecommendPage[], scale: number, modules: ModuleKind[]): Promise<void> => {
       if (!table) return
       if (exportPages.length === 0) {
         toast.warn('没有可导出的页面')
+        return
+      }
+      if (modules.length === 0) {
+        toast.warn('至少选一个模块再导出')
         return
       }
       // 双保险：弹窗里已经按 5 页卡过，这里再挡一次（将来别处调用也不会越过主进程的高度上限）
@@ -330,13 +352,17 @@ export function RecommendTablePage() {
           pageNos,
           pageCount: table.pages.length,
           tableName: table.name,
-          recommender
+          recommender,
+          // 用户勾选的模块白名单：没勾的不画，但页面尺寸与其它模块的位置完全不变
+          modules
         })
         const r = await api.tools.exportCardImage({
           title: EXPORT_TITLE,
           /*
-           * 宽度**用文档算出来的那个值**（按内容收紧，见 styles.ts 的文件头）。
-           * 这里写死 1200 就会在右边留一大块空白 —— 那正是用户反馈的问题 4。
+           * 宽度 = **页面宽度**（固定 1200，见 styles.RL.width）。
+           * v0.3.8 用户明确要求「导出图片的最大宽度 = 推荐页宽度，不要再按内容另外收窄」，
+           * 所以这里直接取文档算出来的宽度（它内部就是 RL.width），
+           * 与页面里模块的坐标系完全一致 —— 也就不会出现「内容只占左边一块」。
            */
           width: doc.width,
           html: doc.html,
@@ -380,7 +406,6 @@ export function RecommendTablePage() {
     },
     [recommender, table]
   )
-
   // ---------------- 渲染 ----------------
 
   /**
@@ -716,6 +741,10 @@ export function RecommendTablePage() {
                   ))}
                 </Select>
                 <div className="ml-auto flex items-center gap-2">
+                  {/* 模块只剩「显示 / 隐藏」（v0.3.8 第三轮取消了自定义移动） */}
+                  <Button size="sm" variant="ghost" icon={LayoutGrid} onClick={() => setLayoutOpen(true)}>
+                    模块
+                  </Button>
                   <Button size="sm" variant="ghost" icon={Palette} onClick={() => setBgOpen(true)}>
                     背景
                   </Button>
@@ -734,9 +763,9 @@ export function RecommendTablePage() {
               </div>
 
               {/*
-                预览：整页内容**完整落在可视区里**（FittedRecommendCard 同时按宽高缩放，
-                v0.3.7 追加需求 1），所以这里不再出现滚动条。
-                版式宽度用 `cardWidthOfAll(pages)`：翻页时卡片不跳，而且这正是长图导出会用的宽度。
+                预览：整页**完整落在可视区里**（FittedRecommendCard 同时按宽高缩放），所以不会出现滚动条。
+                页面宽度固定 1200，高度与"图区 / 内容区"的划分由 styles.frameOf 决定；
+                模块位置也由版式现算（moduleRectsOf），界面与导出用的是同一份几何。
                 右键绑在卡片本体上（点空白处不该弹菜单）。
               */}
               <div className="flex min-h-0 flex-1 flex-col rounded-xl" style={sheetStyle}>
@@ -747,7 +776,6 @@ export function RecommendTablePage() {
                   pageCount={pages.length}
                   tableName={table.name}
                   recommender={recommender}
-                  width={previewWidth}
                   onContextMenu={openCardMenu}
                 />
               </div>
@@ -783,7 +811,19 @@ export function RecommendTablePage() {
         }}
       />
 
-      {/* 导出（当前页 / 长图 + 推荐人 + 清晰度） */}
+      {/* 显示哪些模块（v0.3.8 第三轮：只剩显示 / 隐藏 + 全部显示） */}
+      <ModuleLayoutDialog
+        open={layoutOpen}
+        page={currentPage}
+        onToggle={handleModuleToggle}
+        onReset={() => {
+          if (!currentPage) return
+          resetModules(table.id, currentPage.id)
+        }}
+        onClose={() => setLayoutOpen(false)}
+      />
+
+      {/* 导出（当前页 / 长图 + 模块勾选 + 推荐人 + 清晰度） */}
       <ExportDialog
         open={exportOpen}
         tableName={table.name}
@@ -792,7 +832,7 @@ export function RecommendTablePage() {
         recommender={recommender}
         onRecommenderChange={setRecommender}
         exporting={exporting}
-        onExport={(list, scale) => void runExport(list, scale)}
+        onExport={(list, scale, mods) => void runExport(list, scale, mods)}
         onClose={() => setExportOpen(false)}
       />
 

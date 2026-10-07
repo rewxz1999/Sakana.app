@@ -45,7 +45,9 @@ const api: SakanaApi = {
   },
   store: {
     get: (ns) => call(CH.storeGet, ns),
-    set: (ns, data) => call(CH.storeSet, ns, data)
+    set: (ns, data) => call(CH.storeSet, ns, data),
+    /** 库数据（收藏/历史）被主进程改过（v0.3.8：手机端同步回来）时通知界面重新读 */
+    onChanged: (cb) => subscribe<[]>(CH.evLibrary, cb)
   },
   bangumi: {
     calendar: (force) => call(CH.bgmCalendar, force),
@@ -228,6 +230,19 @@ const api: SakanaApi = {
     open: (ruleId, keyword, bounds) => call(CH.rulesVerifyOpen, ruleId, keyword, bounds),
     setBounds: (bounds) => call(CH.rulesVerifyBounds, bounds),
     close: () => call(CH.rulesVerifyClose)
+  },
+  // v0.3.8：投屏（发现设备 / 投屏 / 遥控）
+  cast: {
+    discover: () => call(CH.castDiscover),
+    stopDiscover: () => call(CH.castStopDiscover),
+    addManual: (addr) => call(CH.castAddManual, addr),
+    play: (deviceId, media) => call(CH.castPlay, deviceId, media),
+    control: (deviceId, action, value) => call(CH.castControl, deviceId, action, value),
+    info: (deviceId) => call(CH.castInfo, deviceId),
+    stop: (deviceId) => call(CH.castStop, deviceId),
+    syncUrl: () => call(CH.castSyncUrl),
+    setTarget: (deviceId) => call(CH.castSetTarget, deviceId),
+    onDevices: (cb) => subscribe(CH.evCastDevices, cb)
   },
   ruleWebview: {
     open: (url, bounds, referer) => call(CH.ruleWebviewOpen, url, bounds, referer),

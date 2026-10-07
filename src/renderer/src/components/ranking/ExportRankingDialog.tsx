@@ -86,9 +86,12 @@ export function ExportRankingDialog({
         <div className="rounded-lg border border-border bg-elev1 p-3 text-[11px] leading-relaxed text-dim">
           表名「{table.name}」· {table.tiers.length} 档 · 排名区 {table.items.length} 部作品
           <br />
-          版式只保留「排名表信息 + 排名详细区域」，宽度按内容自动收紧：
-          <span className="text-text"> {layout.width}px</span> × {scale} 倍 =
-          <span className="text-text"> {layout.width * scale}px</span> 宽，高由内容决定。
+          版式只有「排名表信息 + 排名详细区域」，
+          <span className="text-text">每个等级一行</span>；宽度跟着内容走，取最宽的那一档（标签列 + 该档全部卡片）：
+          <br />
+          版式宽度 <span className="text-text">{layout.width}px</span> × 倍率 {scale} = 实际像素{' '}
+          <span className="font-semibold text-text">{layout.width * scale}px</span> 宽，高由内容决定。
+          <br />
           背景与标签配色用这张表自己的设置，不跟随应用主题。
         </div>
 
@@ -99,7 +102,9 @@ export function ExportRankingDialog({
 
         <div className="flex items-end gap-3">
           <div>
-            <div className="mb-1.5 text-xs font-semibold text-dim">清晰度</div>
+            <div className="mb-1.5 text-xs font-semibold text-dim">
+              清晰度（实际像素 = 版式宽度 × 倍率）
+            </div>
             <Select value={String(scale)} onChange={(e) => setScale(Number(e.target.value))} className="w-[128px]">
               {EXPORT_SCALES.map((s) => (
                 <option key={s} value={String(s)}>
@@ -110,6 +115,7 @@ export function ExportRankingDialog({
           </div>
           <div className="pb-2 text-[11px] leading-relaxed text-faint">
             点导出后会弹出系统保存对话框，位置和文件名都由你自己选。
+            {layout.width * scale > 8000 ? ' 当前尺寸偏大，觉得过大可以降到 2 倍。' : ''}
           </div>
         </div>
 

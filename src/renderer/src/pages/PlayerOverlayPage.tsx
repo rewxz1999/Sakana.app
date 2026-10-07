@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Camera,
+  Cast,
   Crop,
   Expand,
   Info,
@@ -27,7 +28,7 @@ import {
   X
 } from 'lucide-react'
 import type { OverlayAction, OverlayDanmaku, OverlayEpisodes, OverlayState } from '@shared/api'
-import type { Anime4kSettings, AspectMode, SubjectDetail } from '@shared/types'
+import type { Anime4kSettings, AspectMode, CastDevice, CastReceiverInfo, SubjectDetail } from '@shared/types'
 import { ANIME4K_MODES, ANIME4K_TIERS } from '@shared/anime4k'
 import { api } from '@/lib/api'
 import { StreamInfoModal } from '@/components/StreamInfoModal'
@@ -315,6 +316,17 @@ export default function PlayerOverlay(): React.ReactElement {
   const [showInfo, setShowInfo] = useState(false)
   /** 选集浮层里正在查看的线路（悬浮窗本地状态，切换线路不打断播放） */
   const [browseLine, setBrowseLine] = useState(0)
+  /**
+   * 投屏（v0.3.8）：面板开关、设备列表、手动填的地址、投屏中的设备与它的状态。
+   *
+   * 为什么投屏 UI 在悬浮窗里：画面是原生子窗口，画在播放页里的面板会被它整个盖住
+   * （选集/详情面板都因为同一个原因放在这里）。开始投屏这个动作则**发回播放页**执行 ——
+   * "这一集是什么地址 / Referer / 播放列表"只有播放页知道。
+   */
+  const [castPanel, setCastPanel] = useState(false)
+  const [castDevices, setCastDevices] = useState<CastDevice[]>([])
+  const [castDevice, setCastDevice] = useState<CastDevice | null>(null)
+  const [castInfo, setCastInfo] = useState<CastReceiverInfo | null>(null)
   /** 番剧详情（打开详情浮层时自己去拉，避免主窗口往高频状态里塞大对象） */
   const [detail, setDetail] = useState<SubjectDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -383,6 +395,47 @@ export default function PlayerOverlay(): React.ReactElement {
   useEffect(() => api.overlay.onEpisodes(setEpisodes), [])
   // 弹幕数据（v0.2.8，低频）：同样由播放页推送
   useEffect(() => api.overlay.onDanmaku(setDanmaku), [])
+
+  // ---------------- 投屏（v0.3.8） ----------------
+
+  /**
+   * 刷新设备列表：`discover()` 会启动（或复用）主进程的发现线程，
+   * 之后设备变化走 `onDevices` 推过来 —— 面板打开着就能看到设备自己冒出来。
+   */
+  const refreshCastDevices = useCallback(async (): Promise<void> => {
+    const r = await api.cast.discover()
+    if (r.ok) setCastDevices(r.data)
+  }, [])
+
+  useEffect(() => {
+    const off = api.cast.onDevices((list) => setCastDevices(list))
+    return () => off()
+  }, [])
+
+  /** 手动登记一台设备已挪到**设置页**（用户要求：播放器里不放 IP 输入框），这里不再提供 */
+
+  /**
+   * 投屏开始后由播放页把设备号记在这里 —— 怎么知道"正在投屏"？
+   * 播放页执行 `castPlay` 成功后没有回推事件，所以这里用「面板里最后一次选择的设备」
+   * 来记住它：用户点了设备就当作已经开始（失败时播放页会 toast 提示，这里再点一次即可）。
+   */
+  useEffect(() => {
+    if (!castDevice) return
+    let alive = true
+    const tick = async (): Promise<void> => {
+      const r = await api.cast.info(castDevice.id)
+      if (alive && r.ok) setCastInfo(r.data)
+    }
+    void tick()
+    // 2 秒一次：这是"遥控器"的状态回读，太频繁没有意义（电视端状态本来就秒级变化）
+    const timer = window.setInterval(() => void tick(), 2000)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+    }
+  }, [castDevice])
+
+  const castActive = castDevice !== null
 
   // 打开详情浮层时拉一次番剧详情（悬浮窗有完整的 api 能力）
   const showInfoPanel = state?.showInfo === true
@@ -1410,12 +1463,118 @@ export default function PlayerOverlay(): React.ReactElement {
                 <Maximize size={18} />
               </IconBtn>
             )}
+            {/*
+              投屏（v0.3.8）。放在「全屏 / 退出」左边：它属于"输出到哪"这一类动作，
+              与画面比例、全屏同组，符合用户找它的习惯。
+              面板也画在悬浮窗里 —— 画面是原生子窗口，画在播放页里的面板会被它整个盖住。
+            */}
+            <IconBtn
+              title={castActive ? `正在投屏：${castDevice?.name ?? ''}` : '投屏到电视 / 接收端'}
+              active={castPanel}
+              onClick={() => {
+                setCastPanel(!castPanel)
+                setSubMenu(false)
+                setAspectMenu(false)
+                if (!castPanel) void refreshCastDevices()
+              }}
+            >
+              {castActive ? <Cast size={18} className="text-accent" /> : <Cast size={18} />}
+            </IconBtn>
             <IconBtn title="退出播放" onClick={() => send({ type: 'exitPlayer' })}>
               <LogOut size={18} />
             </IconBtn>
           </div>
         </div>
       </div>
+
+      {/* 投屏面板（v0.3.8）：设备列表 + 手动连接 + 投屏中的遥控 */}
+      {castPanel ? (
+        <div className="absolute bottom-[92px] right-4 z-50 w-[330px] rounded-xl border border-white/10 bg-black/85 p-3 text-white/90 shadow-2xl backdrop-blur">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-medium">投屏</span>
+            <button className="rounded px-1.5 py-0.5 text-[11px] text-white/60 hover:bg-white/10" onClick={refreshCastDevices}>
+              刷新
+            </button>
+          </div>
+          {castActive ? (
+            <div className="mt-2 rounded-lg bg-white/5 p-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="truncate text-[12px]">{castDevice?.name ?? '已连接的设备'}</span>
+                <span className="shrink-0 text-[10px] text-accent">投屏中</span>
+              </div>
+              <div className="mt-1 text-[10px] leading-relaxed text-white/50">
+                {castInfo
+                  ? `${castInfo.state === 'playing' ? '播放中' : castInfo.state ?? '已连接'} · ${Math.floor((castInfo.positionMs ?? 0) / 1000)}s${castInfo.durationMs ? ` / ${Math.floor(castInfo.durationMs / 1000)}s` : ''}${castInfo.total ? ` · 第 ${(castInfo.index ?? 0) + 1}/${castInfo.total} 集` : ''}`
+                  : '这台电视不支持查询状态（DLNA）；用电视遥控器或下面按钮控制'}
+              </div>
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                <Chip onClick={() => send({ type: 'castControl', action: 'pause' })}>暂停</Chip>
+                <Chip onClick={() => send({ type: 'castControl', action: 'resume' })}>继续</Chip>
+                <Chip
+                  onClick={() => {
+                    send({ type: 'castStop' })
+                    setCastDevice(null)
+                    setCastInfo(null)
+                  }}
+                >
+                  停止投屏
+                </Chip>
+              </div>
+              {castInfo?.titles && castInfo.titles.length > 0 ? (
+                <div className="mt-2 max-h-32 overflow-y-auto rounded border border-white/10">
+                  {castInfo.titles.map((t, i) => (
+                    <div
+                      key={`${t}-${i}`}
+                      className={`truncate px-2 py-1 text-[11px] ${i === castInfo.index ? 'bg-accent/20 text-accent' : 'text-white/70'}`}
+                    >
+                      {t}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              <div className="mt-1.5 text-[10px] leading-relaxed text-white/40">
+                投屏期间本机播放已暂停（把带宽让给电视）。换集请在电脑上操作 —— 会自动把新的一集推给同一台设备。
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="mt-2 max-h-56 overflow-y-auto">
+                {castDevices.length === 0 ? (
+                  <div className="px-1 py-3 text-[11px] leading-relaxed text-white/50">
+                    没有发现设备。请确认电视与本机在同一个网络，
+                    或让安卓接收端保持打开；也可以直接在下面填地址。
+                  </div>
+                ) : (
+                  castDevices.map((d) => (
+                    <button
+                      key={d.id}
+                      className="flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-left hover:bg-white/10"
+                      onClick={() => {
+                        send({ type: 'castPlay', deviceId: d.id })
+                        setCastDevice(d)
+                        setCastInfo(null)
+                        setCastPanel(false)
+                      }}
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate text-[12px]">{d.name}</span>
+                        <span className="block text-[10px] text-white/40">
+                          {d.kind === 'sakana' ? 'Sakana 接收端（直连，最流畅）' : 'DLNA 电视'}
+                        </span>
+                      </span>
+                      <Cast size={14} className="shrink-0 text-accent" />
+                    </button>
+                  ))
+                )}
+              </div>
+              <div className="mt-2 border-t border-white/10 pt-2 text-[10px] leading-relaxed text-white/45">
+                有线共享网络 / 其它网段时自动发现不生效：请在「设置 → 播放器设置 → 投屏」里手动填接收端显示的 IP:端口
+                （按用户要求，这一项已经挪到设置里，播放器里不再放输入框）。
+              </div>
+            </>
+          )}
+        </div>
+      ) : null}
 
       {/* 流详情弹窗（与播放页里的那个是同一组件，两处口径一致） */}
       <StreamInfoModal open={showInfo} onClose={() => setShowInfo(false)} />

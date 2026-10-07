@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 退出全屏：四个向内的角（Material 的 fullscreen_exit）。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5,16h3v3h2v-5H5v2z M8,8H5v2h5V5H8v3z M14,19h2v-3h3v-2h-5v5z M16,8V5h-2v5h5V8h-3z" />
+</vector>

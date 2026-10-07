@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
-import { CheckCircle2, MonitorPlay, RefreshCw, Sparkles, TriangleAlert, XCircle } from 'lucide-react'
+import { CheckCircle2, Copy, Download, Link2, MonitorPlay, RefreshCw, Sparkles, TriangleAlert, XCircle } from 'lucide-react'
 import type { PlayerAssets } from '@shared/api'
+import type { CastDevice } from '@shared/types'
 import {
   ANIME4K_MODES,
   ANIME4K_TIERS,
@@ -216,6 +217,71 @@ export function PlayerSettingsPage() {
   const { settings, save } = useSettings()
   const [assets, setAssets] = useState<PlayerAssets | null>(null)
   const [checking, setChecking] = useState(false)
+  /** 投屏：手动连接的地址输入、已连接的移动端、本机同步地址（v0.3.8） */
+  const [castAddr, setCastAddr] = useState('')
+  const [castTarget, setCastTarget] = useState<CastDevice | null>(null)
+  const [syncUrl, setSyncUrl] = useState('')
+
+  /**
+   * 接收端工程的仓库地址（用户要求"投屏设置里增加下载地址"）。
+   *
+   * 前两条分别是"直接下载可安装的 APK"与"看源码/构建说明"：
+   * `dist/` 下的 APK 是 debug 签名（能直接装，适合自用）；要正式分发得自己换 keystore 重新签名。
+   */
+  const RECEIVER_REPO = 'https://github.com/rewxz1999/Sakana.app/tree/main/android-receiver'
+  const RECEIVER_APK =
+    'https://github.com/rewxz1999/Sakana.app/raw/main/android-receiver/dist/SakanaReceiver-0.3.8-debug.apk'
+
+  const refreshSync = async (): Promise<void> => {
+    const [url, devices] = await Promise.all([api.cast.syncUrl(), api.cast.discover()])
+    if (url.ok) setSyncUrl(url.data)
+    if (devices.ok) setCastTarget(devices.data.find((d) => d.kind === 'sakana') ?? null)
+  }
+
+  const connectByHand = async (): Promise<void> => {
+    const addr = castAddr.trim()
+    if (!addr) {
+      toast.warn('请先填接收端的 IP:端口（接收端主界面顶部就显示着）')
+      return
+    }
+    const r = await api.cast.addManual(addr)
+    if (!r.ok) {
+      toast.error(`连接失败：${r.error}`)
+      return
+    }
+    if (!r.data) {
+      toast.error('连不上这个地址：确认接收端已打开、且与本机在同一网络（或已 USB 共享网络）')
+      return
+    }
+    await api.cast.setTarget(r.data.id)
+    setCastTarget(r.data)
+    setCastAddr('')
+    toast.success(`已连接 ${r.data.name}`)
+  }
+
+  const openReceiverRepo = (): void => {
+    // 走系统浏览器：主进程的 setWindowOpenHandler 会把 http 外链交给默认浏览器
+    window.open(RECEIVER_REPO, '_blank')
+  }
+
+  /** 直接下载 APK（浏览器打开 raw 链接即可下载） */
+  const openReceiverApk = (): void => {
+    window.open(RECEIVER_APK, '_blank')
+  }
+
+  const copyReceiverUrl = async (): Promise<void> => {
+    // 纯文本复制直接用 Chromium 的剪贴板 API（Electron 里可用，也不需要额外 IPC）
+    try {
+      await navigator.clipboard.writeText(RECEIVER_REPO)
+      toast.success('已复制接收端仓库地址')
+    } catch (err) {
+      toast.error(`复制失败：${String((err as Error)?.message ?? err)}`)
+    }
+  }
+
+  useEffect(() => {
+    void refreshSync()
+  }, [])
 
   const detect = async (): Promise<void> => {
     setChecking(true)
@@ -815,6 +881,103 @@ export function PlayerSettingsPage() {
             拿不到任何真实音频数据。与其画一个跟声音无关的假动画，不如画上面那条
             <strong className="font-medium text-dim">由你自己的 EQ 设置算出来的音色响应曲线</strong> ——
             调均衡器时真正想看的其实是它。
+          </div>
+        </div>
+      </Card>
+
+      {/*
+        投屏（v0.3.8，用户要求「投屏相关设置记得添加到设置中」）。
+        这里的策略直接决定投屏流畅度，所以每一项都写清代价。
+      */}
+      <Card title="投屏" desc="把当前这一集投到电视（DLNA）或本仓库的安卓接收端；控制栏「投屏」按钮里选设备">
+        <div className="flex flex-col gap-2.5">
+          <div className="flex gap-2">
+            {(
+              [
+                { v: 'auto' as const, label: '自动（推荐）', desc: '给电视时重封装成 MP4（-c:v copy，不重编码）以兼容大多数电视；Sakana 接收端直连' },
+                { v: 'direct' as const, label: '只用直连', desc: '电脑完全不参与传输，但站点校验 Referer 时电视会 403' },
+                { v: 'relay' as const, label: '只用中转（HLS 直通）', desc: '电脑只转发字节、不重封装；电视确认支持 HLS 时用它，能拖进度' },
+                { v: 'transcode' as const, label: '中转并转码', desc: '转成 H.264/AAC；电视解不了 HEVC 时才用，会明显增加延迟与画质损失' }
+              ] as const
+            ).map((o) => (
+              <button
+                key={o.v}
+                onClick={() => save({ castStrategy: o.v })}
+                className={`flex-1 rounded-xl border px-3 py-2.5 text-left transition-colors ${
+                  (settings.castStrategy ?? 'auto') === o.v
+                    ? 'border-accent bg-accent-soft'
+                    : 'border-border hover:border-accent/50'
+                }`}
+              >
+                <div className="text-xs font-semibold text-text">{o.label}</div>
+                <div className="mt-0.5 text-[10px] leading-snug text-faint">{o.desc}</div>
+              </button>
+            ))}
+          </div>
+          <p className="text-[11px] leading-relaxed text-faint">
+            投屏时本机播放会自动暂停，把带宽让给电视（同一路流在两处同时拉会互相抢带宽）。
+            中转服务只监听局域网、端口 52890，不做任何重编码；投屏结束后自动停止。
+            有线共享网络或跨网段时自动发现不生效，请用下面的「手动连接」填接收端显示的 IP:端口。
+          </p>
+          {/*
+            手动连接（v0.3.8：按用户要求从播放器的投屏面板**挪到设置里**）。
+            广播发现到不了的地方（USB 网络共享、跨网段、AP 隔离）只能手填地址，
+            所以它是"兜底入口"而不是装饰。
+          */}
+          <div className="rounded-xl border border-border px-3 py-2.5">
+            <div className="text-xs font-semibold text-text">手动连接移动端</div>
+            <div className="mt-1.5 flex gap-2">
+              <Input
+                placeholder="接收端显示的 IP，例如 192.168.42.129:52889"
+                value={castAddr}
+                onChange={(e) => setCastAddr(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void connectByHand()
+                }}
+              />
+              <Button size="sm" icon={Link2} onClick={() => void connectByHand()}>
+                连接
+              </Button>
+            </div>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-faint">
+              地址在接收端应用的主界面顶部（点一下即可复制）。连接成功后电脑会记住它，之后投屏默认给这台设备。
+              {castTarget ? ` 当前已连接：${castTarget.name}` : ' 当前未连接任何移动端。'}
+            </p>
+          </div>
+          {/* 同步状态：手机端靠这个地址拉收藏/历史（也会随投屏自动告诉手机） */}
+          <div className="rounded-xl border border-border px-3 py-2.5">
+            <div className="text-xs font-semibold text-text">双端同步</div>
+            <p className="mt-1 text-[11px] leading-relaxed text-faint">
+              连上移动端后会自动同步：把电脑的收藏与观看历史给它，也接收它那边的观看历史合并回来。
+              手机端会把这个地址（本机局域网地址）连同投屏一起收到，无需手动配置。
+            </p>
+            <div className="mt-1.5 flex items-center gap-2">
+              <code className="min-w-0 flex-1 truncate rounded bg-elev2 px-2 py-1 text-[11px] text-dim">
+                {syncUrl || '同步服务未启动'}
+              </code>
+              <Button size="sm" variant="outline" onClick={() => void refreshSync()}>
+                刷新
+              </Button>
+            </div>
+          </div>
+          {/* 接收端下载入口（用户要求：投屏设置里给出下载地址） */}
+          <div className="rounded-xl border border-border px-3 py-2.5">
+            <div className="text-xs font-semibold text-text">安卓接收端</div>
+            <p className="mt-1 text-[11px] leading-relaxed text-faint">
+              极简的安卓投屏接收端（约 1 MB 的 release 包，装到手机/平板/盒子上打开即可被搜到）。
+              仓库地址：github.com/rewxz1999/Sakana.app 的 <code>android-receiver/</code> 目录。
+            </p>
+            <div className="mt-1.5 flex flex-wrap gap-2">
+              <Button size="sm" icon={Download} onClick={() => openReceiverApk()}>
+                下载安卓接收端 APK
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => openReceiverRepo()}>
+                仓库目录 / 构建说明
+              </Button>
+              <Button size="sm" variant="ghost" icon={Copy} onClick={() => void copyReceiverUrl()}>
+                复制地址
+              </Button>
+            </div>
           </div>
         </div>
       </Card>

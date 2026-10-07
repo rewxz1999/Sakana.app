@@ -6,11 +6,12 @@ import { coverFields } from '@/stores/customHistory'
 /**
  * 「作品评级排名表」（工具页入口 /tools/ranking，v0.3.7 用户需求）的数据层。
  *
- * 用户在做什么：新建一张表（自定义表名 + 选一套等级标签 + 每个标签可自定义颜色），
+ * 用户在做什么：新建一张表（自定义表名 + 选一套等级标签 + 每个标签可自定义颜色与内容），
  * 自建作品池（最多 5 个）放在**左侧**（可折叠），把收藏 / 书签 / galgame 库里的作品导入池子、
  * 或用池子里的搜索框搜番剧与 galgame 加进池子，再把作品**拖**到右侧等级里排位。
- * 拖到**两个等级的分界线**上时，作品**骑缝**：中心挂在分界线上，并且**上下两档各算它占了一个位置**。
- * 排完导出成一张高清图片（只有「排名表信息 + 排名详细区域」，版式宽度按内容收紧）。
+ * 拖到**两个等级的分界线**上时作品**骑缝**：封面中心压在分界线上、同时计入上下两档，且排在这两档所有作品的最后。
+ * 排完导出成一张高清图片：只有「排名表信息 + 排名详细区域」，**每个等级一行**，
+ * **宽度等于最宽那一行的实际内容宽度**（不再固定、不再换行）。
  *
  * ============================ 数据怎么存 ============================
  *
@@ -36,22 +37,25 @@ import { coverFields } from '@/stores/customHistory'
  * ③ **「骑缝」= `straddle: true`，语义是「同时属于上下两档」，不是「第三档」。**
  *    v1 曾把它写成 `between`（介于两档之间的第三个位置）：那样它既不属于上一档也不属于下一档，
  *    档内计数、导出排版、右键换级都要为它单开一套逻辑。现在按用户要求改成
- *    「作品中心挂在分界线上（视觉骑缝）+ 上下两档各占一个位置（语义双属）」：
+ *    「**封面中心**压在分界线上（视觉骑缝）+ 同时计入上下两档（语义双属）」：
  *    `tierIndex` 始终表示**上方那一档**，`straddle` 表示它同时计入 `tierIndex` 与 `tierIndex + 1`。
  *    好处是所有「这一档里有什么」的问题都能用一个函数回答（`itemsOfTier`），
  *    不需要再在每个调用点记得把"半档"也算进来。老数据里的 `between: true` 在收窄时直接映射成
  *    `straddle: true` —— 语义一致（都在两档之间），不会丢作品。
+ *    另外用户这轮要求：骑缝作品**永远排在这两档所有作品的最后面**，所以放置时忽略落点锚点（见 withPlaced）。
  *
  * ④ **`items` 是一维数组，靠稳定的槽位排序保持「同一格内的先后」。**
  *    每个槽位（第 i 档本身 / 第 i 档与下一档的分界线）用 `slotRank = tierIndex * 2 + (straddle ? 1 : 0)`
  *    排序，同槽位内保持原有相对顺序（JS 的 Array.sort 是稳定排序）。渲染时按槽位过滤即可，
  *    不需要再维护一套嵌套结构；拖动重排也只是「按锚点插入 + 重新排序」两步。
+ *    ⚠️ 这里的「顺序」只决定**同一行内的先后**：界面上每一档只有一行、不换行（用户要求），
+ *    一行放不下的部分靠横向滚动看，宽度由 `rankRowLayouts` 统一算（界面与导出共用）。
  *
  * ⑤ **同一部作品在一张表里只允许出现一次**（无论在池子里还是排名区里）。
  *    这是「排名表」这个东西的语义要求：同一部番出现两次，这张表就没有意义了。
  *    （骑缝作品在**两档里各占一位**，但它在 `items` 里仍然只有一条记录、在池子里也仍然只有一份。）
  *
- * ⑥ **等级是 `{ name, color }` 而不是裸字符串**，因为用户要求标签可自定义颜色，
+ * ⑥ **等级是 `{ name, color }` 而不是裸字符串**，因为用户要求标签可自定义颜色与内容，
  *    而且导出图必须用**同一套颜色**。把颜色和标签存在一起（而不是另开一个平行数组）后，
  *    「删掉中间某一档」「把标签排序」这类操作不可能把颜色错位配到别的标签上。
  */
@@ -87,23 +91,28 @@ export const BACKGROUND_PRESETS: { value: string; label: string }[] = [
 ]
 
 /**
- * 导出图的版式宽度上限与下限（CSS 像素）。
+ * 导出图的版式宽度上下限（CSS 像素）。
  *
- * v1 固定 1400：档数少、作品少时右边会空出一大片（用户反馈「长图右侧不要留大片空白」）。
- * 现在宽度**按内容算**（见 exportLayout）：够用就窄，最多不超过上限。
- * 上下限都保留是为了两头都好看 —— 太窄的图连标题都排不开，太宽的图在聊天软件里会被压得看不清。
+ * v1 固定 1400、v2 按"最挤那一档的列数"估算 —— 都不是用户要的：用户要的是
+ * **每个等级只有一行，导出宽度就等于最宽的那一行的实际内容宽度**（见 exportLayout）。
+ * 所以上限放到 4000（主进程 exportCardImage 的入参范围也是 600–4000），下限保留 720
+ * 是因为再窄连标题与标签列都排不开。宽度够用时绝不夹紧，不会出现右侧大片空白。
  */
 export const EXPORT_MIN_WIDTH = 720
-export const EXPORT_MAX_WIDTH = 1600
+export const EXPORT_MAX_WIDTH = 4000
 
-/** 导出倍率（实际像素 = 版式宽度 × scale）。默认 2 倍，上限 3（主进程的硬上限也是 3） */
+/**
+ * 导出倍率。默认 **3 倍**（用户要求"加强清晰度"；实际像素 = 版式宽度 × 倍率），上限仍是 3（主进程硬上限）。
+ * 注意：宽度跟着内容走之后，一张 3000px 宽的版式 3 倍就是 9000px —— 主进程按 Chromium 的安全值兜着，
+ * 弹窗里也会把实际像素写清楚，用户觉得太大可以自己降到 1–2 倍。
+ */
 export const EXPORT_SCALES = [1, 2, 3] as const
-export const DEFAULT_EXPORT_SCALE = 2
+export const DEFAULT_EXPORT_SCALE = 3
 
-/** 作品来源。三种来源在列表与导出图里都要能区分（用户明确要求） */
+/** 作品来源。三种来源在**数据**里必须区分（右键菜单/提示里也照实写），但卡面上不再挂角标（用户要求去掉） */
 export type RankingSource = 'bangumi' | 'galgame' | 'manual'
 
-/** 来源的界面文案。导出图里也用它当小角标，所以别写成「番剧(合集)」这种长词 */
+/** 来源的界面文案。用在鼠标悬停提示与右键菜单里（用户明确不要卡片下面那一行标签） */
 export const SOURCE_LABELS: Record<RankingSource, string> = {
   bangumi: '番剧',
   galgame: 'galgame',
@@ -576,6 +585,238 @@ export function tiersOfItem(item: RankedItem): number[] {
   return item.straddle ? [item.tierIndex, item.tierIndex + 1] : [item.tierIndex]
 }
 
+/**
+ * 把颜色按比例压暗（用于标签色块的左边条 / 边框：需要一个"同色的深一档"）。
+ * 只在 sRGB 上做线性缩放 —— 标签底色都是用户随手挑的纯色，这一步不需要真正的色彩空间转换。
+ */
+export function darkenColor(color: string, amount = 0.28): string {
+  if (!isHexColor(color)) return '#1b1b1f'
+  const k = Math.min(0.9, Math.max(0, amount))
+  const channel = (hex: string): string => {
+    const v = Math.round(parseInt(hex, 16) * (1 - k))
+    return Math.max(0, Math.min(255, v)).toString(16).padStart(2, '0')
+  }
+  return `#${channel(color.slice(1, 3))}${channel(color.slice(3, 5))}${channel(color.slice(5, 7))}`
+}
+
+/**
+ * 一档在版面里的几何（**界面画布与导出图共用这一份计算**，两侧排版不会各自漂移）。
+ *
+ * 用户这轮的两条硬要求都落在这里：
+ *   ① **每个等级只有一行**：所以一行的宽度就是该档作品卡的宽度之和（不换行、不折行）；
+ *   ② **骑缝作品排在这两档所有作品的最后面**：所以骑缝带的左偏移取上下两档中较长的那一行，
+ *      并且两档的长度都要把这条带算进去（骑缝在两档里各占居末尾的位置）。
+ */
+export interface RankRow {
+  tierIndex: number
+  /** 坐在这一档里的作品 */
+  seated: RankedItem[]
+  /** 骑在这一档与下一档分界线上的作品（最后一行没有） */
+  below: RankedItem[]
+  /** 本档自己作品的宽度（空档为 0） */
+  seatedW: number
+  /** 骑缝带相对作品区起点的左偏移 */
+  bandLeft: number
+  /** 骑缝带的宽度（没有骑缝作品时为 0） */
+  bandW: number
+  /** 本行连同骑缝带在内的总宽（含标签列，相对内容原点） */
+  rowW: number
+}
+
+export interface RankRowMetrics {
+  cardW: number
+  gap: number
+  labelW: number
+  labelGap: number
+  /**
+   * 每一行除了"标签列 + 作品"之外还要占掉的横向宽度（界面里是档位卡的内边距与边框，见 TierBoard）。
+   * 导出图的行没有内边距，所以不传（默认 0）—— 两侧共用同一个函数，但各自的"壳"不同。
+   */
+  rowChrome?: number
+}
+
+export function rankRowLayouts(
+  table: RankingTable,
+  metrics: RankRowMetrics
+): { rows: RankRow[]; contentW: number } {
+  const { cardW, gap, labelW, labelGap, rowChrome = 0 } = metrics
+  const widthOf = (n: number): number => (n > 0 ? n * cardW + (n - 1) * gap : 0)
+  const rows: RankRow[] = table.tiers.map((_, i) => {
+    const seated = seatedItemsOfTier(table.items, i)
+    const below = straddleItemsAt(table.items, i)
+    return {
+      tierIndex: i,
+      seated,
+      below,
+      seatedW: widthOf(seated.length),
+      bandLeft: 0,
+      bandW: widthOf(below.length),
+      rowW: 0
+    }
+  })
+  rows.forEach((row, i) => {
+    const next = rows[i + 1]
+    // 骑缝带排在两档所有作品的后面（见上面 ②）
+    row.bandLeft = next ? Math.max(row.seatedW, next.seatedW) : 0
+  })
+  rows.forEach((row) => {
+    const worksStart = labelW + labelGap
+    const bandEnd = worksStart + row.bandLeft + (row.bandW > 0 ? gap + row.bandW : 0) + rowChrome
+    row.rowW = Math.max(worksStart + row.seatedW + rowChrome, bandEnd)
+  })
+  const contentW = rows.reduce((max, row) => Math.max(max, row.rowW), labelW + labelGap + rowChrome)
+  return { rows, contentW }
+}
+
+// ------------------------------------------------------------------
+// 纯函数：整块画布的几何（骑缝卡片为什么不会压到别人，全靠这里）
+// ------------------------------------------------------------------
+
+/**
+ * 画布尺寸参数（界面侧的排版常量，见 TierBoard 的 layoutFor）。
+ * 全部是"内容盒子"里的相对坐标：x 从左内边距开始、y 从画布内容顶端开始。
+ */
+export interface BoardMetrics {
+  /** 档位卡（每一档那张卡）的高度 */
+  rowH: number
+  /** 两档之间**没有**骑缝时的间距 */
+  rowGap: number
+  /** 两档之间**有**骑缝时，那条独立骑缝条的高度 */
+  stripH: number
+  cardW: number
+  cardH: number
+  cardGap: number
+  /** 标签列宽 */
+  labelW: number
+  /** 标签列与作品行之间的间距 */
+  labelGap: number
+  /** 档位卡自己的内边距 + 边框（上下/左右各一份） */
+  rowPad: number
+  /** 作品行自己的内边距 */
+  worksPad: number
+}
+
+/** 一张作品卡在画布里的矩形（给渲染与"任意两张卡不相交"的自测共用） */
+export interface BoardCardBox {
+  workId: string
+  /** seated = 坐在某一档里；straddle = 骑在两档分界线上 */
+  kind: 'seated' | 'straddle'
+  /** 计入的**上方**那一档（骑缝时是分界线上方那一档） */
+  tierIndex: number
+  left: number
+  top: number
+  width: number
+  height: number
+}
+
+/** 画布上的一块：档位行，或两档之间那条骑缝条 */
+export interface BoardBlock {
+  kind: 'row' | 'strip'
+  tierIndex: number
+  top: number
+  height: number
+  /** 相对上一块下沿的间距（渲染时就是 marginTop，保证 DOM 与这里的坐标一致） */
+  marginTop: number
+  /** 骑缝条里卡片相对作品区起点的左偏移（档位行恒为 0） */
+  bandLeft: number
+  cards: BoardCardBox[]
+}
+
+export interface BoardGeometry {
+  blocks: BoardBlock[]
+  /** 作品区相对档位卡左边的内缩（档位卡内边距 + 边框 + 标签列 + 间距 + 作品行内边距） */
+  worksLeftInset: number
+  contentW: number
+  contentH: number
+}
+
+/**
+ * 算出画布的完整几何。
+ *
+ * ============================ 为什么骑缝卡片单独占一条"高带" ============================
+ *
+ * 之前骑缝卡片是绝对定位、跨在分界线上（上半伸进上一档、下半伸进下一档）。它的高度是整张卡片，
+ * 而两档之间的缝只有 8px，所以它必然侵入行内空间；更糟的是它纵向能伸到**下一档之外**，
+ * 只要下下档的作品比这两档更长，就会压到人家的卡片上（用户实测："骑缝的作品有时候会遮住其它区域正常的作品"）。
+ *
+ * 现在的做法（用户给的方案之一）：**两档之间给骑缝单独留一条横向的高带**（`stripH`），
+ * 带里除了骑缝卡片什么都没有，于是有两条硬保证：
+ *   ① 纵向：骑缝卡片被夹在两个档位行之间，永远不与任何档位行重叠；
+ *   ② 横向：骑缝卡片只落在这一条带里，带内没有别的卡片，所以也不会与任何档的卡片重叠。
+ * 卡片在带里**垂直居中**——带的中心就是两档的分界线，所以"封面中心压在交界线上"依然成立。
+ *
+ * 渲染侧（TierBoard）用的就是这里的 `top / height / marginTop / left`，
+ * 自测里"任意两张卡片矩形都不相交"也是断言同一组数字，两边不可能对不上。
+ */
+export function boardGeometry(table: RankingTable, m: BoardMetrics): BoardGeometry {
+  const worksLeftInset = m.rowPad + m.labelW + m.labelGap + m.worksPad
+  // 横向仍然复用 rankRowLayouts：一行一档 + 骑缝排在两档所有作品之后
+  const { rows, contentW } = rankRowLayouts(table, {
+    cardW: m.cardW,
+    gap: m.cardGap,
+    // 把"档位卡内边距 + 标签列 + 间距 + 作品行内边距"整体当成左边距，右边只留档位卡与作品行的内边距
+    labelW: worksLeftInset,
+    labelGap: 0,
+    rowChrome: m.rowPad + m.worksPad
+  })
+
+  const blocks: BoardBlock[] = []
+  let y = 0
+  let prevBottom = 0
+  const push = (block: Omit<BoardBlock, 'marginTop'>): void => {
+    blocks.push({ ...block, marginTop: block.top - prevBottom })
+    prevBottom = block.top + block.height
+  }
+
+  rows.forEach((row, i) => {
+    const cardTop = y + (m.rowH - m.cardH) / 2
+    push({
+      kind: 'row',
+      tierIndex: i,
+      top: y,
+      height: m.rowH,
+      bandLeft: 0,
+      cards: row.seated.map((item, k) => ({
+        workId: item.work.id,
+        kind: 'seated' as const,
+        tierIndex: i,
+        left: worksLeftInset + k * (m.cardW + m.cardGap),
+        top: cardTop,
+        width: m.cardW,
+        height: m.cardH
+      }))
+    })
+    y += m.rowH
+    if (i >= rows.length - 1) return
+    if (row.below.length > 0) {
+      const stripTop = y
+      const stripCardTop = stripTop + (m.stripH - m.cardH) / 2
+      push({
+        kind: 'strip',
+        tierIndex: i,
+        top: stripTop,
+        height: m.stripH,
+        bandLeft: row.bandLeft,
+        cards: row.below.map((item, k) => ({
+          workId: item.work.id,
+          kind: 'straddle' as const,
+          tierIndex: i,
+          left: worksLeftInset + row.bandLeft + k * (m.cardW + m.cardGap),
+          top: stripCardTop,
+          width: m.cardW,
+          height: m.cardH
+        }))
+      })
+      y += m.stripH
+    } else {
+      // 没有骑缝：这 8px 的间距由下一块的 marginTop 表达（这里只把游标推过去）
+      y += m.rowGap
+    }
+  })
+
+  return { blocks, worksLeftInset, contentW, contentH: prevBottom }
+}
+
 /** 这张表里已经用掉的作品 id（池子 + 排名区），用于去重判断 */
 export function usedWorkIds(table: RankingTable): Set<string> {
   const set = new Set<string>()
@@ -809,10 +1050,15 @@ function withPlaced(
   poolId: string | null
 ): RankingTable {
   const rest = table.items.filter((it) => it.work.id !== work.id)
-  const index = insertIndexIn(rest, slot, anchorId)
-  const next = [...rest]
   // 最后一档下面没有分界线：骑缝位不成立时落到该档本身（宁可少一点语义，也不让作品消失）
   const straddle = slot.straddle && slot.tierIndex < table.tiers.length - 1
+  /**
+   * 骑缝作品**忽略落点锚点、永远追加到末尾**（用户要求"横跨两个等级的作品要自动排在这两个区域所有作品的最后面"）。
+   * 它画在分界线上、排在两档所有作品之后，所以"插到某张卡前面"对骑缝没有意义；
+   * 档内（非骑缝）的落点仍然按锚点精确插入（同格内排顺序还是要保留的）。
+   */
+  const index = insertIndexIn(rest, slot, straddle ? null : anchorId)
+  const next = [...rest]
   next.splice(index, 0, { work, tierIndex: slot.tierIndex, straddle, poolId })
   // 稳定排序：槽位内保持插入顺序（见文件头 ④）
   next.sort((a, b) => slotRank(a) - slotRank(b))
@@ -843,39 +1089,31 @@ const EXPORT_LABEL_W = 152
 const EXPORT_LABEL_GAP = 20
 /** 左右内边距 */
 const EXPORT_PAD = 44
-/**
- * 卡片列的硬上限：再多就换行，避免档内作品一多就拉成一张超宽图。
- * 取 10 是算出来的：标签列 + 内边距占掉 404px，剩给卡片的最多 1196px，
- * 而一列是 104+14=118px → 正好 10 列。这样"按内容算出来的宽度"永远不会被上限夹到，
- * 也就不会出现"宽度被夹住、内容只占左边一半"（用户反馈的那个右侧空白）的情况。
- */
-const EXPORT_MAX_COLS = 10
+/** 骑缝带上下各留的空白（卡片在带里垂直居中 → 带心就是两档的分界线） */
+const EXPORT_STRIP_PAD = 10
 
 /**
  * 算出导出图该多宽。
  *
- * 用户反馈「长图拼合后右侧不要留大片空白」：固定 1400 宽时，档里只有 3 部作品的话
- * 右边会有半张图的白。所以宽度按**最挤的那一档**反推：
- *   需要的列数 = 所有档里最多的作品数（含骑缝占位），上限 EXPORT_MAX_COLS；
- *   版式宽度 = 内边距 + 标签列 + 间距 + 列数 × 卡片宽 + 列间距。
- * 这样最挤的那一档正好填满宽度，其余档只会短一点点（不会半张白）。
- * 再夹在 [EXPORT_MIN_WIDTH, EXPORT_MAX_WIDTH] 之间：太窄连标题都排不开，太宽在聊天软件里会被压糊。
+ * 用户的规则（原话）：「在某个等级下面放了超出页面宽度的多个作品，输出图片宽度就以**这一等级下作品的最大宽度**为准」。
+ * 也就是：**每个等级只有一行、作品不换行**，宽度 = 最宽那一行的实际内容宽度（内边距 + 标签列 + 该行所有卡片宽度之和）。
+ * 这里直接用 rankRowLayouts（界面画布用的是同一个函数）算出 contentW，再加左右内边距。
  *
- * 注意：骑缝作品**同时计入上下两档**（文件头 ③），所以两档各为它留一个列位 —— 这里也一样。
+ * 上下限只做安全兜底：宽度够用时绝不夹紧（夹紧就等于又把内容压回去、右边留白）。
  */
-export function exportLayout(table: RankingTable): { width: number; cols: number } {
-  let maxPerTier = 0
-  for (let i = 0; i < table.tiers.length; i += 1) {
-    maxPerTier = Math.max(maxPerTier, itemsOfTier(table.items, i).length)
+export function exportLayout(table: RankingTable): { width: number; contentW: number; rows: RankRow[] } {
+  const { rows, contentW } = rankRowLayouts(table, {
+    cardW: EXPORT_CARD_W,
+    gap: EXPORT_CARD_GAP,
+    labelW: EXPORT_LABEL_W,
+    labelGap: EXPORT_LABEL_GAP
+  })
+  const raw = contentW + EXPORT_PAD * 2
+  return {
+    width: Math.round(Math.min(EXPORT_MAX_WIDTH, Math.max(EXPORT_MIN_WIDTH, raw))),
+    contentW,
+    rows
   }
-  const cols = Math.min(EXPORT_MAX_COLS, Math.max(1, maxPerTier))
-  const raw =
-    EXPORT_PAD * 2 +
-    EXPORT_LABEL_W +
-    EXPORT_LABEL_GAP +
-    cols * EXPORT_CARD_W +
-    (cols - 1) * EXPORT_CARD_GAP
-  return { width: Math.round(Math.min(EXPORT_MAX_WIDTH, Math.max(EXPORT_MIN_WIDTH, raw))), cols }
 }
 
 /**
@@ -885,16 +1123,17 @@ export function exportLayout(table: RankingTable): { width: number; cols: number
  * 版式只有一份（这份 HTML），界面所见与成图基本一致，改样式不用改两处。
  * 图片位置写 `{{img:key}}`，主进程会换成 data URL（离屏窗口不加载任何外部资源）。
  *
- * 用户要求「简化版式」：只保留两段 —— **排名表信息**（表名 / 排名人 / 导出时间 / 规模）
- * 和**排名详细区域**（标签列 + 作品卡）。v1 的页脚说明、图例、"介于两档之间"的独立虚线格全部去掉。
+ * 版式只有两段（用户要求简化）：**排名表信息**（表名 / 排名人 / 导出时间 / 规模）
+ * 与**排名详细区域**（标签列 + 作品卡）。页脚说明、图例、"介于两档之间"的独立虚线格全部没有。
  *
- * 骑缝作品在这里的呈现：卡片中心压在分界线上（上下各一半负外边距，文档流里净位移为 0），
- * 并且**上下两档都给它留出列位**（各放一个同宽的空白占位），于是"同时占上下两档各一个位置"
- * 在成图上也是看得出来的 —— 用户要求这一点必须在导出图里体现。
- * 卡片上另有一个小标「骑缝」，写明它同时计入哪两档。
+ * 三条本轮的排版规则（与界面画布共用 rankRowLayouts，所以两侧永远一致）：
+ *   ① 每个等级**只有一行**，作品不换行（`flex-wrap: nowrap`）—— 宽度不够就看不着，这是用户要的；
+ *   ② 骑缝卡片的**封面中心**压在分界线上（上下各一半负外边距，净位移为 0），
+ *      并且骑缝带排在**这两档所有作品的后面**（左偏移 = 两档中较长的那一行）；
+ *   ③ 卡面上不再有"番剧 / galgame"来源角标（用户要求去掉），只保留骑缝小标。
  *
- * 配色**不跟随应用主题**：表背景用这张表自己的背景色（默认就是用户要求的白色），
- * 标签底色用用户在界面上给这一档选的颜色（同一份色值，见文件头 ⑥）。
+ * 配色**不跟随应用主题**：表背景用这张表自己的背景色（默认白色），
+ * 标签色块用用户在界面上给这一档选的颜色 + 同色系加深的左边条（见文件头 ⑥）。
  */
 export function buildRankingExportHtml(
   table: RankingTable,
@@ -907,7 +1146,7 @@ export function buildRankingExportHtml(
   const dateText = `${stamped.getFullYear()}-${String(stamped.getMonth() + 1).padStart(2, '0')}-${String(
     stamped.getDate()
   ).padStart(2, '0')}`
-  const { width } = exportLayout(table)
+  const { width, rows } = exportLayout(table)
 
   const cardHtml = (item: RankedItem): string => {
     const work = item.work
@@ -922,50 +1161,46 @@ export function buildRankingExportHtml(
       // 没有封面地址（手动添加的居多）：画名字前两个字当占位，别在成图里留一块白
       cover = `<div class="cover ph">${escapeHtml(name.slice(0, 2))}</div>`
     }
+    // 只有骑缝作品带小标（来源角标已按用户要求去掉）
     const mark = item.straddle
       ? `<span class="mark">骑缝 · 计入「${escapeHtml(table.tiers[item.tierIndex]?.name ?? '')}」「${escapeHtml(
           table.tiers[item.tierIndex + 1]?.name ?? ''
         )}」</span>`
-      : `<span class="mark plain">${SOURCE_LABELS[work.source]}</span>`
+      : ''
     return `<figure class="card${item.straddle ? ' straddle' : ''}">${cover}<figcaption class="name">${escapeHtml(
       name
     )}</figcaption>${mark}</figure>`
   }
 
-  /** 骑缝作品在相邻两档里各占掉的列位（保持与骑缝卡片同样的宽度，视觉上能对上） */
-  const spacerOf = (count: number): string =>
-    count > 0 ? `<span class="spacer" style="width:${count * EXPORT_CARD_W + (count - 1) * EXPORT_CARD_GAP}px"></span>` : ''
-
-  const rows: string[] = []
-  for (let i = 0; i < table.tiers.length; i += 1) {
-    const tier = table.tiers[i]
-    const seated = seatedItemsOfTier(table.items, i)
-    // 这一档要为"上边界"与"下边界"上的骑缝作品各留出列位：它们都算占用了这一档的位置
-    const reserveAbove = straddleItemsAt(table.items, i - 1).length
-    const reserveBelow = straddleItemsAt(table.items, i).length
-    const reserved = reserveAbove + reserveBelow
-    const label = `<div class="label" style="background:${tier.color};color:${readableTextOn(tier.color)}">${escapeHtml(
-      tier.name
-    )}</div>`
-    const works = `${spacerOf(reserved)}${seated.map(cardHtml).join('')}`
-    rows.push(
-      `<section class="tier">${label}<div class="works${seated.length + reserved > 0 ? '' : ' empty'}">${works}</div></section>`
-    )
-
-    // 这一档与下一档的分界线：骑缝作品中心压在这条线上，且上下两档都已经为它留了列位
-    if (i < table.tiers.length - 1) {
-      const straddlers = straddleItemsAt(table.items, i)
-      if (straddlers.length > 0) {
-        rows.push(
-          `<section class="straddle-row"><div class="label ghost"></div><div class="works straddle-works">${straddlers
-            .map(cardHtml)
-            .join('')}</div></section>`
-        )
-      } else {
-        rows.push('<div class="divider"></div>')
-      }
-    }
+  const labelHtml = (tier: TierDef, ghost = false): string => {
+    if (ghost) return '<div class="label ghost"></div>'
+    return `<div class="label" style="background:${tier.color};color:${readableTextOn(tier.color)};border-left-color:${darkenColor(
+      tier.color
+    )}">${escapeHtml(tier.name)}</div>`
   }
+
+  const blocks: string[] = []
+  rows.forEach((row, i) => {
+    const tier = table.tiers[i]
+    blocks.push(
+      `<section class="tier">${labelHtml(tier)}<div class="works${row.seated.length > 0 ? '' : ' empty'}">${row.seated
+        .map(cardHtml)
+        .join('')}</div></section>`
+    )
+    if (i >= rows.length - 1) return
+    if (row.below.length === 0) {
+      blocks.push('<div class="divider"></div>')
+      return
+    }
+    // 骑缝带：**两档之间一条独立的行**（不是压在分界线上的浮层）——
+    // 这样它在文档流里就有自己的高度，永远不会压到上一档或下一档的卡片（界面侧同理，见 boardGeometry）
+    // 横向仍排在两档所有作品的后面（padding-left = bandLeft）
+    blocks.push(
+      `<section class="straddle-row">${labelHtml(tier, true)}<div class="straddle-works" style="padding-left:${
+        row.bandLeft
+      }px">${row.below.map(cardHtml).join('')}</div></section>`
+    )
+  })
 
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -989,18 +1224,19 @@ export function buildRankingExportHtml(
   .meta { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 13px; color: #55565e; }
   .meta b { font-weight: 700; color: #1b1b1f; }
 
-  /* ---- 排名详细区域 ---- */
-  .tier { display: flex; align-items: stretch; gap: ${EXPORT_LABEL_GAP}px; padding: 8px 0; }
+  /* ---- 排名详细区域：每个等级一行，不换行 ---- */
+  .tier { display: flex; align-items: stretch; gap: ${EXPORT_LABEL_GAP}px; padding: 8px 0; width: max-content; }
+  /* 等级标签：带底色的色块 + 同色系加深的左边条，层级一眼能看出来 */
   .label {
     flex: 0 0 ${EXPORT_LABEL_W}px; width: ${EXPORT_LABEL_W}px; display: flex; align-items: center; justify-content: center;
-    padding: 8px 6px; border-radius: 10px; border: 1px solid rgba(0,0,0,0.10);
-    font-size: 20px; font-weight: 800; text-align: center; word-break: break-all; line-height: 1.15;
+    padding: 8px 6px; border-radius: 10px; border: 1px solid rgba(0,0,0,0.14); border-left: 8px solid rgba(0,0,0,0.3);
+    font-size: 20px; font-weight: 800; letter-spacing: 0.5px; text-align: center; word-break: break-all; line-height: 1.15;
   }
   .label.ghost { background: transparent; border-color: transparent; }
-  .works { flex: 1 1 auto; display: flex; flex-wrap: wrap; align-content: flex-start; gap: ${EXPORT_CARD_GAP}px; min-height: ${EXPORT_CARD_H}px; }
+  /* flex-wrap: nowrap —— 作品只放在这一行里，宽度不够的部分靠"导出宽度跟着内容走"解决 */
+  .works { flex: 0 0 auto; display: flex; flex-wrap: nowrap; align-items: flex-start; gap: ${EXPORT_CARD_GAP}px; min-height: ${EXPORT_CARD_H}px; }
   .works.empty { min-height: 40px; align-items: center; }
   .works.empty::after { content: "（空）"; color: #b9b9c0; font-size: 13px; }
-  .spacer { flex: 0 0 auto; }
 
   .card { width: ${EXPORT_CARD_W}px; margin: 0; }
   .cover {
@@ -1012,13 +1248,14 @@ export function buildRankingExportHtml(
     margin-top: 6px; height: 32px; font-size: 12px; line-height: 1.35; overflow: hidden;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word;
   }
-  .mark { display: inline-block; margin-top: 4px; padding: 0 6px; border: 1px solid #e2e2e6; border-radius: 999px; font-size: 10px; color: #8a8a93; }
-  .mark.plain { color: #b0b0b8; border-color: #ededf1; }
+  /* 卡面上没有来源角标（用户要求去掉），只有骑缝作品带这一行说明 */
+  :empty.mark { display: none; }
+  .mark { display: inline-block; margin-top: 4px; padding: 0 6px; border: 1px solid #c9c9d1; border-radius: 999px; font-size: 10px; color: #4b4c55; background: #ffffff; font-weight: 700; }
 
-  /* 骑缝：整块卡片中心压在分界线上（负外边距一上一下，文档流里净位移为 0） */
-  .straddle-row { display: flex; align-items: stretch; gap: ${EXPORT_LABEL_GAP}px; height: 0; }
-  .straddle-row .straddle-works { flex: 1 1 auto; display: flex; align-items: flex-start; gap: ${EXPORT_CARD_GAP}px; }
-  .straddle-row .card { margin-top: -${Math.round(EXPORT_CARD_H / 2)}px; }
+  /* 骑缝带：两档之间一条独立的行，卡片在带里垂直居中（带心 = 两档分界线），
+     文档流里占自己的高度 → 不可能压到上下两档的卡片 */
+  .straddle-row { display: flex; align-items: center; gap: ${EXPORT_LABEL_GAP}px; width: max-content; padding: ${EXPORT_STRIP_PAD}px 0; }
+  .straddle-row .straddle-works { flex: 0 0 auto; display: flex; align-items: center; gap: ${EXPORT_CARD_GAP}px; }
   .straddle-row .mark { color: #4b4c55; border-color: #c9c9d1; background: #ffffff; font-weight: 700; }
   .divider { height: 1px; margin: 0 0 0 ${EXPORT_LABEL_W + EXPORT_LABEL_GAP}px; background: #e8e8ea; }
 </style>
@@ -1034,7 +1271,7 @@ export function buildRankingExportHtml(
       ${name2 ? `<span>排名人 <b>${escapeHtml(name2)}</b></span>` : ''}
     </div>
   </div>
-  ${rows.join('\n  ')}
+  ${blocks.join('\n  ')}
 </div>
 </body>
 </html>`
@@ -1048,6 +1285,8 @@ export function buildRankingExportHtml(
 
 export type AddWorksResult = { added: number; skipped: number }
 export type AddPoolResult = { ok: true; pool: RankingPool } | { ok: false; message: string }
+/** 改标签名的结果（重名 / 空名都要给用户一句人话，而不是静默失败） */
+export type SetTierNameResult = { ok: true } | { ok: false; message: string }
 /** 移出排名区后作品去哪儿了：回到池子里 / 表里一个池子都没有，只能丢掉 */
 export type RemoveRankedResult = 'pool' | 'dropped'
 
@@ -1061,8 +1300,10 @@ interface RankingTableState {
   renameTable: (tableId: string, name: string) => void
   /** 改等级标签与颜色；返回**离开排名区（回到作品池）**的条目数（调用方负责提前警告用户） */
   setTiers: (tableId: string, tiers: TierDef[]) => number
-  /** 只改某一档的底色（界面上的色点选色）：不动标签名，也不动任何作品 */
+  /** 只改某一档的底色（右键菜单 / 标签上的色板）：不动标签名，也不动任何作品 */
   setTierColor: (tableId: string, tierIndex: number, color: string) => void
+  /** 只改某一档的标签内容（右键菜单）。重名会被拒绝：两个同名档会让「移到「X」」失去意义 */
+  setTierName: (tableId: string, tierIndex: number, name: string) => SetTierNameResult
   setBackground: (tableId: string, background: string) => void
   addPool: (tableId: string, name?: string) => AddPoolResult
   renamePool: (tableId: string, poolId: string, name: string) => void
@@ -1184,6 +1425,18 @@ export const useRankingTable = create<RankingTableState>((set, get) => {
           ? { ...t, tiers: t.tiers.map((tier, i) => (i === tierIndex ? { ...tier, color } : tier)) }
           : t
       )
+    },
+    setTierName: (tableId, tierIndex, name) => {
+      const trimmed = name.trim()
+      if (trimmed.length === 0) return { ok: false, message: '标签内容不能为空' }
+      const target = get().tables.find((t) => t.id === tableId)
+      if (!target) return { ok: false, message: '排名表不存在' }
+      if (!target.tiers.some((_, i) => i === tierIndex)) return { ok: false, message: '这一档已经不存在了' }
+      if (target.tiers.some((tier, i) => i !== tierIndex && tier.name === trimmed)) {
+        return { ok: false, message: `已经有一档叫「${trimmed}」了，换个名字` }
+      }
+      patch(tableId, (t) => ({ ...t, tiers: t.tiers.map((tier, i) => (i === tierIndex ? { ...tier, name: trimmed } : tier)) }))
+      return { ok: true }
     },
     setBackground: (tableId, background) => {
       if (!isHexColor(background)) return

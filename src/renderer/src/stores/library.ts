@@ -68,6 +68,12 @@ export function isCompleted(fav: FavoriteItem, history: WatchHistoryItem[]): boo
   return false
 }
 
+/**
+ * 是否已经订阅过"库数据被主进程改过"的通知（v0.3.8）。
+ * 放在模块作用域而不是 store 里：它是**进程级只订阅一次**的副作用，不是界面状态。
+ */
+let storeSubscribed = false
+
 export const useLibrary = create<LibraryState>((set, get) => ({
   favorites: [],
   keyConcerns: [],
@@ -76,6 +82,20 @@ export const useLibrary = create<LibraryState>((set, get) => ({
   loaded: false,
   enriched: false,
   load: async () => {
+    /*
+     * v0.3.8：主进程（手机端把观看历史推回来时）会广播一次 ev:library，这里必须跟着重新读。
+     *
+     * 为什么非读不可：这份 watchHistory 是**整份缓存在渲染层、整份写回磁盘**的
+     * （见下面 addWatch → api.store.set('watchHistory', next)）。主进程那边合并进来的手机端记录
+     * 如果不同步到这份缓存，用户下一次在本机看番时就会用旧数组把它整段覆盖掉 ——
+     * 表现是"手机同步过来的历史过一会儿自己没了"。
+     *
+     * 用模块级标志保证只订阅一次：load() 在启动流程里可能被调用多次（严格模式/热更新）。
+     */
+    if (!storeSubscribed) {
+      storeSubscribed = true
+      api.store.onChanged(() => void get().load())
+    }
     const [f, k, w, s] = await Promise.all([
       api.store.get('favorites'),
       api.store.get('keyConcerns'),

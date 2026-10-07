@@ -22,6 +22,8 @@ import {
   X
 } from 'lucide-react'
 import { useLocation, useNavigate } from 'react-router-dom'
+// v0.3.8：投屏要往悬浮窗推一份「这一段媒体是什么」，类型取自悬浮窗状态契约
+import type { OverlayState } from '@shared/api'
 import type {
   AspectMode,
   DanmakuComment,
@@ -630,6 +632,19 @@ export function PlayerPage() {
              * 所以必须由宿主把 `state.url`（规则模式下就是播放页地址）告诉它。
              */
             if (state.mode === 'rule' && state.url) void api.player.setDanmakuSource(state.url)
+            /*
+             * 正在投屏时，换集/换源要**跟着电视一起换**（v0.3.8）。
+             *
+             * 规则模式下每一集都是新的播放页地址与新抓到的直链，接收端拿不到别的集的地址
+             * （那需要再走一遍"解析播放页 + 嗅探"），所以"选集"这件事以电脑这边为准：
+             * 用户在电脑上切集，投屏自动把新的一集推给同一台设备。
+             */
+            if (castDeviceRef.current) {
+              const deviceId = castDeviceRef.current
+              window.setTimeout(() => {
+                if (castDeviceRef.current === deviceId) void startCastTo(deviceId)
+              }, 600)
+            }
             return
           }
           console.warn(`[player] 交给内核播放失败（第 ${attempt + 1} 次）：${r.error}`)
@@ -1764,6 +1779,26 @@ export function PlayerPage() {
           else if (fullscreen) toggleFullscreen()
           else exitPlayer()
           break
+        /**
+         * v0.3.8 投屏：面板在悬浮窗里，但"这一集是什么"只有播放页知道，
+         * 所以开始投屏这个动作回到播放页来执行（媒体信息由它组装）。
+         */
+        case 'castPlay':
+          void startCastTo(a.deviceId)
+          break
+        case 'castControl':
+          if (castDeviceRef.current) void api.cast.control(castDeviceRef.current, a.action)
+          break
+        case 'castStop':
+          if (castDeviceRef.current) {
+            const id = castDeviceRef.current
+            castDeviceRef.current = null
+            void api.cast.stop(id)
+            toast.info('已停止投屏')
+            // 投屏时本机是暂停的（把带宽让给电视），停止后恢复本机播放
+            if (!playingRef.current) void api.player.togglePause()
+          }
+          break
       }
     })
     return off
@@ -1883,7 +1918,16 @@ export function PlayerPage() {
         return { x: 0, y: 56, width: window.innerWidth, height: Math.max(120, window.innerHeight - 112) }
       })(),
       // v0.2.18：控制栏已交给 uosc 时，悬浮窗不再绘制自己的控件
-      uoscBar: uoscBarMode
+      uoscBar: uoscBarMode,
+      /*
+       * v0.3.8：投屏面板要用到的"这一段媒体是什么"。
+       *
+       * 为什么放在这条高频推送里：悬浮窗的 `onState` 是**整体替换**语义（`setState`），
+       * 只在低频通道里推的话会被这条每秒几次的推送覆盖掉。
+       * 内容本身按"流地址 + 集数"缓存（castMediaRef），只有换集/换源时才重建，
+       * 所以每一次推送传的都是同一个对象引用，代价可以忽略。
+       */
+      castMedia: castMediaPayload()
     })
   }, [
     overlayActive,
@@ -2060,6 +2104,76 @@ export function PlayerPage() {
    */
   const currentEpisodeNo = (): number =>
     state.mode === 'rule' ? (ruleCurrent?.ep ?? 0) + 1 : (currentFile?.episode ?? currentIndex + 1)
+
+  // ---------------- 投屏（v0.3.8） ----------------
+
+  /** 正在投屏的设备 id；为空表示没在投屏 */
+  const castDeviceRef = useRef<string | null>(null)
+
+  /**
+   * 投屏要用的这一段媒体（按「模式 + 番剧 + 流地址 + 线路 + 集」缓存）。
+   *
+   * 为什么缓存：这份数据要跟着每秒几次的状态推送进悬浮窗（那边是整体替换语义），
+   * 每帧重新构造一个几十项的播放列表纯属浪费；只有换集/换源时才真的变。
+   *
+   * 本地播放没有可投的在线地址（`url` 为空），界面据此提示改用接收端自己打开文件。
+   */
+  const castMediaCacheRef = useRef<{ key: string; payload: OverlayState['castMedia'] } | null>(null)
+  const castMediaPayload = (): OverlayState['castMedia'] => {
+    const url =
+      state.mode === 'rule' ? (ruleStreamRef.current ?? '') : state.mode === 'online' ? (state.url ?? '') : ''
+    const line = ruleCurrent?.line ?? 0
+    const ep = ruleCurrent?.ep ?? currentIndex
+    const key = `${state.mode}|${state.title}|${url}|${line}|${ep}|${files.length}`
+    if (castMediaCacheRef.current?.key === key) return castMediaCacheRef.current.payload
+    const groups = state.groups ?? []
+    const playlist =
+      state.mode === 'rule'
+        ? (groups[line]?.episodes ?? []).map((e, i) => ({ url: '', title: e.name || `第 ${i + 1} 集` }))
+        : files.map((f, i) => ({ url: f.path, title: f.name || `第 ${i + 1} 集` }))
+    const payload: OverlayState['castMedia'] = url
+      ? {
+          url,
+          title: `${state.title}${ep >= 0 ? ` · 第 ${ep + 1} 集` : ''}`,
+          referer: state.referer,
+          index: ep,
+          /*
+           * 播放列表只带**标题**、不带地址：规则模式下每集的直链都要重新"解析播放页 + 嗅探"才能拿到，
+           * 现在没有现成的地址可给。所以接收端/电视上的"选集"列表是只读的展示，
+           * 真正的选集以电脑这边为准（换集时播放页会自动把新的一集推给同一台设备，见 onFound 里的注释）。
+           */
+          playlist
+        }
+      : null
+    castMediaCacheRef.current = { key, payload }
+    return payload
+  }
+
+  /**
+   * 开始投屏：把当前这一集（含进度与选集列表）交给选中的设备。
+   *
+   * 投屏成功后**暂停本机播放**：同一路流在两个地方同时拉会互相抢带宽，
+   * 而用户真正在看的是电视 —— 把带宽让给它，这也是「投屏要流畅」的一部分。
+   */
+  const startCastTo = async (deviceId: string): Promise<void> => {
+    const media = castMediaPayload()
+    if (!media) {
+      toast.warn('本地文件没有可投的在线地址：请在接收端直接打开这个文件')
+      return
+    }
+    const r = await api.cast.play(deviceId, { ...media, startMs: Math.round(current * 1000) })
+    if (!r.ok) {
+      toast.error(`投屏失败：${r.error}`)
+      return
+    }
+    if (!r.data.ok) {
+      toast.error(`投屏失败：${r.data.message}`)
+      return
+    }
+    castDeviceRef.current = deviceId
+    toast.success(r.data.message)
+    if (playingRef.current) void api.player.togglePause()
+  }
 
   const loadDanmaku = async (force = false, opts: { aliasMode?: boolean } = {}): Promise<void> => {
     const episode =

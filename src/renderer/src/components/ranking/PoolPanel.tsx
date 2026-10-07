@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { ChevronsLeft, FolderPlus, Gamepad2, Layers, Plus, Search, Star, Upload } from 'lucide-react'
-import { Button, Input } from '@/components/ui'
+import { Button, Badge, IconButton, Input } from '@/components/ui'
 import { WorkCard } from '@/components/ranking/WorkCard'
 import { api } from '@/lib/api'
 import { useLibrary } from '@/stores/library'
@@ -135,38 +135,30 @@ export function PoolPanel({
       <div className="flex h-11 shrink-0 items-center gap-1.5 border-b border-border px-3">
         <Layers size={13} className="text-accent" />
         <span className="text-xs font-semibold">作品池</span>
-        <span className="text-[10px] text-faint">
+        <Badge>
           {table.pools.length}/{MAX_POOLS}
-        </span>
-        <button
-          type="button"
-          title="收起作品池（排名区会变宽）"
-          onClick={onCollapse}
-          className="ml-auto rounded p-1 text-faint transition-colors hover:bg-elev2 hover:text-text"
-        >
+        </Badge>
+        <IconButton title="收起作品池（排名区会变宽）" className="ml-auto" onClick={onCollapse}>
           <ChevronsLeft size={14} />
-        </button>
+        </IconButton>
       </div>
 
-      {/* 池子列表（纵向） */}
+      {/* 池子列表（纵向）：用应用统一的 Button，不再自己写裸 button 样式 */}
       <div className="flex shrink-0 flex-col gap-1 px-2 py-2">
         {table.pools.map((pool) => (
-          <button
+          <Button
             key={pool.id}
-            type="button"
+            size="sm"
+            variant={pool.id === activePoolId ? 'soft' : 'outline'}
+            className="w-full justify-between"
+            title="双击改名 · 右键打开菜单"
             onClick={() => onSelectPool(pool.id)}
             onDoubleClick={() => onEditPool(pool)}
             onContextMenu={(e) => onPoolContextMenu(e, pool)}
-            title="双击改名 · 右键打开菜单"
-            className={`flex items-center gap-2 rounded-lg border px-2 py-1.5 text-left text-xs transition-colors ${
-              pool.id === activePoolId
-                ? 'border-accent bg-accent-soft text-accent'
-                : 'border-border bg-elev1 text-dim hover:text-text'
-            }`}
           >
-            <span className="min-w-0 flex-1 truncate">{pool.name}</span>
-            <span className="shrink-0 text-[10px] text-faint">{pool.works.length}</span>
-          </button>
+            <span className="min-w-0 flex-1 truncate text-left">{pool.name}</span>
+            <span className="shrink-0 text-[10px] opacity-70">{pool.works.length}</span>
+          </Button>
         ))}
         <Button
           size="sm"
@@ -288,16 +280,11 @@ export function PoolPanel({
 /** 折叠后的细栏：只留一个展开按钮（不整块消失，用户才知道怎么找回来） */
 export function PoolRail({ onExpand, count }: { onExpand: () => void; count: number }) {
   return (
-    <div className="flex h-full w-9 shrink-0 flex-col items-center gap-2 border-r border-border bg-elev1/60 py-2">
-      <button
-        type="button"
-        title="展开作品池"
-        onClick={onExpand}
-        className="rounded p-1 text-faint transition-colors hover:bg-elev2 hover:text-accent"
-      >
+    <div className="flex h-full w-11 shrink-0 flex-col items-center gap-2 border-r border-border bg-elev1 py-2">
+      <IconButton title="展开作品池" onClick={onExpand}>
         <Layers size={14} />
-      </button>
-      <span className="text-[10px] text-faint">{count}</span>
+      </IconButton>
+      <Badge>{count}</Badge>
       <span className="mt-1 select-none text-[11px] tracking-widest text-faint" style={{ writingMode: 'vertical-rl' }}>
         作品池已收起
       </span>

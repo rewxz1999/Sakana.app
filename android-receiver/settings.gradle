@@ -1,0 +1,26 @@
+// Sakana 投屏接收端 —— 独立的 Gradle 工程。
+//
+// 这个目录和 E:\sakana.app 根目录那套 Electron/Node 构建**完全无关**：
+// 它不 include 仓库里任何其它模块，也不读根目录的任何配置。
+// 用 Android Studio 打开时请直接 Open 这个 android-receiver 目录（不要 Open 仓库根目录）。
+
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    // 依赖仓库只在这里声明，app/build.gradle 里不再写 repositories。
+    // 这样"某个依赖到底是从哪个仓库来的"只有一处答案，排查冲突时省事。
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'sakana-receiver'
+include ':app'

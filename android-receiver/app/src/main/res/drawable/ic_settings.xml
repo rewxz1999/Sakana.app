@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  设置：两条滑轨 + 两个旋钮（Material 的"tune"图标）。
+  比画齿轮简单得多，而且在 24dp 下依然一眼能认出来。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M3,5.9h18v2H3z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M8.7,4.2 a2.8,2.8 0 1,0 0,5.6 a2.8,2.8 0 1,0 0,-5.6 z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M3,16.1h18v2H3z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M15.3,14.4 a2.8,2.8 0 1,0 0,5.6 a2.8,2.8 0 1,0 0,-5.6 z" />
+</vector>

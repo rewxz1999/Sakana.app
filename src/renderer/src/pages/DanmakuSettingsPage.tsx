@@ -123,7 +123,10 @@ export function DanmakuSettingsPage() {
             </Pill>
           ))}
         </Row>
-        <Toggle label="加粗描边" desc="复杂画面上更清楚" value={d.bold} onChange={(v) => patch({ bold: v })} />
+        <Toggle label="加粗" desc="复杂画面上更清楚" value={d.bold} onChange={(v) => patch({ bold: v })} />
+        {/* v0.3.8：描边与阴影分开控制，用户可按画面风格取舍 */}
+        <Toggle label="描边" desc="文字外描一圈黑边，亮画面上最清晰" value={d.outline !== false} onChange={(v) => patch({ outline: v })} />
+        <Toggle label="阴影" desc="柔和一点；与描边同开时最清楚" value={d.shadow === true} onChange={(v) => patch({ shadow: v })} />
       </Card>
 
       <Card title="时间轴" desc="弹幕与画面不同步时在这里微调（正数 = 弹幕提前出现）">

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标（API 26+）的前景层：一个播放三角。
+  108x108 的画布里只有中间约 72x72 是安全区（会被裁成圆形/方形等形状），
+  所以三角画在 x:44-76、y:34-74，稳稳落在安全区内。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#4DD0E1"
+        android:pathData="M44,34 L44,74 L76,54 Z" />
+</vector>

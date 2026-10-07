@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 上一集：一根竖条 + 向左的三角。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M7,6h2.6v12H7z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M18.4,6 L9.6,12 L18.4,18 Z" />
+</vector>

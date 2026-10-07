@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  控制栏图标的着色。
+  用 ColorStateList 而不是在每个图标里写死颜色：这样"禁用"（例如没有播放列表时的选集按钮）
+  会自动变暗，不用在代码里逐个 setAlpha。
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:color="@color/text_muted" android:state_enabled="false" />
+    <item android:color="@color/accent" android:state_pressed="true" />
+    <item android:color="@color/text_primary" />
+</selector>

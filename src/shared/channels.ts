@@ -245,6 +245,20 @@ export const CH = {
   rulesVerifyBounds: 'rules:verify-bounds',
   rulesVerifyClose: 'rules:verify-close',
 
+  // 投屏（v0.3.8）：发现设备、投屏、遥控
+  castDiscover: 'cast:discover',
+  castStopDiscover: 'cast:stop-discover',
+  castAddManual: 'cast:add-manual',
+  castPlay: 'cast:play',
+  castControl: 'cast:control',
+  castInfo: 'cast:info',
+  castStop: 'cast:stop',
+  /** v0.3.8：投屏/同步服务的局域网地址（手机端手填它就能互通） */
+  castSyncUrl: 'cast:sync-url',
+  /** 记住"投给哪台设备"（用户选过之后下一次自动用它） */
+  castSetTarget: 'cast:set-target',
+  evCastDevices: 'ev:cast-devices',
+
   // galgame 快捷启动器
   galImport: 'gal:import',
   galList: 'gal:list',
@@ -273,6 +287,12 @@ export const CH = {
   statGet: 'stat:get',
   statApply: 'stat:apply',
   evStat: 'ev:stat',
+  /*
+   * v0.3.8：主进程改了「收藏 / 观看历史」这类库数据后广播一次，界面重新读一遍。
+   * 目前唯一的触发点是手机端把观看历史推回电脑（castSync.mergeHistory）——
+   * 渲染层那份 watchHistory 是整份缓存 + 整份写回，不重新读就会被旧数组覆盖掉。
+   */
+  evLibrary: 'ev:library',
   statExportImage: 'stat:export-image',
   /** 详情窗口的剧照来源：番剧截图目录（<截图目录>/<番剧名>图片） */
   statShots: 'stat:shots',

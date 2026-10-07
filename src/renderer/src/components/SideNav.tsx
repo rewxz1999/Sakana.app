@@ -12,6 +12,7 @@ import {
   type LucideIcon
 } from 'lucide-react'
 import { NavLink, useLocation } from 'react-router-dom'
+import type { CastDevice } from '@shared/types'
 import { api } from '@/lib/api'
 import sidebarArt from '@/assets/sidebar-art.png'
 
@@ -41,6 +42,8 @@ export function SideNav() {
   const location = useLocation()
   /** 应用版本号（v0.2.8 附加：底部标签改为读真实版本，不再写死） */
   const [appVersion, setAppVersion] = useState('0.2.8')
+  /** 已发现的移动端接收端（v0.3.8：底部左下的连接状态） */
+  const [castDevice, setCastDevice] = useState<CastDevice | null>(null)
 
   useEffect(() => {
     void api.app
@@ -49,6 +52,20 @@ export function SideNav() {
         if (r.ok && r.data) setAppVersion(String(r.data))
       })
       .catch(() => undefined)
+  }, [])
+
+  useEffect(() => {
+    /*
+     * 主进程在启动后就会开始自动发现（见 src/main/index.ts 的投屏服务启动），
+     * 这里订阅设备变化即可；顺手主动问一次，避免订阅建立晚于首轮发现。
+     */
+    const off = api.cast.onDevices((list) => {
+      setCastDevice(list.find((d) => d.kind === 'sakana') ?? null)
+    })
+    void api.cast.discover().then((r) => {
+      if (r.ok) setCastDevice(r.data.find((d) => d.kind === 'sakana') ?? null)
+    })
+    return () => off()
   }, [])
 
   const active =
@@ -117,6 +134,24 @@ export function SideNav() {
         />
       </div>
       <div className="relative shrink-0 border-t border-border px-4 py-3 text-[10px] leading-relaxed text-faint">
+        {/*
+          移动端连接状态（v0.3.8，用户要求「应用主界面最左下方显示当前是否连接到移动端」）。
+          判据是"发现到了 Sakana 接收端"——电脑是投屏的客户端，没有长连接可维持，
+          能看见就等于能投；这里如实显示设备名，点一下去投屏设置。
+        */}
+        <button
+          className="mb-1.5 flex w-full items-center gap-1.5 rounded-md px-1 py-1 text-left transition-colors hover:bg-elev2"
+          title={castDevice ? `${castDevice.name}（${castDevice.host}:${castDevice.port}）` : '未发现手机投屏应用'}
+          onClick={() => void api.window.openSmall('/player-settings', { width: 700, height: 620, title: '播放器设置' })}
+        >
+          <span
+            className={`h-1.5 w-1.5 shrink-0 rounded-full ${castDevice ? 'bg-ok' : 'bg-faint/60'}`}
+            style={castDevice ? { boxShadow: '0 0 6px var(--color-ok, #46a758)' } : undefined}
+          />
+          <span className={`min-w-0 flex-1 truncate ${castDevice ? 'text-text' : ''}`}>
+            {castDevice ? `已连接移动端：${castDevice.name}` : '未连接移动端'}
+          </span>
+        </button>
         {/* v0.2.8 附加：版本号改为读取应用版本（此前这里写死 v0.1.4，早就过期了） */}
         Sakana v{appVersion}
         <br />

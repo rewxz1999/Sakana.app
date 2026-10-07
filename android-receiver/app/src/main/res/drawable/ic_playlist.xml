@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 选集：三行列表 + 一个小播放三角。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M3,5.5h12v2H3z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M3,11h12v2H3z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M3,16.5h8v2H3z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M17,8.6 L22.4,12 L17,15.4 Z" />
+</vector>

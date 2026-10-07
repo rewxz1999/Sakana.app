@@ -1,31 +1,35 @@
 import { useState } from 'react'
-import { X } from 'lucide-react'
+import { GripVertical, X } from 'lucide-react'
 import { CoverImage } from '@/components/CoverImage'
+import { IconButton } from '@/components/ui'
 import { SOURCE_LABELS, displayName, type RankingWork } from '@/stores/rankingTable'
 
 /**
- * 排名表里的一张作品卡：**上封面 + 下名字**（用户明确要求的展示形式）。
+ * 排名表里的一张作品卡：**上封面 + 下名字**。
  *
- * 为什么卡片自己处理 `draggable` 而不用拖拽库：
- * 项目里没有引第三方拖拽库（也不允许为此加依赖），而「从作品池拖到排名档」这种同窗口内的移动，
- * 原生 HTML5 drag 的 draggable + dataTransfer 已经够用，还能沿用统计工具那一套写法（拖拽中虚化、落点高亮）。
+ * ============================ 样式：照抄应用自己的卡片语言 ============================
+ * 用户反馈「排名区域 ui 还是太丑了，就像我们应用主界面 ui 一样来布置就行」，所以这里不再自己造配色，
+ * 全部用应用既有的设计令牌与写法（参考 StatToolPage 的条目卡、AnimeCard、ui.tsx）：
+ *   · 卡片 = `rounded-lg border bg-elev2 p-1`，hover `border-accent` + `bg-accent-soft`（与应用里"可点/可选"的约定一致）；
+ *   · 拖动中 `border-accent/60 opacity-50`，与 StatToolPage 的条目完全一致；
+ *   · "这里能拖"用 AnimeCard 那种浮层小图标（`GripVertical` + 半透明黑底）提示，而不是额外的文字；
+ *   · 名字 `line-clamp-1/2 leading-snug`，完整名字放 `title`。
  *
- * 尺寸为什么是**数字参数**而不是几套 Tailwind 预设：
- * 排名区要在一屏里完整放下最多 10 档（用户要求「不要滚动才能看完」），
- * 每张卡的高度只能**按可用高度反算**（见 TierBoard 的 layoutFor），是运行时数值。
+ * 尺寸仍然是**数字参数**（排名区按可用高度反算，见 TierBoard 的 layoutFor）：
  * Tailwind 的动态类名（`h-[${n}px]`）不会被 JIT 收集，所以这类尺寸一律走行内 style。
+ * `WORK_CARD_CHROME` 是"卡片比封面大出来的一圈"（边框 1px×2 + 内边距 4px×2），
+ * 排名区的行宽计算要用它（见 TierBoard），所以在这里定义一次、别处引用。
  *
- * 颜色一律**继承父容器**（不写死）：同一张卡在左侧作品池里要跟随应用主题的浅色文字，
- * 在白色画布上要是深色文字 —— 写死任何一边都会让另一边看不见。
- *
- * 名字用 `line-clamp` 截断而不是撑开卡片：一张表里可能几十张卡，
- * 名字长短不一会让每档高度参差、整张表看起来是散的；截断后所有卡等高，版面才"格式规范"。
- * 完整名字放在 `title` 里，鼠标悬停仍能看到。
+ * 卡片**不挂 onDragOver / onDrop**：投放判定统一由排名区容器按坐标做（见 TierBoard），
+ * 卡片只负责"能拖"和把事件冒泡上去。
  */
 
-/** 由运行时算出来的卡片尺寸（排名区按档数自适应，见 TierBoard） */
+/** 卡片相对封面的额外尺寸：左右/上下各 4px 内边距 + 1px 边框（横竖都按这个数算） */
+export const WORK_CARD_CHROME = 10
+
+/** 由运行时算出来的卡片尺寸（排名区按可用高度自适应，见 TierBoard） */
 export interface WorkCardMetrics {
-  /** 封面宽（= 卡片宽） */
+  /** 封面宽 */
   w: number
   /** 封面高 */
   h: number
@@ -33,14 +37,12 @@ export interface WorkCardMetrics {
   lines: 1 | 2
   /** 名字字号（像素） */
   font: number
-  /** 是否显示来源角标（卡片太矮时藏起来，把高度让给名字） */
-  showSource: boolean
 }
 
 /** 左侧作品池里用的固定尺寸（池子宽度固定，不需要自适应） */
-const POOL_METRICS: WorkCardMetrics = { w: 70, h: 96, lines: 2, font: 10, showSource: true }
+const POOL_METRICS: WorkCardMetrics = { w: 66, h: 88, lines: 2, font: 10 }
 /** 搜索结果弹窗里的小图 */
-const TINY_METRICS: WorkCardMetrics = { w: 52, h: 70, lines: 2, font: 10, showSource: false }
+const TINY_METRICS: WorkCardMetrics = { w: 52, h: 70, lines: 2, font: 10 }
 
 export type WorkCardSize = 'pool' | 'tiny' | WorkCardMetrics
 
@@ -56,10 +58,11 @@ export function WorkCard({
   draggable = false,
   dragging = false,
   removable = false,
+  showGrip = true,
+  highlight = false,
+  cornerBadge,
   onDragStart,
   onDragEnd,
-  onDragOver,
-  onDrop,
   onClick,
   onRemove,
   onContextMenu,
@@ -72,10 +75,18 @@ export function WorkCard({
   dragging?: boolean
   /** 卡角显示一个「×」（作品池里用来快速移除；排名区的移除走右键菜单） */
   removable?: boolean
+  /** hover 时在封面左上角显示"可拖"手柄（与 StatToolPage 的可发现性一致） */
+  showGrip?: boolean
+  /** 强制高亮（骑缝卡片这类需要"被指到"的场合） */
+  highlight?: boolean
+  /**
+   * 贴在封面左下角的小角标（骑缝作品用）。
+   * 做成"压在封面上的角标"而不是"卡片下面再加一行"：这样卡片高度不变，
+   * 骑缝条的高度就等于卡片高度，卡片能在两档之间精确居中（见 TierBoard / boardGeometry）。
+   */
+  cornerBadge?: React.ReactNode
   onDragStart?: (workId: string) => void
   onDragEnd?: () => void
-  onDragOver?: (e: React.DragEvent<HTMLDivElement>) => void
-  onDrop?: (e: React.DragEvent<HTMLDivElement>) => void
   onClick?: () => void
   onRemove?: () => void
   onContextMenu?: (e: React.MouseEvent<HTMLDivElement>) => void
@@ -103,16 +114,22 @@ export function WorkCard({
           : undefined
       }
       onDragEnd={onDragEnd}
-      onDragOver={onDragOver}
-      onDrop={onDrop}
       onClick={onClick}
       onContextMenu={onContextMenu}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       title={tip}
-      style={{ width: m.w }}
-      className={`group relative shrink-0 select-none ${draggable ? 'cursor-grab active:cursor-grabbing' : ''} ${
-        dragging ? 'opacity-40' : ''
+      style={{ width: m.w + WORK_CARD_CHROME }}
+      className={`group relative shrink-0 rounded-lg border bg-elev2 p-1 transition-colors ${
+        draggable ? 'cursor-grab active:cursor-grabbing' : ''
+      } ${
+        dragging
+          ? 'border-accent/60 opacity-50'
+          : // hover 用纯 CSS（与 StatToolPage 的 `hover:border-accent/40` 同一套约定），
+            // JS 的 hover 状态只用来决定"能不能拖"那个小手柄显不显示
+            highlight
+            ? 'border-accent bg-accent-soft'
+            : 'border-border hover:border-accent hover:bg-accent-soft'
       }`}
     >
       <div className="relative">
@@ -120,37 +137,36 @@ export function WorkCard({
         <div style={{ width: m.w, height: m.h }} className="overflow-hidden rounded-md">
           <CoverImage src={work.cover} alt={name} className="h-full w-full" rounded="rounded-md" />
         </div>
+        {/* "这里能拖"的手柄（浮层小图标，与 AnimeCard 的角标同一个做法） */}
+        {draggable && showGrip && hover && !dragging ? (
+          <span className="pointer-events-none absolute left-0.5 top-0.5 rounded-md bg-black/40 p-0.5 text-white backdrop-blur-sm">
+            <GripVertical size={11} />
+          </span>
+        ) : null}
+        {/* 角标（骑缝）：压在封面左下角，不占卡片高度 */}
+        {cornerBadge ? <span className="pointer-events-none absolute bottom-0.5 left-0.5">{cornerBadge}</span> : null}
         {removable && hover && onRemove ? (
-          <button
-            type="button"
+          <IconButton
             title="从作品池移除"
+            className="absolute -right-1 -top-1 h-5 w-5 bg-danger text-white hover:bg-danger/90 hover:text-white"
             onClick={(e) => {
               e.stopPropagation()
               onRemove()
             }}
-            className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-danger text-white shadow"
           >
-            <X size={10} />
-          </button>
+            <X size={11} />
+          </IconButton>
         ) : null}
       </div>
       {/* 名字：按可用高度决定一行还是两行（见文件头），完整名在 title 里 */}
       <div
-        style={{ fontSize: m.font, lineHeight: 1.25, WebkitLineClamp: m.lines }}
-        className={m.lines === 1 ? 'mt-0.5 line-clamp-1' : 'mt-0.5 line-clamp-2'}
-        title={name}
+        style={{ fontSize: m.font, lineHeight: 1.3, WebkitLineClamp: m.lines }}
+        className={m.lines === 1 ? 'mt-1 line-clamp-1 px-0.5' : 'mt-1 line-clamp-2 px-0.5'}
       >
         {name}
       </div>
-      {/* 来源小角标：三种来源（番剧 / galgame / 手动）在列表里要能一眼区分；颜色随父容器 */}
-      {m.showSource ? (
-        <span
-          style={{ fontSize: Math.max(8, m.font - 1) }}
-          className="mt-0.5 inline-block rounded-full border border-current px-1 leading-tight opacity-55"
-        >
-          {SOURCE_LABELS[work.source]}
-        </span>
-      ) : null}
+      {/* 这里刻意什么都不再放：来源角标（番剧/galgame/手动）按用户要求去掉了（占位置），
+          来源信息在 title 提示里；骑缝说明由父组件按需画在卡片下方 */}
     </div>
   )
 }

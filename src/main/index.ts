@@ -164,6 +164,13 @@ if (!gotLock) {
   app.whenReady().then(() => {
     store.init()
     log.init()
+    /*
+     * v0.3.8：修复被早期"手机端历史合并"写坏的观看历史（详见 castSync.repairHistoryShape）。
+     * 放在**建窗口之前**：界面第一次读 watchHistory 时拿到的就该是修好的数据。
+     */
+    void import('./services/castSync')
+      .then((m) => m.repairHistoryShape())
+      .catch(() => 0)
     log.append('info', 'app', `Sakana v${app.getVersion()} 启动`)
     log.append('info', 'app', `数据根目录：${dataRootLabel()}${DATA_PATHS.fallback ? '（安装目录不可写）' : ''}`)
     bangumi.init()
@@ -231,6 +238,35 @@ if (!gotLock) {
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createMainWindow()
     })
+
+    /*
+     * 投屏 / 双端同步服务（v0.3.8）。
+     *
+     * 用户要求：「应用启动时自动检测移动端是否在同一网络/有线/蓝牙下打开了手机投屏应用，
+     * 打开了就连接」——所以这里在启动时就
+     *   ① 把同步服务拉起来（手机随时可能来拉收藏/历史，不该等到第一次投屏才有接口）；
+     *   ② 开始自动发现（SSDP 找 DLNA 电视 + UDP 广播找 Sakana 接收端）。
+     * 发现到接收端之后，`cast.ts` 的 upsert 会自动把它记成默认投屏目标（等效于"已连接"），
+     * 主界面左下角的那行状态就是读这个设备列表。
+     */
+    setTimeout(() => {
+      void (async () => {
+        try {
+          const win = getMainWindow()
+          const { ensureCastServer } = await import('./services/castRelay')
+          const port = await ensureCastServer().catch(() => 0)
+          const { startCastDiscovery } = await import('./services/cast')
+          if (win) startCastDiscovery(win)
+          log.append(
+            'info',
+            'cast',
+            `投屏/同步服务已就绪（端口 ${port || '未启动'}），已开始自动发现附近的电视与手机接收端`
+          )
+        } catch (err) {
+          log.append('warn', 'cast', `投屏服务启动失败：${String((err as Error)?.message ?? err).slice(0, 140)}`)
+        }
+      })()
+    }, 9000)
 
     // 在线播放端到端自检（SAKANA_ONLINE_TEST=关键词）：规则搜索 → 剧集 → 播放页 → 流嗅探
     if (process.env.SAKANA_ONLINE_TEST) {
@@ -3382,6 +3418,206 @@ if (!gotLock) {
           app.quit()
         })()
       }, 3000)
+    }
+
+    /*
+     * 投屏自检（SAKANA_CAST_TEST=<一个 m3u8 地址>，v0.3.8）。
+     *
+     * 为什么必须自检：投屏这条路里最容易错的是**播放列表改写**（相对地址、子列表、密钥 URI
+     * 都要换成经过我们的地址）和**局域网可达性**（服务必须绑 0.0.0.0，电视才连得上）。
+     * 这两件事都没法靠读代码确认，所以这里真的起一次中转、用**局域网 IP** 把它当作电视去访问：
+     *   ① 拉播放列表 → 检查里面的分片地址是不是都指回我们；
+     *   ② 拉第一个分片 → 检查真的取到了字节。
+     * 另外顺带跑一轮 SSDP 发现，把现场能找到的投屏设备打出来。
+     */
+    if (process.env.SAKANA_CAST_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const src = String(process.env.SAKANA_CAST_TEST)
+          const mode = (process.env.SAKANA_CAST_MODE as 'hls' | 'mp4' | 'transcode' | undefined) ?? undefined
+          const { startCastRelay, lanIPv4 } = await import('./services/castRelay')
+          const { startCastDiscovery, castDevices } = await import('./services/cast')
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
+          console.log(`[cast-test] 本机局域网 IP: ${lanIPv4()}；中转形态=${mode ?? '自动（m3u8→hls）'}`)
+          const relay = await startCastRelay(src, { referer: 'https://example.com/', mode })
+          if (!relay) {
+            console.log('[cast-test] ❌ 中转服务启动失败')
+          } else {
+            console.log(`[cast-test] 中转地址（电视看到的就是它）: ${relay.url}`)
+            try {
+              const res = await fetch(relay.url)
+              if (relay.kind === 'file') {
+                /*
+                 * MP4 形态：这一路是 FFmpeg 边转边发的连续流（没有 Content-Length），
+                 * 只读前 64KB 就够验证了 —— 检查它确实是 MP4（`ftyp` 盒子）而不是错误页面。
+                 */
+                const reader = res.body?.getReader()
+                let got = 0
+                let head = Buffer.alloc(0)
+                while (reader && got < 65536) {
+                  const { value, done } = await reader.read()
+                  if (done) break
+                  if (value) {
+                    head = Buffer.concat([head, Buffer.from(value)])
+                    got += value.byteLength
+                  }
+                }
+                void reader?.cancel().catch(() => undefined)
+                const txt = head.subarray(0, 16).toString('latin1')
+                console.log(
+                  `[cast-test] MP4 流转发 HTTP ${res.status}，读到 ${head.byteLength} 字节；头部 ftyp=${head.includes(Buffer.from('ftyp'))}`
+                )
+                if (!head.includes(Buffer.from('ftyp'))) {
+                  console.log(`[cast-test]   ⚠ 头部不像 MP4：${txt.replace(/[^\x20-\x7e]/g, '.')}`)
+                }
+              } else {
+                const text = await res.text()
+                const refs = text.split(/\r?\n/).filter((l) => l && !l.startsWith('#'))
+                const allOurs = refs.length > 0 && refs.every((l) => l.includes(`/cast/${relay.id}/`))
+                console.log(
+                  `[cast-test] 播放列表 HTTP ${res.status}，引用地址 ${refs.length} 条，全部指向本机=${allOurs}`
+                )
+                console.log(`[cast-test] 第一条引用: ${(refs[0] ?? '').slice(0, 120)}`)
+                if (refs[0]) {
+                  const segUrl = refs[0].startsWith('http') ? refs[0] : new URL(refs[0], relay.url).toString()
+                  const seg = await fetch(segUrl)
+                  const buf = await seg.arrayBuffer()
+                  console.log(`[cast-test] 分片 HTTP ${seg.status}，${buf.byteLength} 字节`)
+                }
+              }
+            } catch (err) {
+              console.log(`[cast-test] ❌ 经中转取流失败: ${String((err as Error)?.message ?? err).slice(0, 140)}`)
+            }
+          }
+          if (win) {
+            startCastDiscovery(win)
+            await new Promise((r) => setTimeout(r, 6000))
+            const list = castDevices()
+            console.log(`[cast-test] SSDP/UDP 发现到 ${list.length} 台设备`)
+            for (const d of list) {
+              console.log(`[cast-test]   · ${d.kind} ${d.name} @ ${d.host}:${d.port} caps=${d.caps.join(',')}`)
+              // 问一下电视认哪些格式（只读，不会开始播放）：HLS 认不认决定要不要重封装成 MP4
+              const { castDeviceFormats } = await import('./services/cast')
+              const formats = await castDeviceFormats(d.id)
+              if (formats.length > 0) {
+                const hls = formats.some((p) => /mpegurl|mp2t|m3u8/i.test(p))
+                console.log(
+                  `[cast-test]     它能播的格式（前 8 条）：${formats.slice(0, 8).join(' | ')}`.slice(0, 400)
+                )
+                console.log(`[cast-test]     其中支持 HLS = ${hls}${hls ? '' : '（投屏时会自动重封装成 MP4）'}`)
+              }
+            }
+          }
+          console.log('[cast-test] 完成')
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
+    }
+
+    /*
+     * 双端同步接口自检（SAKANA_SYNC_TEST=1，v0.3.8）。
+     *
+     * 为什么单独测：收藏/历史的同步是手机端依赖的接口，出问题时表现是"手机上什么都没有"，
+     * 而这既可能是路由没起来、也可能是字段名对不上。这里真的用 HTTP 打一遍自己的服务，
+     * 把每个接口的状态与条数打出来（不依赖手机端）。
+     */
+    if (process.env.SAKANA_SYNC_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const { ensureCastServer, lanIPv4 } = await import('./services/castRelay')
+          const port = await ensureCastServer()
+          if (!port) {
+            console.log('[sync-test] ❌ 同步服务没起来')
+            markQuitting()
+            app.quit()
+            return
+          }
+          const base = `http://${lanIPv4()}:${port}`
+          console.log(`[sync-test] 同步服务地址: ${base}`)
+          const get = async (path: string): Promise<void> => {
+            const r = await fetch(`${base}${path}`)
+            const text = await r.text()
+            let parsed: Record<string, unknown> = {}
+            try {
+              parsed = JSON.parse(text) as Record<string, unknown>
+            } catch {
+              /* ignore */
+            }
+            const n = Array.isArray(parsed.items) ? `，items=${(parsed.items as unknown[]).length}` : ''
+            console.log(`[sync-test] GET ${path} → HTTP ${r.status}${n} ${text.slice(0, 110)}`)
+          }
+          await get('/sync/ping')
+          await get('/sync/favorites')
+          await get('/sync/history')
+          // 推一条假历史进去，验证合并链路（id 固定，重复跑不会堆积）
+          const stamp = Date.now()
+          const push = await fetch(`${base}/sync/history`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              items: [
+                {
+                  /*
+                   * 字段与单位都按手机端真实推送来造：position/duration 是**毫秒**
+                   * （Media3 原生单位），duration 这里 = 24 分钟。
+                   */
+                  id: 'sync-test-item',
+                  subjectId: 1,
+                  title: '自检条目',
+                  episode: 1,
+                  position: 30000,
+                  duration: 1440000,
+                  watchedAt: stamp
+                }
+              ]
+            })
+          })
+          console.log(`[sync-test] POST /sync/history → HTTP ${push.status} ${(await push.text()).slice(0, 120)}`)
+          /*
+           * 合并进来的是**手机端的形状**，落库前必须换成电脑端的形状（v0.3.8）：
+           * 缺 durationSec 会让工具页「总观看时长」变成 NaN，缺 hour 会让时段分布全掉进最后一个桶。
+           * 所以这里不只看条数，直接把落库后的那一条读出来核对三个字段。
+           */
+          const { store } = await import('./store')
+          const rawHistory = store.get<Record<string, unknown>[]>('watchHistory', [])
+          const row = rawHistory.find((h) => h.id === 'sync-test-item')
+          const shapeOk =
+            !!row &&
+            typeof row.durationSec === 'number' &&
+            (row.durationSec as number) === 1440 &&
+            typeof row.hour === 'number' &&
+            row.source === 'online'
+          console.log(
+            `[sync-test] 落库形状 durationSec=${String(row?.durationSec)} hour=${String(row?.hour)} source=${String(row?.source)} → ${shapeOk ? '✅ 正确' : '❌ 不对'}`
+          )
+          const after = await fetch(`${base}/sync/history`)
+          const afterJson = (await after.json()) as { items?: { id: string; duration?: number }[] }
+          const first = (afterJson.items ?? []).find((i) => (i.duration ?? 0) > 0)
+          console.log(
+            `[sync-test] 合并后历史 ${afterJson.items?.length ?? 0} 条，自检条目在=${(afterJson.items ?? []).some((i) => i.id === 'sync-test-item')}` +
+              `，出口时长按毫秒=${first ? `${String(first.duration)}ms` : '（没有带时长的条目）'}`
+          )
+          /*
+           * 自检条目用完就删：它是往用户真实数据里写的，留着会污染历史与统计
+           * （之前这行清理是手工做的，跑一次忘一次）。
+           */
+          store.set(
+            'watchHistory',
+            rawHistory.filter((h) => h.id !== 'sync-test-item')
+          )
+          // 命令接口的错误分支（不真的投屏：给一个不存在的 subjectId）
+          const cmd = await fetch(`${base}/sync/command`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'no-such-action' })
+          })
+          console.log(`[sync-test] POST /sync/command(非法动作) → HTTP ${cmd.status} ${(await cmd.text()).slice(0, 120)}`)
+          console.log('[sync-test] 完成')
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
     }
 
     // 媒体扫描自检（SAKANA_MEDIA_TEST=文件夹路径）：递归扫描视频与字幕后退出

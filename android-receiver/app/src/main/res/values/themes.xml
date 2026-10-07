@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      主题。
+
+      为什么父主题用系统的 Theme.Material.NoActionBar，而不是 AppCompat/Material 主题：
+        · 不用 AppCompat 主题就不需要引 androidx.appcompat 依赖（省体积）；
+        · 这个主题自带全套 Material 控件样式与 alertDialogTheme，
+          所以 AlertDialog（选集/详情弹窗）能正常显示，不需要额外配置。
+
+      为什么**不**用 NoActionBar.Fullscreen（这一条改过）：
+      首页现在是正常的应用界面（状态卡 + 收藏网格 + 观看历史），需要状态栏那点空间；
+      "全屏"改成**播放时按需进入** —— PlaybackUi 用 WindowInsetsControllerCompat
+      隐藏系统栏并切横屏，退出播放就恢复。两个场景各自都合适。
+    -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/surface</item>
+        <item name="android:colorBackground">@color/surface</item>
+        <item name="android:statusBarColor">@color/surface_header</item>
+        <item name="android:navigationBarColor">@color/surface</item>
+    </style>
+
+    <!--
+      接收端主界面用 AppTheme；设置页用下面这个。
+
+      为什么设置页要单独一个主题：它和首页的背景/系统栏配色保持一致，但用户在这里要输入文字
+      （软键盘），`windowSoftInputMode=adjustResize` 需要一个会随键盘缩放的窗口，
+      单独一个主题也方便以后只调设置页的样式而不影响首页。
+    -->
+    <style name="SettingsTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/surface</item>
+        <item name="android:colorBackground">@color/surface</item>
+        <item name="android:statusBarColor">@color/surface_header</item>
+        <item name="android:navigationBarColor">@color/surface</item>
+    </style>
+
+    <!-- 设置页里的小标题 -->
+    <style name="SectionTitle">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:paddingStart">16dp</item>
+        <item name="android:paddingEnd">16dp</item>
+        <item name="android:paddingTop">20dp</item>
+        <item name="android:paddingBottom">6dp</item>
+        <item name="android:textColor">@color/accent</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:letterSpacing">0.06</item>
+    </style>
+
+    <!-- 设置项标题（左侧标签） -->
+    <style name="FieldLabel">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:paddingStart">16dp</item>
+        <item name="android:paddingEnd">16dp</item>
+        <item name="android:paddingTop">10dp</item>
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textSize">15sp</item>
+    </style>
+
+    <!-- 设置项下面的说明文字 -->
+    <style name="FieldHint">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:paddingStart">16dp</item>
+        <item name="android:paddingEnd">16dp</item>
+        <item name="android:paddingTop">4dp</item>
+        <item name="android:lineSpacingExtra">2dp</item>
+        <item name="android:textColor">@color/text_muted</item>
+        <item name="android:textSize">12sp</item>
+    </style>
+</resources>
