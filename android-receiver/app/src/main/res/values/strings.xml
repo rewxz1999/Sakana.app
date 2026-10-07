@@ -131,6 +131,10 @@
     <string name="sync_pc_unknown">电脑</string>
     <string name="sync_never">还没同步过</string>
     <string name="sync_ago">%1$s 前同步</string>
+    <!-- 离线时要说清"现在看到的是什么时候的缓存"，而不是让用户以为数据没了 -->
+    <string name="sync_status_offline_cached">离线 · 缓存于 %1$s · 收藏 %2$d / 历史 %3$d</string>
+    <string name="sync_offline_suffix">\n（数据还在：本机缓存的 %1$s 那份，稍后会自动重试）</string>
+    <string name="cache_cached_at">缓存于 %1$s</string>
     <string name="sync_need_connection">还没有连上电脑，无法点播。请先投屏一次，或在设置里主动连接电脑。</string>
     <string name="sync_command_ok">%1$s</string>
 
@@ -151,6 +155,16 @@
     <string name="set_sync_now">立即同步</string>
     <string name="set_sync_help">接收端会把收藏与观看历史缓存到本机（断网也能看），并在连上电脑后自动双向同步。\n点收藏里的番剧可以让**电脑**去解析播放源并投回本机 —— 接收端自己不取流。</string>
 
+    <!-- 设置页：图片缓存（数字全部现算，不写死） -->
+    <string name="set_section_cache">图片缓存</string>
+    <string name="set_cover_cache_counting">封面缓存：正在统计…</string>
+    <string name="set_cover_cache_line">封面缓存：%1$d 张 · %2$s · 缓存于 %3$s</string>
+    <string name="set_cover_cache_empty">封面缓存：还没有缓存（连上电脑同步一次就会开始缓存）</string>
+    <string name="set_cover_cache_hint">封面图片缓存在本机，滚到就有、断网也能看，不会每次打开都重新下载。\n上限 300MB，超过后按"最久没用过"自动清理。\n清理图片缓存只删封面图，**收藏与观看历史不受影响**。</string>
+    <string name="btn_clear_cover_cache">清理图片缓存</string>
+    <string name="toast_cover_cleared">已清理 %1$d 张封面</string>
+    <string name="toast_cover_cache_empty">图片缓存本来就是空的</string>
+
     <!-- 设置页：下载电脑端 -->
     <string name="set_section_download">下载 / 构建</string>
     <string name="set_download_body">本 App 是电脑端 Sakana 播放器的配套接收端，随仓库一起分发，没有单独的应用商店版本。\n\n源码与说明：仓库的 android-receiver 目录（含 README 的构建步骤）。\n命令行构建：\n  cd android-receiver\n  .\\gradlew.bat assembleDebug\n产物：app\\build\\outputs\\apk\\debug\\app-debug.apk\n\n电脑端 Sakana 播放器：见项目主页的发布页 / 构建说明。</string>
@@ -166,6 +180,11 @@
     <string name="cd_resize_fit">按比例显示（可能留黑边）</string>
     <string name="cd_resize_fill">铺满屏幕（消除黑边）</string>
     <string name="cd_retry">重试</string>
+
+    <!-- 顶栏的两个"出路"：图标旁边配文字，横屏全屏下才猜不出也找得到 -->
+    <string name="player_exit_fullscreen">退出全屏</string>
+    <string name="player_exit_play">退出播放</string>
+    <string name="cd_exit_play">退出播放并回到首页收藏列表</string>
 
     <!-- 手势提示气泡 -->
     <string name="hint_seek_forward">快进 %1$d 秒</string>

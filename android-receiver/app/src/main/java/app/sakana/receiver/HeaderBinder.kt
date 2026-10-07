@@ -21,6 +21,7 @@ internal class HeaderBinder(private val activity: Activity, header: View) {
     private val tvDetail: TextView = header.findViewById(R.id.tv_detail)
     private val tvAddr: TextView = header.findViewById(R.id.tv_addr)
     private val tvAddrHint: TextView = header.findViewById(R.id.tv_addr_hint)
+    private val tvSyncStatus: TextView = header.findViewById(R.id.tv_sync_status)
 
     /**
      * 网卡列表的缓存。
@@ -43,6 +44,7 @@ internal class HeaderBinder(private val activity: Activity, header: View) {
     fun refresh(snapshot: PlayerController.Snapshot, error: String?, notice: String?) {
         tvName.text = Settings.deviceName
         refreshAddress()
+        refreshSyncStatus()
 
         val connected = Receiver.isConnected()
         val searching = Receiver.isSearching()
@@ -67,6 +69,23 @@ internal class HeaderBinder(private val activity: Activity, header: View) {
                     else -> R.color.text_secondary
                 },
             ),
+        )
+    }
+
+    /**
+     * 同步状态行。
+     *
+     * ⚠️ 这一行曾经是布局里写死的 `android:text="未连接电脑 · …"`，**没有任何代码去改它**，
+     * 所以不管实际同步到没到、缓存了没有，首页永远显示"未连接电脑"。
+     * 真机验证时才发现的（设置页那行是动态的，光看代码不容易注意到首页这行是死的）。
+     * 现在它和设置页共用 [syncStatusText]：连接状态、离线时的"缓存于 …"、
+     * 失败原因都来自同一份判断，不会再对不上。
+     */
+    private fun refreshSyncStatus() {
+        val status = syncStatusText(activity)
+        tvSyncStatus.text = status.text
+        tvSyncStatus.setTextColor(
+            activity.getColor(if (status.error) R.color.warn else R.color.text_muted),
         )
     }
 

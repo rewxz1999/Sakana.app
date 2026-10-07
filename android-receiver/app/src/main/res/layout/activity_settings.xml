@@ -326,6 +326,36 @@
             android:layout_marginTop="16dp"
             android:background="@color/divider" />
 
+        <!-- ============ 图片缓存 ============ -->
+        <TextView style="@style/SectionTitle" android:text="@string/set_section_cache" />
+
+        <!-- 数字由 CoverCacheSection 现算后填进来，布局里不放任何写死的值 -->
+        <TextView
+            android:id="@+id/tv_cover_cache"
+            style="@style/FieldHint"
+            android:paddingTop="2dp"
+            android:text="@string/set_cover_cache_counting"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/btn_clear_cover_cache"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginTop="6dp"
+            android:layout_marginEnd="16dp"
+            android:text="@string/btn_clear_cover_cache"
+            android:textSize="14sp" />
+
+        <TextView style="@style/FieldHint" android:text="@string/set_cover_cache_hint" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="16dp"
+            android:background="@color/divider" />
+
         <!-- ============ 下载 / 构建 ============ -->
         <TextView style="@style/SectionTitle" android:text="@string/set_section_download" />
 

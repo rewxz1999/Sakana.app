@@ -41,6 +41,7 @@ class SettingsActivity : Activity() {
     private lateinit var tvSyncState: TextView
     private lateinit var tvSyncUrl: TextView
     private lateinit var tvSyncCounts: TextView
+    private lateinit var coverCache: CoverCacheSection
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -61,7 +62,6 @@ class SettingsActivity : Activity() {
         refreshAbout()
         refreshSync()
     }
-
     private fun bindViews() {
         etName = findViewById(R.id.et_name)
         etPort = findViewById(R.id.et_port)
@@ -81,6 +81,9 @@ class SettingsActivity : Activity() {
         tvSyncState = findViewById(R.id.tv_sync_state)
         tvSyncUrl = findViewById(R.id.tv_sync_url)
         tvSyncCounts = findViewById(R.id.tv_sync_counts)
+        // 图片缓存区块自己找它的两个控件；这里建好并接上"清理"按钮
+        coverCache = CoverCacheSection(this)
+        coverCache.bind()
     }
 
     private fun loadValues() {
@@ -204,7 +207,9 @@ class SettingsActivity : Activity() {
             R.string.set_sync_counts,
             SyncStore.favorites.size,
             SyncStore.history.size,
-        )
+        ) + cacheAgeText(this)
+        // 图片缓存的占用/时间每次进来都重算（后台线程，见 CoverCacheSection）
+        coverCache.refresh()
     }
 
     private fun refreshAbout() {

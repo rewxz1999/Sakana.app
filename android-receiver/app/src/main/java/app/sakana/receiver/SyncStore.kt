@@ -26,6 +26,8 @@ object SyncStore {
     private const val K_PC_NAME = "pc-name"
     private const val K_PC_VERSION = "pc-version"
     private const val K_LAST_SYNC = "last-sync-at"
+    private const val K_FAVORITES_AT = "favorites-cached-at"
+    private const val K_HISTORY_AT = "history-cached-at"
     private const val K_PUSHED_SIG = "pushed-signature"
 
     private lateinit var prefs: SharedPreferences
@@ -75,9 +77,52 @@ object SyncStore {
     fun saveFavorites(list: List<Favorite>) {
         cachedFavorites = list
         prefs.edit().putString(K_FAVORITES, Json.stringify(list.map { it.toJson() })).apply()
+        favoritesCachedAt = System.currentTimeMillis()
         bump()
         Log.i(TAG, "收藏已缓存：${list.size} 条")
     }
+
+    /**
+     * 用电脑端刚拉到的收藏替换本地缓存，但**不允许空列表覆盖非空缓存**。
+     *
+     * 为什么要这一层：`Favorite.listFromJson` 会把"没有名字"的条目丢掉（脏数据容错）。
+     * 万一电脑端改了字段名，整份列表会被解析成空 —— 那时如果直接保存，
+     * 用户看到的就是"收藏突然全没了"。宁可保留旧数据并在界面上说明同步没成功，
+     * 也不要让一次解析事故把本地缓存清空。真的在电脑上删光了收藏属于极端情况，
+     * 那时用户可以在电脑端重新同步一次（或清掉 App 数据）。
+     */
+    fun replaceFavoritesFromPc(list: List<Favorite>): Boolean {
+        if (list.isEmpty() && favorites.isNotEmpty()) {
+            Log.w(TAG, "电脑端这次返回 0 条收藏，本地有 ${favorites.size} 条，保留本地缓存不覆盖")
+            return false
+        }
+        saveFavorites(list)
+        return true
+    }
+
+    /** 收藏数据的缓存时间（0 = 从没缓存过）。 */
+    var favoritesCachedAt: Long
+        get() = prefs.getLong(K_FAVORITES_AT, 0L)
+        private set(value) {
+            prefs.edit().putLong(K_FAVORITES_AT, value).apply()
+        }
+
+    /** 历史数据的缓存时间（0 = 从没缓存过）。 */
+    var historyCachedAt: Long
+        get() = prefs.getLong(K_HISTORY_AT, 0L)
+        private set(value) {
+            prefs.edit().putLong(K_HISTORY_AT, value).apply()
+        }
+
+    /**
+     * 本地缓存"有多新"：收藏与历史里**最近**的那次缓存时间。
+     * 界面上的"缓存于 …"用的就是它 —— 用户关心的是"我看到的数据是哪一刻的"，
+     * 而不是某个分区的精确时间。
+     */
+    val cachedAt: Long get() = maxOf(favoritesCachedAt, historyCachedAt)
+
+    /** 有没有可用的本地缓存（决定要不要显示"离线 · 缓存于 …"）。 */
+    val hasCachedData: Boolean get() = favoritesCachedAt > 0L || historyCachedAt > 0L
 
     // ---------------- 观看历史 ----------------
 
@@ -93,6 +138,7 @@ object SyncStore {
     fun saveHistory(list: List<HistoryItem>) {
         cachedHistory = list
         prefs.edit().putString(K_HISTORY, Json.stringify(list.map { it.toJson() })).apply()
+        historyCachedAt = System.currentTimeMillis()
         bump()
     }
 

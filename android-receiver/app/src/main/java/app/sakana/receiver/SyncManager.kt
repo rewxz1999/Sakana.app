@@ -139,7 +139,8 @@ object SyncManager {
             val fav = SyncClient.get(base, "/sync/favorites")
             if (fav.ok) {
                 val items = Favorite.listFromJson(Json.obj(fav.json())?.get("items"))
-                SyncStore.saveFavorites(items)
+                // 空列表不覆盖非空缓存：解析事故不该让用户"收藏全没了"（见 SyncStore 的说明）
+                SyncStore.replaceFavoritesFromPc(items)
             } else {
                 Log.w(TAG, "拉收藏失败: ${fav.error}")
             }
@@ -161,6 +162,9 @@ object SyncManager {
             SyncStore.lastSyncAt = System.currentTimeMillis()
             lastError = null
             Log.i(TAG, "同步完成（$reason）：收藏 ${SyncStore.favorites.size} 条，历史 ${SyncStore.history.size} 条")
+            // ⑤ 同步完成后在后台把"缺图"的封面预取一遍，滚到就有。
+            //    已有的缓存会被跳过（一个都不重复抓），计费网络下 CoverPrefetch 自己会放弃。
+            CoverLoader.prefetchMissing(SyncStore.favorites.map { it.cover })
         } catch (t: Throwable) {
             lastError = "同步失败：${t.message ?: t.javaClass.simpleName}"
             Log.w(TAG, "同步异常", t)

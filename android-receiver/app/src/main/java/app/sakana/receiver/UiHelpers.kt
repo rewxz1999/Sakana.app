@@ -13,61 +13,16 @@ import android.widget.ArrayAdapter
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import java.text.DateFormat
-import java.util.Date
 
 /**
- * 界面小工具：状态文字、选集弹窗、网卡选择、最近地址、剪贴板、时间格式化。
+ * 界面小工具：选集弹窗、剪贴板、时间格式化、同步状态文案。
  *
  * 单独一个文件（而不是全塞在 Activity 里）的原因：这些是"和播放状态无关的纯 UI 动作"，
  * Activity 只该负责"接线 + 刷新"，这类函数抽出来两边都更好读，也不会让 Activity 越过 300 行。
  * 全部是顶层函数：它们不需要持有状态，用哪个 Activity 就传哪个进来。
- */
-
-/** 顶部状态区那两行字。 */
-internal data class StatusLines(val state: String, val detail: String)
-
-/**
- * 组装顶部的"大字状态 + 副状态"。
  *
- * 副状态的优先级是有讲究的，从"最该让用户看到"往下排：
- *   失败原因 > 人话提示 > 已被谁连接 > 电脑正在搜索 > USB 共享网络提示 > 请让电脑搜索
- * 例如播放失败时，用户最需要看到的是**为什么失败**，而不是"等待投屏…"。
+ * 顶部那两行状态文字后来挪去了 `StatusText.kt`（见那里的说明）。
  */
-internal fun statusLines(
-    activity: Activity,
-    state: String,
-    title: String?,
-    error: String?,
-    notice: String?,
-    connectedIp: String?,
-    searchingIp: String?,
-    wiredFaceLabel: String?,
-): StatusLines {
-    val name = title?.takeIf { it.isNotBlank() }
-    val stateText = when {
-        error != null -> activity.getString(R.string.state_error)
-        state == Proto.STATE_PLAYING -> if (name != null) {
-            activity.getString(R.string.state_playing, name)
-        } else {
-            activity.getString(R.string.state_playing_no_title)
-        }
-        state == Proto.STATE_PAUSED && name != null -> activity.getString(R.string.state_paused, name)
-        state == Proto.STATE_BUFFERING && name != null -> activity.getString(R.string.state_buffering, name)
-        state == Proto.STATE_ENDED && name != null -> activity.getString(R.string.state_ended, name)
-        else -> activity.getString(R.string.state_idle)
-    }
-
-    val detail = when {
-        error != null -> activity.getString(R.string.detail_error, error)
-        notice != null -> activity.getString(R.string.detail_notice, notice)
-        connectedIp != null -> activity.getString(R.string.detail_connected, connectedIp)
-        searchingIp != null -> activity.getString(R.string.detail_searching, searchingIp)
-        wiredFaceLabel != null -> activity.getString(R.string.detail_usb, wiredFaceLabel)
-        else -> activity.getString(R.string.detail_waiting)
-    }
-    return StatusLines(stateText, detail)
-}
 
 /**
  * 选集弹窗。
@@ -138,24 +93,6 @@ internal fun copyToClipboard(activity: Activity, label: String, text: String): B
     return true
 }
 
-/**
- * 毫秒 -> `mm:ss` 或 `h:mm:ss`。
- * 时长未知（0 或负数）时返回 [unknown]，而不是显示 "00:00" ——
- * 后者看起来像"已经播完了"，容易误导。
- */
-internal fun formatTime(ms: Long, unknown: String): String {
-    if (ms <= 0) return unknown
-    val total = ms / 1000
-    val h = total / 3600
-    val m = (total % 3600) / 60
-    val sec = total % 60
-    return if (h > 0) {
-        String.format("%d:%02d:%02d", h, m, sec)
-    } else {
-        String.format("%02d:%02d", m, sec)
-    }
-}
-
 // ---------------- 同步相关 ----------------
 
 /** 同步状态行的文字 + 是否算"需要注意"（用警告色显示）。 */
@@ -166,16 +103,27 @@ internal data class SyncStatus(val text: String, val error: Boolean)
  *
  * 优先级：正在做的事（解析播放源 / 同步中）> 出错 > 已连接 > 未连接。
  * "还没连过电脑"时要说清**怎么才能连上**，而不是干瘪地说"未连接"。
+ *
+ * 这一轮补上的关键一条：**离线时也必须说清"现在看到的是什么时候的缓存"**。
+ * 用户看到的收藏/历史其实来自本机缓存（见 SyncStore），不说的话他会以为
+ * "数据是刚同步的"，或者反过来以为"同步失败 = 数据没了"。所以离线/失败两种情况下
+ * 都带上"缓存于 …"和条数。
  */
 internal fun syncStatusText(activity: Activity): SyncStatus {
     SyncManager.statusMessage?.let { message ->
         if (SyncManager.busyCommand) return SyncStatus(message, false)
     }
     if (SyncManager.syncing) return SyncStatus(activity.getString(R.string.sync_status_syncing), false)
-    SyncManager.lastError?.let { return SyncStatus(it, true) }
+    SyncManager.lastError?.let {
+        // 失败时先给原因，再补一句"数据还在，是缓存于 X 的"
+        return SyncStatus(it + cacheSuffix(activity), true)
+    }
 
     val base = SyncStore.syncUrl
-    if (base.isNullOrBlank()) return SyncStatus(activity.getString(R.string.sync_status_offline), false)
+    if (base.isNullOrBlank()) {
+        if (!SyncStore.hasCachedData) return SyncStatus(activity.getString(R.string.sync_status_offline), false)
+        return SyncStatus(cachedLine(activity), false)
+    }
 
     val pc = SyncStore.pcName?.takeIf { it.isNotBlank() } ?: activity.getString(R.string.sync_pc_unknown)
     val at = SyncStore.lastSyncAt
@@ -195,6 +143,50 @@ internal fun syncStatusText(activity: Activity): SyncStatus {
         ),
         false,
     )
+}
+
+/**
+ * "离线 · 缓存于 3 小时前 · 收藏 86 / 历史 14"。
+ * 没有缓存过（全新安装、从没连上过电脑）时不显示这一行，避免"缓存于 0 秒前"这种鬼话。
+ */
+private fun cachedLine(activity: Activity): String {
+    val at = SyncStore.cachedAt
+    val whenText = if (at <= 0L) {
+        activity.getString(R.string.sync_never)
+    } else {
+        formatTime(System.currentTimeMillis() - at, activity.getString(R.string.sync_never))
+    }
+    return activity.getString(
+        R.string.sync_status_offline_cached,
+        whenText,
+        SyncStore.favorites.size,
+        SyncStore.history.size,
+    )
+}
+
+/** 拼在失败原因后面的缓存说明；没有缓存时是空串（不硬凑一句话）。 */
+private fun cacheSuffix(activity: Activity): String {
+    if (!SyncStore.hasCachedData) return ""
+    return activity.getString(R.string.sync_offline_suffix, cacheAge(activity))
+}
+
+/**
+ * "缓存于 3 小时前"（设置页的收藏/历史计数行后面会接上它）。
+ * 没缓存过时返回空串 —— 新装的 App 上显示"缓存于 0 秒前"是自欺欺人。
+ */
+internal fun cacheAgeText(activity: Activity): String {
+    if (!SyncStore.hasCachedData) return ""
+    return "\n" + activity.getString(R.string.cache_cached_at, cacheAge(activity))
+}
+
+/** 本地数据的缓存时间描述（相对时间）。 */
+private fun cacheAge(activity: Activity): String {
+    val at = SyncStore.cachedAt
+    return if (at <= 0L) {
+        activity.getString(R.string.sync_never)
+    } else {
+        formatTime(System.currentTimeMillis() - at, activity.getString(R.string.sync_never))
+    }
 }
 
 /**
@@ -222,29 +214,6 @@ internal fun showFavoriteDialog(activity: Activity, favorite: Favorite) {
         .setMessage(lines.joinToString("\n"))
         .setPositiveButton(R.string.close, null)
         .show()
-}
-
-/**
- * 观看历史的"相对时间"：刚刚 / N 分钟前 / N 小时前 / 昨天 / N 天前 / 具体日期。
- *
- * 为什么不用 DateUtils.getRelativeTimeSpanString：它返回的是"3 小时前"这一类**本地化**文案，
- * 但不同 API 级别的措辞和粒度都不一样，还会带上"0 分钟前"这种别扭结果；
- * 这里自己算，规则单一、可预期，也好在断言里验证。
- */
-internal fun relativeTime(context: Context, timestampMs: Long): String {
-    if (timestampMs <= 0L) return ""
-    val diff = System.currentTimeMillis() - timestampMs
-    // 电脑与设备时钟不同步时 diff 可能是负数，别显示"-3 分钟前"
-    if (diff < 60_000L) return context.getString(R.string.time_just_now)
-    val minutes = diff / 60_000L
-    return when {
-        minutes < 60 -> context.getString(R.string.time_minutes_ago, minutes.toInt())
-        minutes < 24 * 60 -> context.getString(R.string.time_hours_ago, (minutes / 60).toInt())
-        // 24-48 小时按"昨天"处理：够用且不用处理时区/夏令时
-        minutes < 48 * 60 -> context.getString(R.string.time_yesterday)
-        minutes < 30L * 24 * 60 -> context.getString(R.string.time_days_ago, (minutes / (24 * 60)).toInt())
-        else -> DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(timestampMs))
-    }
 }
 
 /**

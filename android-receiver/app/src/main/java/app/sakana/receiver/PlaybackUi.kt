@@ -10,9 +10,6 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import kotlin.math.abs
 
-/** 播放中控制栏自动淡出的时间；暂停时改成 0（不淡出）。 */
-private const val HIDE_TIMEOUT_MS = 4_000
-
 /** 手势提示气泡的显示时长。 */
 private const val HINT_MS = 900L
 
@@ -40,31 +37,29 @@ internal class PlaybackUi(
     private val gestureLayer: View,
     private val onPlaylist: () -> Unit,
     private val onSettings: () -> Unit,
+    private val onExitPlayback: () -> Unit,
 ) {
 
     private val titleView: TextView = playerView.findViewById(R.id.player_title)
-    private val hintView: TextView = playerView.findViewById(R.id.player_hint)
     private val retryButton: View = playerView.findViewById(R.id.btn_retry)
-    private val resizeButton: ImageButton = playerView.findViewById(R.id.btn_resize)
     private val lockButton: ImageButton = playerView.findViewById(R.id.btn_lock_orientation)
-
-    private val handler = Handler(Looper.getMainLooper())
+    private val exitFullscreenEntry: View = playerView.findViewById(R.id.btn_exit_fs)
 
     /** 全屏/方向/系统栏的细节都在 FullscreenController.kt，这里只负责调用。 */
     private val fullscreen = FullscreenController(activity)
 
+    /**
+     * 控制栏显隐的**唯一**负责人（含那个 4 秒计时器）。
+     * 之所以单独一个类：以前是"每个心跳兜底判断 + Media3 自带逻辑"两头管，
+     * 结果两边互相顶，控制栏永不隐藏（真因写在 `PlaybackControls` 的类注释里）。
+     */
+    private val controls = PlaybackControls(playerView)
+
+    /** 音量/亮度/提示气泡/铺满这些小动作（拆出去让这里只剩主干）。 */
+    private val actions = PlayerActions(activity, playerView, controller)
+
     private var inPlayerMode = false
     private var durationMs = 0L
-
-    /**
-     * 控制栏当前是否可见。
-     * 自己记一份而不是问 PlayerView：它只暴露 `isControllerFullyVisible()`（带"完全"的语义，
-     * 动画过程中会是 false），而我们要的是"我上一次是显示还是隐藏"，自己的状态最准。
-     */
-    private var controlsVisible = true
-
-    private val hideControls = Runnable { hideController() }
-    private val dismissHint = Runnable { hintView.visibility = View.GONE }
 
     // ---------------- 手势 ----------------
 
@@ -72,130 +67,180 @@ internal class PlaybackUi(
         view = gestureLayer,
         listener = object : PlayerGestures.Listener {
             override val volumePercent: Int get() = controller.snapshot().volume
-            override val brightnessPercent: Int get() = currentBrightness()
-            override val durationMs: Long get() = durationMs
+            override val brightnessPercent: Int get() = actions.brightness()
+            /*
+             * ⚠️ 必须写 `this@PlaybackUi.durationMs`。
+             * 只写 `durationMs` 会解析成**这个匿名对象自己的** durationMs（也就是这一行本身），
+             * 于是无限递归 → StackOverflowError。
+             * 这个坑一直藏着没发作：手势层以前根本收不到触摸（被上层 clickable 的 PlayerView 吃掉），
+             * 所以没人读过这个值；真机上一拖进度就崩了才暴露出来。
+             */
+            override val durationMs: Long get() = this@PlaybackUi.durationMs
 
             override fun onToggleControls() {
-                if (controlsVisible) hideController() else showController()
+                /*
+                 * 以 PlayerView 的**真实**可见性为准，而不是我们自己的标志位：
+                 * 一旦两个状态不同步（比如别处调过 show/hide），"点一下"就会点不动 ——
+                 * 去 hide 一个已经隐藏的、或者 show 一个本来就显示的，看起来就是"没反应"。
+                 * 控件动画已经关掉，`isControllerFullyVisible()` 在这里是准的。
+                 */
+                if (playerView.isControllerFullyVisible()) hideController() else showController()
             }
 
             override fun onSeekBy(deltaMs: Long) {
-                showHint(
+                actions.showHint(
                     activity.getString(
                         if (deltaMs >= 0) R.string.hint_seek_forward else R.string.hint_seek_backward,
                         (abs(deltaMs) / 1000).toInt(),
                     ),
                 )
-                seekBy(deltaMs)
+                actions.seekBy(deltaMs, durationMs)
             }
 
             override fun onSpeed(active: Boolean) {
                 controller.setPlaybackSpeed(if (active) 2f else 1f)
-                if (active) showHint(activity.getString(R.string.hint_speed_2x)) else hintView.visibility = View.GONE
+                if (active) {
+                    actions.showHint(activity.getString(R.string.hint_speed_2x))
+                } else {
+                    actions.hideHint()
+                }
             }
 
-            override fun onVolume(percent: Int) {
-                // 走同一条 /control 路径，这样电脑端读 /info 拿到的音量也一致
-                controller.control("volume", percent.toLong())
-                showHint(activity.getString(R.string.hint_volume, percent))
-            }
+            override fun onVolume(percent: Int) = actions.setVolume(percent)
 
-            override fun onBrightness(percent: Int) {
-                applyBrightness(percent)
-                showHint(activity.getString(R.string.hint_brightness, percent))
-            }
+            override fun onBrightness(percent: Int) = actions.setBrightness(percent)
 
-            override fun onSeekPreview(deltaMs: Long) {
-                val unknown = activity.getString(R.string.time_unknown)
-                val target = (controller.snapshot().positionMs + deltaMs).coerceAtLeast(0L)
-                showHint("${formatTime(target, unknown)} / ${formatTime(durationMs, unknown)}")
-            }
+            override fun onSeekPreview(deltaMs: Long) =
+                actions.showSeekPreview(controller.snapshot().positionMs, deltaMs, durationMs)
 
             override fun onSeekCommit(deltaMs: Long) {
-                seekBy(deltaMs)
-                hintView.visibility = View.GONE
+                actions.seekBy(deltaMs, durationMs)
+                actions.hideHint()
             }
         },
     )
 
     /** 接线：必须在 setContentView 之后调一次（此时 PlayerView 的控制栏已经 inflate）。 */
     fun bind() {
-        // 控制栏显隐由我们自己管：官方默认"点画面切换"会和我们的手势打架
-        // （双击快进时会被顺带切两次）。关掉它之后点击统一走手势，行为才可控。
-        playerView.controllerAutoShow = false
-        playerView.controllerHideOnTouch = false
+        // 控制栏的自动行为全部交给 PlaybackControls（它会把 Media3 那套关掉）：
+        // 官方默认"点画面切换"会和我们的手势打架（双击快进时会被顺带切两次）。
+        controls.bind()
         playerView.setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
+        // 用户操作之后重新计时：免得"正在调音量，控制栏却淡出了"
+        actions.keepAliveHook = { keepControlsAlive() }
 
         gestureLayer.setOnTouchListener { _, event -> gestures.onTouchEvent(event) }
+        /*
+         * 手势还要挂到 **PlayerView 自己**身上，否则整套手势（单击切换、双击快进、
+         * 左右滑动调亮度/音量、长按 2 倍速）在真机上一次都不会触发。
+         *
+         * 原因：`gesture_layer` 在布局里排在 `player_view` **前面**，而 FrameLayout 里
+         * 后面的孩子在上层 —— PlayerView 又是 clickable 的（真机 uiautomator dump 里能看到
+         * `clickable="true"`），于是它在 ACTION_DOWN 就把事件吃掉了，下层的 gesture_layer
+         * 永远收不到。真机上"点一下画面没反应"就是这么来的。
+         *
+         * 挂到 PlayerView 上为什么不会影响控制栏的按钮：ViewGroup 派发触摸时**先给子 View**
+         * （也就是那些按钮），只有没有子 View 消费时才轮到自己的 OnTouchListener。
+         * 所以点按钮照旧、点空白处才轮到手势 —— 这正是我们想要的优先级。
+         */
+        playerView.setOnTouchListener { _, event -> gestures.onTouchEvent(event) }
+        // 拖进度条时重新计时：不这么做的话，拖到一半控制栏就自己淡出了
+        actions.bindScrubKeepAlive { keepControlsAlive() }
 
         playerView.findViewById<ImageButton>(R.id.btn_pick_episode).setOnClickListener { onPlaylist() }
-        playerView.findViewById<ImageButton>(R.id.btn_exit_fs).setOnClickListener { exitFullscreenIfNeeded() }
-        playerView.findViewById<ImageButton>(R.id.btn_volume_down).setOnClickListener { volumeBy(-VOLUME_STEP) }
-        playerView.findViewById<ImageButton>(R.id.btn_volume_up).setOnClickListener { volumeBy(VOLUME_STEP) }
         playerView.findViewById<ImageButton>(R.id.btn_settings_player)?.setOnClickListener { onSettings() }
+        // 退出全屏：回到竖屏但**继续播放**（等于返回键的第一步）
+        exitFullscreenEntry.setOnClickListener { exitFullscreenIfNeeded() }
+        // 退出播放（✕）：和返回键第二步同一套动作，见 exitPlayback()
+        playerView.findViewById<View>(R.id.btn_exit_play).setOnClickListener { exitPlayback() }
+        playerView.findViewById<ImageButton>(R.id.btn_volume_down)
+            .setOnClickListener { actions.volumeBy(-VOLUME_STEP) }
+        playerView.findViewById<ImageButton>(R.id.btn_volume_up)
+            .setOnClickListener { actions.volumeBy(VOLUME_STEP) }
         lockButton.setOnClickListener { toggleOrientationLock() }
-        resizeButton.setOnClickListener { toggleResize() }
+        playerView.findViewById<ImageButton>(R.id.btn_resize).setOnClickListener { actions.toggleResize() }
         retryButton.setOnClickListener {
             controller.retry()
             showController()
         }
-        applyResizeMode()
+        actions.applyResizeMode()
+        syncExitFullscreenEntry()
     }
 
     // ---------------- 播放层切换与全屏 ----------------
 
-    fun setPlayerMode(active: Boolean, playing: Boolean) {
-        // 播放中 4 秒淡出；暂停时不淡出（否则用户找不到继续的按钮）
-        playerView.controllerShowTimeoutMs = if (playing) HIDE_TIMEOUT_MS else 0
+    fun setPlayerMode(active: Boolean) {
         if (active == inPlayerMode) return
         inPlayerMode = active
         homeView.visibility = if (active) View.GONE else View.VISIBLE
         (playerView.parent as? View)?.visibility = if (active) View.VISIBLE else View.GONE
         if (active) {
+            // 刚进播放层：按"第一次看到这个状态"重新判断显隐（缓冲/播放/暂停各有规矩）
+            controls.reset()
             enterFullscreen()
             showController()
         } else {
             exitFullscreen()
-            hintView.visibility = View.GONE
+            actions.hideHint()
+            controls.reset()
         }
+        syncExitFullscreenEntry()
     }
 
     /** 进横屏全屏（细节见 FullscreenController）。 */
-    fun enterFullscreen() = fullscreen.enter()
+    fun enterFullscreen() {
+        fullscreen.enter()
+        syncExitFullscreenEntry()
+    }
 
     /** 退出全屏：恢复竖屏（交回系统决定）并显示系统栏。 */
-    fun exitFullscreen() = fullscreen.exit()
+    fun exitFullscreen() {
+        fullscreen.exit()
+        syncExitFullscreenEntry()
+    }
+
+    /**
+     * 「退出全屏」这个入口只在**真的全屏时**才显示 ——
+     * 已经回到竖屏还摆一个"退出全屏"只会让人困惑（点了什么都不会发生）。
+     */
+    private fun syncExitFullscreenEntry() {
+        exitFullscreenEntry.visibility = if (fullscreen.immersive) View.VISIBLE else View.GONE
+    }
 
     /** 返回键：全屏时先退全屏（不退出播放、更不退出应用）。 */
     fun exitFullscreenIfNeeded(): Boolean {
         if (!fullscreen.exitIfNeeded()) return false
+        syncExitFullscreenEntry()
         showController()
         return true
+    }
+
+    /**
+     * 顶栏的「退出播放」（✕）：**和返回键的第二步是同一套动作** ——
+     * 停止播放 → 退全屏 → 回首页层。
+     *
+     * 停止后的画面层/首页层切换由随后的 `setPlayerMode(false)` 完成
+     * （`onExitPlayback` 里 MainActivity 会立刻刷一次界面，所以首页马上就有收藏和历史）。
+     * 这里只负责把浮层先收干净，免得"已经回首页了控制栏还挂在半空"。
+     */
+    fun exitPlayback() {
+        hideController()
+        actions.hideHint()
+        controls.reset()
+        onExitPlayback()
     }
 
     fun isInPlayerMode(): Boolean = inPlayerMode
 
     // ---------------- 控制栏显隐 ----------------
+    // 真正的逻辑在 PlaybackControls（唯一计时器）+ ControlsPolicy（纯逻辑的状态跃迁）。
 
-    fun showController() {
-        controlsVisible = true
-        playerView.showController()
-        scheduleHide()
-    }
+    fun showController() = controls.show()
 
-    fun hideController() {
-        controlsVisible = false
-        handler.removeCallbacks(hideControls)
-        playerView.hideController()
-    }
+    fun hideController() = controls.hide()
 
-    fun keepControlsAlive() = scheduleHide()
-
-    private fun scheduleHide() {
-        handler.removeCallbacks(hideControls)
-        val timeout = playerView.controllerShowTimeoutMs
-        if (timeout > 0) handler.postDelayed(hideControls, timeout.toLong())
-    }
+    /** 用户操作之后重新计时（拖进度、调音量、点按钮都调它）。 */
+    fun keepControlsAlive() = controls.keepAlive()
 
     // ---------------- 刷新（每个心跳一次） ----------------
 
@@ -212,81 +257,38 @@ internal class PlaybackUi(
 
         // 出错：官方错误文案（PlayerView 自带的 exo_error_message）+ 我们的「重试」
         retryButton.visibility = if (error != null) View.VISIBLE else View.GONE
-        // 缓冲中让控制栏别淡出；暂停/出错时常显，用户才找得到按钮
-        if (snapshot.state == Proto.STATE_BUFFERING) keepControlsAlive()
-        if (!snapshot.playing && !controlsVisible) showController()
+        /*
+         * 控制栏显隐：**只在状态跃迁时**动手（缓冲→播放、播放→暂停、出错……）。
+         *
+         * 上一版这里有两句"每秒兜底"：
+         *   if (state == BUFFERING) keepControlsAlive()          // 每秒取消一次隐藏
+         *   if (!snapshot.playing && !controlsVisible) show()     // 缓冲时 isPlaying=false → 每秒重新显示
+         * 它们就是"控制栏永远不隐藏"的直接原因，现在整段删掉，换成状态跃迁判断。
+         */
+        controls.applyState(hasError = error != null, state = snapshot.state)
     }
 
     // ---------------- 具体动作 ----------------
-
-    private fun seekBy(deltaMs: Long) {
-        val position = controller.snapshot().positionMs
-        var target = (position + deltaMs).coerceAtLeast(0L)
-        if (durationMs > 0) target = target.coerceAtMost(durationMs)
-        controller.control("seek", target)
-    }
-
-    private fun volumeBy(delta: Int) {
-        val target = (controller.snapshot().volume + delta).coerceIn(0, 100)
-        controller.control("volume", target.toLong())
-        showHint(activity.getString(R.string.hint_volume, target))
-        keepControlsAlive()
-    }
+    // 音量/亮度/提示气泡/铺满都在 PlayerActions 里（那些是"拿一个值、改一个地方"的小动作）。
 
     private fun toggleOrientationLock() {
         val locked = fullscreen.toggleOrientationLock()
         lockButton.contentDescription = activity.getString(
             if (locked) R.string.cd_unlock_orientation else R.string.cd_lock_orientation,
         )
-        showHint(
+        actions.showHint(
             activity.getString(
                 if (locked) R.string.toast_locked_orientation else R.string.toast_unlocked_orientation,
             ),
         )
     }
 
-    private fun toggleResize() {
-        Settings.resizeFill = !Settings.resizeFill
-        applyResizeMode()
-        showHint(
-            activity.getString(if (Settings.resizeFill) R.string.toast_resize_fill else R.string.toast_resize_fit),
-        )
-    }
-
-    /** resize_mode：fit = 按比例（可能留黑边），fill = 铺满（拉伸，消除黑边）。 */
-    fun applyResizeMode() {
-        val fill = Settings.resizeFill
-        playerView.resizeMode =
-            if (fill) AspectRatioFrameLayout.RESIZE_MODE_FILL else AspectRatioFrameLayout.RESIZE_MODE_FIT
-        resizeButton.setImageResource(if (fill) R.drawable.ic_fullscreen_exit else R.drawable.ic_fullscreen)
-        resizeButton.contentDescription = activity.getString(
-            if (fill) R.string.cd_resize_fit else R.string.cd_resize_fill,
-        )
-    }
-
-    /** 亮度：写 window 的 screenBrightness（0-1，-1 表示跟随系统）。留 5% 下限，别让屏幕全黑。 */
-    private fun applyBrightness(percent: Int) {
-        val attrs = activity.window.attributes
-        attrs.screenBrightness = percent.coerceIn(5, 100) / 100f
-        activity.window.attributes = attrs
-    }
-
-    private fun currentBrightness(): Int {
-        val value = activity.window.attributes.screenBrightness
-        return if (value < 0f) 100 else (value * 100).toInt().coerceIn(5, 100)
-    }
-
-    // ---------------- 提示气泡 ----------------
-
-    private fun showHint(text: String) {
-        hintView.text = text
-        hintView.visibility = View.VISIBLE
-        handler.removeCallbacks(dismissHint)
-        handler.postDelayed(dismissHint, HINT_MS)
-    }
+    /** resize_mode 由播放层底栏的「铺满」和设置页共用（设置页回来时 MainActivity 会调它）。 */
+    fun applyResizeMode() = actions.applyResizeMode()
 
     fun onDestroy() {
-        handler.removeCallbacksAndMessages(null)
+        actions.onDestroy()
+        controls.onDestroy()
         fullscreen.onDestroy()
     }
 }

@@ -58,11 +58,79 @@
             android:contentDescription="@string/cd_settings"
             android:src="@drawable/ic_settings" />
 
-        <ImageButton
+        <!--
+          顶栏右侧的两个"出路"。都做成「图标 + 文字」而不是纯图标按钮：
+          用户在横屏全屏里最常问的就是"怎么出去"，一个光秃秃的图标猜不出来。
+          两个都带 contentDescription（无障碍，顺便让真机自检能按描述找到它们）。
+        -->
+
+        <!-- 退出全屏：只在全屏时显示（已经回了竖屏就没必要再摆一个） -->
+        <LinearLayout
             android:id="@+id/btn_exit_fs"
-            style="@style/PlayerIconButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="?android:attr/selectableItemBackground"
+            android:clickable="true"
             android:contentDescription="@string/cd_exit_fs"
-            android:src="@drawable/ic_fullscreen_exit" />
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:minWidth="48dp"
+            android:minHeight="48dp"
+            android:orientation="horizontal"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp">
+
+            <ImageView
+                android:layout_width="18dp"
+                android:layout_height="18dp"
+                android:contentDescription="@null"
+                android:src="@drawable/ic_fullscreen_exit"
+                android:tint="@color/player_icon" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:text="@string/player_exit_fullscreen"
+                android:textColor="@color/player_icon"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <!--
+          退出播放（✕）：停止播放并回到首页收藏列表。
+          和返回键的第二步是**同一套动作**（stop → 退全屏 → 回首页层），
+          竖屏/横屏都在顶栏上，用户不会找不到出口。
+        -->
+        <LinearLayout
+            android:id="@+id/btn_exit_play"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="?android:attr/selectableItemBackground"
+            android:clickable="true"
+            android:contentDescription="@string/cd_exit_play"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:minWidth="48dp"
+            android:minHeight="48dp"
+            android:orientation="horizontal"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp">
+
+            <ImageView
+                android:layout_width="18dp"
+                android:layout_height="18dp"
+                android:contentDescription="@null"
+                android:src="@drawable/ic_close"
+                android:tint="@color/player_icon" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:text="@string/player_exit_play"
+                android:textColor="@color/player_icon"
+                android:textSize="13sp" />
+        </LinearLayout>
     </LinearLayout>
 
     <!--

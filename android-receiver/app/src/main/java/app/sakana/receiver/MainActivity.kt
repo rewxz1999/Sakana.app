@@ -1,6 +1,7 @@
 package app.sakana.receiver
 
 import android.app.Activity
+import android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW
 import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
@@ -87,10 +88,24 @@ class MainActivity : Activity() {
         // 顺序不能反：先让控制接口拿不到播放器，再拆服务，最后释放播放器
         ui.removeCallbacksAndMessages(null)
         playback.onDestroy()
+        // 界面没了就别再抓封面图了（预取是"为了体验提前下"，界面都不在就没意义）
+        CoverLoader.cancelPrefetch()
         if (Receiver.gateway === player) Receiver.gateway = null
         Receiver.stop()
         player.release()
         super.onDestroy()
+    }
+
+    /** 系统/应用内存紧张：把封面内存缓存丢掉（磁盘还在，下次显示会读回来）。 */
+    @Suppress("DEPRECATION") // TRIM_MEMORY_RUNNING_LOW 只是个档位常量，新 API 里没有等价物
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_RUNNING_LOW) CoverLoader.onLowMemory()
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        CoverLoader.onLowMemory()
     }
 
     /**
@@ -101,12 +116,22 @@ class MainActivity : Activity() {
     override fun onBackPressed() {
         if (playback.exitFullscreenIfNeeded()) return
         if (playback.isInPlayerMode()) {
-            // 退全屏后还在播放：这一步是"退出播放"（回首页，播放器停止但不退出应用）
-            player.control("stop", 0L)
-            refreshUi()
+            exitPlayback()
             return
         }
         super.onBackPressed()
+    }
+
+    /**
+     * 退出播放：停止播放并回到首页收藏列表。
+     * 返回键的第二步和顶栏的「退出播放」（✕）走的是**同一个方法**，
+     * 保证两条路径的行为不会各走各的（用户报的"没有退出键"就是因为只有返回键这一条路）。
+     */
+    private fun exitPlayback() {
+        player.control("stop", 0L)
+        // 立刻刷一次：状态变回 idle → setPlayerMode(false) 会把画面层收掉、首页露出来，
+        // 首页的收藏与历史也就跟着刷新了（不用等下一个心跳）
+        refreshUi()
     }
 
     // ---------------- 视图与交互 ----------------
@@ -130,6 +155,9 @@ class MainActivity : Activity() {
             gestureLayer = findViewById(R.id.gesture_layer),
             onPlaylist = { showPlaylist() },
             onSettings = { openSettings() },
+            // 顶栏「退出播放」（✕）：**和返回键第二步是同一套动作** ——
+            // 停止播放 → 退全屏 → 回首页层。写成一个方法，两处共用，免得以后改漏一处。
+            onExitPlayback = { exitPlayback() },
         )
         playback.bind()
 
@@ -227,7 +255,7 @@ class MainActivity : Activity() {
 
         // 有媒体就是"播放态"（含缓冲/暂停/播完）；stop 之后 state 回到 idle 即回首页
         val active = snapshot.state != Proto.STATE_IDLE
-        playback.setPlayerMode(active, snapshot.playing)
+        playback.setPlayerMode(active)
 
         if (active) {
             playback.refresh(snapshot, error, notice)
