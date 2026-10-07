@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 收藏网格里的一格：封面 + 名字 + 评分/集数。
-     封面固定 150dp 高 + centerCrop：图片没加载完时高度也不会跳，网格不会抖。 -->
+<!-- 收藏网格里的一格（span=1）。封面 150dp 固定高 + centerCrop：没加载完时高度也不跳，网格不抖。 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:background="?android:attr/selectableItemBackground"
+    android:layout_margin="4dp"
+    android:background="@drawable/bg_card"
     android:clickable="true"
     android:focusable="true"
     android:orientation="vertical"
@@ -14,7 +14,7 @@
         android:id="@+id/fav_cover"
         android:layout_width="match_parent"
         android:layout_height="150dp"
-        android:background="@color/surface_card"
+        android:background="@color/surface"
         android:contentDescription="@string/cd_cover"
         android:scaleType="centerCrop"
         android:src="@drawable/ic_cover_placeholder" />
@@ -37,6 +37,6 @@
         android:layout_marginTop="2dp"
         android:ellipsize="end"
         android:maxLines="1"
-        android:textColor="@color/text_muted"
+        android:textColor="@color/accent"
         android:textSize="11sp" />
 </LinearLayout>

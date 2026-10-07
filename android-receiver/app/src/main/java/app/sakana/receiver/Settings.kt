@@ -25,6 +25,7 @@ object Settings {
     private const val K_FACE = "preferred-interface"
     private const val K_PEER = "manual-peer"
     private const val K_RECENT = "recent-peers"
+    private const val K_RESIZE_FILL = "resize-fill"
 
     /** 最近地址最多留几条：留太多设置页会变成一屏历史，反而不好点。 */
     private const val RECENT_MAX = 8
@@ -95,6 +96,17 @@ object Settings {
     var preferredInterface: String?
         get() = prefs.getString(K_FACE, null)?.takeIf { it.isNotBlank() }
         set(value) = prefs.edit().putString(K_FACE, value).apply()
+
+    /**
+     * 播放时是否**铺满**屏幕（resize_mode = fill）。
+     *
+     * 为什么单独一个开关：用户说的"不能完全全屏"里有一半是**上下黑边** ——
+     * 片源比例和设备比例不一致时，fit 模式必然留黑边。默认 false（按比例，不拉伸变形），
+     * 想要满屏的可以打开；播放控制栏上也有同一个按钮，改哪边都同步。
+     */
+    var resizeFill: Boolean
+        get() = prefs.getBoolean(K_RESIZE_FILL, false)
+        set(value) = prefs.edit().putBoolean(K_RESIZE_FILL, value).apply()
 
     // ---------------- 主动连接电脑 ----------------
 

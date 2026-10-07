@@ -128,13 +128,18 @@ function inlineImages(html: string, map: Record<string, string>): string {
   return html.replace(/\{\{img:([^}]+)\}\}/g, (_m, key: string) => map[key.trim()] || BLANK_PX)
 }
 
+/** 从 PNG 头部读出真实像素宽高（IHDR 的宽/高各 4 字节，偏移 16 / 20） */
+function pngSize(png: Buffer): { width: number; height: number } {
+  if (png.length < 24) return { width: 0, height: 0 }
+  return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) }
+}
+
 /**
  * 在隐藏的 offscreen 窗口里渲染 HTML 并截图成 PNG。
  *
  * 与统计工具那份的差别：这里显式设 `zoomFactor`（放大渲染，而不是把窗口开大、
  * 让 CSS 自己撑 —— 后者会改变版式，前者只是把同一份版式画到更多像素上）。
- */
-export async function renderHtmlToPng(
+ */export async function renderHtmlToPng(
   html: string,
   widthCss: number,
   scale: number
@@ -160,6 +165,15 @@ export async function renderHtmlToPng(
   })
   try {
     await win.loadFile(tmpFile)
+    /*
+     * ★ v0.3.8 修：这里以前**只把窗口开大、没有真的设 zoom** ★
+     *
+     * 上面注释写的方案是「窗口按 width × scale 开，再用 setZoomFactor(scale) 放大渲染」，
+     * 但 `setZoomFactor` 这一行一直没写 —— 结果是页面仍按 1× 排版，只占了窗口左边的 1/scale，
+     * 右边一大片是文档底色。用户看到的就是「导出图右边空一大截 / 宽度跟内容不跟」
+     * （2 倍导出空一半、3 倍空三分之二），而且"2 倍/3 倍"其实只放大了空白的面积，并没有更清晰。
+     */
+    win.webContents.setZoomFactor(s)
     // 等一帧排版与字体就绪（图片已是 data URL，不依赖网络）
     await new Promise((r) => setTimeout(r, 400))
     /*
@@ -178,14 +192,16 @@ export async function renderHtmlToPng(
           })))
       return imgs.length
     })()`)
+    // scrollHeight 是 CSS 像素；窗口尺寸用的是逻辑像素（DIP），所以还要乘上 zoom 倍率
     const h = (await win.webContents.executeJavaScript('document.body.scrollHeight')) as number
-    const height = Math.max(200 * s, Math.min(Math.round(h) + 20 * s, MAX_HEIGHT))
+    const height = Math.max(200 * s, Math.min((Math.round(h) + 20) * s, MAX_HEIGHT))
     win.setContentSize(W, height)
     await new Promise((r) => setTimeout(r, 300))
     const img = await win.webContents.capturePage()
     const png = img.toPNG()
     if (!png || png.length === 0) throw new Error('截图生成失败（拿到空图）')
-    return { png, width: W, height }
+    // 如实回报**文件里的像素尺寸**：capturePage 受系统缩放（125% 这类）影响，会和窗口逻辑尺寸不一样
+    return { png, ...pngSize(png) }
   } finally {
     if (!win.isDestroyed()) win.destroy()
     try {

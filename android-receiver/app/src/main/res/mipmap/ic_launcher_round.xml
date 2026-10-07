@@ -1,38 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-  API 24/25 用的传统图标（自适应图标是 API 26 才有的）。
-  这是接收端**自己的**图标：蓝色圆角方块 + 白色投屏符号，与电脑端应用的图标区分开。
-  用矢量图而不是多套 PNG：一个文件适配所有分辨率，仓库里也不用塞二进制资源。
--->
+<!-- 圆形版本（API 24/25 的启动器会请求 roundIcon）：蓝色圆 + 同一个白色投屏符号。 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="48dp"
     android:height="48dp"
     android:viewportWidth="48"
     android:viewportHeight="48">
-    <!-- 背景：蓝色圆角方块（圆角约 22%，和现代启动器图标的观感一致） -->
     <path
         android:fillColor="#2E6BE6"
-        android:pathData="M11,2h26a9,9 0 0 1 9,9v26a9,9 0 0 1 -9,9h-26a9,9 0 0 1 -9,-9v-26a9,9 0 0 1 9,-9z" />
-    <!-- 屏幕 -->
+        android:pathData="M24,1a23,23 0 1,0 0,46a23,23 0 1,0 0,-46z" />
     <path
         android:fillColor="#FFFFFF"
         android:pathData="M20,12h14a1.4,1.4 0 0 1 1.4,1.4v8.2a1.4,1.4 0 0 1 -1.4,1.4h-14a1.4,1.4 0 0 1 -1.4,-1.4v-8.2a1.4,1.4 0 0 1 1.4,-1.4z" />
-    <!-- 扩散弧 -->
     <path
         android:fillColor="#00000000"
-        android:pathData="M12.5,30.5 A5,5 0 0 1 17.5,35.5"
+        android:pathData="M13,30.5 A5,5 0 0 1 18,35.5"
         android:strokeColor="#FFFFFF"
         android:strokeLineCap="round"
         android:strokeWidth="2.8" />
     <path
         android:fillColor="#00000000"
-        android:pathData="M12.5,24.5 A11,11 0 0 1 23.5,35.5"
+        android:pathData="M13,24.5 A11,11 0 0 1 24,35.5"
         android:strokeColor="#FFFFFF"
         android:strokeLineCap="round"
         android:strokeWidth="2.8" />
     <path
         android:fillColor="#00000000"
-        android:pathData="M12.5,19 A16,16 0 0 1 28.5,35.5"
+        android:pathData="M13,19 A16,16 0 0 1 29,35.5"
         android:strokeColor="#FFFFFF"
         android:strokeLineCap="round"
         android:strokeWidth="2.8" />

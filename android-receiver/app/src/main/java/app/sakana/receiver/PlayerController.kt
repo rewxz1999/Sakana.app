@@ -3,22 +3,23 @@ package app.sakana.receiver
 import android.content.Context
 import android.util.Log
 import androidx.media3.common.C
-import androidx.media3.common.PlaybackException
-import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 
 private const val TAG = "SakanaPlayer"
 
+/** ±秒按钮与双击手势的统一步长（10 秒）。 */
+private const val SEEK_STEP_MS = 10_000L
+
 /**
  * 播放控制：ExoPlayer 的封装 + 播放列表 / 音量 / 状态。
  *
- * 职责边界：本类只关心"什么时候播、播哪一集、音量多少、现在是什么状态"。
- * "这个 URL 该怎么组装成 MediaSource、Referer/Cookie 怎么带上去"在 MediaSources.kt。
+ * 职责边界：只关心"什么时候播、播哪一集、音量多少、现在什么状态"；
+ * URL 怎么变成 MediaSource 在 MediaSources.kt，播放事件回调在 PlaybackEvents.kt，
+ * 控制栏与手势在 PlaybackUi.kt。
  *
- * **线程约定（很重要）**：ExoPlayer 只允许在创建它的线程上访问，这里就是主线程。
- * 所以本类所有 public 方法都必须从主线程调用 —— ControlApi 负责把 HTTP 线程上的
- * 请求 post 到主线程（见 ControlApi.onMain）。
+ * **线程约定**：ExoPlayer 只允许在创建它的线程（主线程）上访问，
+ * 所以本类所有 public 方法都必须从主线程调用（ControlApi 负责把 HTTP 请求 post 过来）。
  */
 class PlayerController(
     context: Context,
@@ -28,10 +29,8 @@ class PlayerController(
 
     /**
      * 播放列表里的一集。
-     *
-     * ⚠️ `url` 可能是**空串**：电脑端在"规则模式"下只能拿到剧集标题、拿不到每一集的取流地址，
-     * 于是 playlist 里全是 `{"url":"","title":"第 3 集"}`。这种项要保留（选集列表得显示标题），
-     * 但**绝不能**拿空地址去请求 —— 那会变成一句谁也看不懂的解码错误。
+     * ⚠️ `url` 可能是**空串**（规则模式下电脑端只有标题）：要保留（选集要显示标题），
+     * 但**绝不能**拿空地址去请求。
      */
     data class Item(val url: String, val title: String)
 
@@ -46,7 +45,6 @@ class PlayerController(
         val titles: List<String>,
         val state: String,
         val title: String?,
-        /** 上一集/下一集有没有能切的目标（规则模式下 playlist 只有标题，这里就是 false）。 */
         val canStepPrev: Boolean,
         val canStepNext: Boolean,
     )
@@ -71,32 +69,25 @@ class PlayerController(
     private var headers: Map<String, String> = emptyMap()
 
     init {
-        // 用 PlayerView 只为了拿到它现成的 Surface 与画面比例适配逻辑。
-        // 控制条自己画（useController = false）：投屏的人是坐在电脑前面操作的，
-        // 设备上那套触摸控制条既用不上，还会跟我们的按钮抢焦点、挡住画面。
-        playerView.useController = false
+        // 画面与控制栏都由 Media3 的 PlayerView 提供（useController = true 在布局里设的）。
+        // 注意：控制栏的**显隐与手势**由 PlaybackUi 接管（见那里的注释），
+        // 这里只把播放器挂上去，并把播放器事件桥接到我们的状态。
         playerView.player = player
-
-        player.addListener(object : Player.Listener {
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                onChanged()
-            }
-
-            override fun onIsPlayingChanged(isPlaying: Boolean) {
-                onChanged()
-            }
-
-            override fun onPlayerError(error: PlaybackException) {
-                // ExoPlayer 出错后自己会停在 IDLE，不会自动恢复。
-                // 这里记下来给界面和 /info 用；要不要重试由电脑端决定（再发一次 /play），
-                // 接收端擅自重试反而可能把"地址过期"变成无限重连。
-                errorText = "${error.errorCodeName}：${error.message ?: "未知错误"}"
-                Log.w(TAG, "播放失败", error)
-                onChanged()
-            }
-        })
+        player.addListener(
+            PlaybackEvents(
+                onChanged = { onChanged() },
+                onError = { message ->
+                    errorText = message
+                    onChanged()
+                },
+            ),
+        )
 
         applyVolume()
+        // 让官方控制栏上的「±秒」按钮与双击手势的步长一致（默认是倒退 5 秒、前进 15 秒，
+        // 按钮上显示的数字也会跟着变）：两边不一样会让用户以为是 bug。
+        player.setSeekBackIncrementMs(SEEK_STEP_MS)
+        player.setSeekForwardIncrementMs(SEEK_STEP_MS)
     }
 
     // ---------------- /play ----------------
@@ -173,6 +164,22 @@ class PlayerController(
     // ---------------- /control ----------------
 
     /**
+     * 出错后重新加载当前这一集（控制栏上的「重试」）。
+     * 从这一集开头重来而不是接着出错位置：出错多半是流地址/网络问题，从断点重试往往再错一次。
+     */
+    fun retry(): Boolean {
+        if (index !in items.indices) return false
+        errorText = null
+        noticeText = null
+        return startItem(index, 0L)
+    }
+
+    /** 倍速播放（长按 2 倍速的手势用）。ExoPlayer 只允许在主线程访问，所以走这里。 */
+    fun setPlaybackSpeed(speed: Float) {
+        player.setPlaybackSpeed(speed.coerceIn(0.25f, 4f))
+    }
+
+    /**
      * 执行一个控制动作。
      * @return false 表示动作名不认识、或参数不合法 / 目标集没有播放地址，
      *         调用方会据此回 400（并可用 [notice] 拿到人话解释）。
@@ -196,8 +203,7 @@ class PlayerController(
             "seek" -> {
                 val target = value.coerceAtLeast(0L)
                 val duration = player.duration
-                // 直播流（duration 未知 = C.TIME_UNSET）也允许 seek，
-                // 超出范围的值交给 ExoPlayer 自己夹紧
+                // 直播流（duration 未知）也允许 seek；超范围的值交给 ExoPlayer 自己夹紧
                 player.seekTo(
                     if (duration != C.TIME_UNSET && duration > 0) target.coerceAtMost(duration) else target,
                 )

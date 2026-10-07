@@ -1,6 +1,6 @@
 import type { CSSProperties } from 'react'
-import type { ModuleKind, ModuleRect, RecommendBackground } from '@/stores/recommendTable'
-import { DEFAULT_MODULES, MODULE_KINDS } from '@/stores/recommendTable'
+import type { CropRect, ModuleKind, ModuleRect, PageSize, RecommendBackground } from '@/stores/recommendTable'
+import { DEFAULT_MODULES, MODULE_KINDS, normalizePageSize } from '@/stores/recommendTable'
 
 /**
  * 「番剧推荐表」的**版式常量 + 样式生成器** —— 界面预览与导出图共用同一份。
@@ -108,6 +108,9 @@ export const IMAGE_BAND_FRACTION = IMAGE_CONTENT_RATIO / (IMAGE_CONTENT_RATIO + 
  * （两套相似旋钮合并成一套，见 BackgroundDialog 的说明）。
  */
 export const BLEND_FEATHER = 150
+
+// 内容区宽度小于这个值就换成纵向一列排版（两栏要 ~1000 才不挤）
+export const SIDE_MIN_W = 1000
 
 /**
  * 左侧/右侧图版式下，内容区那一列的纵向排布（内容区宽 480）。
@@ -325,80 +328,95 @@ function clampNum(v: number, min: number, max: number): number {
 }
 
 /**
- * 算出一页的框：总尺寸、图区、内容区，以及页面高度。
+ * 算出一页的框：总尺寸、图区、内容区。
  *
- * ## 比例与高度的公式（这是本轮的核心，界面与导出都只用这一个函数）
+ * ## 尺寸优先级（v0.3.8 第四轮加进来的一条，**必须记牢**）
  *
- *   · **图区 : 内容区 = 1.5 : 1**（常量 `IMAGE_CONTENT_RATIO`）：
- *     - 左/右图：整体宽度按比例切 → 图区 `round(1200 × 0.6) = 720`，内容区 `480`；
- *     - 上图：整体**高度**按同样比例切 → 图区高 `round(H × 0.6)`，内容区 `H − 图区高 = 0.4H`。
- *   · **上图**的内容区仍是 1200 宽（用整页那套模块摆放），因此必须放得下它需要的 920：
- *     `0.4H ≥ 920` → `H ≥ 2300`。所以 `H = clamp(max(2300, 原图比例算出的高度), …)`。
- *   · **左/右图**的内容区是 480 宽的一列，改用纵向堆叠（`SIDE_STACK`），
- *     它需要 `SIDE_CONTENT_H` 这么高 → `H = clamp(max(SIDE_CONTENT_H, 原图比例算出的高度), …)`。
- *     「原图比例算出的高度」沿用上一轮的规则：`round(1200 × 图高 / 图宽)`，
- *     所以竖图仍然会让页面变高（图区跟着变高，而不是把图挤扁）。
- *   · 高度一律夹在 `[baseHeight, maxHeight]`：太矮内容会被切、太高会撞离屏截图的上限。
+ *   1. **用户手填的 `page.size` 最高优先** —— 一旦填过，下面就一行公式都不参与，
+ *      页面就是这么大（导出严格按它，预览也一样）。用户可以随时用「跟随内容（自适应）」
+ *      清掉它回到 2。
+ *   2. 没填 → 按内容/比例自适应（原来的规则）：
+ *      - 没图：`1200 × 920`（整页都是内容区）；
+ *      - 上图：`H = clamp(max(2300, round(1200×图高/图宽)), 920, 3200)`，
+ *        图区 = `0.6H`、内容区 = `0.4H`（要放得下 920 的整页版式）；
+ *      - 左/右图：图区 : 内容区 = 1.5 : 1（`round(1200×0.6) = 720` / `480`），
+ *        `H = clamp(max(SIDE_CONTENT_H, round(1200×图高/图宽)), 920, 3200)`。
+ *    比例在这两种切法里都是**精确**的 1.5（左/右按宽度、上图按高度）。
  *
- * 比例在两种切法里都是**精确**的：左/右按宽度 720:480 = 1.5，上图按高度 0.6H:0.4H = 1.5。
+ * 手填尺寸时图区仍然按 `imagePos` 与同一个 1.5 比例切（用户手填的目的正是"让背景图展示得更好"，
+ * 所以切法不变、只是纸张变大变小）；内容区宽度小于 `SIDE_MIN_W` 时自动换成纵向一列，
+ * 避免"内容溢出页面"。
  */
-export function frameOf(page: { background?: RecommendBackground }): PageFrame {
+export function frameOf(page: { background?: RecommendBackground; size?: PageSize }): PageFrame {
   const bg = page.background
-  const W = RL.width
   const isImage = !!bg && bg.kind === 'image'
   const pos: PageFrame['pos'] = isImage ? bg.imagePos : 'none'
+  /** 手填尺寸：非法/没填 → null（走自适应） */
+  const manual = normalizePageSize(page.size)
 
   if (!isImage) {
+    const width = manual ? manual.w : RL.width
+    const height = manual ? manual.h : RL.baseHeight
     return {
-      width: W,
-      height: RL.baseHeight,
+      width,
+      height,
       pos: 'none',
       contentX: 0,
       contentY: 0,
-      contentW: W,
-      contentH: RL.baseHeight,
+      contentW: width,
+      contentH: height,
       imageX: 0,
       imageY: 0,
       imageW: 0,
       imageH: 0,
       photoCellH: RL.photoH,
-      side: false
+      side: width < SIDE_MIN_W
     }
   }
 
-  // 原图比例推出的页面高度（沿用上一轮规则的同一套公式）
-  const ratioH =
-    bg.imgW > 0 && bg.imgH > 0 ? Math.round((W * bg.imgH) / bg.imgW) : 0
+  // 原图比例推出的高度（自适应时用；手填时完全不用）
+  const ratioH = bg.imgW > 0 && bg.imgH > 0 ? Math.round((RL.width * bg.imgH) / bg.imgW) : 0
 
   if (pos === 'top') {
-    // 内容区 = 0.4H 且要放下 920 → H 至少 920/0.4 = 2300
-    const minH = Math.ceil(RL.baseHeight / (1 - IMAGE_BAND_FRACTION))
-    const height = Math.round(clampNum(Math.max(minH, ratioH), RL.baseHeight, RL.maxHeight))
+    const height = manual
+      ? manual.h
+      : Math.round(
+          clampNum(
+            Math.max(Math.ceil(RL.baseHeight / (1 - IMAGE_BAND_FRACTION)), ratioH),
+            RL.baseHeight,
+            RL.maxHeight
+          )
+        )
+    const width = manual ? manual.w : RL.width
     const imageH = Math.round(height * IMAGE_BAND_FRACTION)
+    const contentH = height - imageH
     return {
-      width: W,
+      width,
       height,
       pos,
       contentX: 0,
       contentY: imageH,
-      contentW: W,
-      contentH: height - imageH,
+      contentW: width,
+      contentH,
       imageX: 0,
       imageY: 0,
-      imageW: W,
+      imageW: width,
       imageH,
       photoCellH: RL.photoH,
-      side: false
+      side: width < SIDE_MIN_W
     }
   }
 
-  const imageW = Math.round(W * IMAGE_BAND_FRACTION)
-  const contentW = W - imageW
-  const height = Math.round(clampNum(Math.max(SIDE_CONTENT_H, ratioH), RL.baseHeight, RL.maxHeight))
+  const width = manual ? manual.w : RL.width
+  const height = manual
+    ? manual.h
+    : Math.round(clampNum(Math.max(SIDE_CONTENT_H, ratioH), RL.baseHeight, RL.maxHeight))
+  const imageW = Math.round(width * IMAGE_BAND_FRACTION)
+  const contentW = width - imageW
   const imageX = pos === 'left' ? 0 : contentW
   const contentX = pos === 'left' ? imageW : 0
   return {
-    width: W,
+    width,
     height,
     pos,
     contentX,
@@ -410,12 +428,12 @@ export function frameOf(page: { background?: RecommendBackground }): PageFrame {
     imageW,
     imageH: height,
     photoCellH: SIDE_STACK.photoCellH,
-    side: true
+    side: contentW < SIDE_MIN_W
   }
 }
 
 /** 一页的画布高度（= frameOf 的高度；保留这个函数名是因为弹窗与导出都在用它） */
-export function pageHeightOf(page: { background?: RecommendBackground }): number {
+export function pageHeightOf(page: { background?: RecommendBackground; size?: PageSize }): number {
   return frameOf(page).height
 }
 
@@ -435,24 +453,47 @@ export function pageHeightOf(page: { background?: RecommendBackground }): number
 export function moduleRectsOf(frame: PageFrame): Record<ModuleKind, ModuleRect> {
   const out = {} as Record<ModuleKind, ModuleRect>
   if (!frame.side) {
-    for (const id of MODULE_KINDS) {
-      const r = DEFAULT_MODULES[id]
-      out[id] = { x: r.x + frame.contentX, y: r.y + frame.contentY, w: r.w, h: r.h }
-    }
+    /*
+     * 整页版式（两栏）。**横轴按内容区宽度现算**，纵轴沿用基准值：
+     *   · 左列（标题 / 页脚 / 封面）贴左边距 34；
+     *   · 封面固定 300×426（图片不缩放才对）；
+     *   · 右列从 360 起、宽度 = 内容区宽 − 396（含右边距 36）；
+     *   · 页脚贴底（离下边缘 62px，与基准版式 920 时一致）。
+     * 内容区宽 = 1200 时算出来就是原来那套默认摆放（rightW = 804）——所以**老数据外观不变**；
+     * 用户把页面改宽/改窄时，右列与标题会跟着变，不会溢出也不会留一大片空白。
+     */
+    const x0 = frame.contentX
+    const cw = frame.contentW
+    const rightX = x0 + 360
+    const rightW = Math.max(200, cw - 396)
+    const wideW = Math.max(200, cw - 68)
+    out.title = { x: x0 + 34, y: frame.contentY + 34, w: wideW, h: 96 }
+    out.cover = { x: x0 + 34, y: frame.contentY + 166, w: 300, h: 426 }
+    out.ratings = { x: rightX, y: frame.contentY + 166, w: rightW, h: 78 }
+    out.level = { x: rightX, y: frame.contentY + 256, w: rightW, h: 40 }
+    out.meta = { x: rightX, y: frame.contentY + 308, w: rightW, h: 116 }
+    out.reason = { x: rightX, y: frame.contentY + 436, w: rightW, h: 274 }
+    out.photos = { x: rightX, y: frame.contentY + 722, w: rightW, h: 122 }
+    // 页脚贴底：页面高 920（基准）时算出来 y = 858，与 DEFAULT_MODULES 一致
+    out.foot = { x: x0 + 34, y: frame.height - 62, w: wideW, h: 30 }
     return out
   }
   const pad = SIDE_STACK.pad
   const x = frame.contentX + pad
-  const w = frame.contentW - pad * 2
+  const w = Math.max(120, frame.contentW - pad * 2)
   let y = frame.contentY + pad
   const put = (id: ModuleKind, h: number, xOverride = x, wOverride = w): void => {
     out[id] = { x: xOverride, y, w: wOverride, h }
     y += h + SIDE_STACK.gap
   }
   put('title', SIDE_STACK.title)
-  // 封面按原始尺寸居中（300×426：480 宽的一列放得下）
-  const coverW = DEFAULT_MODULES.cover.w
-  put('cover', DEFAULT_MODULES.cover.h, frame.contentX + Math.round((frame.contentW - coverW) / 2), coverW)
+  // 封面按原始尺寸居中；内容区比封面还窄时（手填了很窄的页面）等比缩到放得下
+  const baseCoverW = DEFAULT_MODULES.cover.w
+  const baseCoverH = DEFAULT_MODULES.cover.h
+  const fit = Math.min(1, w / baseCoverW)
+  const coverW = Math.round(baseCoverW * fit)
+  const coverH = Math.round(baseCoverH * fit)
+  put('cover', coverH, frame.contentX + Math.round((frame.contentW - coverW) / 2), coverW)
   put('ratings', SIDE_STACK.ratings)
   put('level', SIDE_STACK.level)
   put('meta', SIDE_STACK.meta)
@@ -460,6 +501,18 @@ export function moduleRectsOf(frame: PageFrame): Record<ModuleKind, ModuleRect> 
   put('photos', SIDE_STACK.photos)
   put('foot', SIDE_STACK.foot)
   return out
+}
+
+/** 内容区放得下默认模块所需的**最小高度**（给"手填高度不够"的提示与"按内容调整高度"按钮用） */
+export function contentHeightNeeded(frame: PageFrame): number {
+  const rects = moduleRectsOf(frame)
+  let max = 0
+  for (const id of MODULE_KINDS) {
+    // 封面在侧栏版式里是居中放的一块，比较时用它的底边
+    const r = rects[id]
+    max = Math.max(max, r.y + r.h + 34)
+  }
+  return Math.ceil(max)
 }
 
 // ------------------------------------------------------------------
@@ -529,14 +582,91 @@ export function imageBandImageStyle(
 ): StyleRecord {
   const b = blurOf(bg)
   const grow = b > 0 ? b + 6 : 0
+  const layerW = frame.imageW + grow * 2
+  const layerH = frame.imageH + grow * 2
+  const crop = bg?.kind === 'image' ? bg.crop : null
+  /*
+   * 有取景框时用**像素定位**（不走 `background-size: 100/w%` 那套百分比公式）：
+   *   · 百分比公式只有在"取景框比例 == 图区比例"时才精确；用户换过页面尺寸之后两者会不等，
+   *     那时百分比会把图**拉伸变形** —— 用户明确要求"不要偷偷拉伸出变形"。
+   *   · 这里改成：算出取景框在图上的像素矩形，再按 `max(层宽/框宽, 层高/框高)` 缩放
+   *     （cover 语义：框内内容一定铺满图层，多出来的部分被裁掉，绝不拉伸），
+   *     最后把框的中心对准图层的中心。取景框比例与图区一致时，结果与百分比公式**完全相同**。
+   * 没有取景框 → 还是原来的 `center/cover`（老数据行为一字未改）。
+   */
+  const bgPos = crop && bg ? bandImageCropPosition(crop, bg, layerW, layerH) : null
   return {
     position: 'absolute',
     left: `${-grow}px`,
     top: `${-grow}px`,
-    width: `${frame.imageW + grow * 2}px`,
-    height: `${frame.imageH + grow * 2}px`,
-    background: bg && bg.kind === 'image' ? `${resolveImage(bg.path)} center/cover no-repeat` : RC.imageBg,
+    width: `${layerW}px`,
+    height: `${layerH}px`,
+    backgroundImage: bg && bg.kind === 'image' ? resolveImage(bg.path) : 'none',
+    backgroundColor: bg && bg.kind === 'image' ? undefined : RC.imageBg,
+    backgroundRepeat: 'no-repeat',
+    backgroundSize: bgPos ? `${bgPos.w}px ${bgPos.h}px` : 'cover',
+    backgroundPosition: bgPos ? `${bgPos.x}px ${bgPos.y}px` : 'center',
     filter: b > 0 ? `blur(${b}px)` : 'none'
+  } as StyleRecord
+}
+
+/**
+ * 取景框 → `background-size` / `background-position`（px）。
+ *
+ * 纯计算函数，**预览与导出共用**（导出是 HTML→图片，所以这里只产出 CSS 数值，
+ * 不碰 canvas / DOM API）。`layerW/H` 是图片层的实际尺寸（含模糊外扩）。
+ *
+ * 边界处理：
+ *   · 取景框比例与图层比例不一致 → 按 cover 缩放（裁掉多余的边，**不拉伸**，
+ *     用户在框选弹窗里强行框了一个不同比例的区域时，看到的就是"多出来的被裁掉"）；
+ *   · 图层/框尺寸为 0（图片还没加载完、尺寸未知）→ 退回 `cover` + `center`；
+ *   · 源图比框还小 → 数学上自然变成放大，不额外处理（放大是用户自己框出来的结果）。
+ */
+export function bandImageCropPosition(
+  crop: CropRect,
+  bg: RecommendBackground,
+  layerW: number,
+  layerH: number
+): { w: number; h: number; x: number; y: number } | null {
+  const imgW = bg.imgW
+  const imgH = bg.imgH
+  if (!(imgW > 0 && imgH > 0) || layerW <= 0 || layerH <= 0) return null
+  const cw = crop.w * imgW
+  const ch = crop.h * imgH
+  if (cw <= 0 || ch <= 0) return null
+  // cover：框内内容铺满图层（比例一致时恰好 1:1，就是"框里是什么就显示什么"）
+  const scale = Math.max(layerW / cw, layerH / ch)
+  const w = imgW * scale
+  const h = imgH * scale
+  const cx = crop.x * imgW + cw / 2
+  const cy = crop.y * imgH + ch / 2
+  return { w, h, x: layerW / 2 - cx * scale, y: layerH / 2 - cy * scale }
+}
+
+/**
+ * 剧照/封面这类"按比例铺满"的取景：把取景框换成 CSS 的 background-size / position 百分比。
+ * 只给**框选弹窗里的预览**用（那里图层比例固定等于图区比例，百分比公式精确）。
+ */
+export function cropToBackgroundCss(
+  crop: CropRect | null,
+  resolveImage: (path: string) => string,
+  imgPath: string
+): StyleRecord {
+  if (!crop) {
+    return {
+      backgroundImage: resolveImage(imgPath),
+      backgroundSize: 'cover',
+      backgroundPosition: 'center',
+      backgroundRepeat: 'no-repeat'
+    }
+  }
+  return {
+    backgroundImage: resolveImage(imgPath),
+    backgroundSize: `${100 / crop.w}% ${100 / crop.h}%`,
+    backgroundPosition: `${crop.w >= 1 ? 0 : (crop.x / (1 - crop.w)) * 100}% ${
+      crop.h >= 1 ? 0 : (crop.y / (1 - crop.h)) * 100
+    }%`,
+    backgroundRepeat: 'no-repeat'
   }
 }
 

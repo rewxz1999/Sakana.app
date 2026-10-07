@@ -342,7 +342,15 @@ ${body}
 </body>
 </html>`
 
-  return { html, images, width: RL.width, height: height + RL.bodyPadV * 2 }
+  /*
+   * 导出宽度 = **页面宽度**（v0.3.8 第四轮起宽高可手填，所以不能再写死 RL.width）。
+   * 长图里各页必须同宽（否则右边缘参差、分页虚线长短不一），所以取各页的最大值 ——
+   * 同一张表里用户通常统一设置，取最大值只是兜底。
+   * 高度 = 各页高之和 + 分页间距 + 上下留白；`renderHtmlToPng` 按这个高度开离屏窗口，
+   * 于是**导出 PNG 的像素尺寸 = 用户填的尺寸 × 清晰度**，与预览完全对得上。
+   */
+  const width = pages.reduce<number>((m, p) => Math.max(m, frameOf(p).width), RL.width)
+  return { html, images, width, height: height + RL.bodyPadV * 2 }
 }
 
 /**

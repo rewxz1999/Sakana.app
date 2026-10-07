@@ -795,15 +795,27 @@ export function RecommendTablePage() {
         onSave={handleSavePage}
       />
 
-      {/* 背景（v0.3.7 追加需求 3：右键当前页 → 背景） */}
+      {/* 背景 / 页面尺寸 / 背景图取景框（v0.3.8 第四轮：尺寸与框选都按页保存） */}
       <BackgroundDialog
         open={bgOpen}
         page={currentPage}
         onClose={() => setBgOpen(false)}
-        onApply={(bg) => {
+        onApply={(bg, size, crop) => {
           if (!currentPage) return
-          updatePage(table.id, currentPage.id, { background: bg })
-          toast.success(bg ? '这一页的背景已保存' : '这一页已恢复白底')
+          /*
+           * 三样一起写回：背景（含取景框 crop）、页面尺寸（size=null 表示回到跟随内容自适应）。
+           * 取景框挂在背景上（`bg.crop`），所以「取景」只在图片背景里存在 ——
+           * 换成纯色/渐变时弹窗那边会把它置为 null，不留一份不生效的设置。
+           */
+          updatePage(table.id, currentPage.id, {
+            background: bg ? { ...bg, crop } : undefined,
+            size: size ?? undefined
+          })
+          toast.success(
+            bg
+              ? `已保存这一页的背景${size ? `（页面 ${size.w}×${size.h}）` : '（尺寸跟随内容）'}`
+              : '这一页已恢复白底'
+          )
         }}
         onApplyAll={(bg) => {
           const n = applyBackground(table.id, bg ?? null)

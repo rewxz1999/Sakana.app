@@ -1,26 +1,50 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 深色配色：投屏时画面以外的地方越暗越好，避免亮色边框影响观感。 -->
+    <!--
+      全局配色：**白蓝**（浅色主题）。
 
-    <!-- 主色调，和启动图标里的播放三角一致 -->
-    <color name="accent">#4DD0E1</color>
+      为什么改成浅色：接收端的首页是一个正常的应用界面（状态卡 + 收藏 + 历史），
+      浅色更好读；只有**播放浮层**保留深色半透明底 —— 视频画面明暗不定，
+      浮层按钮只有在深色底上才始终看得清（见下面的 player_* 一组）。
+    -->
 
-    <color name="text_primary">#FFFFFF</color>
-    <color name="text_secondary">#B0BEC5</color>
-    <color name="text_muted">#78909C</color>
+    <!-- 主色：蓝 -->
+    <color name="accent">#2E6BE6</color>
+    <!-- 主色的按下/深色变体 -->
+    <color name="accent_pressed">#1F55C0</color>
+    <!-- 主色的浅底（选中态、徽标底色） -->
+    <color name="accent_soft">#E8F0FF</color>
 
-    <!-- 页面底色（近黑，但比纯黑柔和一点，和视频画面之间能看出边界） -->
-    <color name="surface">#0F1B22</color>
+    <!-- 页面底色 -->
+    <color name="surface">#FFFFFF</color>
+    <!-- 顶部状态卡 / 底栏的底色（比纯白稍冷一点，让分区看得出来） -->
+    <color name="surface_header">#F5F8FF</color>
+    <!-- 卡片（收藏一格、历史一张卡） -->
+    <color name="surface_card">#F5F8FF</color>
 
-    <!-- 顶部状态区的底色：比页面底色稍微亮一点点，让"信息区"和"画面区"分得开 -->
-    <color name="surface_header">#16262F</color>
+    <color name="text_primary">#101828</color>
+    <color name="text_secondary">#667085</color>
+    <color name="text_muted">#98A2B3</color>
 
-    <!-- 设置页里卡片/分组的底色 -->
-    <color name="surface_card">#182A34</color>
+    <color name="divider">#E4E7EC</color>
 
-    <!-- 分割线 -->
-    <color name="divider">#1F3742</color>
+    <!-- 状态色：降饱和，避免在白底上刺眼 -->
+    <color name="warn">#C77700</color>
+    <color name="success">#1F7A45</color>
 
-    <!-- 警告色（播放失败、广播可能不通这类提示） -->
-    <color name="warn">#FFB74D</color>
+    <!-- ============ 播放浮层（深色半透明底 + 白色/蓝色元素） ============ -->
+    <!-- 浮层底色：70% 黑。浅色浮层在亮画面上会瞎，所以这里刻意保留深底 -->
+    <color name="player_bar">#B3000000</color>
+    <!-- 浮层上的文字 -->
+    <color name="player_text">#FFFFFF</color>
+    <color name="player_text_dim">#C7D2E4</color>
+    <!-- 浮层图标：白（Media3 自带的图标本身是白色系，保持一致最好看） -->
+    <color name="player_icon">#FFFFFF</color>
+    <!-- 进度条：已播 = 主色蓝；缓冲 = 半透明浅蓝；未播 = 半透明白 -->
+    <color name="player_played">#2E6BE6</color>
+    <color name="player_buffered">#6690B4FF</color>
+    <color name="player_unplayed">#59FFFFFF</color>
+    <color name="player_scrubber">#2E6BE6</color>
+    <!-- 手势提示气泡（"快进 10 秒"这类） -->
+    <color name="player_hint_bg">#CC0B1B33</color>
 </resources>

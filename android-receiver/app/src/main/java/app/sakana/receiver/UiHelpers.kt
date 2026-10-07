@@ -12,6 +12,9 @@ import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
+import java.text.DateFormat
+import java.util.Date
 
 /**
  * 界面小工具：状态文字、选集弹窗、网卡选择、最近地址、剪贴板、时间格式化。
@@ -128,64 +131,6 @@ internal fun showPlaylistDialog(
         .show()
 }
 
-/**
- * 首选网卡选择弹窗（单选列表）。
- * 每一项都带着"接口名 · 地址（类型）"，用户才能认出哪一块是 USB 共享网络。
- */
-internal fun showFacePickerDialog(
-    activity: Activity,
-    faces: List<NetFace>,
-    currentName: String?,
-    onPick: (String?) -> Unit,
-) {
-    val labels = ArrayList<String>()
-    labels.add(activity.getString(R.string.set_face_auto))
-    faces.forEach { labels.add(it.label) }
-
-    val checked = faces.indexOfFirst { it.name == currentName }.let { if (it < 0) 0 else it + 1 }
-    if (faces.isEmpty()) {
-        AlertDialog.Builder(activity)
-            .setTitle(R.string.set_face_label)
-            .setMessage(R.string.set_face_none)
-            .setPositiveButton(R.string.close, null)
-            .show()
-        return
-    }
-
-    AlertDialog.Builder(activity)
-        .setTitle(R.string.set_face_label)
-        .setSingleChoiceItems(labels.toTypedArray(), checked) { dialog, which ->
-            onPick(if (which == 0) null else faces[which - 1].name)
-            dialog.dismiss()
-        }
-        .setNegativeButton(R.string.close, null)
-        .show()
-}
-
-/** 把"最近用过的电脑地址"填进容器；点一行就等于把它填进输入框。 */
-internal fun bindRecentHosts(container: LinearLayout, hosts: List<String>, onPick: (String) -> Unit) {
-    container.removeAllViews()
-    if (hosts.isEmpty()) {
-        val empty = TextView(container.context)
-        empty.setText(R.string.set_peer_empty)
-        empty.setTextColor(container.context.getColor(R.color.text_muted))
-        empty.textSize = 13f
-        empty.setPadding(dp(container.context, 24), dp(container.context, 8), 0, dp(container.context, 8))
-        container.addView(empty)
-        return
-    }
-    val inflater = LayoutInflater.from(container.context)
-    for (host in hosts) {
-        val row = inflater.inflate(R.layout.item_recent_host, container, false) as TextView
-        row.text = host
-        row.setOnClickListener { onPick(host) }
-        container.addView(row)
-    }
-}
-
-private fun dp(context: Context, value: Int): Int =
-    (value * context.resources.displayMetrics.density).toInt()
-
 /** 复制文本到剪贴板；返回是否成功（拿不到剪贴板服务时返回 false）。 */
 internal fun copyToClipboard(activity: Activity, label: String, text: String): Boolean {
     val manager = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return false
@@ -276,5 +221,72 @@ internal fun showFavoriteDialog(activity: Activity, favorite: Favorite) {
         .setTitle(favorite.displayName)
         .setMessage(lines.joinToString("\n"))
         .setPositiveButton(R.string.close, null)
+        .show()
+}
+
+/**
+ * 观看历史的"相对时间"：刚刚 / N 分钟前 / N 小时前 / 昨天 / N 天前 / 具体日期。
+ *
+ * 为什么不用 DateUtils.getRelativeTimeSpanString：它返回的是"3 小时前"这一类**本地化**文案，
+ * 但不同 API 级别的措辞和粒度都不一样，还会带上"0 分钟前"这种别扭结果；
+ * 这里自己算，规则单一、可预期，也好在断言里验证。
+ */
+internal fun relativeTime(context: Context, timestampMs: Long): String {
+    if (timestampMs <= 0L) return ""
+    val diff = System.currentTimeMillis() - timestampMs
+    // 电脑与设备时钟不同步时 diff 可能是负数，别显示"-3 分钟前"
+    if (diff < 60_000L) return context.getString(R.string.time_just_now)
+    val minutes = diff / 60_000L
+    return when {
+        minutes < 60 -> context.getString(R.string.time_minutes_ago, minutes.toInt())
+        minutes < 24 * 60 -> context.getString(R.string.time_hours_ago, (minutes / 60).toInt())
+        // 24-48 小时按"昨天"处理：够用且不用处理时区/夏令时
+        minutes < 48 * 60 -> context.getString(R.string.time_yesterday)
+        minutes < 30L * 24 * 60 -> context.getString(R.string.time_days_ago, (minutes / (24 * 60)).toInt())
+        else -> DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(timestampMs))
+    }
+}
+
+/**
+ * 观看历史的详情弹窗（长按触发）：显示完整信息，并提供「删除这条记录」。
+ *
+ * 删除只动**本机**历史（电脑端的那份不动）—— 接收端没有"删除电脑历史"的接口，
+ * 而且用户在这里想清理的多半是设备上的这份记录。
+ */
+internal fun showHistoryDialog(activity: Activity, item: HistoryItem, onChanged: () -> Unit) {
+    val unknown = activity.getString(R.string.time_unknown)
+    val lines = ArrayList<String>(5)
+    lines.add(
+        activity.getString(
+            R.string.hist_detail_title_line,
+            item.title.ifBlank { activity.getString(R.string.player_unknown_title) },
+        ),
+    )
+    if (item.episode > 0) lines.add(activity.getString(R.string.hist_detail_episode, item.episode))
+    lines.add(
+        activity.getString(
+            R.string.hist_detail_position,
+            formatTime(item.position, unknown),
+            formatTime(item.duration, unknown),
+        ),
+    )
+    lines.add(activity.getString(R.string.hist_detail_watched, relativeTime(activity, item.watchedAt)))
+    lines.add(
+        if (item.subjectId > 0) {
+            activity.getString(R.string.hist_detail_id, item.subjectId)
+        } else {
+            activity.getString(R.string.hist_detail_no_id)
+        },
+    )
+
+    AlertDialog.Builder(activity)
+        .setTitle(R.string.hist_detail_title)
+        .setMessage(lines.joinToString("\n"))
+        .setPositiveButton(R.string.close, null)
+        .setNeutralButton(R.string.hist_delete) { _, _ ->
+            SyncStore.removeHistory(item)
+            Toast.makeText(activity, R.string.toast_hist_deleted, Toast.LENGTH_SHORT).show()
+            onChanged()
+        }
         .show()
 }

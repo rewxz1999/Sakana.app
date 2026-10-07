@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 空态文案（span=2）：卡片式，不留白屏。 -->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/empty_text"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_margin="4dp"
+    android:background="@drawable/bg_card"
+    android:lineSpacingExtra="3dp"
+    android:padding="14dp"
+    android:textColor="@color/text_secondary"
+    android:textSize="13sp" />

@@ -154,4 +154,55 @@
     <!-- 设置页：下载电脑端 -->
     <string name="set_section_download">下载 / 构建</string>
     <string name="set_download_body">本 App 是电脑端 Sakana 播放器的配套接收端，随仓库一起分发，没有单独的应用商店版本。\n\n源码与说明：仓库的 android-receiver 目录（含 README 的构建步骤）。\n命令行构建：\n  cd android-receiver\n  .\\gradlew.bat assembleDebug\n产物：app\\build\\outputs\\apk\\debug\\app-debug.apk\n\n电脑端 Sakana 播放器：见项目主页的发布页 / 构建说明。</string>
+
+    <!-- ================= 播放器（Media3 PlayerView 的控制栏 + 手势） ================= -->
+
+    <string name="player_unknown_title">未命名</string>
+    <string name="player_time_separator">/</string>
+    <string name="cd_playback_speed">倍速</string>
+    <string name="cd_pick_episode">选集</string>
+    <string name="cd_lock_orientation">锁定方向</string>
+    <string name="cd_unlock_orientation">解锁方向</string>
+    <string name="cd_resize_fit">按比例显示（可能留黑边）</string>
+    <string name="cd_resize_fill">铺满屏幕（消除黑边）</string>
+    <string name="cd_retry">重试</string>
+
+    <!-- 手势提示气泡 -->
+    <string name="hint_seek_forward">快进 %1$d 秒</string>
+    <string name="hint_seek_backward">快退 %1$d 秒</string>
+    <string name="hint_speed_2x">2 倍速播放中</string>
+    <string name="hint_volume">音量 %1$d%%</string>
+    <string name="hint_brightness">亮度 %1$d%%</string>
+    <string name="toast_locked_orientation">已锁定当前方向</string>
+    <string name="toast_unlocked_orientation">已解锁方向（跟随重力感应）</string>
+    <string name="toast_resize_fill">已铺满画面</string>
+    <string name="toast_resize_fit">已按原始比例显示</string>
+
+    <!-- ================= 观看历史（卡片式） ================= -->
+    <string name="hist_episode_badge">第 %1$d 集</string>
+    <string name="hist_view_all">查看全部 %1$d 条</string>
+    <string name="hist_view_all_generic">查看全部</string>
+    <string name="hist_collapse">收起</string>
+    <string name="hist_delete">删除这条记录</string>
+    <string name="hist_detail_title">观看详情</string>
+    <string name="hist_detail_title_line">标题：%1$s</string>
+    <string name="hist_detail_episode">集数：第 %1$d 集</string>
+    <string name="hist_detail_position">进度：%1$s / %2$s</string>
+    <string name="hist_detail_watched">观看时间：%1$s</string>
+    <string name="hist_detail_id">Bangumi 条目 id：%1$d</string>
+    <string name="hist_detail_no_id">这条记录没有条目 id（电脑端没给），接收端无法定位番剧 —— 请回到电脑上点播。</string>
+    <string name="toast_hist_deleted">已删除这条观看记录</string>
+    <string name="hist_need_sync">还没有连上电脑，无法点播。</string>
+
+    <!-- 相对时间 -->
+    <string name="time_just_now">刚刚</string>
+    <string name="time_minutes_ago">%1$d 分钟前</string>
+    <string name="time_hours_ago">%1$d 小时前</string>
+    <string name="time_yesterday">昨天</string>
+    <string name="time_days_ago">%1$d 天前</string>
+
+    <!-- ================= 设置页：播放 ================= -->
+    <string name="set_section_player">播放</string>
+    <string name="set_resize_fill">铺满画面（消除黑边）</string>
+    <string name="set_resize_hint">关掉时按原始比例显示（可能上下留黑边）；打开时拉伸铺满整块屏幕。播放器控制栏上也有同一个按钮。</string>
 </resources>

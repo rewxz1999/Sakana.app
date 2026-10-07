@@ -31,6 +31,7 @@ class SettingsActivity : Activity() {
     private lateinit var swKeepOn: Switch
     private lateinit var swAutoplay: Switch
     private lateinit var swBoot: Switch
+    private lateinit var swResize: Switch
     private lateinit var tvAboutVersion: TextView
     private lateinit var tvAboutPort: TextView
     private lateinit var tvAboutFace: TextView
@@ -70,6 +71,7 @@ class SettingsActivity : Activity() {
         swKeepOn = findViewById(R.id.sw_keep_on)
         swAutoplay = findViewById(R.id.sw_autoplay)
         swBoot = findViewById(R.id.sw_boot)
+        swResize = findViewById(R.id.sw_resize)
         tvAboutVersion = findViewById(R.id.tv_about_version)
         tvAboutPort = findViewById(R.id.tv_about_port)
         tvAboutFace = findViewById(R.id.tv_about_face)
@@ -88,6 +90,7 @@ class SettingsActivity : Activity() {
         swKeepOn.isChecked = Settings.keepScreenOn
         swAutoplay.isChecked = Settings.autoPlay
         swBoot.isChecked = Settings.autoOpenOnBoot
+        swResize.isChecked = Settings.resizeFill
         tvFace.text = faceLabel()
         bindRecentHosts(layoutRecent, Settings.recentPeers) { etPeer.setText(it) }
     }
@@ -120,6 +123,11 @@ class SettingsActivity : Activity() {
         swBoot.setOnCheckedChangeListener { _, checked ->
             Settings.autoOpenOnBoot = checked
             toast(getString(R.string.toast_saved))
+        }
+        // 铺满画面：只存设置，回到接收端界面时 onResume 会把它应用到播放器的 resize_mode
+        swResize.setOnCheckedChangeListener { _, checked ->
+            Settings.resizeFill = checked
+            toast(getString(if (checked) R.string.toast_resize_fill else R.string.toast_resize_fit))
         }
     }
 

@@ -134,6 +134,74 @@ export interface RecommendBackground {
   imagePos: ImagePos
   /** 背景模糊 px（0–40）；只作用于图区那一层 */
   blur: number
+  /**
+   * 背景图的**归一化取景框**（0–1 的源图坐标；`null` = 整图，即原来的 cover 自动居中）。
+   *
+   * 用户要能自己框选"图片哪一块显示在图区里"。存源图坐标而不是像素，是为了让
+   * 换页面尺寸 / 换图区比例 / 导出放大 2~3 倍都只是换一套换算，取景框本身不动 ——
+   * 预览与导出因此能共用同一个换算函数（见 styles.ts 的 bandImageCss）。
+   * 老数据没有这个字段 → 默认 null，行为与加这个功能之前完全一致。
+   */
+  crop: CropRect | null
+}
+
+/**
+ * 归一化取景框（0–1 的源图坐标）。
+ * 与角色图鉴「逐图裁切选择」是**同一套语义**（那边也叫 CropRect），所以两处的框选手感一致：
+ * 拖动平移、滚轮缩放、确认后存 `{x,y,w,h}`。
+ */
+export interface CropRect {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+/**
+ * 取景框收窄（判据照抄角色图鉴那份 normalizeCrop）：宽高必须 > 0 且落在 0–1 内；
+ * **轻微越界（浮点误差）整体平移回来**而不是丢弃 —— 丢掉的后果是"用户辛苦框好的取景突然没了"，
+ * 比一点点偏差严重得多。
+ */
+export function normalizeCrop(raw: unknown): CropRect | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  const w = Number(o.w)
+  const h = Number(o.h)
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0.001 || h <= 0.001) return null
+  const cw = Math.min(1, w)
+  const ch = Math.min(1, h)
+  const clamp01 = (v: number, max: number): number => Math.min(max, Math.max(0, v))
+  return {
+    x: clamp01(Number(o.x) || 0, 1 - cw),
+    y: clamp01(Number(o.y) || 0, 1 - ch),
+    w: cw,
+    h: ch
+  }
+}
+
+/**
+ * 页面尺寸（用户手填）的上下限：720–4096。
+ * 比 720 窄的话内容怎么排都会挤（封面 300 + 信息列）；4096 是导出与离屏截图的实用上限
+ * （再大文件体积与内存都不划算）。
+ */
+export const PAGE_SIZE_MIN = 720
+export const PAGE_SIZE_MAX = 4096
+
+/** 一页的手填尺寸 */
+export interface PageSize {
+  w: number
+  h: number
+}
+
+/** 尺寸收窄：夹到 [720, 4096]；非法返回 null（= 跟随内容自适应） */
+export function normalizePageSize(raw: unknown): PageSize | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  const w = Number(o.w)
+  const h = Number(o.h)
+  if (!Number.isFinite(w) || !Number.isFinite(h)) return null
+  const clamp = (v: number): number => Math.min(PAGE_SIZE_MAX, Math.max(PAGE_SIZE_MIN, Math.round(v)))
+  return { w: clamp(w), h: clamp(h) }
 }
 
 /** 背景图的位置：左 / 右 / 上（用户只提了这三个，没有"下"） */
@@ -283,7 +351,7 @@ export function normalizeBackground(raw: unknown): RecommendBackground | undefin
   if (kind === 'color') {
     const color = normalizeHexColor(r.color)
     return color
-      ? { kind, color, angle: 135, stops: [], path: '', imgW: 0, imgH: 0, imagePos, blur }
+      ? { kind, color, angle: 135, stops: [], path: '', imgW: 0, imgH: 0, imagePos, blur, crop: null }
       : undefined
   }
   if (kind === 'image') {
@@ -292,7 +360,7 @@ export function normalizeBackground(raw: unknown): RecommendBackground | undefin
     if (!path) return undefined
     const imgW = typeof r.imgW === 'number' && Number.isFinite(r.imgW) && r.imgW > 0 ? Math.round(r.imgW) : 0
     const imgH = typeof r.imgH === 'number' && Number.isFinite(r.imgH) && r.imgH > 0 ? Math.round(r.imgH) : 0
-    return { kind, color: '#ffffff', angle: 135, stops: [], path, imgW, imgH, imagePos, blur }
+    return { kind, color: '#ffffff', angle: 135, stops: [], path, imgW, imgH, imagePos, blur, crop: normalizeCrop(r.crop) }
   }
   const layer = normalizeLayer({ angle: r.angle, stops: r.stops })
   if (!layer) return undefined
@@ -305,7 +373,8 @@ export function normalizeBackground(raw: unknown): RecommendBackground | undefin
     imgW: 0,
     imgH: 0,
     imagePos,
-    blur
+    blur,
+    crop: null
   }
 }
 
@@ -511,6 +580,14 @@ export interface RecommendPage {
    * 只有用户真的拖过或改过的模块才会出现在这里。
    */
   layout?: ModuleLayout[]
+  /**
+   * 用户手填的页面尺寸（v0.3.8 第四轮）。
+   *
+   * `undefined` = **跟随内容自适应**（按 `styles.frameOf` 的公式算：没图 1200×920、
+   * 上图 ≥2300、侧边图按 1.5:1 + 内容所需高度）。一旦用户填过，`frameOf` 就**优先用它**，
+   * 不再被自动公式覆盖 —— 这是这个功能最容易出 bug 的点，优先级写在 `frameOf` 的注释里。
+   */
+  size?: PageSize
 }
 
 /** 一张推荐表 */
@@ -557,7 +634,15 @@ export interface RecommendPageInput {
 export type RecommendPagePatch = Partial<
   Pick<
     RecommendPage,
-    'myRating' | 'recommendLevel' | 'reason' | 'photos' | 'genres' | 'airDate' | 'background' | 'layout'
+    | 'myRating'
+    | 'recommendLevel'
+    | 'reason'
+    | 'photos'
+    | 'genres'
+    | 'airDate'
+    | 'background'
+    | 'layout'
+    | 'size'
   >
 >
 
@@ -650,7 +735,9 @@ export function normalizePage(raw: unknown, index: number): RecommendPage | null
     // 背景非法就当没设过（白底），见 normalizeBackground 的说明
     background: normalizeBackground(r.background),
     // 布局：只有合法的条目会留下，缺的模块渲染时补默认摆放（见 resolveModules）
-    layout: normalizeModules(r.layout)
+    layout: normalizeModules(r.layout),
+    // 手填尺寸：非法/没填就回成"跟随内容自适应"（不猜一个尺寸）
+    size: normalizePageSize(r.size) ?? undefined
   }
 }
 
@@ -983,6 +1070,8 @@ export const useRecommendTable = create<RecommendState>((set, get) => {
             if ('background' in patch) next.background = normalizeBackground(patch.background)
             // layout 同理：undefined = 整页回默认摆放
             if ('layout' in patch) next.layout = normalizeModules(patch.layout)
+            // size 允许为 null/undefined（= 回到跟随内容自适应）
+            if ('size' in patch) next.size = patch.size ? (normalizePageSize(patch.size) ?? undefined) : undefined
             return next
           })
         }))

@@ -102,8 +102,16 @@ object SyncStore {
      */
     fun recordWatch(item: HistoryItem) {
         val merged = HistoryMerge.upsert(history, item)
-        if (merged === history || merged == history) return
+        if (merged == history) return
         saveHistory(merged)
+    }
+
+    /** 删掉一条本地历史（长按历史卡片的「删除这条记录」）。 */
+    fun removeHistory(item: HistoryItem) {
+        val key = HistoryMerge.keyOf(item)
+        val kept = history.filterNot { HistoryMerge.keyOf(it) == key }
+        if (kept.size == history.size) return
+        saveHistory(kept)
     }
 
     // ---------------- 与电脑的连接信息 ----------------

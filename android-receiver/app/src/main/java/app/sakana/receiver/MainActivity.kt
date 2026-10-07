@@ -17,16 +17,16 @@ private const val UI_TICK_MS = 1000L
  * 接收端主界面。
  *
  * 两个形态（见 activity_main.xml 的两层布局）：
- *  · **首页**：状态卡（设备名/IP/状态/同步）+ 收藏网格 + 观看历史 + 底部「立即同步/设置」；
- *  · **播放**：铺满窗口的播放器 + 横屏全屏 + 浮在画面上的控制栏（自动淡出）。
+ *  · **首页**：固定状态卡 + 单个 RecyclerView（收藏两列网格 + 观看历史卡片）+ 固定底栏；
+ *  · **播放**：官方 PlayerView 铺满窗口 + 横屏全屏 + 浮在画面上的控制栏与手势。
  *
  * 职责边界（每一块都单独成文件，这里只负责接线、刷新与生命周期）：
  *  · 播放器        PlayerController
  *  · 投屏协议      ControlApi / ControlServer
  *  · 双端同步      SyncManager / SyncStore / SyncClient / WatchRecorder
- *  · 两个形态与全屏 PlaybackUi
+ *  · 播放层（控制栏/手势/全屏）PlaybackUi + PlayerGestures + player_control_view.xml
+ *  · 首页列表      HomeRows（纯逻辑）+ HomeAdapter + HomeBinder
  *  · 顶部状态区    HeaderBinder
- *  · 收藏/历史列表 HomeBinder
  *  · 弹窗与文案    UiHelpers
  */
 class MainActivity : Activity() {
@@ -71,6 +71,8 @@ class MainActivity : Activity() {
         applyKeepScreenOn()
         Receiver.applyConfig(this)
         SyncManager.autoConnect()
+        // 设置页里可能改过"铺满画面"，回来时同步一下播放器的 resize_mode
+        playback.applyResizeMode()
         refreshUi()
     }
 
@@ -85,12 +87,18 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 返回键：**全屏时先退出全屏**（回竖屏、显示系统栏），而不是直接退出应用；
-     * 第二次按才走系统默认行为。这是用户点名要的顺序。
+     * 返回键：**先退全屏，再退出播放，最后才退出应用** —— 用户点名要的顺序，
+     * 免得看得好好的按一下返回就把应用关了。
      */
     @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
         if (playback.exitFullscreenIfNeeded()) return
+        if (playback.isInPlayerMode()) {
+            // 退全屏后还在播放：这一步是"退出播放"（回首页，播放器停止但不退出应用）
+            player.control("stop", 0L)
+            refreshUi()
+            return
+        }
         super.onBackPressed()
     }
 
@@ -105,16 +113,14 @@ class MainActivity : Activity() {
             onPlayFavorite = { playFavorite(it) },
             onFavoriteDetails = { showFavoriteDialog(this, it) },
             onHistoryClick = { playHistory(it) },
+            onHistoryDetails = { showHistoryDialog(this, it) { refreshUi() } },
         )
         playback = PlaybackUi(
             activity = this,
+            playerView = playerView,
+            controller = player,
             homeView = findViewById(R.id.home_view),
-            layer = findViewById(R.id.player_layer),
-            // 控制栏里的动作统统走同一条路：交给播放器，失败就把"人话提示"弹出来
-            onControl = { action, value ->
-                if (!player.control(action, value)) player.notice()?.let { toast(it) }
-                refreshUi()
-            },
+            gestureLayer = findViewById(R.id.gesture_layer),
             onPlaylist = { showPlaylist() },
             onSettings = { openSettings() },
         )
@@ -132,6 +138,7 @@ class MainActivity : Activity() {
             toast(getString(R.string.toast_no_playlist))
             return
         }
+        playback.keepControlsAlive()
         showPlaylistDialog(this, snapshot.titles, snapshot.index, player.playableFlags()) { which ->
             if (!player.control("select", which.toLong())) {
                 toast(player.notice() ?: getString(R.string.toast_rule_mode, snapshot.titles.getOrNull(which) ?: ""))
@@ -165,11 +172,11 @@ class MainActivity : Activity() {
     /** 点历史：能认出条目 id 就从那一集接着播，否则如实说清为什么点不了。 */
     private fun playHistory(item: HistoryItem) {
         if (item.subjectId <= 0) {
-            toast(getString(R.string.fav_detail_no_id))
+            toast(getString(R.string.hist_detail_no_id))
             return
         }
         if (SyncStore.syncUrl.isNullOrBlank()) {
-            toast(getString(R.string.sync_need_connection))
+            toast(getString(R.string.hist_need_sync))
             return
         }
         // episode 是"第几集"（从 1 开始），play-subject 要的是从 0 开始的下标
@@ -216,13 +223,7 @@ class MainActivity : Activity() {
         playback.setPlayerMode(active, snapshot.playing)
 
         if (active) {
-            playback.refresh(
-                snapshot = snapshot,
-                error = error,
-                notice = notice,
-                connectedIp = if (Receiver.isConnected()) Receiver.lastClientIp else null,
-                searchingIp = null,
-            )
+            playback.refresh(snapshot, error, notice)
         } else {
             // 只刷新当前可见的那一层，省掉看不见的视图上的无谓工作
             header.refresh(snapshot, error, notice)

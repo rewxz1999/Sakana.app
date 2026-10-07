@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 次级按钮：白底蓝字 + 蓝描边，按下时填充浅蓝。 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/accent_soft" />
+            <stroke android:width="1dp" android:color="@color/accent" />
+            <corners android:radius="8dp" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/surface" />
+            <stroke android:width="1dp" android:color="@color/accent" />
+            <corners android:radius="8dp" />
+        </shape>
+    </item>
+</selector>

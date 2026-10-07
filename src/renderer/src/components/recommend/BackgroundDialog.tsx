@@ -12,16 +12,23 @@ import {
   MIN_GRADIENT_STOPS,
   normalizeBackground,
   normalizeHexColor,
+  normalizePageSize,
+  PAGE_SIZE_MIN,
+  PAGE_SIZE_MAX,
   type GradientLayer,
   type GradientStop,
   type ImagePos,
+  type CropRect,
+  type PageSize,
   type RecommendBackground,
   type RecommendPage
 } from '@/stores/recommendTable'
 import { Button, Input, Modal } from '@/components/ui'
+import { CropSelector } from './CropSelector'
 import {
   RL,
   asReactStyle,
+  contentHeightNeeded,
   blendStyle,
   displayName,
   frameOf,
@@ -195,8 +202,8 @@ export function BackgroundDialog({
   /** 正在编辑背景的那一页（null = 弹窗没开） */
   page: RecommendPage | null
   onClose: () => void
-  /** 只改这一页（undefined = 清掉背景回白底） */
-  onApply: (bg: RecommendBackground | undefined) => void
+  /** 只改这一页（undefined = 清掉背景回白底）；size 为 null = 回到跟随内容自适应 */
+  onApply: (bg: RecommendBackground | undefined, size: PageSize | null, crop: CropRect | null) => void
   /** 应用到这张表的所有页（undefined = 全部回白底） */
   onApplyAll: (bg: RecommendBackground | undefined) => void
 }) {
@@ -208,6 +215,13 @@ export function BackgroundDialog({
   const [blur, setBlur] = useState(0)
   /** 图片放在哪一侧（v0.3.8 第三轮：图只占页面一部分，交融渐变自动接在中间） */
   const [imagePos, setImagePos] = useState<ImagePos>('left')
+  /** 手填页面尺寸草稿（字符串：输入框里要能留空/中间态） */
+  const [sizeW, setSizeW] = useState('')
+  const [sizeH, setSizeH] = useState('')
+  /** 跟随内容（自适应）= 不存 size */
+  const [autoSize, setAutoSize] = useState(true)
+  /** 背景图取景框草稿（null = 整图） */
+  const [crop, setCrop] = useState<CropRect | null>(null)
   const [importing, setImporting] = useState(false)
 
   useEffect(() => {
@@ -226,27 +240,33 @@ export function BackgroundDialog({
       setImgSize({ w: 0, h: 0 })
       setBlur(0)
       setImagePos('left')
-      return
-    }
-    setBlur(bg.blur)
-    setImagePos(bg.imagePos)
-    if (bg.kind === 'color') {
-      setKind('color')
-      setColor(bg.color)
-    } else if (bg.kind === 'image') {
-      setKind('image')
-      setImagePath(bg.path)
-      setImgSize({ w: bg.imgW, h: bg.imgH })
     } else {
-      setKind('gradient')
-      setLayer({ angle: bg.angle, stops: bg.stops })
+      setBlur(bg.blur)
+      setImagePos(bg.imagePos)
+      setCrop(bg.crop)
+      if (bg.kind === 'color') {
+        setKind('color')
+        setColor(bg.color)
+      } else if (bg.kind === 'image') {
+        setKind('image')
+        setImagePath(bg.path)
+        setImgSize({ w: bg.imgW, h: bg.imgH })
+      } else {
+        setKind('gradient')
+        setLayer({ angle: bg.angle, stops: bg.stops })
+      }
     }
+    // 页面尺寸：有 size 就是手填过（关掉自适应），没有就是自适应
+    setAutoSize(!page.size)
+    setSizeW(page.size ? String(page.size.w) : '')
+    setSizeH(page.size ? String(page.size.h) : '')
     // 依赖刻意只写 [open, page?.id]：见上面的说明
   }, [open, page?.id])
 
   /** 草稿 → 数据层的背景值（走 normalizeBackground，保证与落盘用同一套校验） */
   function draft(): RecommendBackground | undefined {
-    const shared = { blur, imagePos }
+    // 取景框只在"图片背景"下有意义；其它背景类型一律 null（切回去时不会留着上一次的框）
+    const shared = { blur, imagePos, crop: kind === 'image' ? crop : null }
     if (kind === 'none') return undefined
     if (kind === 'color') return normalizeBackground({ kind: 'color', color, ...shared })
     if (kind === 'image') {
@@ -262,15 +282,29 @@ export function BackgroundDialog({
     return normalizeBackground({ kind: 'gradient', angle: layer.angle, stops: layer.stops, ...shared })
   }
 
+  /** 草稿 → 页面尺寸：自适应时给 null（清掉 size），否则夹到合法区间 */
+  function draftSize(): PageSize | null {
+    if (autoSize) return null
+    return normalizePageSize({ w: Number(sizeW), h: Number(sizeH) })
+  }
+
   /**
    * 预览用的页面框与各层样式：走**同一套** `frameOf` / `imageBand*` / `blendStyle`，
    * 所以弹窗里看到的构图（图区在哪、多宽、怎么交融）与推荐卡、导出图完全一致。
+   * 页面尺寸也用草稿（手填值优先），否则预览会与导出对不上。
    */
-  const previewFrame = useMemo(() => frameOf({ background: draft() }), [draft])
+  const previewFrame = useMemo(
+    () => frameOf({ background: draft(), size: draftSize() ?? undefined }),
+    // eslint 无关：这里的依赖就是"草稿的每一部分"，少一个预览就会与导出不一致
+    [kind, color, layer, imagePath, imgSize, blur, imagePos, crop, autoSize, sizeW, sizeH]
+  )
   const previewBandWrap = imageBandWrapStyle(previewFrame)
   const previewResolve = (p: string): string => `url('${localImgUrl(p)}')`
-  /** 预览条只有 224px 高，所以按比例缩一下（只影响这个预览框，不影响真实页面尺寸） */
+  /** 预览条只有 260px 宽，所以按比例缩一下（只影响这个预览框，不影响真实页面尺寸） */
   const previewScale = Math.min(1, 260 / previewFrame.width)
+  /** 内容区需要的实际高度：手填高度不够时提示用户（并给"一键按内容"按钮） */
+  const neededH = contentHeightNeeded(previewFrame)
+  const tooShort = previewFrame.height < neededH - 1
 
   /** 选图 → 复制进应用数据目录 → 量原图尺寸（页面高度要靠它算） */
   async function pickImage(): Promise<void> {
@@ -486,6 +520,38 @@ export function BackgroundDialog({
                 ))}
               </div>
             </div>
+
+            {/*
+              框选背景图的展示区域（v0.3.8 第四轮）。
+              交互与「最XX的角色」那个逐图裁切弹窗一致：视口比例 = 图区比例、拖动平移、滚轮缩放，
+              确认后存归一化 `{x,y,w,h}`。viewport 里看到的**就是**图区里会显示的，
+              因为两边用的是同一个换算（styles.bandImageCropPosition / cropToBackgroundCss）。
+            */}
+            <div className="mt-3">
+              <div className="mb-1.5 flex items-center justify-between text-[11px]">
+                <span className="text-dim">展示区域（框选）</span>
+                <span className="text-[10px] text-faint">
+                  {crop
+                    ? `框 ${Math.round(crop.w * 100)}% × ${Math.round(crop.h * 100)}%`
+                    : '整图（自动居中）'}
+                </span>
+              </div>
+              {imagePath && imgSize.w > 0 ? (
+                <CropSelector
+                  key={imagePath}
+                  url={localImgUrl(imagePath)}
+                  imgW={imgSize.w}
+                  imgH={imgSize.h}
+                  aspect={previewFrame.imageH > 0 ? previewFrame.imageW / previewFrame.imageH : 1}
+                  crop={crop}
+                  onChange={setCrop}
+                />
+              ) : (
+                <div className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-[10px] text-faint">
+                  先选一张图片，再框选要展示的区域
+                </div>
+              )}
+            </div>
           </div>
         ) : null}
 
@@ -511,8 +577,70 @@ export function BackgroundDialog({
           </div>
         </div>
 
+        {/* 页面尺寸（v0.3.8 第四轮）：手填优先于自适应，「跟随内容」清掉手填值 */}
+        <div className="space-y-2 rounded-xl border border-border bg-elev1/60 p-3">
+          <div className="flex items-center justify-between text-[11px]">
+            <span className="font-semibold text-faint">页面尺寸</span>
+            <span className="text-[10px] text-faint">
+              当前 {previewFrame.width} × {previewFrame.height} px
+              {autoSize ? '（跟随内容自适应）' : '（手填）'}
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-1.5 text-xs text-dim">
+              <span className="shrink-0">宽</span>
+              <Input
+                value={sizeW}
+                inputMode="numeric"
+                placeholder={String(RL.width)}
+                disabled={autoSize}
+                className="h-8 w-20 text-xs"
+                onChange={(e) => setSizeW(e.target.value)}
+                onBlur={(e) => setSizeW(String(normalizePageSize({ w: Number(e.target.value), h: 1000 })?.w ?? RL.width))}
+              />
+            </label>
+            <label className="flex items-center gap-1.5 text-xs text-dim">
+              <span className="shrink-0">高</span>
+              <Input
+                value={sizeH}
+                inputMode="numeric"
+                placeholder={String(RL.baseHeight)}
+                disabled={autoSize}
+                className="h-8 w-20 text-xs"
+                onChange={(e) => setSizeH(e.target.value)}
+                onBlur={(e) => setSizeH(String(normalizePageSize({ w: 1000, h: Number(e.target.value) })?.h ?? RL.baseHeight))}
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => setAutoSize((v) => !v)}
+              className={`h-8 rounded-lg px-3 text-xs transition-colors ${
+                autoSize ? 'bg-accent text-white' : 'bg-elev2 text-dim hover:text-text'
+              }`}
+            >
+              跟随内容（自适应）
+            </button>
+            <button
+              type="button"
+              disabled={autoSize || !tooShort}
+              title="把高度设成内容刚好放得下的值"
+              onClick={() => setSizeH(String(neededH))}
+              className="h-8 rounded-lg bg-elev2 px-3 text-xs text-dim transition-colors hover:text-text disabled:opacity-40"
+            >
+              按内容高度（{neededH}）
+            </button>
+          </div>
+          <div className="text-[10px] leading-relaxed text-faint">
+            范围 {PAGE_SIZE_MIN}–{PAGE_SIZE_MAX} px。**手填之后就不再被自动公式覆盖**（预览与导出都用它）；
+            想回到自动算尺寸，点亮「跟随内容（自适应）」。
+            {tooShort
+              ? ' 注意：当前高度装不下整页内容，超出的部分会被裁掉（可以点「按内容高度」一键调好）。'
+              : ''}
+          </div>
+        </div>
+
         <div className="text-[10px] leading-relaxed text-faint">
-          背景默认「只作用于这一页」（每部番可以不一样）。想让整张表统一，用下面的「应用到所有页」。
+          背景与页面尺寸默认「只作用于这一页」（每部番可以不一样）。想让整张表统一，用下面的「应用到所有页」。
         </div>
       </div>
 
@@ -534,7 +662,7 @@ export function BackgroundDialog({
           <Button
             disabled={!canSave}
             onClick={() => {
-              onApply(draft())
+              onApply(draft(), draftSize(), crop)
               onClose()
             }}
           >

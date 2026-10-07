@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Media3 的**自定义控制栏**（app:controller_layout_id 指向它）。
+
+  为什么是自定义布局而不是自己用 ImageButton 拼一套：
+  Media3 的 PlayerControlView 会把下面这些 id 自动接上官方行为 ——
+    exo_progress / exo_position / exo_duration  → 进度、时间、拖动（含吸附、时间气泡）
+    exo_play_pause / exo_prev / exo_next / exo_rew_with_amount / exo_ffwd_with_amount → 播放、上一下一、±秒
+    exo_playback_speed                          → 倍速菜单（官方弹窗）
+  这些行为都是 Google 从 git 维护的那套播放器 UI（NextPlayer / Just Player 用的同一套）。
+  我们只负责**配色**（白蓝）和**多出来的按钮**（音量、方向锁定、画面比例、选集、退出全屏）。
+
+  注意：PlayerView 自己会 inflate exo_player_view.xml，所以缓冲转圈(exo_buffering)、
+  错误文案(exo_error_message)、字幕(exo_subtitles) 都不用在这里写 —— 它们在 PlayerView 内部，
+  由 app:show_buffering="always" 控制。
+
+  实测确认（反编译 media3-ui 的 PlayerControlView 字节码）：
+  它先找 exo_progress、找到就直接用（所以这里可以自带一个蓝色 DefaultTimeBar），
+  找不到才拿 exo_progress_placeholder 现场造一个。两者都兼容。
+-->
+<merge xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <!-- ==================== 顶部：标题 + 选集 + 退出全屏 ==================== -->
+    <LinearLayout
+        android:id="@+id/player_top_bar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:background="@color/player_bar"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="6dp"
+        android:paddingBottom="8dp">
+
+        <TextView
+            android:id="@+id/player_title"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:textColor="@color/player_text"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <ImageButton
+            android:id="@+id/btn_pick_episode"
+            style="@style/PlayerIconButton"
+            android:contentDescription="@string/cd_pick_episode"
+            android:src="@drawable/ic_playlist" />
+
+        <ImageButton
+            android:id="@+id/btn_settings_player"
+            style="@style/PlayerIconButton"
+            android:contentDescription="@string/cd_settings"
+            android:src="@drawable/ic_settings" />
+
+        <ImageButton
+            android:id="@+id/btn_exit_fs"
+            style="@style/PlayerIconButton"
+            android:contentDescription="@string/cd_exit_fs"
+            android:src="@drawable/ic_fullscreen_exit" />
+    </LinearLayout>
+
+    <!--
+      出错时的「重试」：居中偏下，正好落在 Media3 自带的错误文案（exo_error_message）下面。
+      只在出错时可见（PlaybackUi.refresh 里控制）。
+    -->
+    <Button
+        android:id="@+id/btn_retry"
+        style="@style/AppButtonOutline"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:layout_marginTop="76dp"
+        android:text="@string/cd_retry"
+        android:visibility="gone" />
+
+    <!-- ==================== 底部：进度 + 时间 + 按钮 ==================== -->
+    <LinearLayout
+        android:id="@+id/player_bottom_bar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="@color/player_bar"
+        android:orientation="vertical">
+
+        <!-- 进度条：自带 DefaultTimeBar，配色走主色蓝（Media3 优先用这个，见文件头注释） -->
+        <androidx.media3.ui.DefaultTimeBar
+            android:id="@id/exo_progress"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:bar_height="3dp"
+            app:buffered_color="@color/player_buffered"
+            app:played_color="@color/player_played"
+            app:scrubber_color="@color/player_scrubber"
+            app:scrubber_dragged_size="18dp"
+            app:scrubber_enabled_size="13dp"
+            app:touch_target_height="34dp"
+            app:unplayed_color="@color/player_unplayed" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp">
+
+            <TextView
+                android:id="@id/exo_position"
+                style="@style/PlayerTimeText" />
+
+            <TextView
+                style="@style/PlayerTimeText"
+                android:text="@string/player_time_separator" />
+
+            <TextView
+                android:id="@id/exo_duration"
+                style="@style/PlayerTimeText" />
+        </LinearLayout>
+
+        <!-- 按钮行：官方 5 个（上一下一、±10 秒、播放）+ 我们自己的 5 个 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:orientation="horizontal"
+            android:paddingTop="2dp"
+            android:paddingBottom="4dp">
+
+            <ImageButton
+                android:id="@id/exo_prev"
+                style="@style/PlayerIconButton"
+                android:contentDescription="@string/cd_prev" />
+
+            <include layout="@layout/exo_player_control_rewind_button" />
+
+            <ImageButton
+                android:id="@id/exo_play_pause"
+                style="@style/PlayerIconButton"
+                android:contentDescription="@string/cd_play" />
+
+            <include layout="@layout/exo_player_control_ffwd_button" />
+
+            <ImageButton
+                android:id="@id/exo_next"
+                style="@style/PlayerIconButton"
+                android:contentDescription="@string/cd_next" />
+
+            <View
+                android:layout_width="1dp"
+                android:layout_height="24dp"
+                android:layout_marginStart="8dp"
+                android:layout_marginEnd="8dp"
+                android:background="@color/player_unplayed" />
+
+            <ImageButton
+                android:id="@+id/btn_volume_down"
+                style="@style/PlayerIconButton"
+                android:contentDescription="@string/cd_vol_down"
+                android:src="@drawable/ic_vol_down" />
+
+            <ImageButton
+                android:id="@+id/btn_volume_up"
+                style="@style/PlayerIconButton"
+                android:contentDescription="@string/cd_vol_up"
+                android:src="@drawable/ic_vol_up" />
+
+            <!-- Media3 的倍速按钮：点开是官方的倍速菜单 -->
+            <ImageButton
+                android:id="@id/exo_playback_speed"
+                style="@style/PlayerIconButton"
+                android:contentDescription="@string/cd_playback_speed" />
+
+            <ImageButton
+                android:id="@+id/btn_lock_orientation"
+                style="@style/PlayerIconButton"
+                android:contentDescription="@string/cd_lock_orientation"
+                android:src="@drawable/ic_lock_orientation" />
+
+            <ImageButton
+                android:id="@+id/btn_resize"
+                style="@style/PlayerIconButton"
+                android:contentDescription="@string/cd_resize_fill"
+                android:src="@drawable/ic_fullscreen" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- ==================== 手势提示气泡（双击快进/音量/亮度时浮现） ==================== -->
+    <TextView
+        android:id="@+id/player_hint"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="@color/player_hint_bg"
+        android:paddingStart="18dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="18dp"
+        android:paddingBottom="10dp"
+        android:textColor="@color/player_text"
+        android:textSize="15sp"
+        android:visibility="gone" />
+
+</merge>

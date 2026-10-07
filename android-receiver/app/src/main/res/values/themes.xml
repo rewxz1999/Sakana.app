@@ -1,46 +1,53 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!--
-      主题。
+      主题（白蓝浅色）。
 
-      为什么父主题用系统的 Theme.Material.NoActionBar，而不是 AppCompat/Material 主题：
+      为什么父主题用系统的 Theme.Material.Light.NoActionBar：
         · 不用 AppCompat 主题就不需要引 androidx.appcompat 依赖（省体积）；
-        · 这个主题自带全套 Material 控件样式与 alertDialogTheme，
-          所以 AlertDialog（选集/详情弹窗）能正常显示，不需要额外配置。
-
-      为什么**不**用 NoActionBar.Fullscreen（这一条改过）：
-      首页现在是正常的应用界面（状态卡 + 收藏网格 + 观看历史），需要状态栏那点空间；
-      "全屏"改成**播放时按需进入** —— PlaybackUi 用 WindowInsetsControllerCompat
-      隐藏系统栏并切横屏，退出播放就恢复。两个场景各自都合适。
+        · Light 变体自带全套浅色 Material 控件样式与 alertDialogTheme，
+          所以 AlertDialog（选集/详情/倍速）能正常显示；
+        · colorAccent 直接吃白蓝配色，不用逐个控件设色。
     -->
-    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+
+    <!--
+      windowLayoutInDisplayCutoutMode=shortEdges：**这是"完全全屏"的关键之一** ——
+      允许内容画进刘海/挖孔区。API 28 以下没有这个属性，会被系统忽略（不报错），
+      所以放在基础主题里而不是单独开 values-v28。
+    -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
         <item name="android:windowBackground">@color/surface</item>
         <item name="android:colorBackground">@color/surface</item>
-        <item name="android:statusBarColor">@color/surface_header</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:colorPrimary">@color/accent</item>
+        <item name="android:statusBarColor">@color/surface</item>
+        <!-- 浅色状态栏要配深色图标，否则白底上看不见 -->
+        <item name="android:windowLightStatusBar">true</item>
         <item name="android:navigationBarColor">@color/surface</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+        <item name="android:textColorHint">@color/text_muted</item>
     </style>
 
     <!--
-      接收端主界面用 AppTheme；设置页用下面这个。
+      设置页。
 
-      为什么设置页要单独一个主题：它和首页的背景/系统栏配色保持一致，但用户在这里要输入文字
-      （软键盘），`windowSoftInputMode=adjustResize` 需要一个会随键盘缩放的窗口，
-      单独一个主题也方便以后只调设置页的样式而不影响首页。
+      为什么单独一个主题：它和首页配色一致，但用户在这里要输入文字（软键盘），
+      `windowSoftInputMode=adjustResize` 需要一个会随键盘缩放的窗口；
+      单独一个主题也方便以后只调设置页样式而不影响首页。
     -->
-    <style name="SettingsTheme" parent="@android:style/Theme.Material.NoActionBar">
-        <item name="android:windowBackground">@color/surface</item>
-        <item name="android:colorBackground">@color/surface</item>
-        <item name="android:statusBarColor">@color/surface_header</item>
-        <item name="android:navigationBarColor">@color/surface</item>
+    <style name="SettingsTheme" parent="@style/AppTheme">
+        <item name="android:windowSoftInputMode">adjustResize</item>
     </style>
 
-    <!-- 设置页里的小标题 -->
+    <!-- 分区小标题 -->
     <style name="SectionTitle">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
         <item name="android:paddingStart">16dp</item>
         <item name="android:paddingEnd">16dp</item>
-        <item name="android:paddingTop">20dp</item>
+        <item name="android:paddingTop">18dp</item>
         <item name="android:paddingBottom">6dp</item>
         <item name="android:textColor">@color/accent</item>
         <item name="android:textSize">13sp</item>
@@ -68,6 +75,64 @@
         <item name="android:paddingTop">4dp</item>
         <item name="android:lineSpacingExtra">2dp</item>
         <item name="android:textColor">@color/text_muted</item>
+        <item name="android:textSize">12sp</item>
+    </style>
+
+    <!-- 输入框：白底 + 浅蓝描边，输入文字用主色，聚焦态一眼可见 -->
+    <style name="AppEditText" parent="@android:style/Widget.Material.EditText">
+        <item name="android:background">@drawable/bg_input</item>
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textColorHint">@color/text_muted</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:paddingStart">12dp</item>
+        <item name="android:paddingEnd">12dp</item>
+        <item name="android:paddingTop">10dp</item>
+        <item name="android:paddingBottom">10dp</item>
+    </style>
+
+    <!-- 主按钮：蓝底白字 -->
+    <style name="AppButton" parent="@android:style/Widget.Material.Button">
+        <item name="android:background">@drawable/bg_button_primary</item>
+        <item name="android:textColor">@color/surface</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">40dp</item>
+        <item name="android:stateListAnimator">@null</item>
+    </style>
+
+    <!-- 次级按钮：白底蓝字 + 蓝描边 -->
+    <style name="AppButtonOutline" parent="@style/AppButton">
+        <item name="android:background">@drawable/bg_button_outline</item>
+        <item name="android:textColor">@color/accent</item>
+    </style>
+
+    <!-- 卡片 -->
+    <style name="AppCard">
+        <item name="android:background">@drawable/bg_card</item>
+    </style>
+
+    <!--
+      播放控制栏上的图标按钮。
+      为什么用 ImageButton + tint 而不是给每个图标单独做颜色：Media3 会自己给
+      exo_play_pause / exo_prev / exo_next 换 drawable（播放/暂停切换），
+      而 tint 是**View 的属性**，换 drawable 也不会掉色 —— 这样官方图标和我们的图标能统一成白色。
+    -->
+    <style name="PlayerIconButton">
+        <item name="android:layout_width">48dp</item>
+        <item name="android:layout_height">48dp</item>
+        <item name="android:padding">11dp</item>
+        <item name="android:scaleType">centerInside</item>
+        <item name="android:background">?android:attr/selectableItemBackgroundBorderless</item>
+        <item name="android:tint">@color/player_icon</item>
+    </style>
+
+    <!-- 播放控制栏上的时间文字 -->
+    <style name="PlayerTimeText">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:paddingStart">4dp</item>
+        <item name="android:paddingEnd">4dp</item>
+        <item name="android:textColor">@color/player_text_dim</item>
         <item name="android:textSize">12sp</item>
     </style>
 </resources>

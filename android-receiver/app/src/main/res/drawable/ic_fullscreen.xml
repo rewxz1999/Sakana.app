@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 铺满屏幕：四个向外的角（按下后切换成"按比例显示"，图标换成 ic_fullscreen_exit）。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5,9V5h4V3H3v6h2z M15,3v2h4v4h2V3h-6z M19,15v4h-4v2h6v-6h-2z M5,15H3v6h6v-2H5v-4z" />
+</vector>

@@ -30,11 +30,15 @@
 - **双端同步**：收藏与观看历史缓存到本机（断网也能看），连上电脑后自动双向同步；
   观看历史会在本机记录并推给电脑。
 - **点收藏直接播**：收藏里点一部 → 电脑自己"选源 → 选集 → 嗅探直链 → 投回本机"。
-- **播放时横屏全屏**：进播放自动转横屏 + 隐藏系统栏，控制栏浮在画面上、几秒自动淡出。
-- **设置页**：设备名、控制端口、首选网卡、主动连接、屏幕常亮、自动播放、开机自启、同步状态、下载说明、关于。
-- **状态可见**：缓冲中 / 播放中 / 已暂停 / 播完 / 播放失败（带原因），以及"已被谁连接"。
+- **播放时横屏全屏**：进播放自动转真全屏（edge-to-edge + 隐藏系统栏 + 刘海区域也能用满），
+  控制栏是自己写的（挂在官方 `PlayerView` 的 `controller_layout_id` 上）、几秒自动淡出；
+  支持双击两侧快进快退、左右半边滑音量/亮度、水平拖动定位、长按 2× 速。
+- **自己的图标**：白底蓝色投屏符号，和电脑端应用的图标不是同一个。
+- **设置页**：设备名、控制端口、首选网卡、主动连接、屏幕常亮、自动播放、铺满屏幕、开机自启、同步状态、下载说明、关于。
+- **状态可见**：缓冲中 / 播放中 / 已暂停 / 播完 / 播放失败（带错误码、原因和「重试」），以及"已被谁连接"。
+- **全部白底蓝主色**：所有颜色集中在 `colors.xml` / `themes.xml`，布局里不写死颜色。
 
-体积（本机实测）：debug **5.74 MB**，release（R8 + 资源压缩）**1.11 MB**。
+体积（本机实测）：debug **5.78 MB**，release（R8 + 资源压缩）**1.14 MB**。
 
 ---
 
@@ -146,18 +150,64 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
   副状态（请让电脑搜索本设备 / 电脑 192.168.1.20 正在搜索 / 已被 192.168.1.20 连接 / 失败原因 /
   USB 共享网络提示）、本机地址（**点击复制**，只显示不输入），以及**同步状态行**。
 - 收藏：两列网格（封面 + 名字 + 评分/集数），点一下让电脑播，长按看详情。
-- 观看历史：横向列表，点一下从那一集接着播。
+  **全部收藏都在同一个列表里，可以一直往下滚**（见下面的"收藏翻不动"）。
+- 观看历史：**竖排卡片**（封面缩略图 + 标题 + 「第 N 集」徽标 + 进度条 + 相对时间"3 小时前/昨天"）。
+  点一下从那一集接着播，长按看详情 / 删掉这一条。
+  为什么不做成横向长条：横向列表要么把最近几条藏在屏幕外、要么为了一屏塞下而砍掉标题和进度，
+  而历史条目恰恰是"标题 + 第几集 + 看到哪了"三样都要看的东西；竖排卡片能一行给全，
+  也和上面的收藏网格用同一条滚动轴。默认只显示最近 4 条，多出来的折成一行「查看全部」(N)，
+  点开变成「收起」——这样历史很长时也不会把收藏挤到看不见。
 - 底部：「立即同步」「设置」。
 - 两个列表都有**空态文案**（"还没有从电脑同步收藏，连上电脑后会自动同步"之类），不会留白屏。
 
+> **"收藏翻不动、看不到其它收藏"是怎么回事（已修）**
+>
+> 原来的首页是 `ScrollView` 里塞两个各自 `wrap_content` 的 `RecyclerView`。
+> 嵌套滚动容器里的 `RecyclerView` 拿到的是 `AT_MOST` 高度约束，`LinearLayoutManager`
+> 只按这个上限布局，**超出屏幕的条目根本不会被创建**，所以既滚不到、也不显示；
+> 而且内外两层都能滚，手势还会互相抢，滑一下动一下又弹回去。
+> 现在首页只留**一个** `RecyclerView`（`layout_height="0dp"` + `layout_weight="1"`，
+> 父容器给的是精确高度），收藏、历史、分区标题、空态、"查看全部"全部作为不同的
+> item 类型由 `HomeAdapter` 按 span size 拼在这一条滚动轴上；固定的状态卡和底栏放在
+> 它外面，所以状态一直可见、底栏一直可点。见 `HomeRows.kt` / `HomeAdapter.kt` /
+> `HomeBinder.kt`，以及 `activity_main.xml:147-160`。
+
 **② 播放层**（有媒体时）
 
-- 播放器铺满整个窗口，自动切**横屏全屏**并隐藏系统栏；
-- 控制栏浮在画面上（半透明）：进度条 + 上一集 / 播放暂停 / 下一集 / 音量− / 音量+ / 选集 / 设置，
-  右上角一个「退出全屏」；
-- **点一下画面**显示/隐藏控制栏；播放中 4 秒无操作自动淡出，暂停时保持常显；拖动进度时不会消失；
-- **返回键先退出全屏**（回到竖屏、恢复系统栏），再按一次才走系统默认行为；
+播放器用的是 Media3 官方的 `PlayerView`（`app:use_controller="true"`），但控制栏是**自己写的**
+（`player_control_view.xml`，通过 `app:controller_layout_id` 挂上去，根节点必须是 `<merge>`）。
+这样做的好处是进度条、按钮、配色、状态显示全在自己手里，也不用引第三方播放器库。
+
+- 画面铺满整个窗口，自动切**横屏全屏**：`WindowCompat.setDecorFitsSystemWindows(window, false)`
+  + `WindowInsetsControllerCompat.hide(systemBars())` + `BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`
+  （边缘上滑可临时唤出系统栏），主题里 `windowLayoutInDisplayCutoutMode=shortEdges`，
+  刘海/挖孔区域也能用满（`FullscreenController.kt`）。
+- **顶栏**：标题（第几集 / 文件名）+「选集」+「设置」+「退出全屏」。
+- **底栏**：进度条（可拖，蓝色已播/缓冲色）+ 当前位置 / 总时长 + 上一集 / 后退 10 秒 /
+  播放暂停 / 前进 10 秒 / 下一集 + 音量− / 音量+ + 倍速 + 锁定方向 / 解锁方向 + 「铺满」/「适应」。
+- **手势**（`PlayerGestures.kt`）：
+  - 单击画面：显示 / 隐藏控制栏；
+  - 双击左半边 / 右半边：后退 / 前进 10 秒，连点会累加（每次 +10 秒，最多 ±60 秒），
+    屏幕上给出提示气泡，停手后真正 seek 一次；
+  - 右半边上下滑：音量；左半边上下滑：亮度；
+  - 水平拖动：拖动即预览目标时间，松手才 seek（不会边拖边跳）；
+  - 长按：2× 倍速，松手恢复。
+- **状态**：缓冲中显示转圈；播完显示重播；**播放失败显示错误码 + 原因 + 「重试」按钮**
+  （重试是重新加载当前这一集并从头开始）。播放中 4 秒无操作控制栏自动淡出，暂停时常显，
+  拖动进度时不消失。
+- **返回键**：先退出全屏（回到竖屏、恢复系统栏），再按一次才退出播放，**永远不会直接退出 App**。
 - 退出播放（停止、或回到 idle）时恢复 `SCREEN_ORIENTATION_UNSPECIFIED` 和系统栏。
+- 设置页里的「铺满」开关等价于底栏的「铺满」按钮：`resize_mode` 在 `fit`（保持比例留黑边）
+  和 `fill`（裁掉多余部分填满屏幕）之间切，`onResume` 时会重新套用。
+
+**配色**：全部白底 + 蓝主色，统一在 `colors.xml` / `themes.xml` 里，布局和 Kotlin 里都不再写死
+颜色（背景 `#FFFFFF`、卡片 `#F5F8FF`、主色 `#2E6BE6`、主文字 `#101828`、次文字 `#667085`、
+分割线 `#E4E7EC`）。播放层浮在画面上，所以底衬仍是半透明深色（否则白字看不清），
+但按钮着色、进度条已播/缓冲色、提示气泡都换成了同一个蓝。
+
+**图标**：本 App 有自己的启动图标（白底蓝色投屏符号，`ic_launcher_foreground.xml` /
+`ic_launcher_background.xml` / `mipmap-anydpi-v26/*`，含圆形 `ic_launcher_round`），
+和电脑端应用的图标不是同一个。自适应图标的前景元素都收在 66×66dp 安全区内。
 
 ### 2.4 设置页
 
@@ -169,6 +219,7 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
 | 主动连接电脑 | 填电脑 IP 后每 5 秒向它单播宣告（见 2.2） |
 | 保持屏幕常亮 | 默认开；黑屏会连带 Wi-Fi 省电，发现与控制都可能不稳 |
 | 收到投屏后自动播放 | 默认开；关掉时只加载不播放，等电脑端按播放 |
+| 铺满屏幕 | 默认关；开 = 画面填满屏幕（可能裁掉一点边），关 = 保持比例、留黑边。等价于播放层底栏的「铺满」按钮 |
 | 开机后尝试自动打开接收端 | 默认关；见下方"已知限制"里关于 Android 10+ 的说明 |
 | 同步状态 | 已连上哪台电脑、上次同步时间、同步地址、收藏/历史各多少条 + **立即同步**按钮 |
 | 下载 / 构建 | 说明本 App 从哪来、怎么构建（见开头"这个 App 从哪来"一节），供电脑端设置页里的"下载地址"指向 |
@@ -387,64 +438,72 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
 
 ## 4. 代码结构
 
-按"一件事一个类 / 一个文件"拆开，**33 个 Kotlin 文件全部 ≤300 行**（最长 294 行）：
+按"一件事一个类 / 一个文件"拆开，**38 个 Kotlin 文件全部 ≤300 行**（最长 278 行）：
 
 **协议与传输**
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `Proto.kt` | 73 | 协议常量（端口、间隔、caps、state、报文字段名）。**改这里等于改协议** |
-| `Json.kt` | 160 | 手写 JSON 的对外 API、序列化、字段取值辅助函数 |
-| `JsonParser.kt` | 160 | 手写 JSON 的递归下降解析器（含局限说明） |
-| `Http.kt` | 250 | 手写 HTTP **服务端**：请求读取与 JSON 响应写出（含 chunked） |
-| `ControlServer.kt` | 193 | ServerSocket、端口顺延、路由分发、`Reply`（成功 200 / 失败 400） |
-| `ControlApi.kt` | 182 | 把 HTTP 请求翻译成播放器调用 + 组装 `/info` JSON；负责切到主线程 |
-| `PlayerGateway.kt` | 38 | 控制接口需要的播放动作（界面活着才注册，避免碰已释放的播放器） |
-| `DiscoveryService.kt` | 285 | UDP 52888 的收发、广播、向手填地址主动宣告 |
-| `WifiMulticastLock.kt` | 50 | MulticastLock 的薄封装（Wi-Fi 省电时不漏收广播） |
-| `Lan.kt` | 201 | 列出网卡（含 Wi-Fi/USB/蓝牙/有线分类）、挑网卡、算广播目标 |
+| `Proto.kt` | 55 | 协议常量（端口、间隔、caps、state、报文字段名）。**改这里等于改协议** |
+| `Json.kt` | 133 | 手写 JSON 的对外 API、序列化、字段取值辅助函数 |
+| `JsonParser.kt` | 153 | 手写 JSON 的递归下降解析器（含局限说明） |
+| `Http.kt` | 213 | 手写 HTTP **服务端**：请求读取与 JSON 响应写出（含 chunked） |
+| `ControlServer.kt` | 164 | ServerSocket、端口顺延、路由分发、`Reply`（成功 200 / 失败 400） |
+| `ControlApi.kt` | 164 | 把 HTTP 请求翻译成播放器调用 + 组装 `/info` JSON；负责切到主线程 |
+| `PlayerGateway.kt` | 30 | 控制接口需要的播放动作（界面活着才注册，避免碰已释放的播放器） |
+| `DiscoveryService.kt` | 251 | UDP 52888 的收发、广播、向手填地址主动宣告 |
+| `WifiMulticastLock.kt` | 43 | MulticastLock 的薄封装（Wi-Fi 省电时不漏收广播） |
+| `Lan.kt` | 170 | 列出网卡（含 Wi-Fi/USB/蓝牙/有线分类）、挑网卡、算广播目标 |
 
 **播放**
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `PlayerController.kt` | 294 | ExoPlayer 封装：播放列表、音量、规则模式的空地址防护 |
-| `PlaylistNav.kt` | 36 | 播放列表切换目标的计算（跳过空地址、不循环）—— 纯逻辑，有单测 |
-| `PlaybackState.kt` | 35 | 播放状态 -> 协议 `state` 枚举的映射 |
-| `MediaSources.kt` | 109 | URL -> MediaSource：请求头透传、过滤，HLS/直链区分 |
+| `PlayerController.kt` | 267 | ExoPlayer 封装：播放列表、音量、倍速、重试、规则模式的空地址防护 |
+| `PlaybackEvents.kt` | 31 | `Player.Listener` 桥：只把"状态变了/出错了"两件事转出来给界面 |
+| `PlayerGestures.kt` | 175 | 手势：单击/双击累加 seek/长按 2× 速/左右分别调亮度音量/水平拖动 seek |
+| `PlaylistNav.kt` | 32 | 播放列表切换目标的计算（跳过空地址、不循环）—— 纯逻辑，有单测 |
+| `PlaybackState.kt` | 28 | 播放状态 -> 协议 `state` 枚举的映射 |
+| `MediaSources.kt` | 82 | URL -> MediaSource：请求头透传、过滤，HLS/直链区分 |
 
 **双端同步**
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `SyncModels.kt` | 166 | 收藏/历史的数据模型 + 宽松 JSON 解析（类型串了也能认） |
-| `HistoryMerge.kt` | 64 | 历史的合并去重与"要不要推"的指纹 —— 纯逻辑，有单测 |
-| `SyncClient.kt` | 100 | 同步服务的 HTTP 客户端（`HttpURLConnection`，地址规范化） |
-| `SyncStore.kt` | 147 | 收藏/历史的本地缓存与持久化、同步地址、上次同步时间 |
-| `SyncManager.kt` | 261 | 同步调度：拉收藏/历史、推本地历史、play-subject 点播 |
-| `SyncDiscovery.kt` | 84 | 找电脑的同步服务：候选端口探测、限流、自动重连 |
-| `WatchRecorder.kt` | 107 | 本地观看历史的记录时机与限流、把播放认到某个条目上 |
-| `CoverLoader.kt` | 172 | 极小的异步封面加载器（内存 + 磁盘两级缓存） |
+| `SyncModels.kt` | 158 | 收藏/历史的数据模型 + 宽松 JSON 解析（类型串了也能认） |
+| `HistoryMerge.kt` | 52 | 历史的合并去重与"要不要推"的指纹 —— 纯逻辑，有单测 |
+| `SyncClient.kt` | 93 | 同步服务的 HTTP 客户端（`HttpURLConnection`，地址规范化） |
+| `SyncStore.kt` | 143 | 收藏/历史的本地缓存与持久化、同步地址、上次同步时间 |
+| `SyncManager.kt` | 234 | 同步调度：拉收藏/历史、推本地历史、play-subject 点播 |
+| `SyncDiscovery.kt` | 80 | 找电脑的同步服务：候选端口探测、限流、自动重连 |
+| `WatchRecorder.kt` | 95 | 本地观看历史的记录时机与限流、把播放认到某个条目上 |
+| `CoverLoader.kt` | 165 | 极小的异步封面加载器（内存 + 磁盘两级缓存） |
 
 **界面与运行时**
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `Settings.kt` | 131 | 用户设置（设备名/端口/网卡/主动连接/开关）的持久化 |
-| `Receiver.kt` | 187 | 运行期外壳：控制服务 + 发现服务的启停、配置变更重启、连接统计 |
-| `ReceiverApp.kt` | 22 | Application：初始化 Settings / 同步 / 封面缓存 |
-| `MainActivity.kt` | 224 | 主界面接线、两个形态的切换、生命周期 |
-| `PlaybackUi.kt` | 232 | 播放层：横屏全屏、系统栏、浮层控制栏与进度条 |
-| `HeaderBinder.kt` | 100 | 顶部状态区（设备名/大字状态/副状态/地址/同步状态） |
-| `HomeBinder.kt` | 83 | 收藏网格与观看历史列表、空态文案 |
-| `ListAdapters.kt` | 108 | 收藏/历史两个 RecyclerView 适配器 |
-| `UiHelpers.kt` | 281 | 状态文案、选集/详情/网卡弹窗、最近地址、剪贴板、时间格式化 |
-| `SettingsActivity.kt` | 265 | 设置页 |
-| `BootReceiver.kt` | 34 | 开机自启（见"已知限制"） |
+| `Settings.kt` | 125 | 用户设置（设备名/端口/网卡/主动连接/铺满等开关）的持久化 |
+| `Receiver.kt` | 176 | 运行期外壳：控制服务 + 发现服务的启停、配置变更重启、连接统计 |
+| `ReceiverApp.kt` | 15 | Application：初始化 Settings / 同步 / 封面缓存 |
+| `MainActivity.kt` | 239 | 主界面接线、两个形态的切换、返回键分级、生命周期 |
+| `PlaybackUi.kt` | 278 | 播放层：官方 `PlayerView` + 自写控制栏、手势、全屏、提示气泡 |
+| `FullscreenController.kt` | 74 | 真全屏：edge-to-edge、系统栏隐藏/恢复、屏幕方向与"锁定方向" |
+| `HeaderBinder.kt` | 88 | 顶部状态区（设备名/大字状态/副状态/地址/同步状态） |
+| `HomeBinder.kt` | 65 | 单一 RecyclerView 的接线、滑动位置保护、避免无谓重绘 |
+| `HomeRows.kt` | 86 | 首页要显示哪些行（收藏全部 + 历史折叠）—— 纯逻辑，有单测 |
+| `HomeAdapter.kt` | 185 | 首页多类型适配器（分区标题/空态/收藏格/历史卡/「查看全部」） |
+| `UiHelpers.kt` | 264 | 状态文案、选集/详情弹窗、相对时间、进度格式化、剪贴板 |
+| `SettingsUi.kt` | 71 | 设置页里较独立的弹窗：首选网卡选择、最近连接过的地址 |
+| `SettingsActivity.kt` | 254 | 设置页 |
+| `BootReceiver.kt` | 29 | 开机自启（见"已知限制"） |
 
 界面资源：`activity_main.xml`（首页层 + 播放层）、`activity_settings.xml`（表单）、
-`item_favorite.xml`（收藏一格）、`item_history.xml`（历史一张卡）、`item_episode.xml`、`item_recent_host.xml`、
-`res/drawable/ic_*.xml` 共 11 个自己画的矢量图标、`res/color/icon_tint.xml`（禁用态自动变暗）。
+`player_control_view.xml`（自写的 Media3 控制栏，根节点 `<merge>`）、
+`item_favorite.xml`（收藏一格）、`item_history.xml`（历史一张卡）、`item_section.xml`、
+`item_empty.xml`、`item_action.xml`、`item_episode.xml`、`item_recent_host.xml`、
+`res/drawable/ic_*.xml` 共 13 个自己画的矢量图标（含启动图标前景）、
+`res/mipmap-anydpi-v26/`（自适应图标）、`res/color/icon_tint.xml`（禁用态自动变暗）。
 
 ### 关于手写 JSON 的局限
 
@@ -508,8 +567,9 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
 - **只支持 HLS(m3u8) 与渐进式 mp4**。DASH/SmoothStreaming 没接（`caps` 里也没承诺）。
   判定方式是"URL 里是否含 `.m3u8`"，所以**不带扩展名的 HLS 地址会被当成直链**播不了。
 - **加密 / DRM 流、需要客户端证书的流不支持**。
-- **播放出错不会自动重试**：出错后 `state` 变回 `idle`，界面显示"播放失败：原因"，
-  需要电脑端重新发 `/play`。接收端不擅自重连，是为了不把"地址已过期"变成无限重连。
+- **播放出错不会自动重试**：出错后 `state` 变回 `idle`，界面显示"播放失败：错误码 + 原因"，
+  并给一个「重试」按钮（重新加载**当前这一集**并从 0 开始）。电脑端也可以随时重发 `/play`。
+  接收端不擅自重连，是为了不把"地址已过期"变成无限重连。
 - **没有字幕/音轨切换**，也不支持外挂字幕。
 - **`playlist` 只透传 url 和标题**，时长/封面/简介之类不会显示。
 - **规则模式下 playlist 只有标题**：接收端上"上一集/下一集"会禁用、选集里点了会提示
@@ -570,11 +630,13 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
 
 **验证状态**
 
-- 已经验证：编译通过、打包通过、协议层/网卡选择/播放列表导航/同步客户端与合并逻辑的自测（见下节）。
-- **没有验证**：没有真机安装过；电脑端的投屏通道（`cast.ts`）是**读代码对齐**的，
+- 已经验证：编译通过、打包通过、协议层/网卡选择/播放列表导航/首页行模型/同步客户端与合并逻辑的自测（见下节）。
+- **没有验证**：**未上机**（没有真机，模拟器在本机沙箱里跑不起来，证据见 6.3）；
+  电脑端的投屏通道（`cast.ts`）是**读代码对齐**的，
   电脑端的**同步服务这一轮还没有代码**（协议是按需求里给的字段实现的），所以两边都没有真正联调过。
   下面这些都还没有实测：
-  - UI 实际观感、**播放时横屏全屏**的实际效果（旋转后画面是否变形、控制栏位置、返回键顺序）；
+  - UI 实际观感、**真全屏与手势**的实际效果（刘海区域、边缘上滑唤出系统栏、返回键顺序）；
+  - 新控制栏在真机上的排版与手感；
   - 电视盒子遥控器的焦点行为；
   - 真实 CDN 的拉流表现、`headers` 是否被接受；
   - 同步端点的真实行为（端口是不是 52890、字段是否与我们解析的一致、`play-subject` 的返回）。
@@ -590,18 +652,20 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
 cd E:\sakana.app\android-receiver
 $env:JAVA_HOME='E:\environment\jdk-21.0.2'
 $env:ANDROID_HOME='E:\environment\Android SDK'
-.\gradlew.bat clean assembleDebug assembleRelease --console=plain --offline --no-watch-fs --warning-mode all
+.\gradlew.bat clean assembleDebug assembleRelease --console=plain --offline --no-watch-fs
 ```
 
 结果：
 
 ```
-BUILD SUCCESSFUL in 3m 34s
+BUILD SUCCESSFUL in 3m 55s
+78 actionable tasks: 49 executed, 28 from cache, 1 up-to-date
 ```
 
-- `app\build\outputs\apk\debug\app-debug.apk` —— **5881 KB**
-- `app\build\outputs\apk\release\app-release-unsigned.apk` —— **1135 KB**（R8 + 资源压缩，未签名）
-- `--warning-mode all` 下**没有**任何废弃 API 警告，也没有 Kotlin 警告。
+- `app\build\outputs\apk\debug\app-debug.apk` —— **5922 KB**
+- `app\build\outputs\apk\release\app-release-unsigned.apk` —— **1164 KB**（R8 + 资源压缩，未签名）
+- `dist\SakanaReceiver-0.3.8-debug.apk` —— 就是上面那个 debug 包（**文件名保持不变**，
+  电脑端设置页里的下载地址指向它），SHA256 `0E8AEEEA1BE5569904324D9C5E96034443ABF5D4387E7A09615784359C479C16`。
 - 注意：本机**没有网络**，所以用的是 `--offline` + 本机已有的 Gradle/依赖缓存；
   另外按 1.4 节设置了 `GRADLE_USER_HOME` / `GRADLE_RO_DEP_CACHE` / `LOCALAPPDATA`。
   有网络的机器上不需要 `--offline`，也不需要那些变量。
@@ -618,24 +682,49 @@ uses-permission: name='android.permission.ACCESS_WIFI_STATE'
 uses-permission: name='android.permission.CHANGE_WIFI_MULTICAST_STATE'
 uses-permission: name='android.permission.RECEIVE_BOOT_COMPLETED'
 uses-permission: name='app.sakana.receiver.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'
+application-label:'Sakana 投屏接收端'
+application-icon-160:'res/mipmap-anydpi-v26/ic_launcher.xml'
 launchable-activity: name='app.sakana.receiver.MainActivity'
 leanback-launchable-activity: name='app.sakana.receiver.MainActivity'
 ```
 
 （`WAKE_LOCK` 已按预期不在列表里。）
 
+`aapt2 dump xmltree --file AndroidManifest.xml` 里关于图标与方向的几行：
+
+```
+android:icon      = @0x7f0a0000   (mipmap/ic_launcher)
+android:roundIcon = @0x7f0a0001   (mipmap/ic_launcher_round)
+android:screenOrientation = 10    (fullSensor)
+android:configChanges     = 0x00000de0
+```
+
+`aapt2 dump resources` 里 `mipmap` 有 4 个条目，说明**旧版（`()`）与自适应（`anydpi-v26`）
+两套图标都进了包**：
+
+```
+resource 0x7f0a0000 mipmap/ic_launcher
+  ()            (file) res/mipmap/ic_launcher.xml
+  (anydpi-v26)  (file) res/mipmap-anydpi-v26/ic_launcher.xml
+resource 0x7f0a0001 mipmap/ic_launcher_round
+  ()            (file) res/mipmap/ic_launcher_round.xml
+  (anydpi-v26)  (file) res/mipmap-anydpi-v26/ic_launcher_round.xml
+```
+
 ### 6.2 协议层自测
 
 编译产物里的 `Json` / `JsonParser` / `Http` / `Proto` / `Lan` / `Reply` /
-`SyncModels` / `HistoryMerge` / `SyncClient` / `PlaylistNav` 都是纯 JVM 代码
+`SyncModels` / `HistoryMerge` / `SyncClient` / `PlaylistNav` / `HomeRows` 都是纯 JVM 代码
 （`Lan` 只用到 `java.net`，`SyncClient` 只用到 `HttpURLConnection`），
 所以可以在桌面上直接跑断言，不需要模拟器。
 同步那部分还额外起了一个**本地的假 PC 同步服务端**（JDK 自带的 `HttpServer`）做真请求。
 用一个临时 Java 测试类加载上面编译出的 class 后执行：
 
 ```
-==== 135 passed, 0 failed ====
+==== 89 passed, 0 failed ====
 ```
+
+> 这是**对着 `clean` 之后重新编译出来的 class** 跑的，不是对着上一轮的旧产物。
 
 覆盖的点（都是两边对接最容易踩坑的地方）：
 
@@ -683,6 +772,24 @@ leanback-launchable-activity: name='app.sakana.receiver.MainActivity'
   - **电脑拒绝时 `ok=false` 且 `message` 原样带回**（界面要显示原因，而不是"失败"两个字）；
   - 未知端点 → `ok=false` 且错误里带 `HTTP 404`；连不上的地址 → 干净失败，不抛异常。
 
+**首页行模型（本轮新增 —— 对应"收藏翻不动、看不到其它收藏"）**
+
+`HomeRows.build(收藏, 历史, 历史是否展开)` 是纯函数，它决定首页到底要显示哪些行。
+断言直接钉住"一条都不能少"：
+
+- **12 条收藏 → 12 个收藏行**；**20 条 → 20 个**；**8 条 → 8 个**
+  （用户要求"喂 8 条以上假数据给那条路径"，这里跑了 8 / 12 / 20 三档）。
+  这条断言如果有任何截断（比如又写成"只取前 N 条"）会立刻失败。
+- 历史折叠时只出 4 个历史行 + 一个「查看全部」行，**收藏仍是 12 行**（历史长不会挤掉收藏）；
+  展开后 9 个历史行全出 + 变成「收起」，收藏还是 12 行。
+- 历史卡片的封面**按 `subjectId` 从收藏里匹配**（第 3 部 → `https://c/3.jpg`）。
+- 空收藏 + 空历史时：两个分区标题都在，两个空态文案都在，收藏行 0 个（不会白屏）。
+
+> 这条数据链路自测只能证明**数据层不丢条目**；真正"能不能滑到"是布局问题，
+> 靠的是 `activity_main.xml` 里那个 `layout_height="0dp"` + `layout_weight="1"`
+> 的单一 `RecyclerView`（精确高度约束），以及全 `res/layout/` 里除了设置页的
+> `ScrollView` 之外**没有任何嵌套滚动容器**（已用检索确认）。这两点合起来才是完整的修复。
+
 > 这个自测脚本是临时文件，验证完已删除，没有留在仓库里。
 
 **自测当场抓出的两个真问题（都已修）**：
@@ -696,18 +803,43 @@ leanback-launchable-activity: name='app.sakana.receiver.MainActivity'
 
 ### 6.3 还没做的验证
 
-- **没有真机安装与运行**（本机没有连接安卓设备），所以 UI 观感、遥控器焦点、
-  **横屏全屏与旋转的实际表现**都只看过代码，没看过画面。
+**本轮的结论是：未上机验证**（下面附完整证据，不是"没试"）。
+
+- **没有真机安装与运行**（本机没有连接安卓设备）。
+- **模拟器也跑不起来**，试过两条路，都卡在同一处：
+  1. 直接用已有的 AVD：
+     ```
+     ERROR | avdInfo_setLastRunQemuVersion: Could not write file:
+             C:\Users\RE妄想症\.android\avd\..\avd\sakana.avd\qemu-version.txt
+     ERROR | Unexpected error while creating:
+             C:\Users\RE妄想症\.android\emu-last-feature-flags.protobuf.lock (error: 5)
+     ```
+     原因：本机沙箱只允许写 `E:\sakana.app` 下面，模拟器坚持要写用户目录，`error: 5` 就是拒绝访问。
+  2. 把 `ANDROID_AVD_HOME` / `ANDROID_USER_HOME` / `LOCALAPPDATA` / `TEMP` 全重定向到
+     工作区里，新建了一个小 AVD（2 核 / 2048 MB）后 `qemu-system-x86_64-headless` **确实起来了**
+     （约 9 分钟 CPU 打满），但：
+     - `adb devices` 里**始终不出现**这个设备；
+     - `adb connect localhost:5555` → `cannot connect to 127.0.0.1:5555 ... (10061)`；
+     - `emulator-check accel` → `Unable to open AEHD device: ERROR_ACCESS_DENIED (code 11)`，即没有可用的硬件加速；
+     - 本机 SDK 里没有 `cmdline-tools` / `avdmanager`。
+  所以**没有截图、没有看到过任何画面**。上面那些模拟器进程与临时目录都已清理。
+
+- **因此下面这些只看过代码，没看过实际效果**（本轮改动集中在这里，请上机重点看）：
+  - 自写控制栏在真机上的排版：进度条拖动、按钮在窄屏/刘海屏下是否挤在一起；
+  - 手势：双击累加 seek 的手感与提示气泡、左右半边亮度/音量、水平拖动 seek 的跟手程度；
+  - 真全屏：`shortEdges` 下刘海区域、边缘上滑唤出系统栏、返回键"先退全屏再退播放"的顺序；
+  - 「铺满 / 适应」切换的实际画面差异；
+  - 白蓝配色在深色模式系统下的观感（主题是 `Theme.Material.Light`，未做深色适配）；
+  - 启动图标在桌面/抽屉里的实际显示（自适应图标的圆形裁切、圆形图标）；
+  - 历史卡片的相对时间文案、长按详情/删除的交互。
 - **没有和电脑端真正联调**：
   - 投屏侧只能读 `cast.ts` / `castRelay.ts` 对齐；
   - **同步侧电脑端这一轮还没有代码**（`/sync/*` 是按需求里给的字段与响应形状实现的），
     所以端口 `52890`、字段名、`play-subject` 的返回都**没有被真实验证过**。
-  下面这些仍需真机/真机联调确认：
   - 电脑端是否真的收到了接收端**主动宣告**（USB 共享网络场景的关键路径）；
   - 电脑端同步服务是否真的在 `52890`（否则自动连接的第 3 条路径失效，投屏一次即可恢复）；
   - `headers`（Referer/Cookie）是否被目标 CDN 接受、HLS 分片是否顺畅；
   - 规则模式下"电脑端换集后重新投屏"这条链路；
-  - 点收藏后电脑"选源→嗅探→投回"整条链路，以及失败时 `message` 的显示；
-  - 旋转后画面是否变形、控制栏位置、返回键两次的顺序。
+  - 点收藏后电脑"选源→嗅探→投回"整条链路，以及失败时 `message` 的显示。
 - 按需求**没有**申请前台服务相关权限，所以"锁屏/切后台后接收端还活着"这件事**做不到**，
   这是刻意的取舍（见"已知限制"）。
