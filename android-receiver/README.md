@@ -74,6 +74,27 @@ $env:ANDROID_HOME='E:\environment\Android SDK'
 release 包**未签名**（本工程没有配置 release 签名，这是有意的：签名密钥不应该进仓库）。
 要装到设备上，用 debug 包，或者自己加一个 signingConfig。
 
+> ⚠️ **debug 包必须用同一把 keystore 签，否则设备上装不上（只能卸载重装）**
+>
+> 仓库里发布的那份 APK（`dist/SakanaReceiver-<版本>-debug.apk`，也就是电脑端设置页里下载的那个）
+> 是用**本机的 `android-receiver/.android-home/debug.keystore`** 签的。如果你换一台机器、
+> 或者让构建用了别的用户目录，Gradle 会生成**另一把** debug 密钥，装到已经有旧版本的手机上会报
+> `INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match`（应用数据也会一起丢）。
+>
+> 想让新包能**原地覆盖安装**（不卸载、不丢设置与缓存），构建时把用户目录指到仓库内那把密钥：
+>
+> ```powershell
+> $env:ANDROID_USER_HOME='E:\sakana.app\android-receiver\.android-home'
+> .\gradlew.bat assembleDebug --offline
+> ```
+>
+> 核对签名是否一致（两条输出必须相同）：
+>
+> ```powershell
+> & "$env:ANDROID_HOME\build-tools\36.0.0\apksigner.bat" verify --print-certs `
+>   app\build\outputs\apk\debug\app-debug.apk | Select-String 'SHA-256 digest'
+> ```
+
 ### 1.4 如果构建环境有限制（本机沙箱/CI 的情况）
 
 本机验证时遇到过两个"环境问题"，都不是代码问题，记录在这里备查。
@@ -803,7 +824,10 @@ resource 0x7f0a0001 mipmap/ic_launcher_round
 
 ### 6.3 还没做的验证
 
-**本轮的结论是：未上机验证**（下面附完整证据，不是"没试"）。
+> **状态更新（v0.3.8 补充轮）**：真机已经接上了（vivo V2302A），下面这些**大部分已经在真机上验过**，
+> 见 6.4 节；这一节保留的是"当时为什么验不了"的环境记录，以及 6.4 里仍然没覆盖的部分。
+
+**当时的结论是：未上机验证**（下面附完整证据，不是"没试"）。
 
 - **没有真机安装与运行**（本机没有连接安卓设备）。
 - **模拟器也跑不起来**，试过两条路，都卡在同一处：
@@ -843,3 +867,82 @@ resource 0x7f0a0001 mipmap/ic_launcher_round
   - 点收藏后电脑"选源→嗅探→投回"整条链路，以及失败时 `message` 的显示。
 - 按需求**没有**申请前台服务相关权限，所以"锁屏/切后台后接收端还活着"这件事**做不到**，
   这是刻意的取舍（见"已知限制"）。
+
+### 6.4 真机验证（v0.3.8 补充轮，vivo V2302A / 1260×2800）
+
+设备通过 USB 连上后逐项验的，命令与证据都留在这里，便于复现。
+
+**a. 发现并修掉一个致命回归：一打开就闪退**
+
+```
+E AndroidRuntime: FATAL EXCEPTION: main
+E AndroidRuntime: Process: app.sakana.receiver
+E AndroidRuntime: java.lang.RuntimeException: Unable to start activity
+    ComponentInfo{app.sakana.receiver/app.sakana.receiver.MainActivity}:
+    kotlin.UninitializedPropertyAccessException: lateinit property player has not been initialized
+E AndroidRuntime: 	at app.sakana.receiver.MainActivity.bindViews(MainActivity.kt:121)
+E AndroidRuntime: 	at app.sakana.receiver.MainActivity.onCreate(MainActivity.kt:56)
+```
+
+原因是 `bindViews()` 排在建 `PlayerController` 之前，而新的 `PlaybackUi` 构造要拿 `controller`。
+修法是把 `playerView` / `player` 的创建提到 `bindViews()` 之前（见 `MainActivity.onCreate` 的注释）。
+**这条也说明：离线断言（89 项）挡不住"Activity 接线顺序"这类错误，以后每次改完都必须真机冷启动一次。**
+
+**b. 安装校验（同一把 keystore 才能原地覆盖）**
+
+```powershell
+adb -s <序列号> install -r app\build\outputs\apk\debug\app-debug.apk   # → Success
+```
+
+换错 keystore 时会得到 `INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match`
+（见 1.3 节那把仓库内密钥）。
+
+**c. 冷启动不闪退 + 同步真的生效**
+
+```
+I ActivityTaskManager: Displayed app.sakana.receiver/.MainActivity for user 0: +580ms
+```
+设置页（`uiautomator dump` 读到的真实文案）：
+`已连接 DESKTOP-IOV63P6 · 02:24 前同步 · 收藏 86 · 历史 14`、`同步地址：http://192.168.1.8:52890`、
+`服务状态：运行中`、`当前监听端口：52889`、`当前网卡：wlan0 · 192.168.1.4（Wi-Fi）`。
+
+**d. 收藏"翻不动"已修（用户报的原始问题）**
+
+滑动前后各 `uiautomator dump` 一次，可见条目**完全不同**：
+
+| | 可见收藏 |
+|---|---|
+| 滑动前 | Little Busters! / 〜Refrain〜 / EX / 败犬女主太多了！ |
+| 向上滑两屏后 | 感谢对战。～大小姐才不玩格斗游戏～ / BanG Dream! YUME∞MITA / 超辉夜姬！ / 上伊那牡丹… |
+
+说明列表真的在滚、86 条都能翻到（改前是 `ScrollView` 套 `wrap_content` 的 RecyclerView，
+只创建"装得下"的那几条，永远翻不到后面）。
+
+**e. 播放与真全屏（用本机测试源投给手机，不动电脑端会话）**
+
+```powershell
+# 本机起测试 HLS 源（.e2e/hls-test 下已有 test.m3u8 + 分片）
+node .e2e/cast-src-server.js 8791
+# 直接调接收端控制接口（curl --noproxy 绕过系统代理，否则会被代理拦成 502）
+curl.exe --noproxy "*" -H "Content-Type: application/json" `
+  --data-binary "@.e2e/play-test.json" http://192.168.1.4:52889/play       # → {"ok":true}
+curl.exe --noproxy "*" http://192.168.1.4:52889/info
+# → {"playing":true,"positionMs":5477,"durationMs":12000,"index":0,"total":2,
+#    "titles":["第 1 集","第 2 集"],"state":"playing"}
+curl.exe --noproxy "*" -H "Content-Type: application/json" -d '{"action":"stop"}' `
+  http://192.168.1.4:52889/control                                          # → {"ok":true} → state:"idle"
+```
+
+播放中 `adb shell screencap -p /sdcard/p.png`（**别用 PowerShell 的 `>` 重定向，会把 PNG 写坏**）
+再 `adb pull`，用自写的 PNG 读数器量像素：
+
+- 截图 **2800×1260**（首页时是 1260×2800）→ **横屏全屏生效**；
+- 画面中心平均色 `[128,128,127]`（测试图是灰阶）→ **视频真的在渲染**，不是黑屏；
+- 左上角区域 `[25,9,9]`，没有状态栏白底 → **系统栏确实被藏起来了**。
+
+**f. 仍然没验到的**
+
+- 手势手感（双击累加、左右半边亮度/音量、横滑 seek）、控制栏在真机上的排版与刘海区表现；
+- 「铺满 / 适应」的实际画面差异、深色系统下的观感、自适应图标在桌面的圆形裁切；
+- **点收藏 → 电脑"选源 → 嗅探 → 投回"** 整条链路（要占用用户的电脑端会话，没在这次自检里跑）；
+- 锁屏/切后台存活（按取舍没有前台服务，做不到）。

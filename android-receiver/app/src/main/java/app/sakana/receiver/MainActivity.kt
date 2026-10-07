@@ -53,9 +53,16 @@ class MainActivity : Activity() {
         applyKeepScreenOn()
 
         setContentView(R.layout.activity_main)
+        /*
+         * ⚠️ 这两行的顺序是**硬性**的，别再挪回去：
+         * 播放层（PlaybackUi）在构造时就要拿到 PlayerController，所以播放器必须比 bindViews() 先建好。
+         * v0.3.8 真机实测："bindViews() 在前、player 在后"会让应用**一打开就闪退** ——
+         * `lateinit property player has not been initialized`（MainActivity.bindViews:121 → onCreate）。
+         */
+        playerView = findViewById(R.id.player_view)
+        player = PlayerController(this, playerView) { refreshUi() }
         bindViews()
 
-        player = PlayerController(this, playerView) { refreshUi() }
         // 把播放器交给运行期外壳：HTTP 控制接口从这里拿播放能力；界面销毁时置回 null
         Receiver.gateway = player
         Receiver.start(this)
@@ -105,7 +112,7 @@ class MainActivity : Activity() {
     // ---------------- 视图与交互 ----------------
 
     private fun bindViews() {
-        playerView = findViewById(R.id.player_view)
+        // playerView 与 player 在 onCreate 里已经建好（见那里的顺序说明），这里只管把各块接起来
         header = HeaderBinder(this, findViewById(R.id.header))
         home = HomeBinder(
             activity = this,
