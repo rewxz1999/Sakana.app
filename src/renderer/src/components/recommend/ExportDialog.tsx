@@ -10,7 +10,7 @@ import {
 } from '@/stores/recommendTable'
 import { toast } from '@/stores/app'
 import { Button, Input, Modal } from '@/components/ui'
-import { RL, displayName, pageHeightOf } from './styles'
+import { RL, displayName, frameOf, pageHeightOf } from './styles'
 
 /**
  * 导出图片弹窗（v0.3.7 引入，v0.3.8 加了「导出哪些模块」）。
@@ -21,8 +21,9 @@ import { RL, displayName, pageHeightOf } from './styles'
  *  3. 导出前填「推荐人」——填了才出现在番剧名下方；
  *  4. 清晰度（2 倍 / 3 倍）：导出实际像素 = **页面宽 1200 × 倍数**。
  *
- * ⚠️ 尺寸预告必须和真正导出的一致，所以宽度直接取 `RL.width`、高度直接累加 `pageHeightOf()` ——
- * 与 `buildExportDocument` 用的是同一批函数（页面宽度固定 1200，因此导出图**不会**比页面更宽）。
+ * ⚠️ 尺寸预告必须和真正导出的一致，所以宽度取各页 `frameOf(p).width` 的最大值、高度直接累加
+ * `pageHeightOf()` —— 与 `buildExportDocument` 用的是**同一批函数**。
+ * v0.3.9 修过一处：以前这里写死 `RL.width`（1200），用户把页面改窄之后预告会比成图宽一大截。
  *
  * ## 「模块勾选」与「页面里隐藏的模块」是两件事
  *
@@ -39,7 +40,8 @@ export function ExportDialog({
   onRecommenderChange,
   exporting,
   onExport,
-  onClose
+  onClose,
+  initialMode = 'current'
 }: {
   open: boolean
   tableName: string
@@ -52,8 +54,18 @@ export function ExportDialog({
   /** 真正导出：要导出的页、清晰度倍数、这次展示的模块 */
   onExport: (pages: RecommendPage[], scale: number, modules: ModuleKind[]) => void
   onClose: () => void
+  /**
+   * 打开时预选哪个导出范围（v0.3.9 补充）。
+   *
+   * 为什么需要它：用户要求把「**只导出当前页**」这个动作放到推荐页自己的右键菜单里，
+   * 而「导出」整套只有这一个实现 —— 那就让**入口决定默认范围**来区分语义：
+   *   · 推荐页右键菜单「只导出这一页为图片」→ `current`（打开就是当前页）；
+   *   · 列表那张表的右键菜单「导出为图片（多页 / 长图）」→ `long`（打开就是长图 + 勾页）。
+   * 进去之后两者都能自由切换范围，所以这只是**默认值**，不是两套功能。
+   */
+  initialMode?: 'current' | 'long'
 }) {
-  const [mode, setMode] = useState<'current' | 'long'>('current')
+  const [mode, setMode] = useState<'current' | 'long'>(initialMode)
   const [scale, setScale] = useState(2)
   /** 长图里勾中的页 id（顺序按表内顺序，不按勾选顺序 —— 长图的页序必须是表面顺序） */
   const [picked, setPicked] = useState<string[]>([])
@@ -63,15 +75,15 @@ export function ExportDialog({
   useEffect(() => {
     if (!open) return
     /*
-     * 每次打开都重置：默认「只导当前页」+ 全部模块。
+     * 每次打开都重置：范围回到调用方指定的那个默认值、模块回到全选。
      * 不保留上次的勾选是因为页数会变（用户可能刚删 / 加过页），
      * 拿一份过期的勾选去导出，用户会得到一张少了几页的图而不知道哪里错了。
      */
-    setMode('current')
+    setMode(initialMode)
     setScale(2)
     setPicked(pages.slice(0, MAX_LONG_PAGES).map((p) => p.id))
     setMods(MODULE_KINDS)
-  }, [open, pages.length])
+  }, [open, pages.length, initialMode])
 
   const pickedPages = useMemo(() => pages.filter((p) => picked.includes(p.id)), [pages, picked])
   const exportPages = mode === 'current' ? pages.slice(currentIndex, currentIndex + 1) : pickedPages
@@ -86,7 +98,7 @@ export function ExportDialog({
     return hidden
   }, [exportPages])
 
-  const width = RL.width
+  const width = exportPages.reduce((m, p) => Math.max(m, frameOf(p).width), 0) || RL.width
   const height =
     exportPages.reduce((sum, p) => sum + pageHeightOf(p), 0) +
     RL.splitH * Math.max(0, exportPages.length - 1) +
@@ -120,7 +132,7 @@ export function ExportDialog({
       <div className="space-y-4">
         <div className="flex flex-wrap items-center gap-2 text-[11px] text-faint">
           <span>
-            表「{tableName}」共 {pages.length} 页 · 导出 PNG，实际像素 = 页面宽 {RL.width} × 清晰度
+            表「{tableName}」共 {pages.length} 页 · 导出 PNG，实际像素 = 页面尺寸（当前页 {width} 宽）× 清晰度
           </span>
         </div>
 

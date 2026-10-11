@@ -3,6 +3,8 @@ import {
   Camera,
   CircleCheck,
   Clock,
+  Copy,
+  Download,
   ExternalLink,
   FolderOpen,
   Gamepad2,
@@ -13,7 +15,7 @@ import {
   X,
   type LucideIcon
 } from 'lucide-react'
-import type { GalGame, GalRecentShot, YmgalCandidate } from '@shared/types'
+import type { GalBgmSaved, GalGame, GalMemRecent, GalRecentShot, YmgalCandidate } from '@shared/types'
 import { toast } from '@/stores/app'
 import { api } from '@/lib/api'
 import { imgUrl, localImgUrl, timeAgo } from '@/lib/format'
@@ -369,6 +371,11 @@ export function GalDetailView({
               进度：{game.lastRouteInfo}
             </div>
           ) : null}
+          {game.chapterName ? (
+            <div className="mt-1.5 whitespace-pre-wrap break-all rounded-md bg-elev2/60 px-2 py-1 text-[10px] leading-relaxed text-dim">
+              章节：{game.chapterName}
+            </div>
+          ) : null}
           <Button className="mt-3 w-full" icon={Play} loading={running} onClick={() => onLaunch(game)}>
             {running ? '游戏中' : '启动游戏'}
           </Button>
@@ -499,7 +506,7 @@ export function GalShotsModal({
             <div className="py-10 text-center text-xs leading-relaxed text-faint">
               {game
                 ? '这款游戏还没有截图。启动游戏后按截图快捷键（默认 Ctrl+Shift+G）或点悬浮拍摄按钮即可。'
-                : '截图目录暂无图片。使用截图助手（随游戏启动）或「试截一张」生成截图。'}
+                : '截图目录暂无图片。使用galgame 助手（随游戏启动）或「试截一张」生成截图。'}
             </div>
           ) : (
             <div className="grid grid-cols-3 gap-2 md:grid-cols-4">
@@ -659,6 +666,349 @@ export function GalYmgalSearchModal({
             ))
           )}
         </div>
+      </div>
+    </Modal>
+  )
+}
+
+// ---------------- 最近识别 BGM 面板 ----------------
+
+/**
+ * 「查看最近识别的 bgm 名称（可复制）」面板。
+ * 数据来自只读内存识别服务（gal:mem-recent）：最近识别到的音频文件名 + 来源引擎。
+ * 未开启 / 未识别到时给出明确中文说明，绝不用假数据占位。
+ */
+export function GalBgmModal({ game, onClose }: { game: GalGame | null; onClose: () => void }) {
+  const [data, setData] = useState<GalMemRecent | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [copied, setCopied] = useState<string | null>(null)
+  const [saving, setSaving] = useState<string | null>(null)
+  const [saved, setSaved] = useState<GalBgmSaved[]>([])
+  const gameId = game?.id ?? ''
+
+  const load = useCallback(async (): Promise<void> => {
+    if (!gameId) return
+    setLoading(true)
+    const r = await api.gal.memRecent(gameId)
+    setLoading(false)
+    if (r.ok) setData(r.data)
+    else toast.error(r.error)
+  }, [gameId])
+
+  /** 已保存的 BGM（沿用截图那套目录：<galgame 保存根目录>/<游戏名>/bgm/） */
+  const loadSaved = useCallback(async (): Promise<void> => {
+    if (!game) return
+    const r = await api.gal.savedBgm(game.id, game.title)
+    if (r.ok) setSaved(r.data)
+  }, [game])
+
+  // 每次打开针对某款游戏时清空旧数据并重拉
+  useEffect(() => {
+    if (!game) return
+    setData(null)
+    setCopied(null)
+    void load()
+    void loadSaved()
+  }, [game, load, loadSaved])
+
+  const copyText = async (text: string): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(text)
+      setTimeout(() => setCopied(null), 1200)
+    } catch {
+      toast.error('复制失败')
+    }
+  }
+
+  const copyAll = async (): Promise<void> => {
+    const text = (data?.entries ?? []).map((e) => (e.title ? `${e.title}（${e.name}）` : e.name)).join('\n')
+    if (!text) return
+    try {
+      await navigator.clipboard.writeText(text)
+      toast.success('已复制全部 BGM 名称')
+    } catch {
+      toast.error('复制失败')
+    }
+  }
+
+  /** 把某首 BGM 从游戏档案里只读提取出来保存到本地（文件名优先真实曲名） */
+  const saveOne = async (code: string): Promise<void> => {
+    if (!gameId) return
+    setSaving(code)
+    const r = await api.gal.saveBgm(gameId, code)
+    setSaving(null)
+    if (!r.ok) {
+      toast.error(r.error)
+      return
+    }
+    if (!r.data.ok) {
+      toast.error(r.data.error || '保存失败')
+      return
+    }
+    toast.success(`已保存 BGM：${r.data.path}`)
+    void loadSaved()
+  }
+
+  /** 打开保存目录（有文件时用文件的目录；一个都没存过就提示先保存） */
+  const openDir = async (): Promise<void> => {
+    const first = saved[0]
+    if (!first) {
+      toast.error('还没有保存过 BGM，先点某一首的「保存」')
+      return
+    }
+    const dir = first.path.replace(/[\\/][^\\/]+$/, '')
+    const r = await api.app.openPath(dir)
+    if (!r.ok) toast.error(r.error)
+  }
+
+  const kindLabel = (k?: string): string =>
+    k === 'playing' ? '当前在播' : k === 'candidate' ? '内存中的候选' : '刚出现'
+
+  return (
+    <Modal open={!!game} onClose={onClose} width={560} title="查看最近识别的 bgm 名称（可复制）">
+      <div>
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <span className="min-w-0 truncate text-[11px] text-faint">
+            {data?.engine ? `识别引擎：${data.engine}` : '引擎：未识别'}
+            {data?.titleSource ? ` · 曲名来源：${data.titleSource}` : ''}
+            {data && data.entries.length > 0 ? ` · ${data.entries.length} 条` : ''}
+          </span>
+          <div className="flex shrink-0 gap-2">
+            <Button variant="outline" size="sm" loading={loading} onClick={() => void load()}>
+              刷新
+            </Button>
+            <Button variant="soft" size="sm" disabled={!(data && data.entries.length > 0)} onClick={() => void copyAll()}>
+              复制全部
+            </Button>
+          </div>
+        </div>
+
+        {/*
+          实时状态：识别「当前在播」靠的是内存里代号出现签名的变化（真机实测的唯一切曲信号），
+          所以必须把"识别于 N 秒前"写出来 —— 用户切场景后能立刻看出刷新了没有。
+        */}
+        {data?.playing ? (
+          <div className="mb-3 rounded-lg border border-accent/40 bg-accent/10 px-3 py-2">
+            <div className="truncate text-sm font-semibold text-accent" title={data.playing.name}>
+              {data.playing.title || data.playing.name}
+            </div>
+            <div className="mt-0.5 truncate text-[10px] text-faint">
+              {data.playing.title ? `代号 ${data.playing.name} · ` : '只有代号（游戏数据里没有曲名）· '}
+              识别于 {Math.max(0, Math.round((Date.now() - (data.playingAt ?? data.playing.time)) / 1000))} 秒前
+            </div>
+          </div>
+        ) : null}
+
+        {data?.codeOnly && (data?.entries.length ?? 0) > 0 ? (
+          <div className="mb-3 rounded-lg border border-border bg-elev2/40 px-3 py-2 text-[11px] leading-relaxed text-faint">
+            游戏数据里没有「代号 → 曲名」的映射（明文曲目表与档案里的 soundlist/bgmtitle 表都没有），
+            所以这里只能显示代号；可以点「保存」把这首 BGM 提取出来自己听。
+          </div>
+        ) : null}
+
+        {data?.lastError ? (
+          <div className="mb-3 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] leading-relaxed text-danger">
+            {data.lastError}
+          </div>
+        ) : null}
+
+        {!loading && (!data || data.entries.length === 0) ? (
+          <div className="py-10 text-center text-xs leading-relaxed text-faint">
+            {data?.lastError
+              ? '未识别到 BGM'
+              : '还没有识别到 BGM。请在设置里开启「内存识别 BGM / 章节」并启动游戏；识别到音频文件名后会按时间列出（仅只读读取，不修改游戏任何数据）。'}
+          </div>
+        ) : (
+          <div className="flex max-h-[46vh] flex-col gap-1.5 overflow-y-auto pr-0.5">
+            {(data?.entries ?? []).map((e) => (
+              <div
+                key={`${e.time}-${e.name}`}
+                className={`flex items-center gap-2 rounded-lg border px-2.5 py-1.5 ${
+                  e.kind === 'playing' ? 'border-accent/40 bg-accent/10' : 'border-border bg-elev2/40'
+                }`}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-xs font-medium" title={e.title ? `${e.title}（${e.name}）` : e.name}>
+                    {e.title || e.name}
+                  </div>
+                  <div className="truncate text-[10px] text-faint">
+                    {kindLabel(e.kind)}
+                    {e.title ? ` · 代号 ${e.name}` : ''}
+                    {' · '}
+                    {timeAgo(e.time)}
+                    {e.engine ? ` · ${e.engine}` : ''}
+                  </div>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  loading={saving === e.name}
+                  icon={Download}
+                  onClick={() => void saveOne(e.name)}
+                >
+                  保存
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  icon={copied === e.name ? CircleCheck : Copy}
+                  onClick={() => void copyText(e.title ? `${e.title}（${e.name}）` : e.name)}
+                >
+                  {copied === e.name ? '已复制' : '复制'}
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* 已保存的 BGM：沿用截图那套目录约定（<galgame 保存根目录>/<游戏名>/bgm/） */}
+        <div className="mt-4 border-t border-border pt-3">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <span className="text-[11px] font-medium text-dim">最近保存的 BGM（{saved.length}）</span>
+            <div className="flex shrink-0 gap-2">
+              <Button variant="ghost" size="sm" disabled={saved.length === 0} onClick={() => void openDir()}>
+                打开所在目录
+              </Button>
+              <Button variant="ghost" size="sm" loading={loading} onClick={() => void loadSaved()}>
+                刷新列表
+              </Button>
+            </div>
+          </div>
+          {saved.length === 0 ? (
+            <div className="text-[11px] leading-relaxed text-faint">
+              还没有保存过。点上面某一首的「保存」会把这首 BGM 从游戏档案里**只读提取**出来存到
+              &lt;galgame 保存目录&gt;/&lt;游戏名&gt;/bgm/，文件名优先用真实曲名。
+            </div>
+          ) : (
+            <div className="flex max-h-[22vh] flex-col gap-1 overflow-y-auto pr-0.5">
+              {saved.slice(0, 20).map((s) => (
+                <div key={s.path} className="flex items-center gap-2 rounded-lg bg-elev2/40 px-2.5 py-1">
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[11px] font-medium" title={s.path}>
+                      {s.name}
+                    </div>
+                    <div className="truncate text-[10px] text-faint">
+                      {timeAgo(s.mtime)} · {(s.size / 1024 / 1024).toFixed(2)} MB
+                    </div>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    icon={copied === s.path ? CircleCheck : Copy}
+                    onClick={() => void copyText(s.path)}
+                  >
+                    {copied === s.path ? '已复制' : '复制路径'}
+                  </Button>
+                  <Button variant="ghost" size="sm" icon={FolderOpen} onClick={() => void api.app.openPath(s.path)}>
+                    打开
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </Modal>
+  )
+}
+
+// ---------------- 最近保存的 BGM ----------------
+
+/**
+ * 卡片右键「最近保存的 bgm」：列出从游戏档案里只读提取出来的 BGM 文件。
+ * 与「最近截图」同一套心智：按游戏名分目录，可复制路径、可直接打开文件/所在目录。
+ */
+export function GalBgmSavedModal({ game, onClose }: { game: GalGame | null; onClose: () => void }) {
+  const [list, setList] = useState<GalBgmSaved[]>([])
+  const [loading, setLoading] = useState(false)
+  const [copied, setCopied] = useState<string | null>(null)
+
+  const load = useCallback(async (): Promise<void> => {
+    if (!game) return
+    setLoading(true)
+    const r = await api.gal.savedBgm(game.id, game.title)
+    setLoading(false)
+    if (r.ok) setList(r.data)
+    else toast.error(r.error)
+  }, [game])
+
+  useEffect(() => {
+    if (!game) return
+    setList([])
+    setCopied(null)
+    void load()
+  }, [game, load])
+
+  const copyPath = async (p: string): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(p)
+      setCopied(p)
+      setTimeout(() => setCopied(null), 1200)
+    } catch {
+      toast.error('复制失败')
+    }
+  }
+
+  const dir = list[0] ? list[0].path.replace(/[\\/][^\\/]+$/, '') : ''
+
+  return (
+    <Modal open={!!game} onClose={onClose} width={560} title={`最近保存的 bgm · ${game?.title ?? ''}`}>
+      <div>
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <span className="min-w-0 truncate text-[11px] text-faint">
+            {list.length > 0 ? `${list.length} 个文件 · 保存目录：${dir}` : '还没有保存过 BGM'}
+          </span>
+          <div className="flex shrink-0 gap-2">
+            <Button variant="outline" size="sm" loading={loading} onClick={() => void load()}>
+              刷新
+            </Button>
+            <Button
+              variant="soft"
+              size="sm"
+              disabled={!dir}
+              onClick={async () => {
+                const r = await api.app.openPath(dir)
+                if (!r.ok) toast.error(r.error)
+              }}
+            >
+              打开所在目录
+            </Button>
+          </div>
+        </div>
+
+        {list.length === 0 ? (
+          <div className="py-10 text-center text-xs leading-relaxed text-faint">
+            还没有保存过 BGM。在游戏卡片右键菜单里选「查看最近识别的 bgm 名称」，点某一首的「保存」，
+            Sakana 会把这首 BGM 从游戏档案里**只读提取**出来（不修改游戏目录），文件名优先用真实曲名。
+          </div>
+        ) : (
+          <div className="flex max-h-[52vh] flex-col gap-1.5 overflow-y-auto pr-0.5">
+            {list.map((s) => (
+              <div key={s.path} className="flex items-center gap-2 rounded-lg border border-border bg-elev2/40 px-2.5 py-1.5">
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-xs font-medium" title={s.path}>
+                    {s.name}
+                  </div>
+                  <div className="truncate text-[10px] text-faint">
+                    {timeAgo(s.mtime)} · {(s.size / 1024 / 1024).toFixed(2)} MB
+                  </div>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  icon={copied === s.path ? CircleCheck : Copy}
+                  onClick={() => void copyPath(s.path)}
+                >
+                  {copied === s.path ? '已复制' : '复制路径'}
+                </Button>
+                <Button variant="ghost" size="sm" icon={FolderOpen} onClick={() => void api.app.openPath(s.path)}>
+                  打开
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </Modal>
   )

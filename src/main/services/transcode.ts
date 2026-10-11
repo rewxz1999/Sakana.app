@@ -9,6 +9,7 @@ import type { LiveStartResult, MediaInspectResult } from '@shared/types'
 import { log } from '../log'
 import { getSettings } from '../net'
 import { handleAdProxyRequest, proxyHlsUrl, setAdProxyPort } from './adFilter'
+import { handleBoostRequest } from './streamBoost'
 
 /**
  * FFmpeg 转码播放管线
@@ -54,6 +55,8 @@ export function initLiveServer(): Promise<number> {
     const server = createServer((req, res) => {
       // 在线播放的 HLS 改写代理复用同一个监听端口（见 adFilter.ts）
       if (handleAdProxyRequest(req, res)) return
+      // 在线播放加速中转（并发 Range / HLS 并发预读）同样复用这个端口（见 streamBoost.ts）
+      if (handleBoostRequest(req, res)) return
       const id = /^\/live\/([A-Za-z0-9_-]+)/.exec(req.url ?? '')?.[1] ?? ''
       const s = sessions.get(id)
       if (!s) {

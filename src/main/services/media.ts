@@ -7,6 +7,7 @@ import {
   readdirSync,
   readFileSync,
   statSync,
+  unlinkSync,
   writeFileSync
 } from 'node:fs'
 import { basename, dirname, extname, join, resolve, sep } from 'node:path'
@@ -230,6 +231,62 @@ function imageCacheDir(): string {
 }
 
 const inflight = new Map<string, Promise<Response>>()
+
+/**
+ * 图片缓存瘦身（v0.3.9 体检 M6）。
+ *
+ * 为什么需要：`cache/img` 目录以前**只增不减** —— 番剧封面、剧照、角色图都在里面，
+ * 看番越久这个目录越大（实测本机已有 1400+ 个文件），而唯一的清理方式是用户手动点「清除缓存」。
+ *
+ * 策略与取舍：
+ *   · 只在**启动时跑一次**（由 index.ts 调用），不放进"每张图的写入路径"——那里扫目录会让加载变慢；
+ *   · 超过上限（默认 1GB）时按**最后访问时间**从旧到新删，删到上限的 80% 为止（留出余量，避免每次启动都删）；
+ *   · 读不到/删不掉的单个文件直接跳过，绝不影响正常加载。
+ */
+export function pruneImageCache(maxBytes = 1024 * 1024 * 1024): { removed: number; freedBytes: number } {
+  const dir = imageCacheDir()
+  const entries: { path: string; size: number; atime: number }[] = []
+  try {
+    for (const name of readdirSync(dir)) {
+      const p = join(dir, name)
+      try {
+        const st = statSync(p)
+        if (!st.isFile()) continue
+        // atime 在部分文件系统上不可靠（可能被挂载参数关掉），用与 mtime 的较大值兜底
+        entries.push({ path: p, size: st.size, atime: Math.max(st.atimeMs || 0, st.mtimeMs || 0) })
+      } catch {
+        /* 单个文件读不到就跳过 */
+      }
+    }
+  } catch {
+    return { removed: 0, freedBytes: 0 }
+  }
+  let total = entries.reduce((n, e) => n + e.size, 0)
+  if (total <= maxBytes) return { removed: 0, freedBytes: 0 }
+  entries.sort((a, b) => a.atime - b.atime)
+  const target = Math.floor(maxBytes * 0.8)
+  let removed = 0
+  let freed = 0
+  for (const e of entries) {
+    if (total <= target) break
+    try {
+      unlinkSync(e.path)
+      total -= e.size
+      freed += e.size
+      removed++
+    } catch {
+      /* 删不掉就留着，下次启动再说 */
+    }
+  }
+  if (removed > 0) {
+    log.append(
+      'info',
+      'img',
+      `图片缓存超过上限，已清理 ${removed} 个最久未使用的文件（释放约 ${Math.round(freed / 1048576)} MB）`
+    )
+  }
+  return { removed, freedBytes: freed }
+}
 
 export function registerMediaProtocols(): void {
   registerDefaultRoots()

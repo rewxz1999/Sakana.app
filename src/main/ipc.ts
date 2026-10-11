@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { extname, join } from 'node:path'
@@ -8,9 +8,13 @@ import type {
   BatchProbeTarget,
   CardExportImageRequest,
   CastMediaInput,
+  GalBgmResult,
   GalRecentShot,
   GalToolsConfig,
   LocalTargetInput,
+  PlayFlowMark,
+  PlayRule,
+  StreamReachabilityReport,
   StatAction,
   StatEntry,
   StatExportOptions,
@@ -21,11 +25,13 @@ import type {
 import type { SaveDirsInfo } from '@shared/api'
 import { safeName } from './lib/parse'
 import { log } from './log'
+import { getSettings } from './net'
 import { store } from './store'
 import { bangumi } from './services/bangumi'
 import { mikan } from './services/mikan'
 import { downloadManager } from './services/downloader/manager'
 import { deleteLocalResources, localDirInfo, removeDownloadRecords } from './services/downloader/localCleanup'
+import { launchQbitAndWait, qbitStatus } from './services/downloader/qbitLauncher'
 import { aria2 } from './services/downloader/aria2'
 import { imageDataUrl, listVideos } from './services/media'
 import { clipboardHasImage, copyImageToClipboard, copyScreenshotIfEnabled } from './services/clipboardCopy'
@@ -36,7 +42,16 @@ import { clipboardHasImage, copyImageToClipboard, copyScreenshotIfEnabled } from
  * 表现就是「设置页改了音频设置但播放器毫无反应」（而且完全不报错）。
  */
 import { applyAudio } from './services/audioSettings'
-import { ruleEpisodes, ruleName, rulePlay, ruleSearch, ruleSearchUrl, rulesRepoImport, rulesRepoIndex } from './services/rules'
+import {
+  archiveRuleChanges,
+  ruleEpisodes,
+  ruleName,
+  rulePlay,
+  ruleSearch,
+  ruleSearchUrl,
+  rulesRepoImport,
+  rulesRepoIndex
+} from './services/rules'
 import {
   getCachedStreamOrWait,
   prefetchStream,
@@ -62,8 +77,13 @@ import {
 import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
 import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested, mpvApplyVideoEnhance, anime4kAvailable, anime4kShaderFiles, mpvRevealUoscUi } from './services/mpv'
 // v0.3.7：画面子窗口诊断（查「正在播放但没有画面」）
-import { mpvDiagnosticBounds, mpvDumpWindows, mpvHitTest, mpvRaiseStats } from './services/mpv'
+import { mpvDiagnosticBounds, mpvDumpWindows, mpvHitTest, mpvRaiseStats, mpvSurfaceInfo } from './services/mpv'
 import { buildStreamInfo } from './services/playerInfo'
+import { applyMark, failStage, flowDetail, noteSlow, setMetrics, snapshot as flowSnapshot } from './services/playFlow'
+import { probeStreamReachability } from './services/streamDiag'
+import { hardResetPlayChain, runPlaySelfCheck, selfCheckSnapshotForInfo } from './services/playSelfCheck'
+import { isOneTimeStream } from './services/ruleProbe'
+import { clearStreamBoostRecords, getStreamBoostRecords, getStreamBoostStatus } from './services/streamBoost'
 import {
   checkUpdate,
   downloadUpdate,
@@ -119,12 +139,15 @@ import {
   galImport as galImportFn,
   galLaunch as galLaunchFn,
   galPushRunning,
+  galRunningInfo,
   galSearchYmgal as galSearchYmgalFn,
   galUpdateDetail as galUpdateDetailFn,
   galgameService
 } from './services/galgame'
+import { galMemRecent, galMemSaveBgm, galMemSavedBgm } from './services/galgameMem'
 import {
   galListShots,
+  galOverlayResize,
   galPickDir,
   galRecentShots,
   galScreenshotNow,
@@ -298,10 +321,59 @@ export function registerIpc(): void {
   ipcMain.handle(CH.winOpenSmall, (_e, hash: string, opts?: { width?: number; height?: number; title?: string }) => {
     openSmallWindow(hash, opts)
   })
+  /*
+   * galgame 沉浸模式（v0.3.9）：进入时记住窗口几何并全屏，退出时恢复小窗口。
+   *
+   * 为什么单独一条通道而不是复用 win:set-fullscreen：
+   * 沉浸模式要求「退出后回到进入前的小窗口」—— 进全屏那一刻窗口的 bounds 已经是全屏尺寸，
+   * 光退全屏只能得到全屏前的尺寸；必须先记住 getNormalBounds()（无论最大化/全屏都返回
+   * 恢复态的尺寸）与是否最大化，退出全屏后再恢复，才能覆盖
+   * 「普通 / 最大化 / 全屏下进沉浸再退出」这几种边界而不丢窗口尺寸。
+   */
+  let immersiveSnapshot: { bounds: Electron.Rectangle; maximized: boolean } | null = null
+  ipcMain.handle(CH.winImmersive, (e, immersive: boolean) => {
+    const w = controlWindow(e)
+    if (!w) return
+    if (immersive) {
+      // 重复进入（连点按钮 / 幂等调用）不覆盖第一次记住的几何，否则恢复态会漂移
+      if (immersiveSnapshot) return
+      immersiveSnapshot = { bounds: w.getNormalBounds(), maximized: w.isMaximized() }
+      if (!w.isFullScreen()) w.setFullScreen(true)
+    } else {
+      const snap = immersiveSnapshot
+      immersiveSnapshot = null
+      if (w.isFullScreen()) w.setFullScreen(false)
+      if (snap) {
+        // 退出全屏是异步的，等窗口回到普通状态再恢复尺寸/最大化，避免竞态
+        setTimeout(() => {
+          if (w.isDestroyed()) return
+          if (snap.maximized) w.maximize()
+          else w.setBounds(snap.bounds)
+        }, 200)
+      }
+    }
+  })
 
   // ---------- 存储 ----------
   ipcMain.handle(CH.storeGet, (_e, ns: string) => store.get(ns, null))
   ipcMain.handle(CH.storeSet, (_e, ns: string, data: unknown) => {
+    /*
+     * 规则被界面改了就留一份到本地库（v0.3.9，用户要求"任何修改都留一份在本地库"）。
+     *
+     * 为什么钩在这里而不是 RulesPage 的保存函数里：规则至少有四条写入路径
+     * （规则页保存、从仓库导入、恢复默认、本地库替换），把留档挂在唯一的写入口上，
+     * 才不会出现"某条路径改了规则但没留档"的漏洞；而且改动前后的对比需要旧值，
+     * 只有这一层同时拿得到旧值和新值。
+     */
+    if (ns === 'rules' && Array.isArray(data)) {
+      try {
+        const prev = store.get<PlayRule[]>('rules', [])
+        archiveRuleChanges(prev, data as PlayRule[], 'before-change')
+      } catch (err) {
+        // 留档失败不能挡住保存本身（规则能不能用比留档重要）
+        log.append('warn', 'rules', `本地库留档失败（界面保存规则）: ${String(err)}`)
+      }
+    }
     store.set(ns, data)
     /*
      * v0.3.1：设置里带播放画质项（Anime4K 模式/着色器链、饱和度对比度、HDR…），
@@ -404,10 +476,20 @@ export function registerIpc(): void {
     const subs = listSubscriptions()
     const existing = subs.find((s) => s.subjectId === input.subjectId)
     if (existing) {
+      /*
+       * v0.3.9 体检 H3：集号合并**不能拿 0 当"未知"**。
+       * 以前是 `Math.max(existing.episode ?? 0, item.episode ?? 0)`：字幕组资源标题里没有集号时
+       * （合集 / 剧场版 / OP-ED，parseEpisode 返回 null）两次都是 0，结果写进库里的 episode=0，
+       * 而界面判据是 `!= null` → 一条什么都没下载的订阅被标成「已下载所有资源」。
+       * 现在：两边都为 null 就保持 null（"还不知道"），只有真的有集号时才取较大值。
+       */
+      const prevEp = existing.episode ?? null
+      const nextEp = input.mikanItem.episode ?? null
+      const mergedEp = prevEp == null ? nextEp : nextEp == null ? prevEp : Math.max(prevEp, nextEp)
       const updated: Subscription = {
         ...existing,
         group: input.mikanItem.group ?? existing.group,
-        episode: Math.max(existing.episode ?? 0, input.mikanItem.episode ?? 0),
+        episode: mergedEp,
         lastPubDate: input.mikanItem.pubDate || existing.lastPubDate
       }
       mutateSubscriptions((list) => list.map((s) => (s.id === existing.id ? updated : s)))
@@ -465,10 +547,13 @@ export function registerIpc(): void {
   )
   ipcMain.handle(
     CH.subsMarkUpdated,
-    (_e, id: string, episode: number, lastPubDate: string) =>
+    // v0.3.9 体检 H3：集号允许为 null（"不知道下到第几集"），不再强制成 0
+    (_e, id: string, episode: number | null, lastPubDate: string) =>
       mutateSubscriptions((list) =>
         list.map((s) =>
-          s.id === id ? { ...s, episode, lastPubDate, status: 'complete' as const } : s
+          s.id === id
+            ? { ...s, episode: episode ?? null, lastPubDate, status: 'complete' as const }
+            : s
         )
       )
   )
@@ -483,6 +568,12 @@ export function registerIpc(): void {
    * 从来没有暴露过，渲染层不可能调到它。留着的唯一效果是让人以为有两条不同的接口。
    */
   ipcMain.handle(CH.dlTest, () => downloadManager.test())
+
+  // ---------- 外部 qBittorrent（状态 / 由应用启动 / 选程序路径） ----------
+  /** 设置页「连接测试」与状态卡都用它：如实返回能不能连、什么版本、路径对不对 */
+  ipcMain.handle(CH.qbitStatus, () => qbitStatus())
+  /** 手动启动：拉起 qb 并等 WebUI 就绪（失败/超时回中文原因） */
+  ipcMain.handle(CH.qbitLaunch, () => launchQbitAndWait())
 
   // ---------- 本地资源（自动推导下载目录 / 删除本地资源 / 只删下载记录） ----------
   /** 卡片上的「本地播放」先问这里：目录自动推导，不再弹文件夹选择框 */
@@ -776,7 +867,20 @@ export function registerIpc(): void {
     } catch {
       state = null
     }
-    return { bounds, state, hit, windows, raiseStats: mpvRaiseStats() }
+    /*
+     * v0.3.9：把「到底有没有画面」的硬数据一并交出去（见 mpvSurfaceInfo 的注释）。
+     *
+     * 没有它时，「正在播放但没有画面」只能靠用户描述，无法区分
+     * 「画面根本没解出来（width=0）」与「解出来了但窗口没显示」——
+     * 而这两种的处置方式完全不同。`video.hasPicture / width / audioOnlyMs` 就是那条分界线。
+     */
+    let video: unknown = null
+    try {
+      video = mpvSurfaceInfo()
+    } catch {
+      video = null
+    }
+    return { bounds, state, video, hit, windows, raiseStats: mpvRaiseStats() }
   })
   // v0.2.9 最后更新：播放倍速（0.25–4）
   ipcMain.handle(CH.playerSetSpeed, (_e, speed: number) => {
@@ -917,6 +1021,11 @@ export function registerIpc(): void {
   ipcMain.handle(CH.clipboardCopyImage, (_e, file: string) => copyImageToClipboard(String(file ?? '')))
   /** 剪贴板是否已有图片（界面提示用） */
   ipcMain.handle(CH.clipboardHasImage, () => clipboardHasImage())
+  /** 把一段文本写进剪贴板（galgame 悬浮按钮「复制 BGM 名称」用） */
+  ipcMain.handle(CH.clipboardCopyText, async (_e, text: string) => {
+    await clipboard.writeText(String(text ?? ''))
+    return true
+  })
 
   // 内置组件探测：libmpv / FFmpeg / aria2 是否随包内置
   ipcMain.handle(CH.playerAssets, async () => ({
@@ -929,6 +1038,11 @@ export function registerIpc(): void {
   }))
 
   // ---------- 工具 ----------
+  /*
+   * v0.3.9：导入返回值从「单个 ToolMeta | null」改成「ToolImportReport」。
+   * 放宽语言要求的核心是"给什么都能尽量吃进去"：一次可选多个文件、每份单独结算、
+   * 每份都带回解析提示（哪一项没认出来 / 该怎么补），界面据此显示"成功 N 份 / M 份带警告"。
+   */
   ipcMain.handle(CH.toolImport, () => toolService.import())
   ipcMain.handle(CH.toolList, () => toolService.list())
   ipcMain.handle(CH.toolRemove, (_e, id: string) => toolService.remove(id))
@@ -1033,6 +1147,22 @@ export function registerIpc(): void {
     })
     return r.canceled ? null : (r.filePaths[0] ?? null)
   })
+  /**
+   * 选可执行文件（目前用于 qBittorrent 程序路径）。
+   * 便携版要选 `qBittorrentPortable.exe`（PortableApps 启动器），所以不做名字过滤，
+   * 只限定 .exe —— 用户也可能直接指向 App\qBittorrent\qbittorrent.exe。
+   */
+  ipcMain.handle(CH.dialogPickExe, async (_e, defaultPath?: string) => {
+    const w = focused()
+    if (!w) return null
+    const r = await dialog.showOpenDialog(w, {
+      title: '选择 qBittorrent 程序（便携版选 qBittorrentPortable.exe）',
+      filters: [{ name: '可执行文件', extensions: ['exe'] }],
+      defaultPath: defaultPath || undefined,
+      properties: ['openFile']
+    })
+    return r.canceled ? null : (r.filePaths[0] ?? null)
+  })
 
   // ---------- galgame 快捷启动器 ----------
   ipcMain.handle(CH.galImport, () => galImportFn())
@@ -1046,6 +1176,8 @@ export function registerIpc(): void {
   ipcMain.handle(CH.galUpdateDetail, (_e, id: string) => galUpdateDetailFn(id))
   ipcMain.handle(CH.galSearchYmgal, (_e, name: string) => galSearchYmgalFn(name))
   ipcMain.handle(CH.galApplyYmgal, (_e, id: string, ymgalId: number) => galApplyYmgalFn(id, ymgalId))
+  // v0.3.9：某款游戏最近识别到的 BGM（只读内存识别，供卡片右键面板）
+  ipcMain.handle(CH.galMemRecent, (_e, gameId: string) => galMemRecent(String(gameId ?? '')))
   // 自定义封面 / 背景图
   ipcMain.handle(CH.galPickImage, async () => {
     const w = focused()
@@ -1068,6 +1200,62 @@ export function registerIpc(): void {
   ipcMain.handle(CH.galPickDir, async () => galPickDir())
   ipcMain.handle(CH.galScreenshotNow, async () => galScreenshotNow())
   ipcMain.handle(CH.galOverlayShot, async () => galScreenshotNow())
+  // 悬浮按钮展开/收起选择面板：渲染层 overlay HTML 告诉主进程该把悬浮窗调到多大
+  ipcMain.handle(CH.galOverlayResize, (_e, open: boolean, height?: number) => {
+    galOverlayResize(!!open, height)
+  })
+  /*
+   * v0.3.9：悬浮按钮「读取 BGM」—— 读取**当前正在运行的游戏**最近的识别结果。
+   *
+   * 只读内存识别服务（services/galgameMem）由另一模块维护，这里只做「解析当前游戏 → 读缓存」：
+   * 有结果回 name + 引擎；没结果/未开启回明确中文提示，绝不编造一个名字。
+   */
+  ipcMain.handle(CH.galBgmRead, async (): Promise<GalBgmResult> => {
+    const run = galRunningInfo()
+    if (!run) return { name: null, message: '未检测到正在运行的 galgame，请先启动游戏' }
+    if (!getSettings().galgameMemRead) {
+      return { name: null, message: 'BGM 识别未开启（请在设置中开启内存识别）' }
+    }
+    const recent = galMemRecent(run.gameId)
+    if (recent.lastError) return { name: null, message: recent.lastError }
+    const entry = recent.entries[0]
+    if (!entry) return { name: null, message: '暂未识别到 BGM（游戏可能尚未播放音乐）' }
+    /*
+     * 分清来源（见 GalMemEntry.kind）：
+     * - playing：出现签名刚变化 —— 实测这是"游戏刚切/刚播放"的信号，可以当作当前在播；
+     * - new / candidate：只是"刚出现"或"内存里现存的候选"，必须说清楚，不能让用户以为就是在播。
+     * 曲名优先用游戏数据里的真实曲名，取不到就如实显示代号。
+     */
+    const how =
+      entry.kind === 'playing'
+        ? recent.playingAt
+          ? `识别于 ${Math.max(0, Math.round((Date.now() - recent.playingAt) / 1000))} 秒前`
+          : '刚捕捉到切曲'
+        : entry.kind === 'new'
+          ? '刚出现（未捕捉到切曲信号）'
+          : '内存中的候选（未捕捉到切曲信号）'
+    const detail = [
+      entry.title ? `${entry.name}` : recent.codeOnly ? `${entry.name}（游戏数据里没有曲名，只有代号）` : entry.name,
+      how,
+      recent.engine ? `识别引擎：${recent.engine}` : ''
+    ]
+      .filter(Boolean)
+      .join(' · ')
+    return { name: entry.title || entry.name, code: entry.name, detail }
+  })
+  /*
+   * v0.3.9：把某首 BGM 从游戏档案只读提取并保存到本地（文件名优先真实曲名，其次代号）。
+   * gameId 允许为空 —— 悬浮窗（galgame 助手）只知道自己正在跟着哪个游戏，不知道 gameId，
+   * 这时按「当前正在运行的游戏」解析，与 gal:bgm-read 保持一致。
+   */
+  ipcMain.handle(CH.galBgmSave, (_e, gameId: string, code: string) => {
+    const id = String(gameId ?? '') || galRunningInfo()?.gameId || ''
+    if (!id) return { ok: false, path: '', error: '未检测到正在运行的 galgame，无法定位它的资源档案' }
+    return galMemSaveBgm(id, String(code ?? ''))
+  })
+  ipcMain.handle(CH.galBgmSaved, (_e, gameId: string, gameName?: string) =>
+    galMemSavedBgm(String(gameId ?? ''), gameName ? String(gameName) : undefined)
+  )
   // 最近截图：截图目录 + 各游戏子目录里最新的 30 张（兼容旧版直接放在根目录的截图）
   ipcMain.handle(CH.galRecentShots, () => galRecentShots(30))
   // 某款游戏自己的截图：只读 <截图目录>/<游戏名>/，供游戏卡片上的「最近截图」使用
@@ -1105,7 +1293,22 @@ export function registerIpc(): void {
   ipcMain.handle(CH.appDataPath, () => app.getPath('userData'))
   ipcMain.handle(CH.appVersion, () => app.getVersion())
   ipcMain.handle(CH.openDataDir, async () => shell.openPath(app.getPath('userData')))
-  ipcMain.handle(CH.openPath, async (_e, path: string) => shell.openPath(path))
+  /*
+   * `openPath` 会交给系统外壳打开（资源管理器 / 默认程序），所以不能什么字符串都收
+   * （v0.3.9 体检 L7）：当前调用点都是硬编码的下载页 URL 或主进程自己返回的路径，暂时没有风险，
+   * 但一旦将来有人把用户可控的字符串接进来（比如"用默认播放器打开这个文件"），
+   * `shell.openPath` 就可能变成任意文件/协议的执行入口。这里按 `appOpenUrl` 的思路加白名单：
+   * 只允许 http(s) 链接与 Windows 绝对路径，其余一律拒绝并留日志。
+   */
+  ipcMain.handle(CH.openPath, async (_e, path: string) => {
+    const target = String(path ?? '')
+    const ok = /^https?:\/\//i.test(target) || /^[A-Za-z]:[\\/]/.test(target) || target.startsWith('\\\\')
+    if (!ok) {
+      log.append('warn', 'app', `拒绝打开不在白名单内的路径：${target.slice(0, 80)}`)
+      return ''
+    }
+    return shell.openPath(target)
+  })
   ipcMain.handle(CH.cacheInfo, () => getCacheBytes())
   ipcMain.handle(CH.cacheClear, () => clearCache())
   ipcMain.handle(CH.junkClear, () => clearJunk())
@@ -1122,7 +1325,93 @@ export function registerIpc(): void {
   ipcMain.handle(CH.saveDirsSet, (_e, patch: Partial<SaveDirsInfo>) => setSaveDirs(patch ?? {}))
 
   // ---------- v0.2.4：播放状态栏 / 更新检查 / 弹幕 ----------
-  ipcMain.handle(CH.playerStreamInfo, () => buildStreamInfo())
+  /*
+   * v0.3.9：在**同一次快照**里补上「播放过程进度」与「嗅探/内核现场读数」。
+   *
+   * 为什么不塞进 playerInfo.buildStreamInfo 自己算：那会让
+   * `playerInfo → playSelfCheck → ruleProbe → playerInfo` 形成 import 环
+   * （ruleProbe 需要 playerInfo 的 noteCapturedStream）。环在 ESM 下靠函数提升勉强能跑，
+   * 但这属于「能跑但没人敢动」的结构，不值得为省两行代码留下。
+   * 组合放在 IPC 边界上，语义也更清楚：详情面板要的是一份「播放现场」的完整快照。
+   */
+  ipcMain.handle(CH.playerStreamInfo, async () => ({
+    ...(await buildStreamInfo()),
+    flow: flowSnapshot(),
+    selfCheck: selfCheckSnapshotForInfo()
+  }))
+  /*
+   * ---------- v0.3.9：播放过程进度 / 失败原因分析 / 自检重置 ----------
+   *
+   * 这四条都刻意做成「薄壳」：真正的逻辑在 playFlow / streamDiag / playSelfCheck 三个服务里，
+   * IPC 层只负责转一次参数。这样自检脚本（SAKANA_ONLINE_TEST / .e2e/*.mjs）
+   * 可以直接 import 那些服务，不必绕过渲染层去伪造一次 IPC 调用。
+   */
+  ipcMain.handle(CH.playerFlow, () => flowSnapshot())
+  ipcMain.handle(CH.playerFlowMark, (_e, mark: PlayFlowMark) => {
+    applyMark(mark)
+    return true
+  })
+  ipcMain.handle(CH.playerDiagnose, async (_e, url: string, referer?: string, cookies?: string) => {
+    /*
+     * ⚠️ 一次性/超短时效的直链**不能探测**（v0.3.9 的关键约束）。
+     *
+     * 有些站点（实测 aafun 的 `tjdownload.pan.wo.cn/openapi/download?fid=…`）给出的是
+     * 一次性下载令牌：**被请求过一次就失效**（完整取证见 ruleProbe.isOneTimeStream 的注释）。
+     * 而这条可达性探测是与播放器**并行**跑的 —— 对这类地址探测就等于把令牌烧掉，
+     * 播放器随即拿不到数据。那会把「本来能播」变成「播不了」，
+     * 属于比不做诊断严重得多的回归。所以这类地址一律跳过，并如实说明跳过了。
+     */
+    if (isOneTimeStream(url)) {
+      const skipped: StreamReachabilityReport = {
+        reason: 'none',
+        verdict: '这条地址是一次性短效直链，已跳过可达性探测（探测会消耗掉令牌，反而导致播放失败）',
+        metrics: { bytes: 0, rateBps: 0, ttfbMs: null }
+      }
+      flowDetail('acquire', skipped.verdict)
+      return skipped
+    }
+    const outcome = await probeStreamReachability({
+      url,
+      referer,
+      cookies,
+      onProgress: (metrics, note) => {
+        setMetrics(metrics)
+        flowDetail('acquire', note)
+      }
+    })
+    if (outcome.reason !== 'none') {
+      if (outcome.reason === 'slow') {
+        // 「过慢」不结束播放，只归因（用户明确要求：还有数据在动就继续等）
+        noteSlow(outcome.metrics.rateBps, outcome.verdict)
+      } else {
+        failStage('inject', outcome.verdict, outcome.reason)
+      }
+    }
+    const report: StreamReachabilityReport = {
+      reason: outcome.reason,
+      verdict: outcome.verdict,
+      metrics: outcome.metrics,
+      container: outcome.container
+    }
+    return report
+  })
+  ipcMain.handle(
+    CH.playerSelfCheck,
+    (_e, opts?: { reset?: boolean; failedPageUrl?: string }) =>
+      runPlaySelfCheck({ reset: opts?.reset !== false, failedPageUrl: opts?.failedPageUrl })
+  )
+  ipcMain.handle(CH.playerHardReset, () => hardResetPlayChain())
+  /*
+   * v0.3.9：在线播放加速器状态（是否真的在加速 / 并发几路 / 实时速率 / 决策原因）。
+   * 与上面几条一样是薄壳：逻辑在 streamBoost.ts，而且**纯内存读**，不触发任何网络请求。
+   */
+  ipcMain.handle(CH.playerBoostStatus, () => getStreamBoostStatus())
+  /*
+   * v0.3.9 补充更新：优化记录（最近 N 条真实测量结果 / 清空）。
+   * 读取走 store 的一份小 JSON（见 streamBoost 的 RECORD_NS 说明），清空只删这一份记录，不动设置。
+   */
+  ipcMain.handle(CH.playerBoostRecords, () => getStreamBoostRecords())
+  ipcMain.handle(CH.playerBoostClearRecords, () => clearStreamBoostRecords())
   ipcMain.handle(CH.appUpdateCheck, () => checkUpdate(true))
   /*
    * v0.2.9 最后更新：应用内一键更新。
@@ -1188,9 +1477,9 @@ export function registerIpc(): void {
 
   // 自动创建未配置的保存目录（baseDir = userData/saves）
   ensureSaveDirs()
-  // 启动时恢复截图助手（快捷键 + 悬浮窗）
+  // 启动时恢复galgame 助手（快捷键 + 悬浮窗）
   galToolsInit()
-  // 退出前结算游玩时长并回收截图助手资源
+  // 退出前结算游玩时长并回收galgame 助手资源
   app.on('before-quit', () => {
     galgameService.shutdown()
     store.flushAll()

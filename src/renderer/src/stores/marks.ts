@@ -5,38 +5,18 @@ import { api } from '@/lib/api'
 /** 搜索历史保留上限（产品要求 50 条） */
 export const HISTORY_LIMIT = 50
 
-/**
- * 搜索页底部展示位（轮播图）的持久化键。
- * 值为图片**绝对路径**数组，交给 sakana-img 协议加载；键名由产品方指定。
- */
-export const SHOWCASE_KEY = 'searchShowcase'
-
-/**
- * 持久化数据来自磁盘（旧版本、手工改动、写入中断都可能出现脏值），
- * 逐项收窄成 string[]，避免把非法值喂给图片协议。
- */
-function toPathList(v: unknown): string[] {
-  if (!Array.isArray(v)) return []
-  return v.filter((x): x is string => typeof x === 'string' && x.length > 0)
-}
-
-/**
- * 把展示图片收进应用数据目录（主进程复制 + 返回白名单内的新路径），并把结果写回。
+/*
+ * v0.3.9：搜索页那块「用户自己上传图片的自定义轮播展示位」已按用户要求整块删除，
+ * 所以本 store 里的 `showcase` 状态、`addShowcase/removeShowcase/clearShowcase`、
+ * `SHOWCASE_KEY`、`toPathList` 与 `migrateShowcase` 一并删掉了（不留死代码）。
  *
- * 为什么要迁移：`sakana-img://local` 只放行 media.ts 白名单里的目录，
- * 而早期版本直接存了用户挑图的原始路径 → 图片 403、轮播全白。
- * 只有内容真的变化时才写回（主进程对已在展示位目录里的路径是原样返回的），
- * 所以这个迁移是幂等的，每次启动跑一遍也不会重复复制或反复写盘。
+ * 两个**故意保留**的东西，说明原因：
+ *   1. 磁盘上历史遗留的 `searchShowcase` 键没有主动清除 —— 它只是没人再读了；
+ *      删数据是不可逆操作，而用户重装/回退旧版本时那份列表还能救回来。
+ *   2. `api.showcase.importImages()` 这条 IPC 也不能删：它现在被
+ *      「最XX的角色 9宫格」（CharacterGridPage）与「推荐表」（stores/recommendTable、
+ *      components/recommend/*）用着，只是搜索页不再读它了。
  */
-async function migrateShowcase(cur: string[]): Promise<void> {
-  if (cur.length === 0) return
-  const r = await api.showcase.importImages(cur)
-  if (!r.ok) return
-  const next = r.data
-  if (next.length === cur.length && next.every((p, i) => p === cur[i])) return
-  useMarks.setState({ showcase: next })
-  void api.store.set(SHOWCASE_KEY, next)
-}
 
 /** 标记一条番剧所需的最小字段：搜索结果里即可拿全，无需再请求详情 */
 export interface MarkSubjectInput {
@@ -49,8 +29,6 @@ interface MarksState {
   lists: MarkList[]
   items: MarkItem[]
   history: SearchHistoryItem[]
-  /** 搜索页底部展示位的图片路径（轮播），与列表/条目共用一次 load() */
-  showcase: string[]
   loaded: boolean
   load: () => Promise<void>
   createList: (name?: string, keyword?: string) => MarkList
@@ -61,10 +39,6 @@ interface MarksState {
   isMarked: (listId: string, subjectId: number) => boolean
   pushHistory: (kw: string) => void
   clearHistory: () => void
-  /** 追加展示图片，返回真正新增的张数（已存在的会被忽略） */
-  addShowcase: (paths: string[]) => number
-  removeShowcase: (path: string) => void
-  clearShowcase: () => void
 }
 
 /**
@@ -87,26 +61,20 @@ export const useMarks = create<MarksState>((set, get) => ({
   lists: [],
   items: [],
   history: [],
-  showcase: [],
   loaded: false,
   load: async () => {
-    const [l, i, h, s] = await Promise.all([
+    // v0.3.9：不再读 `searchShowcase`（自定义轮播展示位已删除），所以这里只剩三个键
+    const [l, i, h] = await Promise.all([
       api.store.get('markLists'),
       api.store.get('markItems'),
-      api.store.get('searchHistory'),
-      api.store.get(SHOWCASE_KEY)
+      api.store.get('searchHistory')
     ])
-    const showcase = s.ok ? toPathList(s.data) : []
     set({
       lists: l.ok && Array.isArray(l.data) ? (l.data as MarkList[]) : [],
       items: i.ok && Array.isArray(i.data) ? (i.data as MarkItem[]) : [],
       history: h.ok && Array.isArray(h.data) ? (h.data as SearchHistoryItem[]) : [],
-      showcase,
       loaded: true
     })
-    // 历史数据迁移：早期版本把用户挑的原始路径直接存了下来，而这些路径不在图片协议白名单里
-    // → 轮播一片空白。这里交给主进程收进应用目录（复制一次），变了的才写回，避免每次启动重复写盘。
-    void migrateShowcase(showcase)
   },
   /**
    * 新建书签。
@@ -177,31 +145,5 @@ export const useMarks = create<MarksState>((set, get) => ({
   clearHistory: () => {
     set({ history: [] })
     void api.store.set('searchHistory', [])
-  },
-  // 同一张图重复加入只会让轮播停在同图上，因此按路径去重并返回真实新增数，让页面能给出准确提示
-  addShowcase: (paths) => {
-    const before = get().showcase
-    const seen = new Set(before)
-    const next = [...before]
-    for (const p of paths) {
-      if (typeof p !== 'string' || p.length === 0 || seen.has(p)) continue
-      seen.add(p)
-      next.push(p)
-    }
-    const added = next.length - before.length
-    if (added === 0) return 0
-    set({ showcase: next })
-    void api.store.set(SHOWCASE_KEY, next)
-    return added
-  },
-  removeShowcase: (path) => {
-    const next = get().showcase.filter((p) => p !== path)
-    set({ showcase: next })
-    void api.store.set(SHOWCASE_KEY, next)
-  },
-  // 只清展示列表，不动磁盘上的图片文件
-  clearShowcase: () => {
-    set({ showcase: [] })
-    void api.store.set(SHOWCASE_KEY, [])
   }
 }))

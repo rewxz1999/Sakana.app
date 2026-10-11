@@ -3,8 +3,10 @@ import { addProbeListeners } from './probeEvents'
 import { noteCapturedStream } from './playerInfo'
 import axios from 'axios'
 import { CH } from '@shared/channels'
+import { ONLINE_PLAY_TIMEOUT_MS } from '@shared/onlinePlay'
 import { log } from '../log'
 import { BROWSER_UA, httpGetText } from '../net'
+import { beginStage, flowDetail, pushStep, succeedStage } from './playFlow'
 
 /**
  * 播放页流嗅探（Kazumi 同思路）：隐藏窗口加载播放页，
@@ -16,8 +18,29 @@ import { BROWSER_UA, httpGetText } from '../net'
  * 这里先直接抓取页面 HTML 提取真实地址，命中即用；未命中再走窗口嗅探兜底。
  */
 
+/** 本模块属于「获取播放资源」阶段：所有过程记录都写进这个阶段（见 playFlow 的三阶段模型） */
+const STAGE = 'acquire' as const
+
 const PARTITION = 'rule-probe'
 export const MEDIA_EXT_RE = /\.(m3u8|mp4|flv|mkv|webm|ts|m4s|mov)(\?|$)/i
+
+/**
+ * HEAD 预筛的超时故意**短**（v0.3.9 明确保留）：
+ *
+ * 它不参与「成功/失败」的判定 —— 只是给多个候选**并行**排个序，
+ * 任何一个没在 6 秒内回答就交给后面的完整校验（`resolvePlayable`，按 60 秒口径）。
+ * 把它也拉长到 60 秒的话，`Promise.all` 会被最慢的那个候选拖住，
+ * 「抓到候选 → 交给播放器」这段本来几百毫秒的路会被拖成分钟级。
+ */
+const HEAD_PROBE_TIMEOUT_MS = 6_000
+
+/**
+ * 「疑似广告短片」判定的超时同样保持短（v0.3.9 明确保留）。
+ *
+ * 它是**启发式预筛**，不是失败判据：最坏情况是候选晚几秒才上报给播放器，
+ * 绝不会让它判失败。拉长到 60 秒反而会把「抓到真流」这件事一起拖慢。
+ */
+const AD_CLIP_PROBE_TIMEOUT_MS = 8_000
 
 /**
  * 这个 URL 该不该被当成「视频流候选」（v0.3.5）。
@@ -178,8 +201,17 @@ export async function extractStreamCandidates(url: string, referer?: string): Pr
       origin = url
     }
     const res = await axios.get<string>(url, {
-      // 直出解析是「快路」，超时给短一点：卡住就交给窗口嗅探，别把整条链拖住
-      timeout: 8000,
+      /*
+       * v0.3.9：超时从 8 秒统一到 60 秒（@shared/onlinePlay）。
+       *
+       * 老注释说「直出解析是快路，超时给短一点，卡住就交给窗口嗅探」——
+       * 但实测（`.e2e/online-test-v037.log`）不少站点的播放页 HTML 在冷启动 + 慢 CDN 下
+       * 要 10–30 秒才吐出来，8 秒放弃的结果是：**明明能直出拿到地址，却退化成整轮窗口嗅探**，
+       * 而窗口嗅探又要再等几十秒 —— 用户看到的就是「一直在捕捉视频流中」。
+       * 现在给足 60 秒；同时窗口嗅探本来就是并行跑的（见 startRuleProbe），
+       * 所以就算这一路真的慢，也不会把总时长叠加成两倍。
+       */
+      timeout: ONLINE_PLAY_TIMEOUT_MS,
       maxRedirects: 5,
       responseType: 'text',
       headers: {
@@ -191,10 +223,17 @@ export async function extractStreamCandidates(url: string, referer?: string): Pr
     const list = findMediaUrls(String(res.data ?? ''))
     if (list.length > 0) {
       log.append('info', 'rule-probe', `播放页直出候选 ${list.length} 个，首选: ${list[0].slice(0, 110)}`)
+      flowDetail(STAGE, `播放页直出候选 ${list.length} 个，正在并行校验`)
+      pushStep(STAGE, `播放页直出候选 ${list.length} 个`)
+    } else {
+      flowDetail(STAGE, '播放页里没有直出地址，继续等页面播放器发请求')
+      pushStep(STAGE, '播放页 HTML 无直出地址')
     }
     return list
   } catch (err) {
-    log.append('warn', 'rule-probe', `播放页直出解析失败: ${String((err as { message?: string })?.message ?? err)}`)
+    const text = String((err as { message?: string })?.message ?? err)
+    log.append('warn', 'rule-probe', `播放页直出解析失败: ${text}`)
+    pushStep(STAGE, `播放页直出解析失败：${text.slice(0, 80)}`)
     return []
   }
 }
@@ -267,7 +306,8 @@ export async function resolvePlayable(
     // 1) HEAD 探测（不消耗下载令牌）
     try {
       const head = await axios.head(url, {
-        timeout: 12000,
+        // v0.3.9：与在线播放链路口径统一为 60 秒（此前 12 秒）
+        timeout: ONLINE_PLAY_TIMEOUT_MS,
         maxRedirects: 6,
         validateStatus: () => true,
         headers: baseHeaders
@@ -286,7 +326,8 @@ export async function resolvePlayable(
     // 2) 回退：Range GET（有些 CDN 不支持 HEAD）
     try {
       const res = await axios.get(url, {
-        timeout: 12000,
+        // v0.3.9：与在线播放链路口径统一为 60 秒（此前 12 秒）
+        timeout: ONLINE_PLAY_TIMEOUT_MS,
         maxRedirects: 6,
         responseType: 'arraybuffer',
         decompress: true,
@@ -316,7 +357,8 @@ export async function resolvePlayable(
 async function headProbeOnce(url: string, referer?: string): Promise<{ url: string; referer?: string } | null> {
   try {
     const head = await axios.head(url, {
-      timeout: 6000,
+      // 预筛用，故意短（见 HEAD_PROBE_TIMEOUT_MS 的说明）：超时了就交给完整校验
+      timeout: HEAD_PROBE_TIMEOUT_MS,
       maxRedirects: 6,
       validateStatus: () => true,
       headers: { 'User-Agent': BROWSER_UA, ...(referer ? { Referer: referer } : {}) }
@@ -341,19 +383,35 @@ async function headProbeOnce(url: string, referer?: string): Promise<{ url: stri
  */
 export async function resolveFirstPlayable(
   candidates: string[],
-  referer?: string
+  referer?: string,
+  /**
+   * 整步预算（v0.3.9）。
+   *
+   * 为什么不是「每个候选各等 60 秒」：`resolvePlayable` 现在单次就允许 60 秒，
+   * 而候选最多 6 个 —— 逐个串起来最坏是 12 分钟，那是用户绝对不能接受的。
+   * 「60 秒」在工单里的语义是**这一步的判定时间**，所以这里给整步一个 60 秒的截止时间：
+   * 到点就返回 null，交给上层按「网站问题/格式不支持」出结论（上层还有可达性探测作为证据）。
+   */
+  budgetMs = ONLINE_PLAY_TIMEOUT_MS
 ): Promise<{ url: string; referer?: string } | null> {
   const list = candidates.slice(0, 6)
   if (list.length === 0) return null
+  const deadline = Date.now() + budgetMs
   if (list.length > 1) {
     const probes = await Promise.all(list.map((u) => headProbeOnce(u, referer)))
     const idx = probes.findIndex((p) => p !== null)
     if (idx >= 0) {
       log.append('info', 'rule-probe', `并行探测命中第 ${idx + 1} 个候选`)
+      flowDetail(STAGE, `直出地址校验通过（第 ${idx + 1} 个候选）`)
       return probes[idx]
     }
   }
   for (const u of list) {
+    if (Date.now() >= deadline) {
+      log.append('warn', 'rule-probe', `直出地址校验超出 ${Math.round(budgetMs / 1000)} 秒预算，停止串行重试`)
+      pushStep(STAGE, `直出地址校验超时（${Math.round(budgetMs / 1000)}s 预算用尽）`)
+      return null
+    }
     const ok = await resolvePlayable(u, referer)
     if (ok) return ok
   }
@@ -590,6 +648,8 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
   foundUrls = []
   doneSent = false
   probeActive = true
+  beginStage(STAGE, '正在打开嗅探窗口（规则站点的隐藏网页）')
+  pushStep(STAGE, `开始嗅探播放页：${url.slice(0, 90)}`)
   // 使用默认会话（自定义分区会话会导致页面加载 ERR_FAILED；probeActive 标志防止误报）
   const ses = session.defaultSession
   try {
@@ -612,6 +672,7 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
     })
   } catch (err) {
     log.append('error', 'rule-probe', `隐藏窗口创建失败: ${String(err)}`)
+    pushStep(STAGE, `嗅探窗口创建失败：${String(err).slice(0, 80)}`)
     return false
   }
 
@@ -639,7 +700,7 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
   const looksLikeAdClip = async (u: string): Promise<boolean> => {
     try {
       if (/\.m3u8(\?|$)/i.test(u)) {
-        const text = await httpGetText(u, 8000, {})
+        const text = await httpGetText(u, AD_CLIP_PROBE_TIMEOUT_MS, {})
         if (!text.includes('#EXTM3U')) return false
         const durs = [...text.matchAll(/#EXTINF:\s*([\d.]+)/g)].map((m) => Number(m[1]) || 0)
         // 主列表（EXT-X-STREAM-INF）里没有 EXTINF，看不到真实时长 → 不判定
@@ -648,7 +709,7 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
         return total > 0 && total < AD_CLIP_MAX_SECONDS
       }
       const head = await axios.head(u, {
-        timeout: 6000,
+        timeout: AD_CLIP_PROBE_TIMEOUT_MS,
         maxRedirects: 6,
         validateStatus: () => true,
         headers: { 'User-Agent': BROWSER_UA }
@@ -667,6 +728,8 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
     if (!probeActive || foundUrls.includes(u)) return
     foundUrls.push(u)
     log.append('info', 'rule-probe', `捕获媒体流: ${u.slice(0, 120)}`)
+    pushStep(STAGE, `捕获媒体流（${channel}）：${u.slice(0, 70)}`)
+    flowDetail(STAGE, `已捕获 ${foundUrls.length} 个候选，正在筛查是否为广告短片`)
     void looksLikeAdClip(u).then((suspect) => {
       if (!probeActive) return
       if (suspect) {
@@ -676,6 +739,7 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
           'rule-probe',
           `疑似广告短片（先不交给播放器，继续等正片）: ${u.slice(0, 110)}`
         )
+        pushStep(STAGE, `疑似广告短片，继续等正片：${u.slice(0, 60)}`)
         return
       }
       noteCapturedStream({
@@ -684,6 +748,8 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
         channel,
         capturedAt: Date.now()
       })
+      // 拿到可用候选 = 「获取播放资源」阶段达成（后面交给播放器是 inject 阶段的事）
+      succeedStage(STAGE, `已获取播放资源（${channel}）`)
       emit(mainWin, { type: 'found', url: u, kind: /\.m3u8(\?|$)/i.test(u) ? 'm3u8' : 'media' })
     })
   }
@@ -735,6 +801,7 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
       channel: 'html 直出',
       capturedAt: Date.now()
     })
+    succeedStage(STAGE, '已获取播放资源（播放页直出）')
     // referer 用空串表示「经校验确定不能带 Referer」（很多 CDN 会因 Referer 直接 400）
     emit(mainWin, { type: 'found', url: ok.url, referer: ok.referer ?? '', kind: 'direct' })
   })
@@ -835,10 +902,20 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
 
   // 播放页大多需要“交互”才会加载播放器：注入脚本自动点击播放按钮 / 触发 video.play()
   probeWin.webContents.on('did-finish-load', () => {
+    flowDetail(STAGE, '播放页已加载，正在触发页面播放器（自动点击）')
+    pushStep(STAGE, '播放页已加载，注入自动点击')
     for (const delay of [1200, 3000, 6000, 10000]) setTimeout(() => runAutoPlayClicks(probeWin), delay)
   })
 
-  // 20 秒后收尾：把最佳候选地址通知渲染层
+  /*
+   * 收尾时间（v0.3.9：20 秒 → 60 秒，与在线播放链路统一）。
+   *
+   * 为什么必须拉长：实测慢站点的播放页从加载到播放器真正发出取流请求，
+   * 冷启动 + 广告脚本 + 播放器 CDN 一起排队时经常要 30–50 秒
+   * （`.e2e/online-test-v037.log` 里 7sefun/AGE 这类站点都在 20 秒后才出流）。
+   * 20 秒收尾的结果是「明明再多等十几秒就能拿到，却先判成未捕获到视频流」，
+   * 界面回退到网页播放 —— 用户看到的就是「有些源偶尔能播、偶尔播不了」。
+   */
   timeoutTimer = setTimeout(() => {
     const best = pickBest(foundUrls)
     if (!doneSent) {
@@ -855,12 +932,12 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
           ? onlyAdClip
             ? '只捕获到疑似广告短片，已按兜底交给播放器（继续等待正片）'
             : '已捕获视频流'
-          : '未捕获到视频流，可回退到网页播放',
+          : `等待 ${ONLINE_PLAY_TIMEOUT_MS / 1000} 秒仍未捕获到视频流（站点可能已失效或需要交互）`,
         url: best ?? undefined
       })
     }
     stopRuleProbe()
-  }, 20000)
+  }, ONLINE_PLAY_TIMEOUT_MS)
   return true
 }
 
@@ -891,4 +968,45 @@ export function stopRuleProbe(): void {
   } catch {
     /* ignore */
   }
+}
+
+/**
+ * 自检读数的现场快照（v0.3.9）。
+ *
+ * 用户报的现象是「上一路播完之后换源/换集会出现播放失败，怀疑嗅探程序没反应过来、
+ * 或者播放器销毁后没重建」。要判定这件事，必须能**从外面看到**嗅探模块的内部状态：
+ * 探针窗口还在不在、共享监听还挂着没有、收尾计时器还在不在跑。
+ * 这些是模块私有变量，所以由模块自己导出读数，而不是让自检去猜。
+ */
+export function ruleProbeDiagnostics(): {
+  active: boolean
+  windowAlive: boolean
+  windowDestroyed: boolean
+  listenersRegistered: boolean
+  timeoutPending: boolean
+  foundCount: number
+} {
+  const w = probeWin
+  return {
+    active: probeActive,
+    windowAlive: !!w && !w.isDestroyed(),
+    windowDestroyed: !!w && w.isDestroyed(),
+    listenersRegistered: disposeListeners !== null,
+    timeoutPending: timeoutTimer !== null,
+    foundCount: foundUrls.length
+  }
+}
+
+/**
+ * 忘掉某个播放页的直链缓存（v0.3.9 自检用）。
+ *
+ * 为什么要能单独忘掉一条：「切源/切集后仍然播放失败」最常见的成因之一，
+ * 就是命中了缓存里那条**已经失效的直链**（一次性令牌被用掉、签名过期）。
+ * 全清会连带丢掉其它还能用的条目，所以自检只清掉「刚刚失败的那一页」。
+ */
+export function forgetStream(pageUrl: string): boolean {
+  if (!pageUrl) return false
+  const had = streamCache.delete(pageUrl)
+  if (had) log.append('warn', 'rule-probe', `自检：清除失效直链缓存 ${pageUrl.slice(0, 110)}`)
+  return had
 }

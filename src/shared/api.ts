@@ -21,8 +21,11 @@ import type {
   EpisodeProgress,
   GalEvent,
   GalGame,
+  GalBgmResult,
   GalLaunchResult,
+  GalMemRecent,
   GalRecentShot,
+  GalBgmSaved,
   GalSiteSearchResult,
   GalToolsConfig,
   ImageDataUrlResult,
@@ -35,6 +38,7 @@ import type {
   MikanSearchResult,
   MirrorTestResult,
   PlayStatus,
+  QbitStatus,
   RemoveRecordsResult,
   RuleEpisodeGroup,
   RuleEpisodesResult,
@@ -44,6 +48,12 @@ import type {
   SearchResult,
   SeasonResult,
   StreamInfo,
+  StreamBoostStatus,
+  StreamBoostRecord,
+  PlayFlowMark,
+  PlayFlowSnapshot,
+  PlaySelfCheckResult,
+  StreamReachabilityReport,
   StatAction,
   StatEntry,
   StatExportOptions,
@@ -55,6 +65,7 @@ import type {
   SubscribeAndDownloadInput,
   SubscribeAndDownloadResult,
   Subscription,
+  ToolImportReport,
   ToolMeta,
   ToolRunResult,
   UpdateInstallState,
@@ -131,6 +142,23 @@ export interface OverlayState {
     /** 选集列表（接收端/电视上能选集） */
     playlist?: { url: string; title: string }[]
   } | null
+  /**
+   * v0.3.9：播放过程进度（三阶段快照）。
+   *
+   * 悬浮窗要画「过程进度显示器」，而进度状态在主进程里 ——
+   * 播放页本来就每 800ms 把这份状态整体推给悬浮窗，
+   * 顺带带上它就等于**零额外轮询**（用户明确要求复用既有推送，别新开一条）。
+   */
+  flow?: PlayFlowSnapshot | null
+  /** v0.3.9：自检做过什么（非空时状态区显示一行，用户要求不许静默） */
+  selfCheckNote?: string
+  /**
+   * v0.3.9：本轮流程是否**成功出过画面**。
+   *
+   * 悬浮窗的「加载中」那一层不能只看 `playing`：用户暂停之后 playing 同样是 false，
+   * 那时再盖一层「加载中」就是误报。所以由播放页给出这个更准确的判据。
+   */
+  startedOnce?: boolean
 }
 
 /**
@@ -261,6 +289,13 @@ export type OverlayAction =
   | { type: 'castPlay'; deviceId: string }
   | { type: 'castControl'; action: 'pause' | 'resume' | 'stop' | 'seek' | 'volume' }
   | { type: 'castStop' }
+  /**
+   * v0.3.9 补充：播放详情面板里的「重跑」（重新解析地址 → 嗅探 → 交给内核）。
+   *
+   * 悬浮窗里点重跑时，真正的链路在**播放页**（它拿着播放页地址、探针取消句柄与看门狗），
+   * 所以悬浮窗只把意图发回来，由播放页执行 —— 与 castPlay 同一个道理。
+   */
+  | { type: 'retryStream' }
 
 /** 渲染层通过 window.sakana 访问的完整 API 契约（preload 实现） */
 export interface SakanaApi {
@@ -270,6 +305,8 @@ export interface SakanaApi {
     close(): Promise<void>
     isMaximized(): Promise<boolean>
     setFullscreen(full: boolean): Promise<void>
+    /** galgame 沉浸模式：进全屏前记住窗口几何，退出恢复小窗口 */
+    setImmersive(immersive: boolean): Promise<void>
     isFullscreen(): Promise<boolean>
     showMain(): Promise<void>
     hideTrayPanel(): Promise<void>
@@ -284,6 +321,8 @@ export interface SakanaApi {
     set(ns: string, data: unknown): Promise<ApiResult<boolean>>
     /** 主进程改了库数据（收藏/历史，v0.3.8 起含手机端同步回来的历史）→ 重新读一遍 */
     onChanged(cb: () => void): () => void
+    /** v0.3.9 体检 H1：设置被任意一方（含主进程内部）改过 → 重新读一遍，避免跨窗口整份覆盖丢配置 */
+    onSettingsChanged(cb: () => void): () => void
   }
   bangumi: {
     calendar(force?: boolean): Promise<ApiResult<CalendarResult>>
@@ -373,7 +412,8 @@ export interface SakanaApi {
     list(): Promise<ApiResult<Subscription[]>>
     remove(id: string): Promise<ApiResult<Subscription[]>>
     setFolder(id: string, folder: string): Promise<ApiResult<Subscription[]>>
-    markUpdated(id: string, episode: number, lastPubDate: string): Promise<ApiResult<Subscription[]>>
+    /** v0.3.9：`episode` 允许 null —— 字幕组资源没写集号时是"不知道"，不能记成 0（0 会被界面当成已下载完） */
+    markUpdated(id: string, episode: number | null, lastPubDate: string): Promise<ApiResult<Subscription[]>>
     onChanged(cb: (subs: Subscription[]) => void): () => void
   }
   downloads: {
@@ -397,6 +437,10 @@ export interface SakanaApi {
     deleteLocal(input: LocalTargetInput): Promise<ApiResult<DeleteLocalResult>>
     /** 只删下载记录，**绝不**删除磁盘上已下载的文件（下载列表综合卡片用） */
     removeRecords(input: { animeTitle?: string; ids?: string[] }): Promise<ApiResult<RemoveRecordsResult>>
+    /** 外部 qBittorrent 的实时状态（设置页显示「为什么连不上」用） */
+    qbitStatus(): Promise<ApiResult<QbitStatus>>
+    /** 由应用启动 qBittorrent 并等 WebUI 就绪（含超时/失败的中文原因） */
+    qbitLaunch(): Promise<ApiResult<{ ok: boolean; message: string }>>
     onChanged(cb: (tasks: DownloadTask[]) => void): () => void
   }
   rules: {
@@ -466,6 +510,23 @@ export interface SakanaApi {
       ApiResult<{
         bounds: { x: number; y: number; width: number; height: number } | null
         state: { time: number; length: number; playing: boolean; volume: number; muted: boolean } | null
+        /**
+         * v0.3.9：「到底有没有画面」的硬数据。
+         *
+         * `hasPicture=false` 且 `audioOnlyMs>0` = 画面根本没解出来（流/解码问题，该换源）；
+         * `hasPicture=true` 而屏幕上仍看不到 = 窗口层问题（子窗口被盖住/尺寸/可见性）。
+         * 判「有声音没画面」属于哪一类，就看这个字段。
+         * `audioOnlyReason` 是有声无画到点后给出的可读结论（没到点是空串）。
+         */
+        video: {
+          width: number
+          height: number
+          videoCodec: string
+          audioCodec: string
+          hasPicture: boolean
+          audioOnlyMs: number
+          audioOnlyReason: string
+        } | null
         hit: { hitClass: string; isOurChild: boolean; ourChain: string[]; hitChain: string[] } | null
         windows: { parentChildren: string[]; childChildren: string[] } | null
         raiseStats: { paint: number; raise: number }
@@ -501,6 +562,50 @@ export interface SakanaApi {
     assets(): Promise<ApiResult<PlayerAssets>>
     /** 当前流的详细信息（分辨率/编码/码率等），供播放状态栏展示 */
     streamInfo(): Promise<ApiResult<StreamInfo>>
+    /**
+     * 在线播放加速器状态（v0.3.9）：是否**真的**在加速、并发几路、实时速率、为什么这么决定。
+     *
+     * 纯内存读，不发网络请求 —— 设置页按秒轮询它，显示的是正在发生的事实
+     * （档位是 auto 时可能这次直连更快，那 `active` 就是 false，界面必须如实显示）。
+     */
+    boostStatus(): Promise<ApiResult<StreamBoostStatus>>
+    /**
+     * 优化记录（v0.3.9 补充更新）：每次**真正启用加速**且转发够量的会话，一条真实测量结果。
+     *
+     * 只读一份小 JSON（`<userData>/data/streamBoostLog.json`，上限 100 条 ≈ 35KB），
+     * 不发网络请求；量不到的字段是 null（界面显示「—」），主进程不会补估算值。
+     */
+    boostRecords(): Promise<ApiResult<StreamBoostRecord[]>>
+    /** 清空优化记录（返回清掉的条数）；不动任何设置 */
+    boostClearRecords(): Promise<ApiResult<number>>
+    /**
+     * 播放过程进度的三阶段快照（v0.3.9）—— **纯内存读，不发任何网络请求**。
+     *
+     * 与 streamInfo 分开的原因：过程进度要按秒刷新（用户要求「必需实时更新」），
+     * 而 streamInfo 每次都可能去源站拉 m3u8。这个接口只读主进程里的一小块状态，
+     * 所以渲染层在「尚未开播」时那次既有轮询里顺手调它即可，不会增加任何请求量。
+     */
+    flow(): Promise<ApiResult<PlayFlowSnapshot>>
+    /** 渲染层把「我现在进到哪一步」写回主进程（阶段划分的知识在渲染层，状态只有一份） */
+    flowMark(mark: PlayFlowMark): Promise<ApiResult<boolean>>
+    /**
+     * 资源可达性取证（v0.3.9）：拿直链真去请求一次，量首字节/速率/HTTP 状态/响应头，
+     * 给出「网站问题 / 资源获取速度过慢 / 格式不支持」的可判定结论。
+     *
+     * ⚠️ 必须在把地址交给播放器**之后**调用（并行跑），不要拿它挡播放这条路。
+     */
+    diagnose(
+      url: string,
+      referer?: string,
+      cookies?: string
+    ): Promise<ApiResult<StreamReachabilityReport>>
+    /**
+     * 在线播放自检（v0.3.9）：查「嗅探残留」与「内核错配」两类问题，
+     * `reset=true` 时自动重置到正常状态（关残留探针窗口、销毁错配内核、清掉坏的直链缓存）。
+     */
+    selfCheck(opts?: { reset?: boolean; failedPageUrl?: string }): Promise<ApiResult<PlaySelfCheckResult>>
+    /** 一键重置整条播放链路：关嗅探、清空直链缓存、销毁内核 */
+    hardReset(): Promise<ApiResult<{ clearedStreams: boolean; engineDestroyed: boolean }>>
   }
   /**
    * 系统剪贴板（v0.3.6「快速粘贴」）。
@@ -514,6 +619,8 @@ export interface SakanaApi {
     copyImage(file: string): Promise<ApiResult<{ ok: boolean; text: string; file: string; error?: string }>>
     /** 剪贴板里当前是否有图片（界面据此提示「已复制 / 可粘贴」） */
     hasImage(): Promise<ApiResult<boolean>>
+    /** 把一段文本写进系统剪贴板（galgame 悬浮按钮「复制 BGM 名称」用） */
+    copyText(text: string): Promise<ApiResult<boolean>>
   }
   /** 全屏控制栏悬浮窗：主窗口播放页 ↔ 悬浮窗渲染层 */
   overlay: {
@@ -547,7 +654,15 @@ export interface SakanaApi {
     onAction(cb: (action: OverlayAction) => void): () => void
   }
   tools: {
-    import(): Promise<ApiResult<ToolMeta | null>>
+    /**
+     * 导入工具（v0.3.9 放宽）：一次可选多个文件，每份单独结算。
+     *
+     * 用户原话「放宽松导入工具需要的语言」—— 这里不再因为"不是 .py / 少写字段 / 编码不是 UTF-8"
+     * 就整份拒绝：认不出元数据只降级 + 给逐条提示，认不出语言也照收（只是标注不能运行）。
+     * 返回 `ToolImportReport`：`imported` 成功份数、`failed` 失败份数、
+     * 每份的 `notes`（warn 条数 = `warnCount`）。`canceled` = 用户取消对话框。
+     */
+    import(): Promise<ApiResult<ToolImportReport>>
     list(): Promise<ApiResult<ToolMeta[]>>
     remove(id: string): Promise<ApiResult<boolean>>
     run(id: string): Promise<ApiResult<ToolRunResult>>
@@ -585,6 +700,8 @@ export interface SakanaApi {
     pickVideo(): Promise<ApiResult<string | null>>
     /** 选择本地视频文件夹（批量加入播放列表） */
     pickVideoDir(): Promise<ApiResult<string | null>>
+    /** 选择可执行文件（qBittorrent 程序路径） */
+    pickExe(defaultPath?: string): Promise<ApiResult<string | null>>
   }
   showcase: {
     /**
@@ -710,6 +827,16 @@ export interface SakanaApi {
     pickDir(): Promise<ApiResult<string | null>>
     screenshotNow(): Promise<ApiResult<string>>
     overlayShot(): Promise<ApiResult<string>>
+    /** v0.3.9：悬浮按钮展开/收起选择面板（动态调整悬浮窗尺寸，height=面板所需窗口高度） */
+    overlayResize(open: boolean, height?: number): Promise<void>
+    /** v0.3.9：读取正在运行的 galgame 的 BGM（识别服务就绪前返回未开启提示） */
+    readBgm(): Promise<ApiResult<GalBgmResult>>
+    /** v0.3.9：某款游戏最近识别到的 BGM（只读内存识别，供卡片右键面板） */
+    memRecent(gameId: string): Promise<ApiResult<GalMemRecent>>
+    /** v0.3.9：把某首 BGM 从游戏档案只读提取并保存到本地（文件名优先真实曲名，其次代号） */
+    saveBgm(gameId: string, code: string): Promise<ApiResult<{ ok: boolean; path: string; error: string }>>
+    /** v0.3.9：最近保存的 BGM（卡片右键菜单「最近保存的 bgm」） */
+    savedBgm(gameId: string, gameName?: string): Promise<ApiResult<GalBgmSaved[]>>
     dirsGet(): Promise<ApiResult<{ dir: string }>>
     dirsSet(dir: string): Promise<ApiResult<{ dir: string }>>
     recentShots(): Promise<ApiResult<GalRecentShot[]>>

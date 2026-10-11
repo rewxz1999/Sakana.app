@@ -1,7 +1,19 @@
-import { useEffect, useMemo, useState } from 'react'
-import { ArrowLeft, CirclePlus, CloudDownload, RotateCcw, Save, Search, Trash2 } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  ArrowLeft,
+  Archive,
+  CirclePlus,
+  CloudDownload,
+  Copy,
+  Download,
+  RotateCcw,
+  Save,
+  Search,
+  Trash2,
+  Upload
+} from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
-import type { PlayRule, RuleEpisodesDef, RuleSearchDef, RulesRepoMeta } from '@shared/types'
+import type { LocalRuleEntry, PlayRule, RuleEpisodesDef, RuleOrigin, RuleSearchDef, RulesRepoMeta } from '@shared/types'
 import { DEFAULT_RULES, emptyRule, isPinnedRule, sortRulesPinnedFirst } from '@shared/types'
 import { api } from '@/lib/api'
 import { toast } from '@/stores/app'
@@ -17,6 +29,59 @@ function fmtCheckTime(ts: number): string {
     d.getMonth() === now.getMonth() &&
     d.getDate() === now.getDate()
   return sameDay ? hm : `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${hm}`
+}
+
+/** 完整时间（本地库要显示"哪一版是什么时候存的"，只到分钟就够） */
+function fmtFullTime(ts: number): string {
+  const d = new Date(ts)
+  return (
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ` +
+    fmtCheckTime(ts)
+  )
+}
+
+/**
+ * 规则来源文案（用户要求：「界面要如实显示当前用的是 git 版还是本地版」）。
+ *
+ * 优先读规则自己带的 `origin`（写入方在导入/替换时就落下来的事实）；
+ * 老数据没有这个字段时按 id 前缀兜底 —— 这是历史约定（default- 内置 / repo- 仓库），
+ * 不去猜内容，猜错了比不显示更糟。
+ */
+function ruleOriginOf(rule: PlayRule): RuleOrigin {
+  if (rule.origin) return rule.origin
+  if (rule.id.startsWith('default-')) return 'builtin'
+  if (rule.id.startsWith('repo-')) return 'repo'
+  return 'local'
+}
+
+function originLabel(origin: RuleOrigin): string {
+  if (origin === 'builtin') return '内置版'
+  if (origin === 'repo') return 'GIT 仓库版'
+  return '本地版'
+}
+
+/** 本地库条目的入库原因文案（让人看懂"这条为什么在库里"） */
+function reasonLabel(reason: LocalRuleEntry['reason']): string {
+  switch (reason) {
+    case 'builtin':
+      return '内置随应用分发'
+    case 'first-seen':
+      return '首次见到时留档'
+    case 'before-change':
+      return '被修改前的版本'
+    case 'after-change':
+      return '修改后的版本'
+    case 'repo-import':
+      return '从 GIT 仓库导入/更新'
+    case 'auto-fix':
+      return '应用改版修正'
+    case 'local-replace':
+      return '用本地库替换时留档'
+    case 'removed':
+      return '删除前留档'
+    default:
+      return String(reason)
+  }
 }
 
 /**
@@ -70,6 +135,125 @@ export function RulesPage() {
   const [repoImporting, setRepoImporting] = useState(false)
   /** 规则仓库自动更新状态（主进程写在 store 的 rulesRepoMeta 里，不新增 IPC 通道） */
   const [repoMeta, setRepoMeta] = useState<RulesRepoMeta | null>(null)
+  /** 本地库（v0.3.9）：主进程写在 store 的 rulesLocal 命名空间里，这里只做展示与操作 */
+  const [localOpen, setLocalOpen] = useState(false)
+  const [localEntries, setLocalEntries] = useState<LocalRuleEntry[]>([])
+  const localFileRef = useRef<HTMLInputElement | null>(null)
+
+  /**
+   * 读本地库。
+   *
+   * 为什么不新增 IPC 通道：规则页已经有通用的 `api.store.get/set`，本地库本身就是一个
+   * store 命名空间 —— 为了读取它再开一条通道，只会让 preload/api/通道表三处跟着改，
+   * 而且这些文件当前有别的 agent 在并行修改（改动面越小越不容易撞车）。
+   */
+  const loadLocal = async () => {
+    try {
+      const r = await api.store.get('rulesLocal')
+      const list = r.ok && Array.isArray(r.data) ? (r.data as LocalRuleEntry[]) : []
+      setLocalEntries([...list].sort((a, b) => b.savedAt - a.savedAt))
+    } catch {
+      setLocalEntries([])
+    }
+  }
+
+  /** 把一份本地库快照写回 rules（替换 / 新增），并如实标成本地版 */
+  const applyLocalEntry = async (entry: LocalRuleEntry) => {
+    const current = rules.find((r) => r.id === entry.ruleId) ?? rules.find((r) => r.name === entry.name)
+    let next: PlayRule[]
+    if (current) {
+      /*
+       * 替换时**保留当前规则的身份**（id / 启用状态 / 创建时间）：
+       * 用户想要的"换回能跑的那一版"，不该顺带把这条规则变成另一条（那样收藏的线路、
+       * 停用状态都会跟着变），只换内容。
+       */
+      next = rules.map((r) =>
+        r.id === current.id
+          ? {
+              ...entry.rule,
+              id: current.id,
+              enabled: current.enabled,
+              createdAt: current.createdAt,
+              origin: 'local' as const
+            }
+          : r
+      )
+    } else {
+      next = [...rules, { ...entry.rule, id: entry.ruleId, origin: 'local' as const }]
+    }
+    await persist(next)
+    // 重新读一遍本地库：主进程在保存时会把"被替换掉的那一版"也留档，列表要跟着更新
+    await loadLocal()
+    toast.success(`已用本地库版本替换「${entry.name}」v${entry.version}`)
+  }
+  const deleteLocalEntry = async (id: string) => {
+    const next = localEntries.filter((e) => e.id !== id)
+    await api.store.set('rulesLocal', next)
+    setLocalEntries(next)
+    toast.info('本地库条目已删除')
+  }
+
+  /** 导出：Blob 下载（Chromium 会按浏览器自己的下载流程落盘，不需要新通道） */
+  const exportLocal = () => {
+    const payload = {
+      kind: 'sakana-rules-local',
+      version: 1,
+      exportedAt: Date.now(),
+      entries: localEntries
+    }
+    const text = JSON.stringify(payload, null, 2)
+    try {
+      const blob = new Blob([text], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `sakana-rules-local-${new Date().toISOString().slice(0, 10)}.json`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 5000)
+      toast.success(`已导出 ${localEntries.length} 条本地库版本`)
+    } catch (err) {
+      toast.error(`导出失败：${String(err)}`)
+    }
+  }
+
+  /** 导出到剪贴板：文件下载受系统/权限影响时，这条永远能用（复制出去自己存文件） */
+  const copyLocal = async () => {
+    const text = JSON.stringify(
+      { kind: 'sakana-rules-local', version: 1, exportedAt: Date.now(), entries: localEntries },
+      null,
+      2
+    )
+    try {
+      await navigator.clipboard.writeText(text)
+      toast.success('本地库 JSON 已复制到剪贴板')
+    } catch (err) {
+      toast.error(`复制失败：${String(err)}`)
+    }
+  }
+
+  /** 导入：读用户选的 json 文件，按 id 去重后合并（同 id 视为同一条，不重复堆积） */
+  const importLocalFile = async (file: File) => {
+    try {
+      const text = await file.text()
+      const parsed = JSON.parse(text) as { entries?: LocalRuleEntry[] } | LocalRuleEntry[]
+      const incoming = Array.isArray(parsed) ? parsed : (parsed.entries ?? [])
+      const valid = incoming.filter((e) => e && e.id && e.rule && e.name)
+      if (valid.length === 0) {
+        toast.warn('这个文件里没有可用的本地库条目')
+        return
+      }
+      const merged = new Map(localEntries.map((e) => [e.id, e]))
+      for (const e of valid) merged.set(e.id, e)
+      const next = [...merged.values()].sort((a, b) => b.savedAt - a.savedAt)
+      await api.store.set('rulesLocal', next)
+      setLocalEntries(next)
+      toast.success(`导入完成：文件里 ${valid.length} 条，本地库现共 ${next.length} 条`)
+    } catch (err) {
+      toast.error(`导入失败：${String(err)}`)
+    }
+  }
 
   const loadRepoMeta = async () => {
     try {
@@ -97,6 +281,10 @@ export function RulesPage() {
     // 首次读到的还是"暂无记录" —— 15 秒后再读一次，把这次检测结果显示出来。
     const timer = setTimeout(() => void loadRepoMeta(), 15000)
     return () => clearTimeout(timer)
+  }, [])
+
+  useEffect(() => {
+    void loadLocal()
   }, [])
 
   useEffect(() => {
@@ -140,10 +328,16 @@ export function RulesPage() {
   }
 
   const restoreDefaults = async () => {
-    const defaults = DEFAULT_RULES.map((d) => ({ ...d, id: `default-${d.name.toLowerCase()}` }))
+    // 内置内容以 shared 的 DEFAULT_RULES 为准（AGE / sorani / aafun 来自 resources/rules/*.json），
+    // 恢复的就是"随应用分发的那三版"，与仓库版本无关
+    const defaults = DEFAULT_RULES.map((d) => ({
+      ...d,
+      id: `default-${d.name.toLowerCase()}`,
+      origin: 'builtin' as const
+    }))
     const custom = rules.filter((r) => !r.id.startsWith('default-'))
     await persist([...custom, ...defaults])
-    toast.success('默认规则已恢复')
+    toast.success('内置规则已恢复（AGE / sorani / aafun 等）')
   }
 
   const patch = (fn: (d: PlayRule) => PlayRule) => {
@@ -183,6 +377,18 @@ export function RulesPage() {
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            icon={Archive}
+            data-testid="rules-local-open"
+            onClick={() => {
+              setLocalOpen(true)
+              void loadLocal()
+            }}
+          >
+            本地库 {localEntries.length > 0 ? `(${localEntries.length})` : ''}
+          </Button>
           <Button
             variant="outline"
             size="sm"
@@ -253,6 +459,13 @@ export function RulesPage() {
               <div className="flex flex-wrap items-center gap-1.5">
                 <Badge tone={rule.enabled ? 'ok' : 'neutral'}>{rule.enabled ? '启用' : '停用'}</Badge>
                 <Badge>{rule.search.type === 'xpath' ? 'XPath' : 'API'}</Badge>
+                {/*
+                  来源徽标（v0.3.9）：用户要求"如实显示当前用的是 git 版还是本地版"。
+                  内置版单独用 accent 标出来，因为那三条是随应用分发的、最可靠的一版。
+                */}
+                <Badge tone={ruleOriginOf(rule) === 'builtin' ? 'ok' : 'neutral'}>
+                  {originLabel(ruleOriginOf(rule))}
+                </Badge>
                 <span className="text-[10px] text-faint">v{rule.version}</span>
               </div>
             </div>
@@ -559,6 +772,113 @@ export function RulesPage() {
             }}
           >
             导入所选 {repoSelected.size} 条
+          </Button>
+        </div>
+      </Modal>
+
+      {/*
+        本地库（v0.3.9，用户要求）。
+
+        用户原话：「规则设置中新增本地库，修改过的规则全部放在本地库中（任何修改都是），
+        当从 git 规则库中导入的规则或者从 git 规则库中更新的规则跑不通时，我们还有本地库可以替换使用。」
+
+        这里的每一条都是**真实可用的一版规则快照**（不是只显示名字的列表）：
+        点「用这版替换」会把该快照内容写回 rules 并立刻生效（搜索/选集读的就是 rules），
+        并且如实把该规则标成"本地版"。
+      */}
+      <Modal open={localOpen} onClose={() => setLocalOpen(false)} title="规则本地库" width={720}>
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <span className="text-xs text-dim">
+            共 {localEntries.length} 条历史版本 · 规则被修改/被仓库覆盖时都会自动留一份
+          </span>
+          <div className="ml-auto flex flex-wrap gap-2">
+            <Button size="sm" variant="outline" icon={Download} data-testid="rules-local-export" onClick={exportLocal} disabled={localEntries.length === 0}>
+              导出
+            </Button>
+            <Button size="sm" variant="outline" icon={Copy} onClick={() => void copyLocal()} disabled={localEntries.length === 0}>
+              复制 JSON
+            </Button>
+            <Button size="sm" variant="outline" icon={Upload} data-testid="rules-local-import" onClick={() => localFileRef.current?.click()}>
+              导入
+            </Button>
+            {/* 真文件选择：导入读的是用户自己选的 json，不弹任何自造对话框 */}
+            <input
+              ref={localFileRef}
+              type="file"
+              accept="application/json,.json"
+              data-testid="rules-local-file"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0]
+                e.target.value = ''
+                if (f) void importLocalFile(f)
+              }}
+            />
+          </div>
+        </div>
+
+        <div className="max-h-[52vh] overflow-y-auto pr-1">
+          {localEntries.length === 0 ? (
+            <div className="py-10 text-center text-xs text-faint">
+              本地库还是空的
+              <div className="mt-1">规则一旦被修改（或从仓库导入/更新），这里就会自动留下可回退的版本</div>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-1.5">
+              {localEntries.map((entry) => {
+                const current =
+                  rules.find((r) => r.id === entry.ruleId) ?? rules.find((r) => r.name === entry.name)
+                const isCurrent = !!current && current.version === entry.version
+                return (
+                  <div
+                    key={entry.id}
+                    className="flex flex-col gap-1.5 rounded-lg border border-border px-3 py-2"
+                    data-testid={`rules-local-entry-${entry.name.toLowerCase()}`}
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-medium">{entry.name}</span>
+                      <Badge tone={entry.origin === 'builtin' ? 'ok' : 'neutral'}>{originLabel(entry.origin)}</Badge>
+                      <Badge>{`v${entry.version}`}</Badge>
+                      <span className="text-[11px] text-faint">{reasonLabel(entry.reason)}</span>
+                      <span className="ml-auto text-[10px] text-faint">{fmtFullTime(entry.savedAt)}</span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {/* 版本/来源/时间三者对照，用户一眼能看出"当前这版和库里这版差在哪" */}
+                      <span className="text-[11px] text-dim">
+                        {current
+                          ? `当前：${originLabel(ruleOriginOf(current))} v${current.version}${isCurrent ? '（与这条版本号相同）' : ''}`
+                          : '当前：规则列表中已不存在这条'}
+                      </span>
+                      <div className="ml-auto flex gap-2">
+                        <Button
+                          size="sm"
+                          variant="soft"
+                          icon={RotateCcw}
+                          data-testid={`rules-local-apply-${entry.name.toLowerCase()}`}
+                          onClick={() => void applyLocalEntry(entry)}
+                        >
+                          用这版替换
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          icon={Trash2}
+                          onClick={() => void deleteLocalEntry(entry.id)}
+                        >
+                          删除
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="mt-4 flex justify-end">
+          <Button variant="ghost" onClick={() => setLocalOpen(false)}>
+            关闭
           </Button>
         </div>
       </Modal>

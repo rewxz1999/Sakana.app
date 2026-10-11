@@ -53,11 +53,16 @@ const snippet = [
   `const CHIP_STEP = ${grabConst('CHIP_STEP')}`,
   `const EARLIEST_YEAR = ${grabConst('EARLIEST_YEAR')}`,
   `const SETTLE_MS = ${grabConst('SETTLE_MS')}`,
+  `const ALL_SEASONS = ${grabConst('ALL_SEASONS')}`,
   // seasonIndexOfMonth 用项目里那一份真实实现的同一算法（1-3 冬 / 4-6 春 / 7-9 夏 / 10-12 秋）
   `const seasonIndexOfMonth = (month: number): number => { const m = Math.min(12, Math.max(1, Math.trunc(month) || 1)); return Math.floor((m - 1) / 3) + 1 }`,
   grabFunction('seasonOrderFor'),
   grabFunction('axisIndexAtScroll'),
-  'export { CHIP_W, CHIP_GAP, CHIP_STEP, EARLIEST_YEAR, SETTLE_MS, seasonOrderFor, axisIndexAtScroll }'
+  // v0.3.9 新增：「季节筛选 → 要取哪几季」与「还缺哪几季」这两条纯逻辑
+  grabFunction('seasonsForFilter'),
+  grabFunction('loadOrderFor'),
+  grabFunction('missingSeasons'),
+  'export { CHIP_W, CHIP_GAP, CHIP_STEP, EARLIEST_YEAR, SETTLE_MS, ALL_SEASONS, seasonOrderFor, axisIndexAtScroll, seasonsForFilter, loadOrderFor, missingSeasons }'
 ].join('\n')
 
 mkdirSync(join(root, '.e2e'), { recursive: true })
@@ -70,7 +75,19 @@ writeFileSync(
 
 const mod = await import(pathToFileURL(snippetFile).href)
 
-const { CHIP_W, CHIP_GAP, CHIP_STEP, EARLIEST_YEAR, SETTLE_MS, seasonOrderFor, axisIndexAtScroll } = mod
+const {
+  CHIP_W,
+  CHIP_GAP,
+  CHIP_STEP,
+  EARLIEST_YEAR,
+  SETTLE_MS,
+  ALL_SEASONS,
+  seasonOrderFor,
+  axisIndexAtScroll,
+  seasonsForFilter,
+  loadOrderFor,
+  missingSeasons
+} = mod
 
 let passed = 0
 const failures = []
@@ -128,7 +145,38 @@ check('四个季度一个不少（去重且长度恒为 4）', [1, 2, 3, 4].ever
 check('四个季度互不重复', [1, 2, 3, 4].every((m) => new Set(seasonOrderFor(2026, new Date(2026, m - 1, 15))).size === 4), true)
 
 // ------------------------------------------------------------------
-section('4. 静态接线检查（读组件源码）')
+section('4. 季节筛选（v0.3.9 第二轮筛选）')
+check('「全部」用 0 表示', ALL_SEASONS, 0)
+check('全部 → 四季', seasonsForFilter(ALL_SEASONS), [1, 2, 3, 4])
+check('夏 → 只有夏', seasonsForFilter(3), [3])
+check('冬 → 只有冬', seasonsForFilter(1), [1])
+check('脏值（9 / -1 / NaN / 小数）一律回退到「全部」', [
+  seasonsForFilter(9),
+  seasonsForFilter(-1),
+  seasonsForFilter(NaN),
+  seasonsForFilter(ALL_SEASONS)
+], [[1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4]])
+check('小数按截断处理（3.7 → 夏）', seasonsForFilter(3.7), [3])
+
+section('5. 按需加载：取数顺序与「只补缺的那几季」')
+const SEP = new Date('2026-09-29T12:00:00')
+check('历史年份 + 全部：冬→春→夏→秋', loadOrderFor(2019, ALL_SEASONS, SEP), [1, 2, 3, 4])
+check('今年（9 月=夏）+ 全部：先夏再补齐', loadOrderFor(2026, ALL_SEASONS, SEP), [3, 1, 2, 4])
+check('今年 + 只选夏：**只取 1 季**（不是整年 4 季，这是本轮「数据量太大」的落点）', loadOrderFor(2026, 3, SEP), [3])
+check('今年 + 只选冬：顺序里也只剩冬', loadOrderFor(2026, 1, SEP), [1])
+check('历史年份 + 只选秋', loadOrderFor(2019, 4, SEP), [4])
+check('取数顺序是 seasonOrderFor 的子序列（不另写一套顺序）', loadOrderFor(2026, ALL_SEASONS, SEP).every((s) => seasonOrderFor(2026, SEP).includes(s)), true)
+
+const none = new Set()
+const winterLoaded = new Set(['2026:1'])
+check('一季都没取过 + 全部 → 四季都缺', missingSeasons(2026, ALL_SEASONS, none, none), [1, 2, 3, 4])
+check('已取过冬 + 全部 → 只缺春/夏/秋', missingSeasons(2026, ALL_SEASONS, winterLoaded, none), [2, 3, 4])
+check('已取过冬 + 只选冬 → 没有可取的（按钮该变成「已加载」而不是再发一次请求）', missingSeasons(2026, 1, winterLoaded, none), [])
+check('正在飞的不重复发（inflight 也算「不缺口」）', missingSeasons(2026, ALL_SEASONS, winterLoaded, new Set(['2026:2'])), [3, 4])
+check('换一年后缺口重新算（缓存键带年份）', missingSeasons(2019, ALL_SEASONS, winterLoaded, none), [1, 2, 3, 4])
+
+// ------------------------------------------------------------------
+section('6. 静态接线检查（读组件源码）')
 // 横轴：容器 gap 必须 == CHIP_GAP，且卡上不能再写 margin（这就是 v0.3.7 那个 bug）
 const axisTag = src.slice(src.indexOf('ref={axisRef}'), src.indexOf('ref={axisRef}') + 700)
 check('横轴容器带 gap-1.5（= 6px）', /gap-1\.5/.test(axisTag), true)
@@ -137,19 +185,29 @@ check('横轴内边距用 calc(50% - 半张卡) 让首尾也能居中', src.incl
 check('滚动位置换算只走 axisIndexAtScroll（不另写一套）', /years\[axisIndexAtScroll\(/.test(src), true)
 check('滚轮用原生非 passive 监听（React 的 onWheel 是 passive，preventDefault 无效）', src.includes("addEventListener('wheel', onWheel, { passive: false })"), true)
 check('支持按住拖动（setPointerCapture）', src.includes('setPointerCapture'), true)
-// 加载只依赖「选中年份」，不依赖「待选年份」——这就是「停下才加载」的实现方式
-check('加载只由 year 触发', /if \(open\) loadYear\(year\)/.test(src), true)
-check('加载的依赖数组里只有 year（没有 pendingYear）', /\}, \[open, year, loadYear\]\)/.test(src), true)
-check('滚动处理里不调用 loadYear（滚动中绝不加载）', /onAxisScroll[\s\S]{0,1200}?loadYear/.test(src), false)
 check('停下后才提交年份（settleTimer 里 setYear）', /settleTimer\.current = window\.setTimeout\(\(\) => \{[\s\S]{0,200}?setYear\(y\)/.test(src), true)
+check('滚动处理里不取数（滚动中绝不加载）', /onAxisScroll[\s\S]{0,1200}?loadScope/.test(src), false)
+
+// v0.3.9：切换年份/季节**不再自动取数**，只有一个取数入口、只由按钮触发
+check('取数入口只有一个（api.bangumi.season 只出现 1 次）', (src.match(/\.season\(/g) || []).length, 1)
+check('没有「打开/切年就自动加载」的 effect', /useEffect\(\(\) => \{\s*if \(open\)[^)]*\)?\s*load/.test(src), false)
+check('没有按 [open, year] 触发加载的 effect', /\[open, year[^\]]*\]/.test(src), false)
+check('「加载」按钮绑定 loadScope', /onClick=\{loadScope\}/.test(src), true)
+check('单季也能单独加载（未加载的那一季里有「只加载 X季」入口）', /只加载 \{seasonShortLabel\(year, s\)\}/.test(src), true)
+check('加载中有进度（k/n 季）', /正在加载 \{scopeArrived\}\/\{scope\.length\} 季/.test(src), true)
+check('加载完成后按钮消失、换成状态文字（不留假按钮）', /scopeDone \? \([\s\S]{0,300}?已加载 \{scopeLabel\}/.test(src), true)
+check('未加载 ≠ 空列表（单独一句「没有加载」提示）', src.includes('还没有加载'), true)
+check('季节标签可点（切换筛选）', /onClick=\{\(\) => setSeasonFilter\(s\)\}/.test(src), true)
+check('季节标签带状态点/计数（一眼看出哪一季有数据）', /arrived \? 'bg-ok' : 'border border-faint'/.test(src), true)
 // 屏蔽规则
 check('复用番剧表屏蔽配置', src.includes('useScheduleBlock') && src.includes('blockReason'), true)
 check('显示「已隐藏 N 部」', src.includes('已隐藏'), true)
 // 缓存说明
-check('说明里写清了本地缓存（主进程季度缓存）', /7 天/.test(src), true)
+check('说明里写清了本地缓存（主进程季度缓存 7 天）', /7 天/.test(src), true)
+check('说明里写清了封面走既有图片磁盘缓存（不复用 sakanana-img 那套就说明没做）', /sakana-img:\/\/fetch/.test(src) && /fetchImageWithCache/.test(src), true)
 
 // ------------------------------------------------------------------
-section('5. 与番剧表页面的接线')
+section('7. 与番剧表页面的接线')
 const schedule = readFileSync(join(root, 'src', 'renderer', 'src', 'pages', 'SchedulePage.tsx'), 'utf8')
 check('番剧表引入了历史表弹窗', schedule.includes("from '@/components/HistoryTableModal'"), true)
 check('时间区域是可点按钮（不是 div）', /title="点击查看历史表/.test(schedule), true)

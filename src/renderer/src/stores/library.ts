@@ -2,10 +2,12 @@ import { create } from 'zustand'
 import type {
   FavoriteItem,
   SubHistoryItem,
-  WatchHistoryItem
+  WatchHistoryItem,
+  WatchProgressItem
 } from '@shared/types'
 import { api } from '@/lib/api'
 import { toast } from '@/stores/app'
+import { useWatchProgress } from '@/stores/watchProgress'
 
 export type FavoriteSubjectInput = {
   id: number
@@ -39,6 +41,15 @@ interface LibraryState {
   keyConcerns: number[]
   watchHistory: WatchHistoryItem[]
   subHistory: SubHistoryItem[]
+  /**
+   * 「每个条目看过哪些集」的长期聚合（v0.3.9 体检 H4/M7）。
+   *
+   * 为什么要单独存一份：`isCompleted()` 以前只看 `watchHistory`，而历史是**流水**且只有 1000 条上限
+   * （手机端同步合并回来的记录也算在里面）。重度用户看过几百集之后，最早的记录会被挤掉，
+   * 于是「已看完」的番会**自己变回未看完** —— 收藏页徽标、番剧表的"只看在看"筛选跟着一起乱。
+   * 这里按 subjectId 聚合集号、不受流水条数限制；`watchHistory` 仍然只当"最近观看"用。
+   */
+  watchedEps: Record<number, number[]>
   loaded: boolean
   enriched: boolean // 本会话是否已做过详情补全
   load: () => Promise<void>
@@ -55,7 +66,15 @@ interface LibraryState {
   refreshFavoriteRatings: () => Promise<void>
 }
 
-/** 已看完判定：手动标记过，或观看记录覆盖全部集数 */
+/**
+ * 已看完判定：手动标记过，或观看记录覆盖全部集数。
+ *
+ * ⚠️ v0.3.9：集号来源 = `watchHistory`（当前这份，参数传入）**并上**持久化的聚合 `watchedEps`。
+ * 只看前者会在历史被截断（上限 1000 条）后把"已看完"判成"没看完"；
+ * 后者是长期聚合，二者取并集即可，代价只是多一次对象查表。
+ * 直接读 store 而不改签名，是为了不动四个调用点（它们都已经订阅了 watchHistory，
+ * 而聚合与历史在 `addWatch` 里是同步更新的，所以重渲染时机不会有问题）。
+ */
 export function isCompleted(fav: FavoriteItem, history: WatchHistoryItem[]): boolean {
   if (fav.watchedAt) return true
   if (fav.eps && fav.eps > 0) {
@@ -63,9 +82,66 @@ export function isCompleted(fav: FavoriteItem, history: WatchHistoryItem[]): boo
     for (const h of history) {
       if (h.subjectId === fav.subjectId && h.episode != null) eps.add(h.episode)
     }
+    // 并上长期聚合（见 watchedEps 的说明）：历史被截断也不会丢掉"看过哪些集"
+    for (const ep of useLibrary.getState().watchedEps[fav.subjectId] ?? []) eps.add(ep)
+    /*
+     * 再并上**当前**的观看进度（v0.3.9 体检 H4/M7 的关键一步）：
+     * 在线播放写进 watchHistory 的 episode 恒为 null，真正的集号在 watchProgress 里
+     * （`watched: ["0:0"]`）。以前"已看完"只看历史 → 在线看的番**永远判不出已看完**；
+     * 而卡片上"观看到第 N 集"用的是 watchProgress → 同一张卡上两个结论互相打脸。
+     */
+    for (const ep of watchedEpsFromProgress(fav.subjectId)) eps.add(ep)
     return eps.size >= fav.eps
   }
   return false
+}
+
+/**
+ * 从观看历史流水 + 观看进度推出「每个条目看过哪些集」（v0.3.9 体检 H4 的首次迁移用）。
+ * 只在本地没有聚合数据时跑一次；之后由 `addWatch` 与 `isCompleted` 的实时读取继续兜着。
+ *
+ * ⚠️ 两个来源都要用：`watchHistory` 里**在线播放的 episode 恒为 null**（只有本地播放才写集号），
+ * 真正带集号的是 `watchProgress`（`watched: ["0:0"]`，键为 `组:集序号`，对外集号 = 序号 + 1）。
+ */
+function deriveWatchedEps(
+  history: WatchHistoryItem[],
+  progress: WatchProgressItem[]
+): Record<number, number[]> {
+  const map: Record<number, number[]> = {}
+  const add = (sid: number, ep: number): void => {
+    const list = map[sid] ?? (map[sid] = [])
+    if (!list.includes(ep)) list.push(ep)
+  }
+  for (const h of history) {
+    if (h.subjectId == null || h.episode == null) continue
+    add(h.subjectId, h.episode)
+  }
+  for (const p of progress) {
+    if (p.subjectId == null) continue
+    for (const ep of episodesOfProgress(p)) add(p.subjectId, ep)
+  }
+  for (const key of Object.keys(map)) map[Number(key)].sort((a, b) => a - b)
+  return map
+}
+
+/** 一条进度记录里"看过哪些集"（`watched` 的键是 `组:集序号`，对外集号从 1 起算） */
+function episodesOfProgress(p: WatchProgressItem): number[] {
+  const out: number[] = []
+  for (const key of p.watched ?? []) {
+    const idx = Number(String(key).split(':')[1])
+    if (Number.isFinite(idx)) out.push(idx + 1)
+  }
+  return out
+}
+
+/** 从当前进度库里取某个条目"看过哪些集"（进度库本身有 300 条上限，所以只当实时来源之一） */
+function watchedEpsFromProgress(subjectId: number): number[] {
+  const out: number[] = []
+  for (const p of useWatchProgress.getState().items) {
+    if (p.subjectId !== subjectId) continue
+    out.push(...episodesOfProgress(p))
+  }
+  return out
 }
 
 /**
@@ -79,6 +155,7 @@ export const useLibrary = create<LibraryState>((set, get) => ({
   keyConcerns: [],
   watchHistory: [],
   subHistory: [],
+  watchedEps: {},
   loaded: false,
   enriched: false,
   load: async () => {
@@ -96,17 +173,31 @@ export const useLibrary = create<LibraryState>((set, get) => ({
       storeSubscribed = true
       api.store.onChanged(() => void get().load())
     }
-    const [f, k, w, s] = await Promise.all([
+    const [f, k, w, s, we, wp] = await Promise.all([
       api.store.get('favorites'),
       api.store.get('keyConcerns'),
       api.store.get('watchHistory'),
-      api.store.get('subHistory')
+      api.store.get('subHistory'),
+      api.store.get('watchedEps'),
+      // 迁移要用它里面的真实集号（在线播放的历史里 episode 是 null，见 deriveWatchedEps）
+      api.store.get('watchProgress')
     ])
+    const history = w.ok && Array.isArray(w.data) ? (w.data as WatchHistoryItem[]) : []
+    const progress = wp.ok && Array.isArray(wp.data) ? (wp.data as WatchProgressItem[]) : []
+    /*
+     * 聚合的读取与迁移（v0.3.9 体检 H4）：老用户盘上没有 watchedEps，就用**历史 + 观看进度**推一份出来
+     * （在线播放的集号只在进度里，所以两个来源都要），之后由 addWatch 持续累加。
+     */
+    const storedEps = we.ok && we.data && typeof we.data === 'object' ? (we.data as Record<number, number[]>) : null
+    const watchedEps =
+      storedEps && Object.keys(storedEps).length > 0 ? storedEps : deriveWatchedEps(history, progress)
+    if (!storedEps || Object.keys(storedEps).length === 0) void api.store.set('watchedEps', watchedEps)
     set({
       favorites: f.ok && Array.isArray(f.data) ? (f.data as FavoriteItem[]) : [],
       keyConcerns: k.ok && Array.isArray(k.data) ? (k.data as number[]) : [],
-      watchHistory: w.ok && Array.isArray(w.data) ? (w.data as WatchHistoryItem[]) : [],
+      watchHistory: history,
       subHistory: s.ok && Array.isArray(s.data) ? (s.data as SubHistoryItem[]) : [],
+      watchedEps,
       loaded: true
     })
     // 后台补全缺失的放送年份/类型/评分/集数（修复「当年番剧被判为未知年份」）
@@ -225,14 +316,40 @@ export const useLibrary = create<LibraryState>((set, get) => ({
     ].slice(0, 1000)
     set({ watchHistory: next })
     void api.store.set('watchHistory', next)
+    /*
+     * 同步更新"看过哪些集"的长期聚合（v0.3.9 体检 H4）。
+     * 为什么和流水一起写：历史会在 1000 条处截断，聚合不能跟着丢；
+     * 只在有 subjectId 与集号时记（本地文件、没有条目归属的记录记了也没用）。
+     */
+    const sid = entry.subjectId
+    if (sid != null && entry.episode != null) {
+      const cur = get().watchedEps[sid] ?? []
+      if (!cur.includes(entry.episode)) {
+        const merged = { ...get().watchedEps, [sid]: [...cur, entry.episode].sort((a, b) => a - b) }
+        set({ watchedEps: merged })
+        void api.store.set('watchedEps', merged)
+      }
+    }
   },
   addSubHistory: (kind, title, detail) => {
-    const next = [
-      { id: crypto.randomUUID(), kind, title, detail, at: Date.now() },
-      ...get().subHistory
-    ].slice(0, 500)
-    set({ subHistory: next })
-    void api.store.set('subHistory', next)
+    /*
+     * ⚠️ 必须先读一次磁盘再合并（v0.3.9 体检 H2）。
+     *
+     * `subHistory` 有**两个写入方**：主进程（订阅 / 订阅并下载这些动作，见 ipc.ts 的 addSubHistory）
+     * 与渲染层（取消订阅 / 确认下载走这里）。渲染层以前拿"本窗口启动那份快照"整份回写，
+     * 于是「先订阅（主进程写一条）→ 不重启就取消订阅（渲染层用旧快照覆盖）」会把刚记的那条吃掉，
+     * 表现是订阅历史时多时少、缺条目。
+     * 读-合并-写把丢失概率压到极低；彻底的做法是把 subHistory 也收归主进程单写（记为后续项）。
+     */
+    const entry = { id: crypto.randomUUID(), kind, title, detail, at: Date.now() }
+    const optimistic = [entry, ...get().subHistory].slice(0, 500)
+    set({ subHistory: optimistic })
+    void api.store.get('subHistory').then((cur) => {
+      const base = cur.ok && Array.isArray(cur.data) ? (cur.data as SubHistoryItem[]) : get().subHistory
+      const next = [entry, ...base.filter((x) => x.id !== entry.id)].slice(0, 500)
+      set({ subHistory: next })
+      void api.store.set('subHistory', next)
+    })
   },
   toggleWatched: (subjectId) => {
     const favorites = get().favorites

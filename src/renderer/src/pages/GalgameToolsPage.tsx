@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowLeft, AudioLines, Camera, FolderOpen, Keyboard, Mic2, ScanLine, Wand2 } from 'lucide-react'
+import { ArrowLeft, Camera, FolderOpen, Hammer, Keyboard, ScanLine, Users, Wand2 } from 'lucide-react'
 import type { GalToolsConfig } from '@shared/types'
 import { DEFAULT_GAL_TOOLS } from '@shared/types'
 import { api } from '@/lib/api'
@@ -145,19 +145,19 @@ export function GalgameToolsPage() {
         <div>
           <div className="flex items-center gap-2">
             <h1 className="text-lg font-bold">Galgame 工具</h1>
-            <span className="rounded-full bg-accent/15 px-2 py-0.5 text-[10px] font-medium text-accent whitespace-nowrap">截屏助手</span>
+            <span className="rounded-full bg-accent/15 px-2 py-0.5 text-[10px] font-medium text-accent whitespace-nowrap">galgame 助手</span>
           </div>
           <p className="mt-0.5 text-xs text-faint">配置截图快捷方式，游戏内随时截图不打断</p>
         </div>
       </div>
 
       <div className="mt-4 flex max-w-3xl flex-col gap-4 pb-10">
-        {/* 截图助手开关 */}
+        {/* galgame 助手（原「截图助手」）开关 */}
         <section className="rounded-xl border border-border bg-elev1 p-4">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <div className="flex items-center gap-2 text-sm font-semibold">
-                <Camera size={15} className="text-accent" /> 截图助手
+                <Camera size={15} className="text-accent" /> galgame 助手
               </div>
               <p className="mt-0.5 text-[11px] leading-relaxed text-faint">
                 开启后注册全局快捷键，只截取正在运行的 galgame 窗口画面（保存为 PNG）。
@@ -266,9 +266,9 @@ export function GalgameToolsPage() {
         <div className="mt-2">
           <div className="mb-2 text-xs font-semibold text-dim">更多工具正在开发…</div>
           <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-            <GhostCard icon={Mic2} name="语音朗读" desc="朗读游戏剧情文本（TTS）" />
+            <GhostCard icon={Users} name="角色立绘提取" desc="提取游戏角色立绘素材" />
             <GhostCard icon={ScanLine} name="文本提取" desc="提取游戏内文本 / 存档" />
-            <GhostCard icon={AudioLines} name="BGM 识别" desc="识别并收藏游戏原声" />
+            <GhostCard icon={Hammer} name="制作 galgame，也许能做出来？" desc="制作自己的 galgame" />
           </div>
         </div>
       </div>

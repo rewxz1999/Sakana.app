@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ArrowLeft, type LucideIcon } from 'lucide-react'
+import { ArrowLeft, ChevronRight, type LucideIcon } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '@/lib/api'
 import { toast } from '@/stores/app'
@@ -83,6 +83,46 @@ export function SubPage({
         {children}
       </div>
     </div>
+  )
+}
+
+/**
+ * 设置入口行：图标 + 标题 + 一行说明 + 右侧箭头（v0.3.9 从设置总览页提到这里共用）。
+ *
+ * 为什么放到共用组件里：v0.3.9 把设置项按「区域」重新排布，番剧表与过滤区域下的
+ * 「番剧表设置」也要用它指向黑名单 / 屏蔽表两个子页 —— 两处各写一份必然出现
+ * 间距、hover、箭头颜色慢慢跑偏，所以只留一份实现。
+ *
+ * `aside` 用来放右侧的小字（例如「3 部」「4 条规则」），是可选的现状提示，不是按钮。
+ */
+export function OpenRow({
+  icon: Icon,
+  title,
+  desc,
+  aside,
+  onOpen
+}: {
+  icon: LucideIcon
+  title: string
+  desc: string
+  aside?: React.ReactNode
+  onOpen: () => void
+}) {
+  return (
+    <button
+      onClick={onOpen}
+      className="group flex w-full items-center gap-3 rounded-lg px-2.5 py-2.5 text-left transition-colors hover:bg-elev2"
+    >
+      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
+        <Icon size={15} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block text-xs font-medium">{title}</span>
+        <span className="mt-0.5 block truncate text-[11px] text-faint">{desc}</span>
+      </span>
+      {aside ? <span className="shrink-0 text-[11px] tabular-nums text-faint">{aside}</span> : null}
+      <ChevronRight size={14} className="shrink-0 text-faint transition-colors group-hover:text-accent" />
+    </button>
   )
 }
 

@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { HashRouter, Route, Routes, useLocation } from 'react-router-dom'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
@@ -26,6 +27,14 @@ import { GalgameToolsPage } from '@/pages/GalgameToolsPage'
 import { DownloadDetailPage } from '@/pages/DownloadDetailPage'
 import { DownloaderConfigPage } from '@/pages/DownloaderConfigPage'
 import { PlayerSettingsPage } from '@/pages/PlayerSettingsPage'
+// v0.3.9：设置项重新排布后新拆出的五个小窗口（设置总览里都有入口，不存在有路由没入口的孤儿页）
+import { PlaybackSettingsPage } from '@/pages/PlaybackSettingsPage'
+import { CastSettingsPage } from '@/pages/CastSettingsPage'
+import { ExperimentalSettingsPage } from '@/pages/ExperimentalSettingsPage'
+import { ScheduleBlacklistPage } from '@/pages/ScheduleBlacklistPage'
+import { ScheduleBlocklistPage } from '@/pages/ScheduleBlocklistPage'
+// v0.3.9 补充更新：在线播放设置（加速器档位 / 实时状态 / 优化记录与对比图）独立成设置项
+import { StreamBoostSettingsPage } from '@/pages/StreamBoostSettingsPage'
 // v0.3.4：番剧表设置（分级标签屏蔽 + 黑名单），从设置总览进入
 import { ScheduleSettingsPage } from '@/pages/ScheduleSettingsPage'
 import { CacheSettingsPage } from '@/pages/CacheSettingsPage'
@@ -54,6 +63,13 @@ const SMALL_WINDOW_TITLES: Record<string, string> = {
   '/downloader-config': '下载器配置',
   '/player-settings': '播放器设置',
   '/schedule-settings': '番剧表设置',
+  // v0.3.9：设置项重新排布拆出的窗口
+  '/playback-settings': '下载与播放',
+  '/stream-boost-settings': '在线播放设置',
+  '/cast-settings': '投屏设置',
+  '/experimental-settings': '测试性设置',
+  '/schedule-blacklist': '黑名单',
+  '/schedule-blocklist': '屏蔽表',
   '/cache-settings': '缓存设置',
   '/danmaku-settings': '弹幕设置',
   '/downloads-win': '下载详情',
@@ -117,6 +133,14 @@ function AnimatedRoutes() {
         <Route path="/schedule-settings" element={<PageTransition><ScheduleSettingsPage /></PageTransition>} />
         <Route path="/cache-settings" element={<PageTransition><CacheSettingsPage /></PageTransition>} />
         <Route path="/danmaku-settings" element={<PageTransition><DanmakuSettingsPage /></PageTransition>} />
+        {/* v0.3.9：设置项重新排布拆出的独立设置项（下载与播放 / 投屏 / 测试性 / 黑名单 / 屏蔽表） */}
+        <Route path="/playback-settings" element={<PageTransition><PlaybackSettingsPage /></PageTransition>} />
+        {/* v0.3.9 补充更新：在线播放设置（入口在设置总览「播放与下载」区域那一行） */}
+        <Route path="/stream-boost-settings" element={<PageTransition><StreamBoostSettingsPage /></PageTransition>} />
+        <Route path="/cast-settings" element={<PageTransition><CastSettingsPage /></PageTransition>} />
+        <Route path="/experimental-settings" element={<PageTransition><ExperimentalSettingsPage /></PageTransition>} />
+        <Route path="/schedule-blacklist" element={<PageTransition><ScheduleBlacklistPage /></PageTransition>} />
+        <Route path="/schedule-blocklist" element={<PageTransition><ScheduleBlocklistPage /></PageTransition>} />
         <Route path="/logs" element={<PageTransition><LogsPage /></PageTransition>} />
         <Route path="/about" element={<PageTransition><AboutPage /></PageTransition>} />
         <Route path="/save-dirs" element={<PageTransition><SaveDirsPage /></PageTransition>} />
@@ -189,6 +213,14 @@ function AppFrame() {
    * 这里必须放在函数最前面（早于下面几个 early return）：Hook 不能被条件分支跳过。
    */
   const immersive = useShell((s) => s.immersive)
+  /*
+   * 沉浸模式进/出时同步主窗口（v0.3.9）：进入自动全屏、退出恢复小窗口。
+   * 这里只发一次 IPC；「记住窗口几何」由主进程 win:immersive 负责，
+   * 保证无论从哪个入口退出（退出按钮 / Esc / 路由跳走）都走同一条恢复路径。
+   */
+  useEffect(() => {
+    void api.window.setImmersive(immersive)
+  }, [immersive])
   // 全屏控制栏悬浮窗：整窗透明，只有控制栏可见
   if (api.overlay.isOverlay || location.pathname.startsWith('/overlay')) {
     return (
@@ -240,9 +272,9 @@ function AppFrame() {
   }
   return (
     <div className="flex h-full flex-col overflow-hidden">
-      <TitleBar />
+      {/* 沉浸模式连顶部标题栏一起隐藏：整窗只剩壁纸（用户要求「顶部导航栏也要藏」） */}
+      {immersive ? null : <TitleBar />}
       <div className="flex min-h-0 flex-1">
-        {/* 沉浸模式隐藏导航栏：整窗只剩壁纸（TitleBar 保留，否则窗口就没法拖动/关闭了） */}
         {immersive ? null : <SideNav />}
         <main className="relative min-w-0 flex-1 overflow-hidden bg-bg">
           <ErrorBoundary>

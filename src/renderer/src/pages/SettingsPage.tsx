@@ -1,18 +1,20 @@
 import { useEffect, useState } from 'react'
-import type { LucideIcon } from 'lucide-react'
 import {
+  Ban,
   Camera,
-  ChevronRight,
+  Cast,
+  CirclePlay,
   CircleCheck,
   Database,
   Download,
   ExternalLink,
   FileText,
+  FlaskConical,
   FolderOpen,
   Gamepad2,
+  Gauge,
   HardDrive,
   Rocket,
-  Image,
   Info,
   Keyboard,
   ListFilter,
@@ -20,6 +22,7 @@ import {
   MonitorPlay,
   RefreshCw,
   ScrollText,
+  ShieldOff,
   Wifi,
   WifiOff
 } from 'lucide-react'
@@ -29,6 +32,7 @@ import { fmtDateTime } from '@/lib/format'
 import { toast, useSettings } from '@/stores/app'
 import { THEME_PRESETS } from '@/theme'
 import { Button, Input, Select, Spinner, Switch } from '@/components/ui'
+import { OpenRow } from '@/components/SettingsShell'
 
 function Section({ title, desc, children }: { title: string; desc?: string; children: React.ReactNode }) {
   return (
@@ -39,35 +43,6 @@ function Section({ title, desc, children }: { title: string; desc?: string; chil
       </div>
       {children}
     </section>
-  )
-}
-
-/** 统一入口行：图标 + 标题 + 一行说明 + 右侧箭头 */
-function OpenRow({
-  icon: Icon,
-  title,
-  desc,
-  onOpen
-}: {
-  icon: LucideIcon
-  title: string
-  desc: string
-  onOpen: () => void
-}) {
-  return (
-    <button
-      onClick={onOpen}
-      className="group flex w-full items-center gap-3 rounded-lg px-2.5 py-2.5 text-left transition-colors hover:bg-elev2"
-    >
-      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
-        <Icon size={15} />
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="block text-xs font-medium">{title}</span>
-        <span className="mt-0.5 block truncate text-[11px] text-faint">{desc}</span>
-      </span>
-      <ChevronRight size={14} className="shrink-0 text-faint transition-colors group-hover:text-accent" />
-    </button>
   )
 }
 
@@ -311,38 +286,162 @@ export function SettingsPage() {
       <h1 className="text-lg font-bold">设置</h1>
 
       <div className="mt-4 flex flex-col gap-4 pb-10">
-        {/* 外观 */}
-        <Section title="外观" desc="主题配色与界面外观">
-          <div className="flex flex-col gap-3">
-            <div>
-              <div className="mb-2 text-[11px] text-faint">主题配色</div>
-              <div className="flex gap-3">
-                {THEME_PRESETS.map((t) => (
-                  <button
-                    key={t.id}
-                    onClick={() => save({ theme: t.id })}
-                    className={`group flex w-24 flex-col items-center gap-1.5 rounded-xl border p-2.5 transition-all ${
-                      settings.theme === t.id ? 'border-accent bg-accent-soft' : 'border-border hover:border-accent/50'
-                    }`}
-                  >
-                    <span className="flex h-9 w-14 overflow-hidden rounded-lg border border-border">
-                      <span className="w-1/2" style={{ background: t.swatch[0] }} />
-                      <span className="w-1/2" style={{ background: t.swatch[1] }} />
-                    </span>
-                    <span className="text-[11px]">{t.label}</span>
-                    <span className="h-1.5 w-1.5 rounded-full" style={{ background: t.swatch[2] }} />
-                  </button>
-                ))}
-              </div>
-            </div>
-            {/* v0.3.1：按用户要求删除「导航栏背景」设置项（连同页面、IPC 与主进程实现一并移除） */}
-            {/* 番剧表设置入口（分级标签屏蔽 + 黑名单）：它改的是番剧表这一页显示什么，算界面偏好，所以放「外观」 */}
+        {/*
+          v0.3.9 结构性调整（用户原话：「由于播放设置中的设置项太多，我决定重新排布」）。
+          设置总览按**区域**分组，每个区域与每个入口都有一句中文说明它管什么：
+
+          · 播放与下载：播放器设置（内核/超分/音频/画面比例/内置组件）+ 播放与下载（行为开关）
+            + 下载器配置 + 快捷键 + 规则管理。原来「快捷键」面板内嵌在播放器设置页底部，
+            现在只保留独立的「快捷键」设置项；
+          · 弹幕：弹幕设置（v0.3.9 把 B 站弹幕从播放器设置并入）
+          · 投屏：投屏设置（v0.3.9 从播放器设置拆出的独立项）
+          · 番剧表与过滤：番剧表设置 + 黑名单 + 屏蔽表（v0.3.9 把后两者从番剧表设置里拆出来，
+            整个区域**与外观分开**，不再挂在外观下面）
+          · 外观：只剩主题配色
+          · 测试性：FFmpeg 与控制栏（v0.3.9 从播放器设置拆出）
+
+          注意：所有设置字段名都没动（settings.json 里仍是 ffmpegPath / uoscControlBar /
+          castStrategy / hlsAdFilter / biliDanmaku …），老用户升级后设置原样生效，只是位置变了。
+        */}
+
+        {/* 播放与下载 */}
+        <Section title="播放与下载" desc="播放内核与画质音质、播放行为、在线播放加速、下载器、快捷键与在线播放规则">
+          <div className="flex flex-col">
+            <OpenRow
+              icon={MonitorPlay}
+              title="播放器设置"
+              desc="播放内核（libmpv）、Anime4K 超分辨率、音频（音量增益/均衡器/压缩）、画面比例、内置组件"
+              onOpen={() => openSmall('/player-settings', 700, 620, '播放器设置')}
+            />
             <RowDivider />
+            {/*
+              说明文字要点名关键功能：设置总览是唯一的入口清单，
+              清单上看不到「超分」「广告过滤」这些词，用户就会以为功能没了（v0.3.2 踩过这个坑）。
+            */}
+            <OpenRow
+              icon={CirclePlay}
+              title="下载与播放"
+              desc="播放行为开关（在线播放剔除贴片广告、截图后自动复制到剪贴板）与下载 / 缓存目录现状"
+              onOpen={() => openSmall('/playback-settings', 700, 620, '下载与播放')}
+            />
+            <RowDivider />
+            {/*
+              v0.3.9 补充更新：在线播放加速器独立成设置项（用户要求「放在外面的播放与下载区域」）。
+              说明里必须点名「加速」「优化记录」「对比图」，否则总览上看不出这一行管什么。
+            */}
+            <OpenRow
+              icon={Gauge}
+              title="在线播放设置"
+              desc="在线播放加速（自动档位 / 强制加速 / 关闭）、当前是否在加速与实时速率，以及每次加速的真实效果记录与直连对比图"
+              onOpen={() => openSmall('/stream-boost-settings', 700, 620, '在线播放设置')}
+            />
+            <RowDivider />
+            <OpenRow
+              icon={Download}
+              title="下载器配置"
+              desc="内置 aria2 / 外部 qBittorrent / 双下载器，参数与连接测试"
+              onOpen={() => openSmall('/downloader-config', 720, 600, '下载器配置')}
+            />
+            <RowDivider />
+            <OpenRow
+              icon={Keyboard}
+              title="快捷键"
+              desc="播放器的播放/暂停、快进、音量、选集、截屏、退出等键位，可逐个自定义"
+              onOpen={() => openSmall('/shortcuts', 640, 620, '快捷键')}
+            />
+            <RowDivider />
+            <OpenRow
+              icon={ScrollText}
+              title="规则管理"
+              desc="播放规则（Kazumi 风格：XPath / API），支持从 Kazumi 规则仓库导入"
+              onOpen={() => openSmall('/rules', 800, 600, '规则管理')}
+            />
+          </div>
+        </Section>
+
+        {/* 弹幕 */}
+        <Section title="弹幕" desc="弹幕显示效果、渲染方式，以及 B 站弹幕（yt-dlp + biliass）">
+          <div className="flex flex-col">
+            <OpenRow
+              icon={MessagesSquare}
+              title="弹幕设置"
+              desc="弹幕开关、覆盖区域、同屏数量、时间轴、字号 / 透明度 / 速度、屏蔽词与 B 站弹幕脚本"
+              onOpen={() => openSmall('/danmaku-settings', 640, 620, '弹幕设置')}
+            />
+          </div>
+        </Section>
+
+        {/* 投屏 */}
+        <Section title="投屏" desc="投到电视（DLNA）或安卓接收端，以及双端同步">
+          <div className="flex flex-col">
+            <OpenRow
+              icon={Cast}
+              title="投屏设置"
+              desc="传输策略（自动 / 直连 / 中转 / 转码）、手动连接移动端、双端同步与接收端下载"
+              onOpen={() => openSmall('/cast-settings', 700, 620, '投屏设置')}
+            />
+          </div>
+        </Section>
+
+        {/* 番剧表与过滤（v0.3.9：与外观区域分开，黑名单/屏蔽表成为独立设置项） */}
+        <Section title="番剧表与过滤" desc="番剧表这条线：屏蔽总览、按具体番剧的黑名单与按标签的屏蔽表">
+          <div className="flex flex-col">
             <OpenRow
               icon={ListFilter}
               title="番剧表设置"
-              desc="分级标签屏蔽（美国 / 美漫 / 英国 / 子供向…）与黑名单，只影响番剧表，不影响搜索结果"
+              desc="本周会被屏蔽多少部、按什么原因屏蔽，以及下面两个子设置项的总览"
               onOpen={() => openSmall('/schedule-settings', 720, 640, '番剧表设置')}
+            />
+            <RowDivider />
+            <OpenRow
+              icon={Ban}
+              title="黑名单"
+              desc="针对某一部具体番剧的屏蔽清单（优先级最高），从本周番剧表点选加入或移出"
+              onOpen={() => openSmall('/schedule-blacklist', 720, 640, '黑名单')}
+            />
+            <RowDivider />
+            <OpenRow
+              icon={ShieldOff}
+              title="屏蔽表"
+              desc="按标签 / 关键词批量屏蔽（一~三级分级标签 + 四级自定义关键词），只作用于番剧表"
+              onOpen={() => openSmall('/schedule-blocklist', 720, 640, '屏蔽表')}
+            />
+          </div>
+        </Section>
+
+        {/* 外观 */}
+        <Section title="外观" desc="应用整体配色方案">
+          <div>
+            <div className="mb-2 text-[11px] text-faint">主题配色</div>
+            <div className="flex gap-3">
+              {THEME_PRESETS.map((t) => (
+                <button
+                  key={t.id}
+                  onClick={() => save({ theme: t.id })}
+                  className={`group flex w-24 flex-col items-center gap-1.5 rounded-xl border p-2.5 transition-all ${
+                    settings.theme === t.id ? 'border-accent bg-accent-soft' : 'border-border hover:border-accent/50'
+                  }`}
+                >
+                  <span className="flex h-9 w-14 overflow-hidden rounded-lg border border-border">
+                    <span className="w-1/2" style={{ background: t.swatch[0] }} />
+                    <span className="w-1/2" style={{ background: t.swatch[1] }} />
+                  </span>
+                  <span className="text-[11px]">{t.label}</span>
+                  <span className="h-1.5 w-1.5 rounded-full" style={{ background: t.swatch[2] }} />
+                </button>
+              ))}
+            </div>
+          </div>
+        </Section>
+
+        {/* 测试性 */}
+        <Section title="测试性" desc="实验性与排障用的开关，普通使用不需要改（放这里是为了不干扰日常设置）">
+          <div className="flex flex-col">
+            <OpenRow
+              icon={FlaskConical}
+              title="测试性设置"
+              desc="FFmpeg 路径（转码兜底 / 在线流中转）与播放器控制栏实现（应用控制栏 / mpv uosc）"
+              onOpen={() => openSmall('/experimental-settings', 700, 620, '测试性设置')}
             />
           </div>
         </Section>
@@ -375,60 +474,8 @@ export function SettingsPage() {
           </div>
         </Section>
 
-        {/* 下载与播放 */}
-        <Section title="下载与播放" desc="下载器、播放器内核与播放规则">
-          <div className="flex flex-col">
-            <OpenRow
-              icon={Download}
-              title="下载器配置"
-              desc="内置 aria2 / 外部 qBittorrent / 双下载器，参数与连接测试"
-              onOpen={() => openSmall('/downloader-config', 720, 600, '下载器配置')}
-            />
-            <RowDivider />
-            <OpenRow
-              icon={MonitorPlay}
-              title="播放器设置"
-              /*
-               * v0.3.2：这一行的说明必须点名「超分 / 画质」。
-               * 用户反馈「超分辨率设置不知所踪」——功能其实就在播放器设置页里（Anime4K 卡片），
-               * 但原来这里只写「播放内核、FFmpeg、快捷键」，用户在设置总览里看不到「画质」二字，
-               * 自然找不到入口。总览是唯一的入口清单，说明文字要点名关键功能。
-               */
-              desc="播放内核（libmpv）、Anime4K 超分与画质与音频（音量增益/均衡器/压缩）、FFmpeg 路径与快捷键"
-              onOpen={() => openSmall('/player-settings', 700, 620, '播放器设置')}
-            />
-            <RowDivider />
-            {/*
-              v0.3.6：补上「快捷键」总览入口（审计发现 `/shortcuts` 是**有路由但没有任何入口**的孤儿页）。
-              它的面板其实已经内嵌在播放器设置页里，但那个页面很长，用户很难意识到「快捷键可以在这里全部改」——
-              而设置总览是唯一的入口清单，清单上没有的东西等于不存在。
-              点进来是同一个面板（ShortcutsPage 只是给面板包了一层 SubPage 外壳）。
-            */}
-            <OpenRow
-              icon={Keyboard}
-              title="快捷键"
-              desc="播放器的播放/暂停、快进、音量、选集、截屏、退出等键位，可逐个自定义"
-              onOpen={() => openSmall('/shortcuts', 640, 620, '快捷键')}
-            />
-            <RowDivider />
-            <OpenRow
-              icon={MessagesSquare}
-              title="弹幕设置"
-              desc="弹幕开关、覆盖区域、同屏数量、时间轴、字号 / 透明度 / 速度与屏蔽词"
-              onOpen={() => openSmall('/danmaku-settings', 640, 620, '弹幕设置')}
-            />
-            <RowDivider />
-            <OpenRow
-              icon={ScrollText}
-              title="规则管理"
-              desc="播放规则（Kazumi 风格：XPath / API），支持从 Kazumi 规则仓库导入"
-              onOpen={() => openSmall('/rules', 800, 600, '规则管理')}
-            />
-          </div>
-        </Section>
-
         {/* Galgame */}
-        <Section title="Galgame" desc="游戏信息检测与截图助手">
+        <Section title="Galgame" desc="游戏信息检测与galgame 助手">
           <div className="flex flex-col gap-3">
             <div className="flex items-center justify-between gap-3">
               <div className="min-w-0 flex-1">
@@ -443,9 +490,22 @@ export function SettingsPage() {
               <Switch checked={settings.galgameDetect} onChange={(v) => save({ galgameDetect: v })} />
             </div>
             <RowDivider />
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 text-xs text-dim">
+                  <Gamepad2 size={13} className="text-accent" />
+                  内存识别 BGM / 章节
+                </div>
+                <div className="mt-0.5 text-[11px] leading-relaxed text-faint">
+                  仅读取游戏内存中的音频文件名与章节名，不会修改游戏任何数据；识别到的 BGM 见游戏卡片右键菜单，章节名显示在卡片上
+                </div>
+              </div>
+              <Switch checked={settings.galgameMemRead} onChange={(v) => save({ galgameMemRead: v })} />
+            </div>
+            <RowDivider />
             <OpenRow
               icon={Camera}
-              title="Galgame 工具（截屏助手）"
+              title="Galgame 工具（galgame 助手）"
               desc="游戏内截图快捷键、保存位置与悬浮拍摄按钮"
               onOpen={() => openSmall('/galgame/tools', 680, 600, 'Galgame 工具')}
             />

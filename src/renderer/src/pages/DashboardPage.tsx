@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Bookmark,
   CirclePlay,
@@ -7,11 +7,13 @@ import {
   Heart,
   History,
   Puzzle,
+  RefreshCw,
   Rss,
   Tv
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import type {
+  EpisodeProgress,
   FavoriteItem,
   PlayRule,
   RuleEpisodeGroup,
@@ -25,8 +27,18 @@ import { useSubs } from '@/stores/subs'
 import { useTools } from '@/stores/tools'
 import { useWatchProgress } from '@/stores/watchProgress'
 import { fmtDateTime, timeAgo } from '@/lib/format'
+import {
+  buildFavUpdateRows,
+  buildWatchedEpisodeMap,
+  currentSeasonFavorites,
+  localDateString,
+  shouldFetchEpisodeProgress,
+  type FavUpdateRow
+} from '@/lib/favUpdates'
+// 本季判据直接用收藏页那一份（@shared/favoritesSeason），保证仪表盘与收藏页的季度划分永远一致
+import { favoritesSeasonBucket } from '@shared/favoritesSeason'
 import { Ring } from '@/components/Ring'
-import { Badge, Button, EmptyState, ProgressBar, Select, Spinner } from '@/components/ui'
+import { Badge, Button, EmptyState, IconButton, Modal, ProgressBar, Select, Spinner } from '@/components/ui'
 import { CoverImage } from '@/components/CoverImage'
 import { toast } from '@/stores/app'
 
@@ -60,6 +72,41 @@ const KIND_LABEL = {
 
 /** 「继续观看」最多展示的条目数：卡片位于统计格内，条目过多会把整行撑高 */
 const CONTINUE_LIMIT = 3
+
+/**
+ * 收藏番剧分集进度的**会话内存缓存**（v0.3.9）。
+ * 主进程对 `bgm:episode-progress` 已有 6 小时 TTL，但每次调用仍要走一次 IPC + 缓存读；
+ * 仪表盘 ↔ 其它页面来回切换时不必重复问，10 分钟内直接用内存里的结果。
+ * 点「重新检测」会绕过这一层（主进程那层 6h TTL 仍在，见 favUpdates 的注释）。
+ */
+const favProgressCache = new Map<number, { at: number; data: EpisodeProgress | null }>()
+const FAV_PROGRESS_MEM_TTL = 10 * 60 * 1000
+
+/**
+ * 同一部番剧正在进行的请求合并。
+ * 为什么需要：React StrictMode（开发模式）会把 effect 跑两次，手动点「重新检测」也可能和自动检测叠上，
+ * 没有这层去重就会对同一部番重复发请求（主进程那层虽能挡住网络，但白跑一趟 IPC）。
+ * 失败不缓存：下次检测/手动刷新要能重试。
+ */
+const favProgressInflight = new Map<number, Promise<Awaited<ReturnType<typeof api.bangumi.episodeProgress>>>>()
+
+function fetchFavProgress(id: number): Promise<Awaited<ReturnType<typeof api.bangumi.episodeProgress>>> {
+  const running = favProgressInflight.get(id)
+  if (running) return running
+  const p = api.bangumi.episodeProgress(id)
+  favProgressInflight.set(id, p)
+  void p.finally(() => {
+    if (favProgressInflight.get(id) === p) favProgressInflight.delete(id)
+  })
+  return p
+}
+
+/**
+ * 分集进度请求的并发上限。
+ * 一部番一次请求（实测约 300ms），4 路并发能在十几秒内跑完一份几百部的收藏，
+ * 又不至于把 Bangumi 反代打成限流（同类批量取数在主进程里也是小并发）。
+ */
+const FAV_PROGRESS_CONCURRENCY = 4
 
 /**
  * 「继续观看」归一化条目。
@@ -105,10 +152,102 @@ export function DashboardPage() {
     if (!progressLoaded) void loadProgress()
   }, [progressLoaded, loadProgress])
 
+  /* ---------------- 收藏番剧更新（v0.3.9） ----------------
+   * 数据源与番剧详情页同一份：api.bangumi.episodeProgress(id)（主进程 /v0/episodes，6h TTL）。
+   * 判定口径（「更新几集」「看过最新一集就消失」）全部在 @/lib/favUpdates 里，页面只负责取数与渲染。
+   */
+  /** subjectId → 分集进度（null = 这次没取到，按无更新处理） */
+  const [favProgress, setFavProgress] = useState<ReadonlyMap<number, EpisodeProgress | null>>(new Map())
+  const [favLoading, setFavLoading] = useState(false)
+  const [favError, setFavError] = useState<string | null>(null)
+  const [favModalOpen, setFavModalOpen] = useState(false)
+  /** 本次检测的世代号：重新检测/离开页面后，旧批次的返回结果一律丢弃，避免覆盖新结果 */
+  const favRunRef = useRef(0)
+
+  /** 已看到第几集（收藏 × 观看历史 × 观看进度），见 lib/favUpdates 的集号口径说明 */
+  const watchedMaxByFav = useMemo(
+    () => buildWatchedEpisodeMap(favorites, watchHistory, progressItems),
+    [favorites, watchHistory, progressItems]
+  )
+
+  /**
+   * 只统计**本季**的收藏（v0.3.9 工单：上一版把 CLANNAD/无职转生这类老番也算进「有更新」，
+   * 用户明确说不对）。季度判据用收藏页那一份 `favoritesSeasonBucket`（adapter 见 lib/favUpdates）：
+   * 今天所在的季度由「把今天的日期丢进同一个函数」得出，所以不会出现两套划分。
+   */
+  const today = localDateString()
+  const seasonFavorites = useMemo(
+    () => currentSeasonFavorites(favorites, today, favoritesSeasonBucket),
+    [favorites, today]
+  )
+
+  const detectFavUpdates = useCallback(async (): Promise<void> => {
+    const run = favRunRef.current + 1
+    favRunRef.current = run
+    const day = localDateString()
+    // 只给「本季收藏」查分集进度：本季之外的收藏连请求都不发（老番不再出现、也不浪费请求）
+    const targets = seasonFavorites.filter((f) => shouldFetchEpisodeProgress(f, watchedMaxByFav, day))
+    // 会话内内存缓存：主进程有 6h TTL，但每次仍是一次 IPC + 缓存读；来回切页面时用内存挡住
+    const acc = new Map<number, EpisodeProgress | null>()
+    for (const f of targets) {
+      const hit = favProgressCache.get(f.subjectId)
+      if (hit && Date.now() - hit.at < FAV_PROGRESS_MEM_TTL) acc.set(f.subjectId, hit.data)
+    }
+    setFavProgress(new Map(acc))
+    setFavError(null)
+    const todo = targets.filter((f) => !acc.has(f.subjectId)).map((f) => f.subjectId)
+    if (todo.length === 0) {
+      setFavLoading(false)
+      return
+    }
+    setFavLoading(true)
+    let cursor = 0
+    let failed = 0
+    let lastFlush = 0
+    /** 渐进刷新界面：一部约 300ms，几十部收藏时不该等全部跑完才显示数字（250ms 节流） */
+    const flush = (final: boolean): void => {
+      const now = Date.now()
+      if (!final && now - lastFlush < 250) return
+      lastFlush = now
+      if (favRunRef.current === run) setFavProgress(new Map(acc))
+    }
+    const worker = async (): Promise<void> => {
+      while (cursor < todo.length) {
+        if (favRunRef.current !== run) return
+        const id = todo[cursor++]
+        const r = await fetchFavProgress(id)
+        if (favRunRef.current !== run) return
+        if (r.ok) {
+          acc.set(id, r.data)
+          favProgressCache.set(id, { at: Date.now(), data: r.data })
+        } else {
+          failed++
+          acc.set(id, null)
+        }
+        flush(cursor >= todo.length)
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(FAV_PROGRESS_CONCURRENCY, todo.length) }, worker))
+    if (favRunRef.current !== run) return
+    setFavProgress(new Map(acc))
+    setFavLoading(false)
+    if (failed > 0 && failed === todo.length) {
+      setFavError('检测失败：读不到 Bangumi 分集数据，请检查网络或数据源设置')
+    }
+  }, [seasonFavorites, watchedMaxByFav])
+
+  // 进页面（以及收藏/观看记录变化）时检测一次；命中内存缓存时是零请求的
+  useEffect(() => {
+    void detectFavUpdates()
+  }, [detectFavUpdates])
+
+  /** 有更新的行：同样只在本季收藏里算（老番不再计入，见 seasonFavorites 的说明） */
+  const favUpdateRows = useMemo(
+    () => buildFavUpdateRows({ favorites: seasonFavorites, progressBySubject: favProgress, watchedMap: watchedMaxByFav }),
+    [seasonFavorites, favProgress, watchedMaxByFav]
+  )
+
   const subUpdateCount = subscriptions.filter((s) => s.status === 'waiting' || s.status === 'updating').length
-  const favSubUpdateCount = subscriptions.filter(
-    (s) => (s.status === 'waiting' || s.status === 'updating') && favorites.some((f) => f.subjectId === s.subjectId)
-  ).length
 
   const activeDownloads = downloads.filter((d) => !['done', 'error'].includes(d.status))
 
@@ -379,31 +518,47 @@ export function DashboardPage() {
       {/* 更新动态 + 历史记录 */}
       <div className="mt-4 grid grid-cols-3 gap-3.5">
         <div className="rounded-xl border border-border bg-elev1 p-4">
-          <div className="mb-3 text-sm font-semibold">更新动态</div>
-          <div className="flex gap-3">
-            <div className="flex-1 rounded-lg bg-accent-soft p-3">
-              <div className="text-2xl font-bold text-accent">{subUpdateCount}</div>
-              <div className="mt-0.5 text-xs text-dim">订阅番剧更新</div>
-            </div>
-            <div className="flex-1 rounded-lg bg-elev2 p-3">
-              <div className="text-2xl font-bold">{favSubUpdateCount}</div>
-              <div className="mt-0.5 text-xs text-dim">收藏番剧更新</div>
-            </div>
+          <div className="mb-3 flex items-center justify-between">
+            <span className="text-sm font-semibold">更新动态</span>
+            {/* 手动重新检测：只重跑一遍判定（主进程 6h 缓存仍在），用于「刚才在别处看完了/加了收藏」后立即刷新 */}
+            <IconButton title="重新检测收藏番剧更新" onClick={() => void detectFavUpdates()}>
+              <RefreshCw size={13} className={favLoading ? 'animate-spin' : ''} />
+            </IconButton>
           </div>
-          {subUpdateCount > 0 ? (
-            <div className="mt-3 flex flex-wrap gap-1.5">
-              {subscriptions
-                .filter((s) => s.status === 'waiting' || s.status === 'updating')
-                .slice(0, 6)
-                .map((s) => (
-                  <Badge key={s.id} tone="accent">
-                    {s.nameCn || s.name}
-                  </Badge>
-                ))}
-            </div>
-          ) : (
-            <div className="mt-3 text-xs text-faint">所有订阅均为最新状态</div>
-          )}
+          <div className="flex gap-3">
+            {/*
+              订阅更新：用户要求「点击后直接跳转到订阅界面（不要再展开/无反应）」。
+              所以这里整块就是一个按钮，直接进订阅页确认下载。
+            */}
+            <button
+              type="button"
+              onClick={() => navigate('/subs')}
+              className="flex-1 rounded-lg border border-transparent bg-accent-soft p-3 text-left transition-colors hover:border-accent"
+            >
+              <div className="text-2xl font-bold tabular-nums text-accent">{subUpdateCount}</div>
+              <div className="mt-0.5 text-xs text-dim">订阅番剧更新</div>
+            </button>
+            {/*
+              收藏更新：点击弹窗列出「本季收藏里有更新」的番剧（口径见 @/lib/favUpdates）。
+              板块只留数字与入口，不再放口径说明文字（v0.3.9 工单要求）。
+            */}
+            <button
+              type="button"
+              onClick={() => setFavModalOpen(true)}
+              className="flex-1 rounded-lg border border-transparent bg-elev2 p-3 text-left transition-colors hover:border-accent"
+            >
+              <div className="flex h-8 items-center text-2xl font-bold tabular-nums">
+                {favLoading && favUpdateRows.length === 0 ? <Spinner size={16} /> : favUpdateRows.length}
+              </div>
+              <div className="mt-0.5 text-xs text-dim">收藏番剧更新</div>
+              {/* 只在「正在检测」与「没有更新」这两种状态下给状态字，其余情况数字本身就是答案 */}
+              {favLoading && favUpdateRows.length === 0 ? (
+                <div className="mt-1 text-[10px] leading-snug text-faint">正在检测…</div>
+              ) : favUpdateRows.length === 0 ? (
+                <div className="mt-1 text-[10px] leading-snug text-faint">暂无更新</div>
+              ) : null}
+            </button>
+          </div>
         </div>
 
         <div className="rounded-xl border border-border bg-elev1 p-4">
@@ -539,6 +694,57 @@ export function DashboardPage() {
         {/* 「最近更新」同时统计观看历史与观看进度（进度可能在历史之后才写入，如续播位置更新） */}
         {fmtDateTime(Math.max(...watchHistory.map((h) => h.watchedAt), ...progressItems.map((p) => p.updatedAt), 0))}
       </div>
+
+      {/*
+        收藏番剧更新弹窗（v0.3.9）：用户要求「点击这个板块后弹窗显示有更新的番剧列表
+        （可以快速进入番剧详情页，列表上显示更新了几集）」。
+        每行点一下就是 /subject/:id，进详情页继续追；行内同时给出「更新至第几集 / 你已看到第几集 / 新几集」，
+        这样「为什么这部算有更新」在界面上自解释。
+      */}
+      <Modal
+        open={favModalOpen}
+        onClose={() => setFavModalOpen(false)}
+        title={`收藏番剧更新 · 有更新 ${favUpdateRows.length} 部`}
+        width={560}
+      >
+        {favLoading && favUpdateRows.length === 0 ? (
+          <div className="flex items-center justify-center gap-2 py-10 text-xs text-dim">
+            <Spinner size={14} /> 正在检测…
+          </div>
+        ) : favUpdateRows.length === 0 ? (
+          // 空态只说结果：口径说明不放界面（v0.3.9 工单要求板块只留数据本身）
+          <EmptyState icon={Heart} title={favError ? '检测失败' : '暂无更新'} desc={favError ?? undefined} />
+        ) : (
+          <div className="flex flex-col gap-1.5">
+            {favUpdateRows.map((row) => (
+              <button
+                key={row.subjectId}
+                type="button"
+                onClick={() => {
+                  setFavModalOpen(false)
+                  navigate(`/subject/${row.subjectId}`)
+                }}
+                className="flex items-center gap-3 rounded-lg border border-border bg-elev2/50 px-3 py-2.5 text-left transition-colors hover:border-accent"
+              >
+                <CoverImage src={row.cover} className="h-14 w-10 shrink-0 rounded-md" />
+                <div className="min-w-0 flex-1">
+                  <div className="line-clamp-1 text-[13px] font-medium">{row.title}</div>
+                  <div className="mt-0.5 line-clamp-1 text-[11px] text-faint">
+                    更新至 第 {row.aired} 集 · {row.watched > 0 ? `你已看到 第 ${row.watched} 集` : '尚未观看'}
+                    {row.nextAirDate ? ` · 下集 ${row.nextAirDate.slice(5)}` : ''}
+                  </div>
+                </div>
+                <Badge tone="accent">新 {row.updateCount} 集</Badge>
+              </button>
+            ))}
+            {favLoading || favError ? (
+              <div className="pt-1 text-center text-[10px] text-faint">
+                {favLoading ? '仍在检测…' : favError}
+              </div>
+            ) : null}
+          </div>
+        )}
+      </Modal>
     </div>
   )
 }

@@ -1,6 +1,24 @@
 import type { CSSProperties } from 'react'
-import type { CropRect, ModuleKind, ModuleRect, PageSize, RecommendBackground } from '@/stores/recommendTable'
-import { DEFAULT_MODULES, MODULE_KINDS, normalizePageSize } from '@/stores/recommendTable'
+import type {
+  CropRect,
+  GradientLayer,
+  ModuleKind,
+  ModuleLayout,
+  ModuleRect,
+  PageSize,
+  RecommendBackground
+} from '@/stores/recommendTable'
+import {
+  DEFAULT_FONT_STACK,
+  DEFAULT_MODULES,
+  IMAGE_POS_SHORT,
+  MODULE_FONT_BASE,
+  MODULE_H_MIN,
+  MODULE_KINDS,
+  MODULE_W_MIN,
+  fontCssOf,
+  normalizePageSize
+} from '@/stores/recommendTable'
 
 /**
  * 「番剧推荐表」的**版式常量 + 样式生成器** —— 界面预览与导出图共用同一份。
@@ -90,15 +108,33 @@ export const RL = {
 } as const
 
 /**
- * **图区 : 内容区 = 1.5 : 1**（用户明确要求的比例）。
+ * **图区 : 内容区 = 1.5 : 1**（用户明确要求的比例，同时也是**默认值**）。
  *
  * 由此推出图区占整体宽（或高）的比例 = 1.5 / (1.5 + 1) = 0.6，即 IMAGE_BAND_FRACTION。
  * 1200 宽的页面在左/右图时：图区 720、内容区 480；上图时按高度切同样的比例（图区占 60% 高）。
  * 比例写在常量里、界面与导出都从这里算，所以不存在"预览和导出比例不一样"。
+ *
+ * v0.3.9 起这个比例**每一页可以自己调**（左菜单 Ⅳ，`page.bandRatio`）：
+ * 所以下面所有"按比例切"的地方都必须走 `bandFractionOf(page)`，**不要**直接用
+ * `IMAGE_BAND_FRACTION` —— 那会让"用户改了占比、导出还是老比例"，而预览却变了。
+ * 这个常量现在只作为默认值存在。
  */
 export const IMAGE_CONTENT_RATIO = 1.5
-/** 图区占整页宽（左/右）或高（上）的比例 = 0.6 */
+/** 默认的图区占比（0.6）；只有"没设过 bandRatio"的页才用它 */
 export const IMAGE_BAND_FRACTION = IMAGE_CONTENT_RATIO / (IMAGE_CONTENT_RATIO + 1)
+
+/**
+ * 这一页实际的图区占比（0–1）。
+ *
+ * 输入是页面（而不是 frame），因为 frame 就是从它算出来的 —— 反过来会变成循环依赖。
+ * `bandRatio` 非法/没设时回默认 1.5 : 1，与加这个字段之前完全一致。
+ */
+export function bandFractionOf(page: { bandRatio?: number }): number {
+  const r = typeof page.bandRatio === 'number' && Number.isFinite(page.bandRatio) && page.bandRatio > 0
+    ? page.bandRatio
+    : IMAGE_CONTENT_RATIO
+  return r / (r + 1)
+}
 
 /**
  * 交融渐变的宽度（px）：图区靠内容区的那一侧，用这么宽一条从"透明"渐隐到**页面底色**，
@@ -174,9 +210,13 @@ export const RC = {
   imageBg: '#eceef1'
 } as const
 
-/** 字体栈：离屏窗口不加载外部资源，只能用系统字体；两边用同一串，换行位置才会一致 */
-export const FONT =
-  '"Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Segoe UI", system-ui, sans-serif'
+/**
+ * 字体栈：离屏窗口不加载外部资源，只能用系统字体；两边用同一串，换行位置才会一致。
+ *
+ * v0.3.9 起这串搬到了数据层的 `DEFAULT_FONT_STACK`（因为**字体白名单是数据**：
+ * 编辑面板要列出来、收窄要按它校验），这里只是换个名字再接出去，值一字未改。
+ */
+export const FONT = DEFAULT_FONT_STACK
 
 // ------------------------------------------------------------------
 // 样式表：一份定义、两个渲染器
@@ -190,10 +230,24 @@ export function asReactStyle(rec: StyleRecord): CSSProperties {
   return rec as unknown as CSSProperties
 }
 
-/** 导出用：拼进 `style="…"`。camelCase → kebab-case */
+/**
+ * 导出用：拼进 `style="…"`。camelCase → kebab-case。
+ *
+ * ⚠️ **值里的双引号必须换成单引号**（v0.3.9 修的一处老 bug）。
+ * 导出那边的行内样式是 `style="…"` 用**双引号**包裹的（见 exportHtml 的 `styleAttr`），
+ * 而 CSS 值里本来就可能出现双引号 —— 最典型的就是字体栈：
+ * `font-family: "Microsoft YaHei", "PingFang SC", …`。
+ * 原样拼进去的话，HTML 解析器在第二个 `"` 就把 style 属性**截断了**：
+ *   ① 后面那些声明（`color`、`text-shadow` 的白色晕圈…）全部丢掉，导出图上的字会失去可读性；
+ *   ② `Microsoft`、`YaHei"` 这些碎片会被当成新的属性名，页面结构跟着乱。
+ * CSS 允许用单引号写字体名，替换之后**渲染结果完全一样**，但 HTML 不再被截断。
+ */
 export function cssText(rec: StyleRecord): string {
   return Object.entries(rec)
-    .map(([k, v]) => `${k.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`)}: ${v}`)
+    // `undefined` 的声明直接丢掉（不是拼成 `background-color: undefined`）：
+    // 那既不是合法 CSS，又会让"某些声明被浏览器丢掉"这件事无声发生（例如图片层的 backgroundColor）。
+    .filter(([, v]) => typeof v === 'string' && v.length > 0)
+    .map(([k, v]) => `${k.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`)}: ${v.replace(/"/g, "'")}`)
     .join('; ')
 }
 
@@ -305,8 +359,8 @@ export function blurOf(bg: RecommendBackground | undefined): number {
 export interface PageFrame {
   width: number
   height: number
-  /** 图片位置；none = 没有图片背景 */
-  pos: 'none' | 'left' | 'right' | 'top'
+  /** 图片位置；none = 没有图片背景（v0.3.9 起多了 bottom，见 ImagePos） */
+  pos: 'none' | 'left' | 'right' | 'top' | 'bottom'
   /** 内容区（模块都在这里面） */
   contentX: number
   contentY: number
@@ -347,12 +401,22 @@ function clampNum(v: number, min: number, max: number): number {
  * 所以切法不变、只是纸张变大变小）；内容区宽度小于 `SIDE_MIN_W` 时自动换成纵向一列，
  * 避免"内容溢出页面"。
  */
-export function frameOf(page: { background?: RecommendBackground; size?: PageSize }): PageFrame {
+export function frameOf(page: {
+  background?: RecommendBackground
+  size?: PageSize
+  bandRatio?: number
+}): PageFrame {
   const bg = page.background
   const isImage = !!bg && bg.kind === 'image'
   const pos: PageFrame['pos'] = isImage ? bg.imagePos : 'none'
   /** 手填尺寸：非法/没填 → null（走自适应） */
   const manual = normalizePageSize(page.size)
+  /**
+   * 这一页的图区占比（v0.3.9 起按页可调）。
+   * 下面每一处"按比例切"都用它，绝不再直接引用 `IMAGE_BAND_FRACTION`
+   * —— 否则用户调了占比之后预览会变、导出不变（或反过来）。
+   */
+  const frac = bandFractionOf(page)
 
   if (!isImage) {
     const width = manual ? manual.w : RL.width
@@ -377,29 +441,31 @@ export function frameOf(page: { background?: RecommendBackground; size?: PageSiz
   // 原图比例推出的高度（自适应时用；手填时完全不用）
   const ratioH = bg.imgW > 0 && bg.imgH > 0 ? Math.round((RL.width * bg.imgH) / bg.imgW) : 0
 
-  if (pos === 'top') {
+  if (pos === 'top' || pos === 'bottom') {
     const height = manual
       ? manual.h
       : Math.round(
-          clampNum(
-            Math.max(Math.ceil(RL.baseHeight / (1 - IMAGE_BAND_FRACTION)), ratioH),
-            RL.baseHeight,
-            RL.maxHeight
-          )
+          clampNum(Math.max(Math.ceil(RL.baseHeight / (1 - frac)), ratioH), RL.baseHeight, RL.maxHeight)
         )
     const width = manual ? manual.w : RL.width
-    const imageH = Math.round(height * IMAGE_BAND_FRACTION)
+    const imageH = Math.round(height * frac)
     const contentH = height - imageH
+    /*
+     * 上/下只差"图在内容前面还是后面"：
+     *   · 上图：图从 0 起，内容区接在它下面；
+     *   · 下图：内容区从 0 起，图贴在页面底部（内容区在它上面）。
+     * 两者的交融渐变都画在图区**靠内容区的那一边**（见 blendStyle），所以接缝一样是软的。
+     */
     return {
       width,
       height,
       pos,
       contentX: 0,
-      contentY: imageH,
+      contentY: pos === 'top' ? imageH : 0,
       contentW: width,
       contentH,
       imageX: 0,
-      imageY: 0,
+      imageY: pos === 'top' ? 0 : contentH,
       imageW: width,
       imageH,
       photoCellH: RL.photoH,
@@ -411,7 +477,7 @@ export function frameOf(page: { background?: RecommendBackground; size?: PageSiz
   const height = manual
     ? manual.h
     : Math.round(clampNum(Math.max(SIDE_CONTENT_H, ratioH), RL.baseHeight, RL.maxHeight))
-  const imageW = Math.round(width * IMAGE_BAND_FRACTION)
+  const imageW = Math.round(width * frac)
   const contentW = width - imageW
   const imageX = pos === 'left' ? 0 : contentW
   const contentX = pos === 'left' ? imageW : 0
@@ -433,24 +499,69 @@ export function frameOf(page: { background?: RecommendBackground; size?: PageSiz
 }
 
 /** 一页的画布高度（= frameOf 的高度；保留这个函数名是因为弹窗与导出都在用它） */
-export function pageHeightOf(page: { background?: RecommendBackground; size?: PageSize }): number {
+export function pageHeightOf(page: {
+  background?: RecommendBackground
+  size?: PageSize
+  bandRatio?: number
+}): number {
   return frameOf(page).height
 }
 
 /**
  * 一页里 8 个模块的矩形（px，页面坐标系）。
  *
+ * ## 第一步：按版式算默认摆放
+ *
  * 两种排法：
- *   · **整页版式**（无图 / 上图）：用 store 的 `DEFAULT_MODULES`（1200×920 那套），
- *     上图时整体下移一个图区高度；换成 480 宽的侧栏会把两栏挤坏，所以不缩排。
+ *   · **整页版式**（无图 / 上图 / 下图）：用 store 的 `DEFAULT_MODULES`（1200×920 那套），
+ *     上/下图时整体下移（或不让位）一个图区高度；换成 480 宽的侧栏会把两栏挤坏，所以不缩排。
  *   · **侧栏版式**（左/右图）：内容区 480 宽，改成纵向堆叠一列
  *     （标题 → 封面居中 → 评分 → 指数 → 时间标签 → 理由 → 剧照 → 页脚），
  *     每块高度取自 `SIDE_STACK`，封面与剧照按更小的尺寸（剧照一行 3 张）。
  *
- * 用户不能改位置（v0.3.8 第三轮取消了自定义移动），所以这份矩形**两边现算同一份**，
- * 界面与导出不可能不一致。
+ * ## 第二步：把用户自定义的坐标叠上去（v0.3.9）
+ *
+ * `layout` 里带 `x/y/w/h` 的模块优先用用户值，并**夹进页面范围**：
+ * 位置夹到 `[0, 页面宽/高 − 最小尺寸]`，尺寸夹到 `[最小尺寸, 页面宽/高 − 位置]`。
+ * 夹取放在这里而不是收窄函数里，是因为只有这里知道"这一页多大"
+ * （收窄发生在读盘时，那时还没有 frame）。
+ *
+ * 这两步合起来的含义：**"没写过坐标"永远是默认版式**（老数据一字不变），
+ * 写过就是用户要的位置；而两种情形下界面与导出读的都是这同一个返回值 ——
+ * 导出是 HTML→图片，只要两边共用这个函数，"所见即所得"就是代码结构保证的，不靠人记得同步。
  */
-export function moduleRectsOf(frame: PageFrame): Record<ModuleKind, ModuleRect> {
+export function moduleRectsOf(
+  frame: PageFrame,
+  layout?: ModuleLayout[] | null
+): Record<ModuleKind, ModuleRect> {
+  const out = defaultModuleRects(frame)
+  if (!layout || layout.length === 0) return out
+  for (const m of layout) {
+    const base = out[m.id]
+    if (!base) continue
+    const x = clampNum(m.x ?? base.x, 0, Math.max(0, frame.width - MODULE_W_MIN))
+    const y = clampNum(m.y ?? base.y, 0, Math.max(0, frame.height - MODULE_H_MIN))
+    const w = clampNum(m.w ?? base.w, MODULE_W_MIN, Math.max(MODULE_W_MIN, frame.width - x))
+    const h = clampNum(m.h ?? base.h, MODULE_H_MIN, Math.max(MODULE_H_MIN, frame.height - y))
+    out[m.id] = {
+      x: Math.round(x),
+      y: Math.round(y),
+      w: Math.round(w),
+      h: Math.round(h)
+    }
+  }
+  return out
+}
+
+/** 一个模块的绘制层级：有 `z` 用 `z`，没有就按 MODULE_KINDS 的顺序（与加这个功能之前一致） */
+export function moduleZOf(layout: ModuleLayout[] | null | undefined, id: ModuleKind): number {
+  const saved = layout?.find((m) => m.id === id)
+  if (saved && typeof saved.z === 'number' && Number.isFinite(saved.z)) return saved.z
+  return MODULE_KINDS.indexOf(id)
+}
+
+/** 只有版式、没有用户坐标的那一份矩形（第一步；`moduleRectsOf` 与预览叠层都用它） */
+function defaultModuleRects(frame: PageFrame): Record<ModuleKind, ModuleRect> {
   const out = {} as Record<ModuleKind, ModuleRect>
   if (!frame.side) {
     /*
@@ -504,8 +615,8 @@ export function moduleRectsOf(frame: PageFrame): Record<ModuleKind, ModuleRect> 
 }
 
 /** 内容区放得下默认模块所需的**最小高度**（给"手填高度不够"的提示与"按内容调整高度"按钮用） */
-export function contentHeightNeeded(frame: PageFrame): number {
-  const rects = moduleRectsOf(frame)
+export function contentHeightNeeded(frame: PageFrame, layout?: ModuleLayout[] | null): number {
+  const rects = moduleRectsOf(frame, layout)
   let max = 0
   for (const id of MODULE_KINDS) {
     // 封面在侧栏版式里是居中放的一块，比较时用它的底边
@@ -671,16 +782,18 @@ export function cropToBackgroundCss(
 }
 
 /**
- * **交融渐变**：贴在图区靠内容区的那一侧，从透明渐隐到页面底色（白）。
+ * **交融渐变**：贴在图区靠内容区的那一侧，从透明渐隐到页面底色（默认白）。
  *
  * 这条渐变整条都在图区内部、结束位置正好落在边界线上，所以边界处的颜色与内容区底色严格相等
  * —— 没有硬边、也没有接缝（用户要求的"纯色渐变交融"）。
  * 它取代了上一版那个"叠加渐变层"控件：功能重叠，两套相似旋钮不如一套自动生效的。
+ *
+ * 四个方向都支持（v0.3.9 补了「下」）：`from` 永远画在图区里侧、`base` 落在边界线上。
+ * `base` 由调用方给（= `pageBackgroundCss(page.background)`）；不传就是导出图默认的白底。
  */
-export function blendStyle(frame: PageFrame): StyleRecord {
+export function blendStyle(frame: PageFrame, base: string = RC.card): StyleRecord {
   const f = BLEND_FEATHER
-  const base = RC.card
-  const from = `rgba(255, 255, 255, 0)`
+  const from = 'rgba(255, 255, 255, 0)'
   if (frame.pos === 'left') {
     return {
       position: 'absolute',
@@ -703,6 +816,19 @@ export function blendStyle(frame: PageFrame): StyleRecord {
       zIndex: '1'
     }
   }
+  if (frame.pos === 'bottom') {
+    // 下图：边界 = 图区的**上边缘**（imageY），渐变从底色渐隐进图里
+    return {
+      position: 'absolute',
+      left: '0',
+      top: `${frame.imageY}px`,
+      width: `${frame.width}px`,
+      height: `${f}px`,
+      background: `linear-gradient(to bottom, ${base} 0%, ${from} 100%)`,
+      zIndex: '1'
+    }
+  }
+  // 上图（以及理论上不会出现的 pos）：边界 = 图区的**下边缘**
   return {
     position: 'absolute',
     left: '0',
@@ -715,24 +841,143 @@ export function blendStyle(frame: PageFrame): StyleRecord {
 }
 
 /**
- * 模块外框：绝对定位到版式算出来的矩形上。
+ * **内容区渐变底色**（v0.3.9 左菜单 Ⅵ）。
+ *
+ * 一块正好铺满内容区的矩形，画在页面底色/图区之上、模块之下。
+ * 没有图片背景时内容区就是整页，所以这一层此时等价于"整页渐变底色"。
+ * 色标不足 2 个（或没设）→ 不画（返回 null），宁可少一层也不要把半截 CSS 塞进页面。
+ */
+export function contentGradientStyle(
+  frame: PageFrame,
+  layer: GradientLayer | null | undefined
+): StyleRecord | null {
+  if (!layer || layer.stops.length < 2) return null
+  return {
+    position: 'absolute',
+    left: `${frame.contentX}px`,
+    top: `${frame.contentY}px`,
+    width: `${frame.contentW}px`,
+    height: `${frame.contentH}px`,
+    background: gradientCss(layer),
+    zIndex: '1'
+  }
+}
+
+/**
+ * 内容区渐变与**页面底色**之间的交融（只在"内容区渐变 + 图片背景"同时存在时才需要）。
+ *
+ * 为什么需要这一层：交融渐变（`blendStyle`）的终点色是**页面底色**，而内容区渐变是另一种颜色，
+ * 两者在边界线上会撞出一条硬边。这一条渐变贴在内容区那一侧、宽度同样是 `BLEND_FEATHER`，
+ * 从页面底色渐隐到透明（透明处露出下面的内容区渐变）—— 于是接缝又变回软的。
+ * 没有内容区渐变时不需要它（那时内容区本来就是页面底色，`blendStyle` 已经把接缝处理干净了）。
+ */
+export function contentBlendStyle(frame: PageFrame, base: string): StyleRecord {
+  const f = BLEND_FEATHER
+  const clear = 'rgba(255, 255, 255, 0)'
+  if (frame.pos === 'left') {
+    return {
+      position: 'absolute',
+      left: `${frame.contentX}px`,
+      top: '0',
+      width: `${f}px`,
+      height: `${frame.height}px`,
+      background: `linear-gradient(to right, ${base} 0%, ${clear} 100%)`,
+      zIndex: '2'
+    }
+  }
+  if (frame.pos === 'right') {
+    // 内容区在左，边界在它的右边缘 → 渐变条贴右边缘，从透明渐到页面底色
+    return {
+      position: 'absolute',
+      left: `${frame.contentX + frame.contentW - f}px`,
+      top: '0',
+      width: `${f}px`,
+      height: `${frame.height}px`,
+      background: `linear-gradient(to right, ${clear} 0%, ${base} 100%)`,
+      zIndex: '2'
+    }
+  }
+  if (frame.pos === 'bottom') {
+    // 内容区在上，边界在它下边缘
+    return {
+      position: 'absolute',
+      left: '0',
+      top: `${frame.contentY + frame.contentH - f}px`,
+      width: `${frame.width}px`,
+      height: `${f}px`,
+      background: `linear-gradient(to bottom, ${clear} 0%, ${base} 100%)`,
+      zIndex: '2'
+    }
+  }
+  // 上图：内容区在上边界的下方
+  return {
+    position: 'absolute',
+    left: '0',
+    top: `${frame.contentY}px`,
+    width: `${frame.width}px`,
+    height: `${f}px`,
+    background: `linear-gradient(to bottom, ${base} 0%, ${clear} 100%)`,
+    zIndex: '2'
+  }
+}
+
+/**
+ * 一个模块的**字体与字号**（v0.3.9 右菜单 Ⅲ）。
+ *
+ * `size` 是用户设的字号（px，不设就是该模块的基准字号），`scale` 是它相对基准的比例 ——
+ * 模块里每一处文字都按 `scale` 缩放，所以"标题比正文大"的层次不会因为调字号而乱掉。
+ * `family` 已经是可用的 CSS 字体栈（白名单之外的值一律回落到默认栈，见 `fontCssOf`）。
+ */
+export interface ModuleFont {
+  size: number
+  scale: number
+  family: string
+}
+
+/** 取一个模块的字体（`layout` 就是 `page.layout`，没有就全用基准） */
+export function moduleFontOf(layout: ModuleLayout[] | null | undefined, id: ModuleKind): ModuleFont {
+  const saved = layout?.find((m) => m.id === id)
+  const base = MODULE_FONT_BASE[id]
+  const size = saved?.fontSize ?? base
+  return {
+    size,
+    scale: base > 0 ? size / base : 1,
+    family: fontCssOf(saved?.fontFamily)
+  }
+}
+
+/** 缩放一个版式像素值（四舍五入到整数 px，避免导出 HTML 里出现 15.299999 这种数） */
+function sc(v: number, scale: number): number {
+  return Math.round(v * scale)
+}
+
+/**
+ * 模块外框：绝对定位到算出来的矩形上。
  *
  * v0.3.8 第三轮起**没有白板**（用户要求去掉模块自带的底），所以这里只有位置与裁剪；
  * 文字的可读性交给 `TEXT_SHADOW` 的白色晕圈。
- * z 用 MODULE_KINDS 的顺序（2 起，给背景层 0 与交融层 1 让位），后画的盖住先画的。
+ * z 默认用 MODULE_KINDS 的顺序（3 起，给背景层 0 / 交融层 1 / 内容区渐变与它的交融层 1–2 让位），
+ * 后画的盖住先画的；用户在编辑模式里改过层级（`layout.z`）时用他的值。
+ *
+ * 字体（family）设在**外框**上：它是继承属性，块内所有文字自动跟随 ——
+ * 与 `pageStyle` 把 `text-shadow` 设在页面上的道理一样，一处生效、不会漏。
+ * 只有真的不是默认字体时才写进样式表：默认字体已经是页面的 `font-family`，
+ * 再写一遍只会让导出 HTML 里多出 8 段一模一样的字体栈。
  */
-export function moduleBoxStyle(rect: ModuleRect, order: number): StyleRecord {
-  return {
+export function moduleBoxStyle(rect: ModuleRect, order: number, font?: ModuleFont): StyleRecord {
+  const rec: StyleRecord = {
     position: 'absolute',
     boxSizing: 'border-box',
     left: `${rect.x}px`,
     top: `${rect.y}px`,
     width: `${rect.w}px`,
     height: `${rect.h}px`,
-    zIndex: String(order + 2),
-    // 内容超出模块就裁掉：版式是固定的，宁可裁掉也不让它盖住别的模块
+    zIndex: String(order + 3),
+    // 内容超出模块就裁掉：宁可裁掉也不让它盖住别的模块
     overflow: 'hidden'
   }
+  if (font && font.family !== FONT) rec.fontFamily = font.family
+  return rec
 }
 
 /** 模块内的正文区（通用列布局） */
@@ -746,36 +991,47 @@ export function moduleInnerStyle(gap: number): StyleRecord {
   }
 }
 
+/*
+ * 下面这一组文字样式都收一个可选的 `font`（= `moduleFontOf(page.layout, 模块 id)`）。
+ * 不传时 `scale` 视为 1，逐项算出来与加"模块字号"之前**逐字节相同**（乘 1 再 round 不改变整数），
+ * 所以老数据、以及没碰过字号的页，导出 HTML 一字未改。字体（family）不在这里设，
+ * 而是设在模块外框上让它继承（见 `moduleBoxStyle`）。
+ */
+const NO_SCALE = 1
+
 /** 一行信息（标签 + 值） */
 export function infoRowStyle(): StyleRecord {
   return { display: 'flex', alignItems: 'flex-start', gap: '10px' }
 }
 
-export function infoLabelStyle(): StyleRecord {
+export function infoLabelStyle(font?: ModuleFont): StyleRecord {
+  const k = font?.scale ?? NO_SCALE
   return {
-    width: `${RL.labelW}px`,
+    width: `${sc(RL.labelW, k)}px`,
     flexShrink: '0',
-    fontSize: `${RL.labelSize}px`,
-    lineHeight: `${RL.rowH}px`,
+    fontSize: `${sc(RL.labelSize, k)}px`,
+    lineHeight: `${sc(RL.rowH, k)}px`,
     color: RC.faint
   }
 }
 
-export function infoValueStyle(): StyleRecord {
+export function infoValueStyle(font?: ModuleFont): StyleRecord {
+  const k = font?.scale ?? NO_SCALE
   return {
     flex: '1',
     minWidth: '0',
-    fontSize: `${RL.valueSize}px`,
-    lineHeight: `${RL.rowH}px`,
+    fontSize: `${sc(RL.valueSize, k)}px`,
+    lineHeight: `${sc(RL.rowH, k)}px`,
     color: RC.text
   }
 }
 
 /** 标题模块：番剧名 */
-export function titleTextStyle(): StyleRecord {
+export function titleTextStyle(font?: ModuleFont): StyleRecord {
+  const k = font?.scale ?? NO_SCALE
   return {
-    fontSize: `${RL.titleSize}px`,
-    lineHeight: `${RL.titleLine}px`,
+    fontSize: `${sc(RL.titleSize, k)}px`,
+    lineHeight: `${sc(RL.titleLine, k)}px`,
     fontWeight: '700',
     color: RC.text,
     margin: '0',
@@ -784,10 +1040,11 @@ export function titleTextStyle(): StyleRecord {
 }
 
 /** 原名 */
-export function subTextStyle(): StyleRecord {
+export function subTextStyle(font?: ModuleFont): StyleRecord {
+  const k = font?.scale ?? NO_SCALE
   return {
-    fontSize: `${RL.subSize}px`,
-    lineHeight: `${RL.subLine}px`,
+    fontSize: `${sc(RL.subSize, k)}px`,
+    lineHeight: `${sc(RL.subLine, k)}px`,
     color: RC.faint,
     marginTop: '2px',
     wordBreak: 'break-word'
@@ -795,31 +1052,34 @@ export function subTextStyle(): StyleRecord {
 }
 
 /** 推荐人署名（标题下方那一行） */
-export function recTextStyle(): StyleRecord {
+export function recTextStyle(font?: ModuleFont): StyleRecord {
+  const k = font?.scale ?? NO_SCALE
   return {
-    fontSize: `${RL.recSize}px`,
-    lineHeight: `${RL.subLine}px`,
+    fontSize: `${sc(RL.recSize, k)}px`,
+    lineHeight: `${sc(RL.subLine, k)}px`,
     color: RC.accent,
     marginTop: '4px'
   }
 }
 
 /** 小节标题（推荐理由 / 剧照） */
-export function secTitleStyle(): StyleRecord {
+export function secTitleStyle(font?: ModuleFont): StyleRecord {
+  const k = font?.scale ?? NO_SCALE
   return {
-    fontSize: `${RL.secTitleSize}px`,
-    lineHeight: '22px',
+    fontSize: `${sc(RL.secTitleSize, k)}px`,
+    lineHeight: `${sc(22, k)}px`,
     fontWeight: '700',
     color: RC.accent,
-    marginBottom: '8px'
+    marginBottom: `${sc(8, k)}px`
   }
 }
 
 /** 推荐理由正文 */
-export function reasonTextStyle(): StyleRecord {
+export function reasonTextStyle(font?: ModuleFont): StyleRecord {
+  const k = font?.scale ?? NO_SCALE
   return {
-    fontSize: `${RL.reasonSize}px`,
-    lineHeight: `${RL.reasonLine}px`,
+    fontSize: `${sc(RL.reasonSize, k)}px`,
+    lineHeight: `${sc(RL.reasonLine, k)}px`,
     color: RC.text,
     // 用户按回车分段要保留（推荐理由常写成几段）
     whiteSpace: 'pre-wrap',
@@ -829,13 +1089,15 @@ export function reasonTextStyle(): StyleRecord {
 }
 
 /** 淡色占位文案（「暂无标签」） */
-export function dimTextStyle(): StyleRecord {
-  return { fontSize: `${RL.valueSize}px`, lineHeight: `${RL.rowH}px`, color: RC.faint }
+export function dimTextStyle(font?: ModuleFont): StyleRecord {
+  const k = font?.scale ?? NO_SCALE
+  return { fontSize: `${sc(RL.valueSize, k)}px`, lineHeight: `${sc(RL.rowH, k)}px`, color: RC.faint }
 }
 
 /** 空理由 / 空剧照提示 */
-export function emptyHintStyle(): StyleRecord {
-  return { fontSize: `${RL.reasonSize}px`, lineHeight: `${RL.rowH}px`, color: RC.faint }
+export function emptyHintStyle(font?: ModuleFont): StyleRecord {
+  const k = font?.scale ?? NO_SCALE
+  return { fontSize: `${sc(RL.reasonSize, k)}px`, lineHeight: `${sc(RL.rowH, k)}px`, color: RC.faint }
 }
 
 /** 评分数字（加粗一点，在信息行里跳出来） */
@@ -844,27 +1106,29 @@ export function scoreTextStyle(): StyleRecord {
 }
 
 /** 星星：亮 / 暗两段 */
-export function starStyle(filled: boolean): StyleRecord {
+export function starStyle(filled: boolean, font?: ModuleFont): StyleRecord {
+  const k = font?.scale ?? NO_SCALE
   return {
-    fontSize: `${RL.starSize}px`,
-    lineHeight: `${RL.rowH}px`,
+    fontSize: `${sc(RL.starSize, k)}px`,
+    lineHeight: `${sc(RL.rowH, k)}px`,
     color: filled ? RC.star : RC.starEmpty,
     letterSpacing: '2px'
   }
 }
 
 /** 类型标签的小胶囊（rest=true 是那个「+N」） */
-export function chipStyle(rest: boolean): StyleRecord {
+export function chipStyle(rest: boolean, font?: ModuleFont): StyleRecord {
+  const k = font?.scale ?? NO_SCALE
   return {
     display: 'inline-block',
-    padding: '3px 12px',
-    marginRight: '8px',
-    marginBottom: '6px',
+    padding: `${sc(3, k)}px ${sc(12, k)}px`,
+    marginRight: `${sc(8, k)}px`,
+    marginBottom: `${sc(6, k)}px`,
     borderRadius: '999px',
     background: rest ? RC.accentSoft : RC.chipBg,
     color: rest ? RC.accent : RC.dim,
-    fontSize: `${15}px`,
-    lineHeight: '20px'
+    fontSize: `${sc(15, k)}px`,
+    lineHeight: `${sc(20, k)}px`
   }
 }
 
@@ -884,7 +1148,6 @@ export function coverImageStyle(): StyleRecord {
 export function photoRowStyle(): StyleRecord {
   return { display: 'flex', flexWrap: 'wrap', gap: `${RL.photoGap}px` }
 }
-
 export function photoBoxStyle(w: number, h: number): StyleRecord {
   return {
     width: `${w}px`,
@@ -901,14 +1164,15 @@ export function photoImgStyle(): StyleRecord {
 }
 
 /** 页脚（左右两端） */
-export function footRowStyle(): StyleRecord {
+export function footRowStyle(font?: ModuleFont): StyleRecord {
+  const k = font?.scale ?? NO_SCALE
   return {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: '12px',
-    fontSize: `${RL.footSize}px`,
-    lineHeight: '20px',
+    fontSize: `${sc(RL.footSize, k)}px`,
+    lineHeight: `${sc(20, k)}px`,
     color: RC.faint
   }
 }
@@ -939,9 +1203,7 @@ export function backgroundKindText(bg: RecommendBackground | undefined): string 
   if (!bg) return '无'
   const base = bg.kind === 'color' ? '纯色' : bg.kind === 'gradient' ? '渐变' : '图片'
   const extra: string[] = []
-  if (bg.kind === 'image') {
-    extra.push(bg.imagePos === 'left' ? '左侧图区' : bg.imagePos === 'right' ? '右侧图区' : '上方图区')
-  }
+  if (bg.kind === 'image') extra.push(`${IMAGE_POS_SHORT[bg.imagePos]}侧图区`)
   if (blurOf(bg) > 0) extra.push(`模糊 ${blurOf(bg)}px`)
   return extra.length > 0 ? `${base}（${extra.join(' · ')}）` : base
 }

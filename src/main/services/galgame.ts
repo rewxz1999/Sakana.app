@@ -11,6 +11,7 @@ import { log } from '../log'
 import { store } from '../store'
 import { buildProxyAgents, getSettings, httpGetBuffer, UA } from '../net'
 import { galToolsActivate, galToolsDeactivate } from './galgameTools'
+import { galMemStart, galMemStop, galMemStopAll } from './galgameMem'
 import { galgameCoversDir } from './settingsExt'
 
 // ---------------- 运行状态（进程内） ----------------
@@ -886,6 +887,8 @@ function stopRun(gameId: string, run: RunningRun): void {
   if (run.detectTimer) clearInterval(run.detectTimer)
   run.detectTimer = null
   runs.delete(gameId)
+  // 停止只读内存识别（BGM / 章节）
+  galMemStop(gameId)
   // 累计游玩时长
   const elapsed = Date.now() - run.startedAt
   if (elapsed >= 1000) {
@@ -894,7 +897,7 @@ function stopRun(gameId: string, run: RunningRun): void {
   }
   sendGal({ type: 'running', gameId, running: false })
   log.append('info', 'gal', `游戏退出: ${gameId}（本次 ${Math.round(elapsed / 1000)}s）`)
-  // 没有游戏在运行 → 关闭截图助手（截图助手随游戏启动/退出）
+  // 没有游戏在运行 → 关闭galgame 助手（galgame 助手随游戏启动/退出）
   if (runs.size === 0) galToolsDeactivate()
 }
 
@@ -1059,12 +1062,26 @@ function launchPidReady(id: string, child: ChildProcess, pid: number): GalLaunch
   sendGal({ type: 'running', gameId: id, running: true })
   log.append('info', 'gal', `启动游戏: ${game.title}`)
 
-  // 截图助手随游戏启动而激活（应用启动时不激活）
+  // galgame 助手随游戏启动而激活（应用启动时不激活）
   galToolsActivate()
 
   // 检测程序：设置开启后启动游戏即自动启用（读取窗口标题记录进度，不再弹窗确认）
   if (getSettings().galgameDetect) {
     startDetect(id, run)
+  }
+
+  // 只读内存识别（BGM / 章节）：设置开启后随游戏启动自动启用
+  if (getSettings().galgameMemRead) {
+    galMemStart({
+      gameId: id,
+      pid,
+      exePath: game.exePath,
+      title: game.title,
+      onChapter: (chapter) => {
+        const updated = updateGame(id, (g) => (g.chapterName === chapter ? g : { ...g, chapterName: chapter }))
+        if (updated) pushGames()
+      }
+    })
   }
   return { started: true }
 }
@@ -1085,6 +1102,7 @@ export function galShutdown(): void {
   }
   runs.clear()
   galToolsDeactivate()
+  galMemStopAll()
 }
 
 /** 供 ipc.ts 统一调用的服务对象（与工具服务风格一致） */
@@ -1227,7 +1245,7 @@ export function galPushRunning(): void {
   }
 }
 
-// ---------------- 供截图助手使用：当前运行的 galgame ----------------
+// ---------------- 供galgame 助手使用：当前运行的 galgame ----------------
 
 export interface GalRunningInfo {
   gameId: string
@@ -1238,7 +1256,7 @@ export interface GalRunningInfo {
   lastTitle: string
 }
 
-/** 最近启动且仍在运行的 galgame（截图助手只截这个游戏窗口） */
+/** 最近启动且仍在运行的 galgame（galgame 助手只截这个游戏窗口） */
 export function galRunningInfo(): GalRunningInfo | null {
   let latest: RunningRun | null = null
   for (const run of runs.values()) {
@@ -1254,7 +1272,7 @@ export function galRunningInfo(): GalRunningInfo | null {
   }
 }
 
-/** 读取指定进程的主窗口标题（截图助手匹配窗口用） */
+/** 读取指定进程的主窗口标题（galgame 助手匹配窗口用） */
 export function galReadWindowTitle(pid: number): Promise<string> {
   return readWindowTitle(pid)
 }

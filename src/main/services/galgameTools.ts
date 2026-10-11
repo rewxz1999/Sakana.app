@@ -10,10 +10,10 @@ import { log } from '../log'
 import { store } from '../store'
 
 /**
- * galgame 截图助手 / 工具配置
+ * galgame galgame 助手 / 工具配置
  * - 配置持久化在 electron-store key `galgameTools`（渲染层经 gal:tools-get/set 读写）
- * - 截图助手开启后注册全局快捷键；不隐藏图标时在屏幕角落显示一个 56×56 悬浮拍摄按钮
- * - 截图在「截屏助手」或全局快捷键触发时由主进程 desktopCapturer 抓取整个主屏
+ * - galgame 助手开启后注册全局快捷键；不隐藏图标时在屏幕角落显示一个 56×56 悬浮拍摄按钮
+ * - 截图在「galgame 助手」或全局快捷键触发时由主进程 desktopCapturer 抓取整个主屏
  */
 
 function getCfg(): GalToolsConfig {
@@ -48,7 +48,7 @@ function applyHotkey(cfg: GalToolsConfig): void {
     })
     if (ok) {
       lastAccel = accel
-      log.append('info', 'gal', `截图助手快捷键已注册: ${accel}`)
+      log.append('info', 'gal', `galgame 助手快捷键已注册: ${accel}`)
     } else {
       log.append('warn', 'gal', `截图快捷键注册失败（可能被占用或格式无效）: ${accel}`)
     }
@@ -57,9 +57,11 @@ function applyHotkey(cfg: GalToolsConfig): void {
   }
 }
 
-// ---------------- 悬浮拍摄窗口 ----------------
+// ---------------- 悬浮按钮窗口（v0.3.9：一个按钮 → 读取 BGM / 截图 选择面板） ----------------
 
 const OVERLAY_SIZE = 56
+/** 面板展开后的悬浮窗宽度（按钮固定在窗口右上角，面板在按钮下方右对齐） */
+const PANEL_WIDTH = 208
 let overlayWin: BrowserWindow | null = null
 
 function overlayHtml(): string {
@@ -67,43 +69,163 @@ function overlayHtml(): string {
 <html lang="zh">
 <head><meta charset="utf-8"><style>
   html,body{margin:0;padding:0;background:transparent;overflow:hidden;user-select:none;-webkit-user-select:none}
-  #wrap{width:${OVERLAY_SIZE}px;height:${OVERLAY_SIZE}px;display:flex;align-items:center;justify-content:center}
-  #btn{width:48px;height:48px;border-radius:50%;border:none;cursor:pointer;
-    background:rgba(0,0,0,.66);color:#fff;font-size:22px;line-height:1;
+  #btn{position:absolute;top:4px;right:4px;width:48px;height:48px;border-radius:50%;border:none;cursor:pointer;
+    background:rgba(0,0,0,.66);color:#fff;font-size:20px;line-height:1;
     display:flex;align-items:center;justify-content:center;
-    box-shadow:0 2px 10px rgba(0,0,0,.35);outline:none;backdrop-filter:blur(4px)}
+    box-shadow:0 2px 10px rgba(0,0,0,.35);outline:none;backdrop-filter:blur(4px);z-index:2}
   #btn:hover{background:rgba(30,30,30,.85)}
   #btn:active{transform:scale(.94)}
-  #msg{position:absolute;right:8px;top:60px;background:rgba(0,0,0,.72);color:#fff;font-size:11px;
-    padding:4px 8px;border-radius:6px;display:none;white-space:nowrap}
+  #panel{position:absolute;top:60px;right:4px;width:200px;border-radius:12px;background:rgba(18,18,22,.94);
+    color:#fff;box-shadow:0 6px 24px rgba(0,0,0,.45);backdrop-filter:blur(8px);
+    display:none;flex-direction:column;overflow:hidden;z-index:1}
+  #panel.open{display:flex}
+  #menu{display:flex;flex-direction:column}
+  .item{display:flex;align-items:center;gap:9px;padding:11px 14px;font-size:13px;color:#fff;cursor:pointer;
+    background:transparent;border:none;text-align:left;width:100%;outline:none}
+  .item:hover{background:rgba(255,255,255,.10)}
+  .item .ic{font-size:16px;line-height:1}
+  .divider{height:1px;background:rgba(255,255,255,.12);margin:1px 0}
+  #result{display:none;flex-direction:column;gap:7px;padding:12px 14px}
+  .r-title{font-size:11px;color:rgba(255,255,255,.55)}
+  .r-name{font-size:13px;line-height:1.4;word-break:break-all;white-space:pre-wrap}
+  .r-detail{font-size:11px;color:rgba(255,255,255,.6);word-break:break-all}
+  .r-row{display:flex;align-items:center;gap:8px;margin-top:3px}
+  .rbtn{display:inline-flex;align-items:center;justify-content:center;font-size:12px;padding:5px 12px;
+    border-radius:8px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.10);color:#fff;
+    cursor:pointer;outline:none}
+  .rbtn:hover{background:rgba(255,255,255,.20)}
 </style></head>
 <body>
-  <div id="wrap"><button id="btn" title="截图">📷</button></div>
-  <div id="msg"></div>
+  <button id="btn" title="galgame 助手（读取 BGM / 截图）">🎮</button>
+  <div id="panel">
+    <div id="menu">
+      <button class="item" id="bgmItem"><span class="ic">🎵</span>读取 BGM</button>
+      <div class="divider"></div>
+      <button class="item" id="shotItem"><span class="ic">📷</span>截图</button>
+    </div>
+    <div id="result">
+      <div class="r-title" id="resultTitle">识别结果</div>
+      <div class="r-name" id="resultName"></div>
+      <div class="r-detail" id="resultDetail"></div>
+      <div class="r-row">
+        <button class="rbtn" id="saveBtn">保存这首</button>
+        <button class="rbtn" id="copyBtn">复制</button>
+        <button class="rbtn" id="backBtn">返回</button>
+      </div>
+    </div>
+  </div>
   <script>
-    const btn = document.getElementById('btn')
-    const msg = document.getElementById('msg')
-    let busy = false
-    function flash(text, ok) {
-      msg.textContent = text
-      msg.style.display = 'block'
-      msg.style.background = ok ? 'rgba(16,120,60,.85)' : 'rgba(190,40,40,.85)'
-      clearTimeout(window.__t)
-      window.__t = setTimeout(() => { msg.style.display = 'none' }, 1600)
+    var btn = document.getElementById('btn')
+    var panel = document.getElementById('panel')
+    var menu = document.getElementById('menu')
+    var result = document.getElementById('result')
+    var resultTitle = document.getElementById('resultTitle')
+    var resultName = document.getElementById('resultName')
+    var resultDetail = document.getElementById('resultDetail')
+    var copyBtn = document.getElementById('copyBtn')
+    var saveBtn = document.getElementById('saveBtn')
+    var open = false
+    var currentName = ''
+    var currentCode = ''
+    var busyShot = false
+
+    function resizeNow() {
+      var h = panel.offsetHeight || 0
+      try { window.sakana.gal.overlayResize(true, 60 + h + 4) } catch (e) {}
     }
-    btn.addEventListener('click', async () => {
-      if (busy) return
-      busy = true
-      btn.style.opacity = '.6'
-      try {
-        const r = await window.sakana.gal.overlayShot()
-        flash(r && r.ok ? '已保存' : ('失败: ' + (r && r.error ? r.error : '未知')), !!(r && r.ok))
-      } catch (e) {
-        flash('失败', false)
-      } finally {
-        busy = false
-        btn.style.opacity = '1'
+    function showMenu() {
+      menu.style.display = 'flex'
+      result.style.display = 'none'
+      resizeNow()
+    }
+    function openPanel() {
+      open = true
+      panel.classList.add('open')
+      btn.textContent = '✕'
+      showMenu()
+    }
+    function closePanel() {
+      open = false
+      panel.classList.remove('open')
+      btn.textContent = '🎮'
+      try { window.sakana.gal.overlayResize(false, 0) } catch (e) {}
+    }
+    function showResult(title, name, detail, ok, withCopy) {
+      menu.style.display = 'none'
+      result.style.display = 'flex'
+      resultTitle.textContent = title
+      resultName.textContent = name
+      resultDetail.textContent = detail || ''
+      resultName.style.color = ok === null ? '#fff' : (ok ? '#7ee2a8' : '#f28b8b')
+      copyBtn.style.display = withCopy ? 'inline-flex' : 'none'
+      if (withCopy) copyBtn.textContent = '复制'
+      resizeNow()
+    }
+
+    btn.addEventListener('click', function () {
+      if (open) closePanel()
+      else openPanel()
+    })
+
+    /* 读取 BGM 之后多一个「保存这首」：把这首从游戏档案里只读提取到本地（不修改游戏目录） */
+    document.getElementById('bgmItem').addEventListener('click', async function () {
+      showResult('BGM 识别', '正在识别…', '', null, false)
+      saveBtn.style.display = 'none'
+      var r = null
+      try { r = await window.sakana.gal.readBgm() } catch (e) { r = null }
+      if (r && r.ok && r.data && r.data.name) {
+        currentName = r.data.name
+        currentCode = r.data.code || r.data.name
+        showResult('BGM 识别', r.data.name, r.data.detail || '', null, true)
+        saveBtn.style.display = 'inline-flex'
+        saveBtn.textContent = '保存这首'
+      } else if (r && r.ok) {
+        currentName = ''
+        currentCode = ''
+        showResult('BGM 识别', (r.data && r.data.message) || '未识别到 BGM', '', null, false)
+      } else {
+        currentName = ''
+        currentCode = ''
+        showResult('BGM 识别', (r && r.error) ? r.error : 'BGM 识别失败', '', false, false)
       }
+    })
+
+    saveBtn.addEventListener('click', async function () {
+      if (!currentCode) return
+      saveBtn.textContent = '保存中…'
+      var r = null
+      try { r = await window.sakana.gal.saveBgm('', currentCode) } catch (e) { r = null }
+      if (r && r.ok && r.data && r.data.ok) {
+        saveBtn.textContent = '已保存'
+        resultDetail.textContent = '已保存到：' + r.data.path
+      } else {
+        saveBtn.textContent = '保存这首'
+        resultDetail.textContent = (r && r.data && r.data.error) || (r && r.error) || '保存失败'
+      }
+      resizeNow()
+    })
+
+    copyBtn.addEventListener('click', async function () {
+      if (!currentName) return
+      try {
+        await window.sakana.clipboard.copyText(currentName)
+        copyBtn.textContent = '已复制'
+        setTimeout(function () { if (copyBtn.textContent === '已复制') copyBtn.textContent = '复制' }, 1500)
+      } catch (e) {
+        copyBtn.textContent = '复制失败'
+      }
+    })
+
+    document.getElementById('backBtn').addEventListener('click', showMenu)
+
+    document.getElementById('shotItem').addEventListener('click', async function () {
+      if (busyShot) return
+      busyShot = true
+      showResult('截图', '正在截图…', '', null, false)
+      var r = null
+      try { r = await window.sakana.gal.overlayShot() } catch (e) { r = null }
+      showResult('截图', (r && r.ok) ? '截图已保存' : '截图失败', (r && r.ok) ? '' : ((r && r.error) || ''), !!(r && r.ok), false)
+      busyShot = false
     })
   </script>
 </body></html>`
@@ -112,9 +234,23 @@ function overlayHtml(): string {
 function positionOverlay(): void {
   if (!overlayWin || overlayWin.isDestroyed()) return
   const wa = screen.getPrimaryDisplay().workArea
-  const x = Math.round(wa.x + wa.width - OVERLAY_SIZE - 16)
+  // 按钮固定在窗口右上角：窗口宽度变化时按右边缘重新定位，按钮位置始终不动
+  const [w] = overlayWin.getSize()
+  const x = Math.round(wa.x + wa.width - w - 16)
   const y = Math.round(wa.y + 100)
   overlayWin.setPosition(x, y, false)
+}
+
+/** 悬浮按钮展开/收起选择面板（渲染层 overlay HTML 调用，动态调整悬浮窗尺寸） */
+export function galOverlayResize(open: boolean, height?: number): void {
+  if (!overlayWin || overlayWin.isDestroyed()) return
+  if (open) {
+    const h = Math.max(OVERLAY_SIZE, Math.round(Number(height) || 0) || OVERLAY_SIZE)
+    overlayWin.setSize(PANEL_WIDTH, h, false)
+  } else {
+    overlayWin.setSize(OVERLAY_SIZE, OVERLAY_SIZE, false)
+  }
+  positionOverlay()
 }
 
 function ensureOverlay(): BrowserWindow {
@@ -156,7 +292,7 @@ function destroyOverlay(): void {
   overlayWin = null
 }
 
-/** 依据配置应用快捷键与悬浮窗；仅在有游戏运行时激活（截图助手随游戏启动） */
+/** 依据配置应用快捷键与悬浮窗；仅在有游戏运行时激活（galgame 助手随游戏启动） */
 function applyCfg(cfg: GalToolsConfig): void {
   const running = galRunningInfo() !== null
   if (!running || !cfg.screenshotEnabled) {
@@ -169,17 +305,17 @@ function applyCfg(cfg: GalToolsConfig): void {
   else destroyOverlay()
 }
 
-/** 应用启动时不激活截图助手（仅配置留存，随游戏启动而激活） */
+/** 应用启动时不激活galgame 助手（仅配置留存，随游戏启动而激活） */
 export function galToolsInit(): void {
   applyCfg(getCfg())
 }
 
-/** 游戏启动时调用：按当前配置激活截图助手（快捷键 + 悬浮窗） */
+/** 游戏启动时调用：按当前配置激活galgame 助手（快捷键 + 悬浮窗） */
 export function galToolsActivate(): void {
   applyCfg(getCfg())
 }
 
-/** 最后一个游戏退出时调用：关闭截图助手（注销快捷键 + 销毁悬浮窗） */
+/** 最后一个游戏退出时调用：关闭galgame 助手（注销快捷键 + 销毁悬浮窗） */
 export function galToolsDeactivate(): void {
   applyHotkey({ ...getCfg(), screenshotEnabled: false })
   destroyOverlay()
@@ -204,7 +340,7 @@ export function galToolsGet(): GalToolsConfig {
 export function galToolsSet(patch: Partial<GalToolsConfig>): GalToolsConfig {
   const next = saveCfg(patch)
   applyCfg(next)
-  log.append('info', 'gal', `截图助手配置已更新: ${JSON.stringify(next)}`)
+  log.append('info', 'gal', `galgame 助手配置已更新: ${JSON.stringify(next)}`)
   return next
 }
 

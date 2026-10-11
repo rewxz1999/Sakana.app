@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useLocation } from 'react-router-dom'
 import {
   Camera,
   Cast,
@@ -32,6 +33,7 @@ import type { Anime4kSettings, AspectMode, CastDevice, CastReceiverInfo, Subject
 import { ANIME4K_MODES, ANIME4K_TIERS } from '@shared/anime4k'
 import { api } from '@/lib/api'
 import { StreamInfoModal } from '@/components/StreamInfoModal'
+import { PlayFlowStages, flowHeadline } from '@/components/PlayFlowProgress'
 import { CoverImage } from '@/components/CoverImage'
 import { DanmakuLayer } from '@/components/DanmakuLayer'
 
@@ -190,6 +192,287 @@ function VolumeSlider({ volume, onSet }: { volume: number; onSet: (v: number) =>
 const SPEED_CHOICES = [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3]
 const fmtSpeed = (s: number): string => `${Number.isInteger(s) ? s.toFixed(1) : s}x`
 
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * v0.3.9「按区域申请鼠标交互」——这是「控制栏按钮点击击穿」的根治办法
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * ## 这个 bug 的成因（一句话）
+ *
+ * 画面是原生 mpv 子窗口、永远盖在网页之上，所以控制栏只能画在**另一个铺满整屏的透明窗口**里。
+ * 过去那个窗口的"是否接收点击"是**整窗切换**的（控制栏显示 → 整窗接收点击；收起 → 整窗穿透）：
+ *   · 整窗接收点击时，画面中部也在吃鼠标 —— mpv 收不到鼠标（点画面不能暂停、拖不动 uosc 进度条）；
+ *   · 而"控制栏显示/收起"与"窗口的系统级穿透状态"之间总有几十~几百毫秒的时间差
+ *     （5 秒自动隐藏、切集重建、窗口隐藏再显示、切后台再回来时最大），
+ *     用户正好在这几十毫秒里点下去，事件就落到"看不见的网"上或者没人接 —— 按钮看得见、点了没反应。
+ *
+ * ## 现在的做法
+ *
+ * 悬浮窗**永远点击穿透**（`setIgnoreMouseEvents(true, { forward: true })`），
+ * 鼠标每次移动就按当前位置做一次命中判定：落在"需要点的东西"上 → 临时关掉穿透；
+ * 移开 → 立刻恢复穿透，鼠标还给 mpv。
+ *
+ * 于是：
+ *   · 不再有"整窗吃鼠标"的状态，画面中部永远是 mpv 的；
+ *   · 时间差从"控制栏显隐那个几百毫秒"缩短到"鼠标从按钮上移开的那一帧"，
+ *     而且**判定用的是鼠标的真实位置**，不是"控制栏应该显示着"这种猜测。
+ *
+ * 实现约定（改 UI 时务必遵守）：
+ *   1. **凡是需要点击的区域**（控制栏、顶栏、各种菜单/浮层、自检提示），
+ *      容器上都要打 `data-sakana-hit`；不打 = 那块区域是穿透明（点了会落到 mpv 上）。
+ *   2. 判定用 `document.elementFromPoint`，所以"看不见但还在 DOM 里"的元素不能算数 ——
+ *      控制栏收起时用的 `pointer-events-none`（见渲染代码）正好让 elementFromPoint 跳过它，
+ *      这就是"收起后立刻穿透"的实现方式，不需要额外同步状态。
+ *   3. 拖动（进度条/音量）期间指针会被捕获、可能拖到区域外，用 `holdPointerRef` 锁住，
+ *      别让判定在中途把点击收回 —— 那会让拖动断在手里。
+ */
+const HIT_ATTR = 'data-sakana-hit'
+
+/**
+ * 「只要求被画出来」的标记（v0.3.9 第六轮）。
+ *
+ * 为什么需要：`setShape` 的裁剪是**双向的** —— 区域之外"不画也不收鼠标"。
+ * 某个纯提示容器若是 `pointer-events-none`（不该吃点击），只按"可点容器"上报就会被**裁掉不画**。
+ * 所以凡"必须显示、但不参与命中"的容器都打这个标记，区域上报时**不看 pointer-events** 一律算进来。
+ *
+ * ⚠️ 第六轮修订的两条硬规矩（踩过坑，别再犯）：
+ *   1. **居中/铺满整窗的提示不能放在 UI 窗口里**：它是居中的，一旦算进区域，**画面正中就落进窗口形状**
+ *      → 那块像素的点击被 Electron 吃掉、mpv 收不到（实测回归：`画面中部不在形状里 = false`）。
+ *      「加载中/过程进度」卡因此搬到了**穿透层（弹幕窗口）**去画 —— 那里不受形状裁剪、还永远不接收鼠标。
+ *   2. 万一将来真有"整窗大小的 draw 容器"，收集时**只取它里面够大的子元素矩形**（见下面的实现）：
+ *      整窗矩形永远不该进入形状，否则等于整窗吃鼠标。
+ */
+const DRAW_ATTR = 'data-sakana-draw'
+
+/**
+ * 弹出面板/菜单的标记（v0.3.9 第六轮）。
+ *
+ * 用户实测 ①「控制栏按钮选项被遮盖：画质、画面比例、弹幕设置、字幕、倍速」的根因是：
+ * 这些 popover 是**挂在底栏容器里、但视觉上伸到容器上方**的（`absolute bottom-12`），
+ * 而形状当时只收了底栏容器自己的矩形 —— 伸出去的那部分既被裁掉不画、也不收鼠标。
+ * 所以每个 popover 既要 `data-sakana-hit`（参与命中与形状），又用这个标记把自己标出来，
+ * 供自检**逐个面板**核对"打开后的矩形是否真的落在下发的形状里"。
+ */
+const POPOVER_ATTR = 'data-sakana-popover'
+
+/** 命中判定结果：命中可点区域 / 贴着可点区域边缘 / 明显离开（见 zoneAt） */
+type HitZone = 'hit' | 'near' | 'away'
+
+/**
+ * 迟滞窗口（v0.3.9 补充工单）。
+ *
+ * 为什么需要：命中判定由 mousemove 驱动，而"接收点击"要等一次 IPC 往返才真正生效。
+ * 鼠标在按钮与它旁边的空隙之间移动时，判定可能在一帧之内从"命中"变成"没命中"，
+ * 用户正好在那几十毫秒里点下去，事件就落到 mpv 上 —— 这就是用户报的「点击击穿」。
+ * 所以：命中过一次之后，HIT_LATCH_MS 内**不因为一次"没命中"就切回穿透**（除非明显离开，见 HIT_NEAR_PX）。
+ * 取 650ms（工单给的 600–800ms 区间偏下限）：窗口越短，鼠标离开控制栏后画面越早拿回鼠标。
+ */
+const HIT_LATCH_MS = 650
+
+/**
+ * "还贴着可点区域"的容差（px）。
+ *
+ * 距最近可点区域在这个距离之内不算"明显离开控制栏/浮层"，迟滞窗口内保持接收点击；
+ * 一旦超出（例如鼠标已经跑到画面中部，或光标离开窗口）就**立刻**恢复穿透 ——
+ * 否则会重新犯"画面中间点不动"的老毛病（`.e2e/run-overlay-hit-test.cmd` 第 2 条断言守着它）。
+ */
+const HIT_NEAR_PX = 24
+
+/**
+ * 可点区域矩形缓存的刷新间隔。
+ * near 判定只在"没命中"时才用得上，而它需要读所有可点容器的布局 —— 缓存 200ms 足够，
+ * 免得每个 mousemove 都触发一次强制布局（弹幕画布就在同一个渲染进程里）。
+ */
+const HIT_RECT_TTL_MS = 200
+
+/**
+ * 判定结果的**最小上报间隔**（v0.3.9 补充工单第二次修改）。
+ *
+ * 规则：**每一次判定都上报**，只按这个间隔节流（鼠标快速划过时每秒最多约 16 条 IPC）。
+ *
+ * 为什么不再用"只在结论变化时上报"（上一版的做法，也是这次 #3 回归的元凶）：
+ *   渲染层本地记着"我上次报的是 true/false"，结论没变就不再发。但主进程那侧的状态**会因兜底判定
+ *   独立变化**（窗口未聚焦时它按系统光标自己判），一旦两边不一致，渲染层就会因为"我这条结论没变"
+ *   而永远不再上报 —— 结果是鼠标明明在按钮上、主进程却一直停在穿透态，点下去就是击穿。
+ *   每条判定都上报（60ms 节流）之后，这种"不一致且自愈不了"的状态最多存在 60ms。
+ */
+const VERDICT_MIN_REPORT_MS = 60
+
+/**
+ * 指针坐标的**模块级**记录 + 收到的鼠标移动次数（v0.3.9 补充工单）。
+ *
+ * 为什么必须放在组件外面：
+ *   ① 自检（以及真实场景里"刚进播放页 / 刚按 F 全屏"）会在 `did-finish-load` 之后**立刻**注入
+ *      mouseMove，而那时 React 还没挂载完、window 上的 mousemove 监听还不存在 —— 事件直接丢掉，
+ *      主进程永远等不到判定，用户在这一瞬间点下去就是击穿。
+ *      模块级代码在 bundle 执行时就开始记录，组件挂载后立刻用它算一次判定。
+ *   ② `overlayMoves` 是排查"渲染层到底有没有收到鼠标"的硬证据（主进程日志会带上它）。
+ * 只在悬浮窗这一侧记录：主窗口也 import 了这个模块，那边记它没有意义。
+ */
+let earlyPointer: { x: number; y: number } | null = null
+let overlayMoves = 0
+if (api.overlay.isOverlay || window.location.hash.startsWith('#/overlay')) {
+  window.addEventListener(
+    'mousemove',
+    (e) => {
+      overlayMoves += 1
+      earlyPointer = { x: e.clientX, y: e.clientY }
+    },
+    { passive: true }
+  )
+}
+
+/**
+ * 收到的鼠标点击统计（v0.3.9 第五轮）。
+ *
+ * 为什么必须与 `[overlay-hit] ACTION` 分开数：ACTION 数的是"动作到达主进程"，
+ * 而"点击有没有进来"是另一回事 —— 落在控制栏**热区空白处**的点击（自动收起后那一帧、按钮之间的空隙、
+ * 面板留白）会到达窗口但不会产生任何动作。只数 ACTION 时，"点击没到窗口"和
+ * "点击到了但没落在按钮上"会混成同一个数字，无法定位（上一轮 8/39 说不清就是这个原因）。
+ *   · down       —— 渲染层收到的 pointerdown 总数（这一下确实落进了 Electron 窗口）
+ *   · onButton   —— 其中落在 `<button>` 上的（正常应 1:1 产生动作）
+ *   · onHitBlank —— 落在可点容器上但不是按钮（热区空白 / 面板留白）
+ *   · elsewhere  —— 落在别处（理论上不该出现）
+ * 用捕获阶段统计：按钮自己 stopPropagation 也不影响计数。
+ */
+/**
+ * 悬浮窗的透明底色**在模块加载时就立刻打上**（v0.3.9 第六轮，用户实测 ④ 的修复之一）。
+ *
+ * 为什么不能只在组件里用 `useEffect` 打标记（原来的做法）：
+ *   · effect 在**首次绘制之后**才跑 —— 这一段时间里 `body` 还是 `background: var(--bg)`
+ *     （曜石黑主题 = 不透明 #0c0d0f），而弹幕窗口是**铺满整屏、位于主窗口之上**的，
+ *     于是整屏会被一块不透明底色盖住（用户看到的「一片黢黑」）；
+ *   · 而且那个 effect 的 cleanup 会在卸载时**移除**标记 —— 恰好是"播放页重建"这条路上
+ *     最需要它的时候。
+ * 现在：模块作用域立刻加（早于 React 首次渲染），并且**永不移除**；同时直接写内联样式兜底，
+ * 不依赖 CSS 类是否命中（表里两层都保住"画面上没有不透明底色"这件事）。
+ */
+if (api.overlay.isOverlay) {
+  const root = document.documentElement
+  root.classList.add('sakana-overlay')
+  root.style.background = 'transparent'
+  const setBody = (): void => {
+    document.body.classList.add('sakana-overlay')
+    document.body.style.background = 'transparent'
+  }
+  if (document.body) setBody()
+  else document.addEventListener('DOMContentLoaded', setBody, { once: true })
+}
+
+const overlayClicks = {
+  down: 0,
+  onButton: 0,
+  onHitBlank: 0,
+  elsewhere: 0,
+  byTitle: {} as Record<string, number>
+}
+if (api.overlay.isOverlay && !window.location.hash.includes('part=danmaku')) {
+  window.addEventListener(
+    'pointerdown',
+    (e) => {
+      overlayClicks.down += 1
+      const el = e.target as HTMLElement | null
+      const btn = el?.closest?.('button') ?? null
+      if (btn) {
+        overlayClicks.onButton += 1
+        // 按 title / 文本归类：便于回答"某个按钮系统性丢"还是"连点太快被吞"
+        const key = btn.getAttribute('title') || (btn.textContent ?? '').trim().slice(0, 12) || '(untitled)'
+        overlayClicks.byTitle[key] = (overlayClicks.byTitle[key] ?? 0) + 1
+      } else if (el?.closest?.(`[${HIT_ATTR}]`)) {
+        overlayClicks.onHitBlank += 1
+      } else {
+        overlayClicks.elsewhere += 1
+      }
+    },
+    true
+  )
+}
+
+/** 拖动进度条时下发 seek 的最小间隔（ms），见 seekTo 的说明 */
+const SEEK_THROTTLE_MS = 120
+
+/** 主进程（playerOverlay.ts）会通过这几个全局函数按需查询命中结果与可交互区域 */
+interface HitProbeWindow extends Window {
+  __sakanaHitAt?: (x: number, y: number) => boolean
+  __sakanaHitLocked?: boolean
+  __sakanaOverlayVisible?: boolean
+  /** 判定细节（zone / 迟滞拦住次数 / 收到多少次鼠标移动…）：主进程读它写日志，不新增 IPC 通道 */
+  __sakanaHitDiag?: () => {
+    zone: HitZone
+    verdict: boolean
+    locked: boolean
+    latched: number
+    msSinceHit: number
+    moves: number
+  }
+  /** 主进程兜底判定用的快照（降级回退与诊断）：可点矩形 + 拖动锁 + 当前判定 */
+  __sakanaHitSnapshot?: () => {
+    rects: { x: number; y: number; w: number; h: number; hittable: boolean }[]
+    locked: boolean
+    verdict: boolean
+    zone: HitZone
+    moves: number
+  }
+  /**
+   * **可交互区域**（v0.3.9 第三轮）：这组矩形就是 UI 窗口的**窗口形状** ——
+   * 区域内的点击由 Electron 窗口接手，区域外的点击由操作系统直接透给下面的 mpv 子窗口。
+   * 命中判定交给 OS，就没有"切换时机"这件事了（用户实测切换式方案 46% 点击落空）。
+   */
+  __sakanaHitRegions?: () => { x: number; y: number; w: number; h: number }[]
+  /**
+   * 收到的点击统计（v0.3.9 第五轮）：把"点击没到窗口"与"到了但没落在按钮上"分开计数。
+   * 主进程会把它打进 `[overlay-hit] STATS` 行，ps1 据此做分段统计。
+   */
+  __sakanaClickStats?: () => {
+    down: number
+    onButton: number
+    onHitBlank: number
+    elsewhere: number
+    byTitle: Record<string, number>
+  }
+  /**
+   * "这次区域为什么是空的"的自述（v0.3.9 第六轮）：主进程只在区域为空时问一次。
+   * `uosc: true` 才允许隐藏窗口；其它原因一律走退化兜底（见 playerOverlay 的 NEVER_DEAD_STATE）。
+   */
+  __sakanaRegionsDiag?: () => {
+    ready: boolean
+    uosc: boolean
+    hasTopBar: boolean
+    hasBottomBar: boolean
+    hitCount: number
+    barVisible: boolean
+    regions: number
+  }
+  /**
+   * 逐个面板自检（v0.3.9 第六轮）：打开每个能从控制栏打开的面板/菜单，
+   * 核对"它打开后的真实矩形是否落在下发的形状里"。返回每一项的判定与缺口比例。
+   */
+  __sakanaPanelProbe?: () => Promise<
+    {
+      kind: 'popover' | 'overlay'
+      title: string
+      found: boolean
+      covered: boolean
+      rect: { x: number; y: number; w: number; h: number } | null
+      missing: number
+      reason: string
+    }[]
+  >
+}
+
+/**
+ * 悬浮窗角色（v0.3.9 第三轮拆窗口）：
+ *   · `ui`      —— 控制栏与所有面板：铺满主窗口 + `setShape` 限定可点区域 + **一直接收鼠标**；
+ *   · `danmaku` —— 弹幕：铺满主窗口、**永久穿透**（`setIgnoreMouseEvents(true,{forward:true})`）。
+ * 为什么必须拆：`setShape` 会同时裁剪绘制，铺满画面中部的弹幕会被裁掉；
+ * 而"整窗接收鼠标"又会把画面上的点击全吃掉。详见 playerOverlay.ts 文件头。
+ */
+type OverlayPart = 'ui' | 'danmaku'
+
+/** 顶栏/底栏容器（控制栏"热区"）：它们即使自动收起也**必须留在可交互区域里**，否则控制栏唤不出来 */
+const TOPBAR_SEL = '[data-sakana-topbar]'
+const BOTTOMBAR_SEL = '[data-sakana-bottombar]'
+
 /** 键位提示小胶囊（自救浮层里用；JSX 里不能写 Markdown，键位要用样式标出来） */
 function Key({ children }: { children: React.ReactNode }) {
   return (
@@ -285,6 +568,13 @@ function IconBtn({
 
 export default function PlayerOverlay(): React.ReactElement {
   const [state, setState] = useState<OverlayState | null>(null)
+  /**
+   * 本窗口的角色（v0.3.9 第三轮拆窗口）：主进程用 `#/overlay?part=ui|danmaku` 加载两块窗口，
+   * 这里按 part 决定渲染哪一半 —— 弹幕窗口只画弹幕，UI 窗口画控制栏与所有面板。
+   */
+  const location = useLocation()
+  const part: OverlayPart = new URLSearchParams(location.search).get('part') === 'danmaku' ? 'danmaku' : 'ui'
+  const isDanmakuPart = part === 'danmaku'
   const [episodes, setEpisodes] = useState<OverlayEpisodes | null>(null)
   /** v0.2.8：弹幕数据与设置（由播放页推送，换集/改设置时更新） */
   const [danmaku, setDanmaku] = useState<OverlayDanmaku | null>(null)
@@ -333,39 +623,669 @@ export default function PlayerOverlay(): React.ReactElement {
   const hideTimer = useRef<number | undefined>(undefined)
   const seekRef = useRef<HTMLDivElement | null>(null)
   const [dragging, setDragging] = useState(false)
-  /** 菜单/浮层打开期间禁止自动隐藏（否则 5 秒后窗口恢复点击穿透，浮层就点不动了） */
+  /**
+   * 拖动中的进度（0~100）。为 null 表示"没在拖"，显示跟随内核真实进度。
+   * 为什么要有本地值：见下面 `shownPercent` 的说明 —— 拖动时不能再被回推的进度覆盖。
+   */
+  const [dragPercent, setDragPercent] = useState<number | null>(null)
+  /** 上一次真的发出 seek 的时刻（节流用，见 seekTo） */
+  const lastSeekAtRef = useRef(0)
+  /** 菜单/浮层打开期间禁止自动隐藏（否则 5 秒后控制栏收起，浮层就点不动了） */
   const holdRef = useRef(false)
 
   const send = useCallback((action: OverlayAction) => {
     api.overlay.action(action)
   }, [])
 
+  // ---------------- v0.3.9：按区域申请鼠标交互（见 HIT_ATTR 上面那段说明） ----------------
+
+  /** 最后一次已知的光标位置（CSS 像素，悬浮窗客户区）；null = 还没收到过坐标/已离开 */
+  const pointerRef = useRef<{ x: number; y: number } | null>(null)
+  /** 当前是否已经申请了"接收点击"（只在**变化**时发 IPC，不再每次 mousemove 都发） */
+  const interactiveRef = useRef(false)
   /**
-   * v0.3.2：uosc 接管控制栏后，这个悬浮窗**必须一直是点击穿透的**。
+   * 指针按下期间的锁（拖动进度条/音量时用）。
    *
-   * 原因（实测，不是推测）：这个悬浮窗是覆盖整个播放器窗口的独立顶层窗口。
-   * 只要它一旦变成「接收点击」（`setIgnoreMouseEvents(false)`），
-   * `WindowFromPoint` 在视频区域命中的就是它（`Chrome_RenderWidgetHostHWND`），
-   * 而**不是** mpv 的原生子窗口 —— 于是 mpv 收不到任何鼠标移动，
-   * uosc 永远等不到「鼠标动了」这个唤出条件。用户看到的现象就是：
-   * 「旧控制栏还在、新的 uosc 控制栏呼不出来、点哪儿都没反应」。
+   * 为什么必须锁：指针被捕获后可以拖出控制栏（甚至拖到窗口外），
+   * 那时如果还按命中结果收回点击，鼠标事件会当场断掉 —— 表现就是"拖一半拖不动了"。
+   */
+  const holdPointerRef = useRef(false)
+  /** 上次"真的命中可点区域"的时刻（迟滞窗口的起点，见 syncInteractive） */
+  const lastHitAtRef = useRef(0)
+  /** 被迟滞拦住的次数（本该收回点击、按迟滞规则先留着）：主进程轮询读它写日志 */
+  const latchedBlocksRef = useRef(0)
+  /** 可点区域矩形缓存（只有"没命中"时才要算距离，刷新间隔见 HIT_RECT_TTL_MS） */
+  const hitRectsRef = useRef<{ at: number; rects: DOMRect[] }>({ at: 0, rects: [] })
+  /** 最近一次判定得到的 zone（诊断与主进程日志用） */
+  const lastZoneRef = useRef<HitZone>('away')
+  /** 最近一次上报判定结果的时刻（心跳节流，见 VERDICT_HEARTBEAT_MS） */
+  const lastReportAtRef = useRef(0)
+
+  /**
+   * 该点是否贴在某块可点区域边缘（HIT_NEAR_PX 之内）。
    *
-   * 所以 uosc 模式下只有「真的需要点的东西」（应用自己的详情/选集/弹幕菜单浮层）
-   * 才临时打开交互，其余时间一律穿透，把鼠标让给 mpv。
-   * `poke` 的依赖数组是空的，所以这里用 ref 读取最新的 uosc 状态，避免闭包拿到旧值。
+   * 只用来**保持**已经申请到的"接收点击"，绝不用来开启（见 syncInteractive）：
+   * 否则控制栏周围会多出一圈 24px 的隐形吃鼠标带，画面中部附近就点不动 mpv 了。
+   */
+  const nearHitRegion = useCallback((x: number, y: number): boolean => {
+    const now = Date.now()
+    const cache = hitRectsRef.current
+    if (now - cache.at > HIT_RECT_TTL_MS) {
+      const rects: DOMRect[] = []
+      for (const el of Array.from(document.querySelectorAll<HTMLElement>(`[${HIT_ATTR}]`))) {
+        // 控制栏收起时容器带 pointer-events:none —— 那种区域不算数，否则"看不见的网"会被当成邻域，
+        // 鼠标一移开就再也回不到穿透态（正是用户抱怨过的"画面中间点不动"）。
+        if (getComputedStyle(el).pointerEvents === 'none') continue
+        const r = el.getBoundingClientRect()
+        if (r.width < 2 || r.height < 2) continue
+        rects.push(r)
+      }
+      hitRectsRef.current = { at: now, rects }
+    }
+    for (const r of hitRectsRef.current.rects) {
+      if (
+        x >= r.left - HIT_NEAR_PX &&
+        x <= r.right + HIT_NEAR_PX &&
+        y >= r.top - HIT_NEAR_PX &&
+        y <= r.bottom + HIT_NEAR_PX
+      ) {
+        return true
+      }
+    }
+    return false
+  }, [])
+
+  /**
+   * 命中判定（**唯一判据**：渲染层的 mousemove 与主进程的光标轮询都走这里）：
+   *   · 'hit'  —— 该点上最上层的元素落在某个 `data-sakana-hit` **容器**里。
+   *              标记打在容器上（顶栏/底栏/各种浮层，见 HIT_ATTR 约定 1），
+   *              所以按钮之间的空隙、容器的内边距、进度条两侧的空白同样算命中；
+   *              这里用 `closest` 向上找最近的标记祖先，命中按钮本身也归到它所在的容器。
+   *   · 'near' —— 没命中，但仍在可点区域边缘 HIT_NEAR_PX 之内（鼠标刚滑出控制栏那种位置）。
+   *   · 'away' —— 明显离开（画面中部、窗口外…）。
+   * 顺序：先 elementFromPoint（它自己会跳过 pointer-events:none 的元素 —— 控制栏收起时正是靠这个
+   * 立刻变回穿透），只有"没命中"时才去算与区域矩形的距离（贵，别在热路径上白算）。
+   */
+  const zoneAt = useCallback(
+    (x: number, y: number): HitZone => {
+      const el = document.elementFromPoint(x, y)
+      const zone: HitZone = el && el.closest(`[${HIT_ATTR}]`) ? 'hit' : nearHitRegion(x, y) ? 'near' : 'away'
+      lastZoneRef.current = zone
+      return zone
+    },
+    [nearHitRegion]
+  )
+
+  /**
+   * 判定并把结果同步给主进程。
+   *
+   * ⚠️ v0.3.9 第三轮：**"吃不吃鼠标"已经不由这个判定决定了** —— 那是 UI 窗口形状的事（OS 判定，
+   * 见 `__sakanaHitRegions`）。这条上报现在的职责是：
+   *   · 告诉主进程"渲染层有话要说"（主进程据此立刻重新拉一次可交互区域，窗口形状跟着控制栏显隐更新）；
+   *   · 诊断（谁能看清"渲染层收到了几次鼠标"）；
+   *   · 以及在没有 `setShape` 的平台上的降级回退（那时它仍然决定吃不吃鼠标）。
+   * 三条规则（命中 / 贴边 24px 迟滞 / 明显离开）保持不变。
+   */
+  const syncInteractive = useCallback((): void => {
+    // 弹幕窗口不上报：它永久穿透，没有任何可交互元素（报了只会污染主进程的诊断与回退判定）
+    if (isDanmakuPart) return
+    const p = pointerRef.current
+    /*
+     * 没有可用坐标时**不下结论**（保持上一次的结果）。
+     *
+     * 为什么：`mouseleave` / `mouseout(relatedTarget=null)` 会把坐标标记为失效，而那两个事件在
+     * `forward: true` 下光标滑到原生 mpv 子窗口上时也会发 —— 若在这里按 null 上报"收回点击"，
+     * 就又会重演"鼠标移到画面上那一帧被判穿透"的横跳（用户实测的击穿）。
+     * "光标是否已离开悬浮窗"由主进程按窗口矩形判定（唯一权威，见 pollCursorHit）。
+     * 拖动中例外：指针被捕获，此时必须保持接收点击，否则拖到窗外就断在手里。
+     */
+    if (!p && !holdPointerRef.current) return
+    let want = holdPointerRef.current
+    if (!want && p) {
+      const zone = zoneAt(p.x, p.y)
+      if (zone === 'hit') {
+        want = true
+        lastHitAtRef.current = Date.now()
+      } else if (zone === 'near') {
+        // 只"保持"不"开启"：贴着边缘不算命中
+        const latched = interactiveRef.current && Date.now() - lastHitAtRef.current <= HIT_LATCH_MS
+        if (latched) latchedBlocksRef.current += 1
+        want = latched
+      }
+    }
+    const now = Date.now()
+    /*
+     * **每一次判定都上报**（只按 VERDICT_MIN_REPORT_MS 节流），不再"结论没变就不吭声"：
+     *   · 主进程据此知道"渲染层还活着、当前判定是这个"，能区分"渲染层说穿透"与"渲染层没收到鼠标"；
+     *   · 更重要的是：主进程兜底判定会独立改状态，若渲染层还按"我这条没变"而静默，
+     *     两边就会永久不一致（鼠标在按钮上、窗口却停穿透态）—— 每次判定都上报把这个窗口压到 60ms。
+     */
+    if (now - lastReportAtRef.current < VERDICT_MIN_REPORT_MS) return
+    lastReportAtRef.current = now
+    interactiveRef.current = want
+    void api.overlay.setInteractive(want).then(
+      (r) => {
+        // IPC 返回失败（窗口正在销毁等）就把本地状态退回去，下一次事件会重发 ——
+        // 否则本地以为"已经申请到接收点击了"，之后同样的判定不再发送，按钮就永远点不动了。
+        if (!r.ok) interactiveRef.current = !want
+      },
+      () => {
+        interactiveRef.current = !want
+      }
+    )
+  }, [zoneAt, isDanmakuPart])
+
+  /**
+   * 算出"交给主进程做窗口形状"的**可交互区域**（v0.3.9 第三轮的核心）。
+   *
+   * 规则（改 UI 时务必遵守）：
+   *   ① `data-sakana-topbar` / `data-sakana-bottombar` 两块控制栏容器 —— 只要它们带 `data-sakana-hit`
+   *      （= 应用自己画控制栏、不是 uosc 接管），就**始终**算在内，包括自动收起的时候：
+   *      窗口形状就是渲染层能收到鼠标的范围，若把它们去掉，鼠标移到底部时渲染层收不到事件，
+   *      控制栏就永远唤不出来（死锁）；
+   *   ② 其他 `data-sakana-hit` 容器（面板/浮层/提示）：只算**当前可点**的（`pointer-events !== none`），
+   *      它们的矩形本身就是"面板的确切范围"；
+   *   ③ 已经被已有区域完全包住的矩形不再重复上报（形状块数越少，系统开销越小）；
+   *   ④ 容器自己没有尺寸时（子元素是 fixed 定位的浮层，例如流详情弹窗）退一步量它的一级子元素。
+   *   ⑤ `data-sakana-draw` 的容器（例如"加载中/过程进度"提示）**不看 pointer-events 一律算进来** ——
+   *      形状同时决定"画什么"，漏了它就会被裁掉不画（用户实测 ④ 的黑屏就是这么来的）。
+   *   ⑥ 容器里**伸到容器外面**的可点后代（popover/菜单，`absolute bottom-12` 那种）单独补一块矩形 ——
+   *      否则它们伸出去的部分既不画也不收鼠标（用户实测 ①「画质/画面比例/弹幕设置/字幕/倍速被遮盖」）。
+   * uosc 接管控制栏时应用没有任何交互元素 → 返回空数组 → 整块区域交还给 mpv
+   * （主进程据此**允许隐藏**窗口；其它原因的空区域一律走退化兜底，绝不隐藏 —— 见 playerOverlay 的
+   *  NEVER_DEAD_STATE 说明与 `__sakanaRegionsDiag`）。
+   */
+  const hitRegionsNow = useCallback((): { x: number; y: number; w: number; h: number }[] => {
+    const out: { x: number; y: number; w: number; h: number }[] = []
+    const addRect = (rect: DOMRect): void => {
+      if (rect.width < 2 || rect.height < 2) return
+      const r = { x: rect.left, y: rect.top, w: rect.width, h: rect.height }
+      const contained = out.some(
+        (o) => r.x >= o.x && r.y >= o.y && r.x + r.w <= o.x + o.w && r.y + r.h <= o.y + o.h
+      )
+      if (!contained) out.push(r)
+    }
+    const addElement = (el: HTMLElement): void => {
+      const own = el.getBoundingClientRect()
+      if (own.width >= 2 && own.height >= 2) {
+        addRect(own)
+        return
+      }
+      for (const child of Array.from(el.children)) addRect(child.getBoundingClientRect())
+    }
+    /**
+     * 把"伸到容器外"的浮层补进来（见规则 ⑥）。
+     *
+     * 只认 `position: absolute | fixed` 的后代：按钮、图标这些 static 元素永远在容器内，
+     * 把它们全量算一遍既慢又没有意义。用 `[class~="absolute"]` 做预筛（Tailwind 的 `absolute`
+     * 就是 class 列表里的一个词），再按"是否真的伸出去 + 是否可点 + 是否有尺寸"三个条件确认。
+     */
+    const addOverflowing = (root: HTMLElement, base: DOMRect): void => {
+      const candidates = root.querySelectorAll<HTMLElement>('[class~="absolute"], [class~="fixed"]')
+      for (const el of Array.from(candidates)) {
+        const r = el.getBoundingClientRect()
+        if (r.width < 8 || r.height < 8) continue
+        if (getComputedStyle(el).pointerEvents === 'none') continue
+        const inside =
+          r.left >= base.left - 0.5 && r.top >= base.top - 0.5 && r.right <= base.right + 0.5 && r.bottom <= base.bottom + 0.5
+        if (inside) continue
+        addRect(r)
+      }
+    }
+    const top = document.querySelector<HTMLElement>(TOPBAR_SEL)
+    const bottom = document.querySelector<HTMLElement>(BOTTOMBAR_SEL)
+    // ① 控制栏热区（顶栏在 uosc 模式下没有 data-sakana-hit，那时不算）
+    if (top?.hasAttribute(HIT_ATTR)) {
+      addElement(top)
+      addOverflowing(top, top.getBoundingClientRect())
+    }
+    if (bottom?.hasAttribute(HIT_ATTR)) {
+      addElement(bottom)
+      addOverflowing(bottom, bottom.getBoundingClientRect())
+    }
+    // ② 其余可点容器（面板/浮层/提示）
+    for (const el of Array.from(document.querySelectorAll<HTMLElement>(`[${HIT_ATTR}]`))) {
+      if (el === top || el === bottom) continue
+      if (getComputedStyle(el).pointerEvents === 'none') continue
+      addElement(el)
+      addOverflowing(el, el.getBoundingClientRect())
+    }
+    // ⑤ 只要求"被画出来"的容器：不看 pointer-events（否则会被形状裁掉 → 加载提示/错误条消失）。
+    //    **整窗大小的 draw 容器只取它里面够大的子元素**：整窗矩形进形状 = 整窗吃鼠标（见 DRAW_ATTR 的说明）。
+    for (const el of Array.from(document.querySelectorAll<HTMLElement>(`[${DRAW_ATTR}]`))) {
+      /* 窗口尺寸用 window.innerWidth/Height（CSS 像素，与 getBoundingClientRect 同单位，读的是当下值） */
+      const vw = window.innerWidth || 1
+      const vh = window.innerHeight || 1
+      const own = el.getBoundingClientRect()
+      const spansWindow = own.width >= vw * 0.8 && own.height >= vh * 0.8
+      if (!spansWindow) {
+        addElement(el)
+        continue
+      }
+      let added = 0
+      for (const child of Array.from(el.querySelectorAll<HTMLElement>('*'))) {
+        const r = child.getBoundingClientRect()
+        if (r.width < 8 || r.height < 8) continue
+        if (r.width >= vw * 0.8 && r.height >= vh * 0.8) continue
+        addRect(r)
+        added += 1
+      }
+      if (added === 0) {
+        /* 里面没有可用的子元素（例如只有一个铺满的画布）：这时**宁可什么都不加** ——
+           "少画一点提示"远好于"把整块画面从 mpv 手里抢走"。 */
+        console.warn('[overlay] data-sakana-draw 容器铺满整窗且没有子元素，已跳过（不把整窗放进形状）')
+      }
+    }
+    return out
+  }, [])
+
+  /**
+   * 向主进程暴露命中查询（见 playerOverlay.ts 的 probeOverlayHit）。
+   *
+   * 主进程这一问有**两个**作用：
+   *   ① 把"真实光标在哪"告诉渲染层（合成事件到不了的地方，例如按 F 全屏后光标一直没动过）；
+   *   ② 让渲染层按这个坐标**重新判定一次**。
+   * 外加两个只读接口（都用 executeJavaScript 读，不往 preload 契约里加通道）：
+   *   · `__sakanaHitDiag()` —— zone / 迟滞拦住次数 / 收到多少次鼠标移动（排查用）；
+   *   · `__sakanaHitSnapshot()` —— 可点矩形 + 拖动锁 + 当前判定，供**主进程在渲染层收不到
+   *     鼠标事件时自己判定**（窗口未聚焦时就是这种情况，见 playerOverlay.ts 的说明）。
+   */
+  useEffect(() => {
+    const w = window as HitProbeWindow
+    w.__sakanaHitAt = (x: number, y: number): boolean => {
+      pointerRef.current = { x, y }
+      syncInteractive()
+      // 返回值只表示"这个点上是否有可点区域"（拖动中恒为 true），供主进程诊断与日志使用
+      return holdPointerRef.current || zoneAt(x, y) === 'hit'
+    }
+    w.__sakanaHitDiag = () => ({
+      zone: lastZoneRef.current,
+      verdict: interactiveRef.current,
+      locked: holdPointerRef.current,
+      latched: latchedBlocksRef.current,
+      msSinceHit: lastHitAtRef.current > 0 ? Date.now() - lastHitAtRef.current : -1,
+      moves: overlayMoves
+    })
+    w.__sakanaHitSnapshot = () => ({
+      rects: Array.from(document.querySelectorAll<HTMLElement>(`[${HIT_ATTR}]`)).map((el) => {
+        const r = el.getBoundingClientRect()
+        return {
+          x: r.left,
+          y: r.top,
+          w: r.width,
+          h: r.height,
+          // 控制栏收起时容器带 pointer-events:none —— 那种区域此刻不可点，主进程也不该拿它当命中区
+          hittable: getComputedStyle(el).pointerEvents !== 'none' && r.width >= 2 && r.height >= 2
+        }
+      }),
+      locked: holdPointerRef.current,
+      verdict: interactiveRef.current,
+      zone: lastZoneRef.current,
+      moves: overlayMoves
+    })
+    /*
+     * 可交互区域（= UI 窗口的窗口形状）。主进程在渲染层每次上报后立刻拉一次，
+     * 所以控制栏显隐、面板开合都会在几毫秒内反映到形状上 —— 不需要新增 IPC 通道。
+     */
+    w.__sakanaHitRegions = () => hitRegionsNow()
+    /** 点击统计（主进程打进 STATS 行；ps1 按阶段取差值，用来区分"没到窗口"与"没落在按钮上"） */
+    w.__sakanaClickStats = () => ({ ...overlayClicks, byTitle: { ...overlayClicks.byTitle } })
+    /**
+     * "这次区域为什么是空的"的自述（v0.3.9 第六轮）。
+     *
+     * 主进程只在**区域为空**时问一次，用来区分两种情况：
+     *   · `uosc: true` —— 控制栏交给 mpv 画，应用确实没有任何可交互元素 → **允许隐藏窗口**
+     *     （整块交还 mpv，这是设计意图）；
+     *   · 其它一切（页面还没就绪 / 控制栏还没渲染出来 / 控制栏正自动收起）→ 主进程**退化兜底**
+     *     （沿用上一份区域或整窗形状），绝不隐藏 —— 否则形状裁剪会把控制栏和加载提示一起裁没。
+     */
+    w.__sakanaRegionsDiag = () => {
+      const top = document.querySelector<HTMLElement>(TOPBAR_SEL)
+      const bottom = document.querySelector<HTMLElement>(BOTTOMBAR_SEL)
+      /*
+       * uosc 判定**只看 DOM**（不看 React state）：与区域收集用的是同一个条件 ——
+       * 两条控制栏都存在、但谁都没带 `data-sakana-hit`，就是"控制栏交给 mpv 画"。
+       * 顺便避免了在 effect 闭包里读 state 的过期值问题。
+       */
+      const uosc = !!(top || bottom) && !top?.hasAttribute(HIT_ATTR) && !bottom?.hasAttribute(HIT_ATTR)
+      return {
+        ready: true,
+        uosc,
+        hasTopBar: !!top,
+        hasBottomBar: !!bottom,
+        hitCount: document.querySelectorAll(`[${HIT_ATTR}]`).length,
+        /* 控制栏自动收起时容器带 pointer-events:none —— 直接量 DOM，不依赖 React 闭包 */
+        barVisible: !!bottom && getComputedStyle(bottom).pointerEvents !== 'none',
+        regions: hitRegionsNow().length
+      }
+    }
+    /**
+     * **逐个面板**核对"打开后的矩形是否落在下发的形状里"（v0.3.9 第六轮，用户实测 ①）。
+     *
+     * 为什么要做成浏览器里的自检而不是只看静态标记：形状是**算出来的**（起点是 DOM 实测矩形），
+     * 标记打得对不对只有比对"打开后的真实矩形 vs 上报区域"才算数。这里对每个能从控制栏打开的
+     * 面板/菜单：派发一次 `pointerdown` 打开它 → 等两帧让 React 把 DOM 落下去 → 读它自己和
+     * `__sakanaHitRegions()` → 判断"完全被区域覆盖" → 再派发一次关掉。
+     * 返回的每一项都带 `missing`（伸到区域外的面积比例），自检据此给出可定位的失败信息。
+     */
+    w.__sakanaPanelProbe = async (): Promise<
+      {
+        kind: 'popover' | 'overlay'
+        title: string
+        found: boolean
+        covered: boolean
+        rect: { x: number; y: number; w: number; h: number } | null
+        missing: number
+        reason: string
+      }[]
+    > => {
+      const frames = (n: number): Promise<void> =>
+        new Promise((resolve) => {
+          let left = n
+          const step = (): void => {
+            left -= 1
+            if (left <= 0) resolve()
+            else requestAnimationFrame(step)
+          }
+          requestAnimationFrame(step)
+        })
+      /**
+       * 打开面板的触发按钮：按 title **包含**匹配（标题里有动态数值，例如「画面比例：适应」「画质…：模式 A」）。
+       *
+       * `drive` 记录这个面板是**谁**在驱动（读代码逐个确认过），它决定"点了没反应"该怎么定性：
+       *   · `local`   —— 面板由渲染层自己的 React state 打开（setSubMenu/setSpeedMenu/…/setShowInfo），
+       *     按钮点下去**必须**立刻出现浮层；没出现就是真 FAIL；
+       *   · `session` —— 面板由**主进程的播放会话状态**打开（`send({type:'toggleEpisodes'|'toggleInfo'})`），
+       *     自检环境里没有真实播放会话，点下去本来就不会有反应 → 如实标 SKIP，
+       *     不能以 FAIL 的形式留在报告里（用户要求能区分"产品坏了"与"环境测不了"）。
+       */
+      const triggers: { kind: 'popover' | 'overlay'; match: string; drive: 'local' | 'session' }[] = [
+        { kind: 'popover', match: '字幕', drive: 'local' },
+        { kind: 'popover', match: '播放倍速', drive: 'local' },
+        { kind: 'popover', match: '画面比例', drive: 'local' },
+        { kind: 'popover', match: '画质', drive: 'local' },
+        { kind: 'popover', match: '弹幕设置', drive: 'local' },
+        { kind: 'overlay', match: '选集', drive: 'session' },
+        { kind: 'overlay', match: '番剧详情', drive: 'session' },
+        { kind: 'overlay', match: '投屏', drive: 'local' },
+        { kind: 'overlay', match: '查看播放状态与流详情', drive: 'local' }
+      ]
+      const findTrigger = (t: { match: string }): HTMLElement | null => {
+        const nodes = Array.from(document.querySelectorAll<HTMLElement>(`[${HIT_ATTR}] button, [${HIT_ATTR}] [role="button"]`))
+        for (const el of nodes) {
+          const title = el.getAttribute('title') ?? ''
+          if (title.includes(t.match)) return el
+        }
+        return null
+      }
+      const fire = (el: HTMLElement): void => {
+        /*
+         * 两种处理器都要照顾到（读代码确认过）：
+         *   · 控制栏按钮（IconBtn）用 React 的 `onClick`；
+         *   · 状态药丸 / 浮层遮罩用 `onPointerDown`（原生窗口叠层下 click 更不可靠）。
+         * 每个触发器**只有其中一种**，所以两个都派发不会把面板开了又关。
+         */
+        el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, isPrimary: true }))
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+      }
+      /**
+       * 关掉当前打开的浮层。
+       *
+       * 触发器的关闭方式不统一（IconBtn 是"再点一次"；状态药丸的流详情弹窗只支持 `onMouseDown` 关闭，
+       * 而且它恰好用遮罩的 mousedown 关），所以这里按顺序试三种办法，
+       * 最后由调用方**复核**是否真的关掉了 —— 留着不管会污染后面的测量（遮罩本身就是一块区域，
+       * 会让"画面中部不在形状里"这类断言为假）。
+       */
+      const closeOpen = async (trigger: HTMLElement): Promise<void> => {
+        fire(trigger)
+        await frames(2)
+        const openNow = (): HTMLElement | null => {
+          const marked = Array.from(document.querySelectorAll<HTMLElement>(`[${POPOVER_ATTR}]`)).find((n) => n.getBoundingClientRect().width >= 8)
+          if (marked) return marked
+          const covered = Array.from(document.querySelectorAll<HTMLElement>(`[${HIT_ATTR}]`)).filter((n) => {
+            const r = n.getBoundingClientRect()
+            return r.width >= 40 && r.height >= 40 && !n.hasAttribute('data-sakana-topbar') && !n.hasAttribute('data-sakana-bottombar')
+          })
+          return covered.length > 0 ? covered[covered.length - 1] : null
+        }
+        if (!openNow()) return
+        /* 办法二：对遮罩本身派发 mousedown（流详情弹窗就是靠这个关的） */
+        const backdrop = openNow()
+        if (backdrop) {
+          backdrop.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+          await frames(2)
+        }
+        if (!openNow()) return
+        /* 办法三：找浮层里的"关闭"类按钮（aria-label / title / 文本） */
+        const closer = Array.from(document.querySelectorAll<HTMLElement>('button')).find((b) => {
+          const t = `${b.getAttribute('aria-label') ?? ''}${b.getAttribute('title') ?? ''}`
+          return t.includes('关闭') && b.getBoundingClientRect().width > 0
+        })
+        if (closer) {
+          fire(closer)
+          await frames(2)
+        }
+      }
+      const results: {
+        kind: 'popover' | 'overlay'
+        title: string
+        found: boolean
+        covered: boolean
+        rect: { x: number; y: number; w: number; h: number } | null
+        missing: number
+        /** 结论：pass / fail / skip（skip = 环境测不了，绝不能以 FAIL 的形式留在报告里） */
+        status: 'pass' | 'fail' | 'skip'
+        reason: string
+      }[] = []
+      /**
+       * 找"这次打开的浮层"。
+       *
+       * v0.3.9 第六轮修订：上一版只找打了 `data-sakana-popover` 的容器 + `data-sakana-hit` 里够大的那些，
+       * 结果**流详情弹窗查不到** —— 它是 `fixed inset-0`，而它外面那层 `<div data-sakana-hit>` 自己**没有尺寸**
+       * （尺寸全在 fixed 子元素上），于是两层都没被选中，面板明明打开了却报"没找到浮层"。
+       * 现在补一条：`data-sakana-hit` 容器**里面**有尺寸的后代（和区域收集里"伸出去的浮层"用的是同一类判据）。
+       */
+      const findFloatingLayer = (): HTMLElement | null => {
+        const sized = (n: HTMLElement): boolean => {
+          const r = n.getBoundingClientRect()
+          return r.width >= 40 && r.height >= 40 && getComputedStyle(n).pointerEvents !== 'none'
+        }
+        const marked = Array.from(document.querySelectorAll<HTMLElement>(`[${POPOVER_ATTR}]`)).filter(sized)
+        if (marked.length > 0) return marked[0]
+        const direct = Array.from(document.querySelectorAll<HTMLElement>(`[${HIT_ATTR}]`)).filter(
+          (n) => sized(n) && !n.hasAttribute('data-sakana-topbar') && !n.hasAttribute('data-sakana-bottombar')
+        )
+        if (direct.length > 0) return direct[direct.length - 1]
+        /* 没有尺寸的 data-sakana-hit 包装器（fixed 弹窗就是这种）：看它里面有没有够大的后代 */
+        for (const wrap of Array.from(document.querySelectorAll<HTMLElement>(`[${HIT_ATTR}]`))) {
+          if (sized(wrap)) continue
+          for (const child of Array.from(wrap.querySelectorAll<HTMLElement>('*'))) {
+            if (sized(child)) return child
+          }
+        }
+        return null
+      }
+      for (const t of triggers) {
+        const el = findTrigger(t)
+        if (!el) {
+          results.push({
+            kind: t.kind,
+            title: t.match,
+            found: false,
+            covered: false,
+            rect: null,
+            missing: 1,
+            status: 'skip',
+            reason: '控制栏里没有这个触发器（当前布局/会话下不显示它）'
+          })
+          continue
+        }
+        fire(el)
+        await frames(3)
+        const target: HTMLElement | null = findFloatingLayer()
+        if (!target) {
+          /*
+           * 点了但没有任何浮层出现。**这里必须区分两种情况**（用户明确要求）：
+           *   · 会话驱动的面板（选集 / 番剧详情）—— 它们由主进程的播放会话状态打开，
+           *     自检环境里没有播放会话，点下去本来就不会有反应 → SKIP + 原因；
+           *   · 本地状态驱动的面板 —— 点下去**必须**立刻出现，没出现就是真 FAIL。
+           */
+          results.push({
+            kind: t.kind,
+            title: el.getAttribute('title') ?? t.match,
+            found: true,
+            covered: false,
+            rect: null,
+            missing: 1,
+            status: t.drive === 'session' ? 'skip' : 'fail',
+            reason:
+              t.drive === 'session'
+                ? '需要真实播放会话（该面板由主进程的播放状态驱动：自检环境没有会话，点了不会有反应，不是产品问题）'
+                : '点了触发器但没找到打开的浮层（本地状态驱动的面板应当立刻打开 —— 这是产品问题）'
+          })
+          await closeOpen(el)
+          continue
+        }
+        const r = target.getBoundingClientRect()
+        const regions = hitRegionsNow()
+        /* 覆盖判定：浮层矩形是否被区域内矩形完全包住（形状裁剪是矩形并集，不做像素级抠图） */
+        const coveredBy = (o: { x: number; y: number; w: number; h: number }): boolean =>
+          r.left >= o.x - 0.5 && r.top >= o.y - 0.5 && r.right <= o.x + o.w + 0.5 && r.bottom <= o.y + o.h + 0.5
+        const covering = regions.filter(coveredBy)
+        const covered = covering.length > 0
+        /* 没被覆盖时，算"伸出去多少"：把浮层矩形裁到最近的那块区域的缺口面积占比 */
+        let missing = 0
+        if (!covered && r.width > 0 && r.height > 0) {
+          const area = r.width * r.height
+          let best = 0
+          for (const o of regions) {
+            const w = Math.max(0, Math.min(r.right, o.x + o.w) - Math.max(r.left, o.x))
+            const h = Math.max(0, Math.min(r.bottom, o.y + o.h) - Math.max(r.top, o.y))
+            best = Math.max(best, w * h)
+          }
+          missing = Math.max(0, Math.min(1, 1 - best / area))
+        }
+        results.push({
+          kind: t.kind,
+          title: el.getAttribute('title') ?? t.match,
+          found: true,
+          covered,
+          rect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+          missing: Math.round(missing * 1000) / 1000,
+          status: covered ? 'pass' : 'fail',
+          reason: covered ? '矩形被某一块上报区域完全包住' : `矩形有 ${Math.round(missing * 100)}% 落在所有上报区域之外（形状会裁掉它）`
+        })
+        /* 关掉它：留着会污染后面的测量（遮罩本身也是一块区域）。关不掉的要在结论里写明。 */
+        await closeOpen(el)
+        const stillOpen = ((): boolean => {
+          const marked = Array.from(document.querySelectorAll<HTMLElement>(`[${POPOVER_ATTR}]`)).some((n) => n.getBoundingClientRect().width >= 8)
+          if (marked) return true
+          const r2 = target?.getBoundingClientRect()
+          return !!r2 && r2.width >= 40 && r2.height >= 40
+        })()
+        if (stillOpen) {
+          const last = results[results.length - 1]
+          last.reason += '；⚠️ 探测后未能自动关闭（它可能影响后续面板的测量）'
+        }
+      }
+      return results
+    }
+    return () => {
+      delete w.__sakanaHitAt
+      delete w.__sakanaHitDiag
+      delete w.__sakanaHitSnapshot
+      delete w.__sakanaHitRegions
+      delete w.__sakanaClickStats
+      delete w.__sakanaRegionsDiag
+      delete w.__sakanaPanelProbe
+      delete w.__sakanaHitLocked
+    }
+  }, [syncInteractive, zoneAt, hitRegionsNow])
+
+  /**
+   * 挂载时把"挂载之前就收到的鼠标位置"补上判一次（v0.3.9 补充工单）。
+   *
+   * 自检（以及真实场景里刚进播放页/刚按 F 全屏）会在页面加载完成后**立刻**把鼠标放在控制栏上、
+   * 甚至直接点下去；那一刻 React 的 mousemove 监听还不存在，事件只能被模块级监听记下来。
+   * 这里在挂载后（DOM 已经能命中）用那个坐标立刻判定一次，避免"第一次点击必击穿"。
+   */
+  useEffect(() => {
+    if (!earlyPointer) return
+    pointerRef.current = earlyPointer
+    syncInteractive()
+  }, [syncInteractive])
+
+  /**
+   * 控制栏**显隐变化**后重算一次判定（v0.3.9 补充工单）。
+   *
+   * 两个方向都要算：
+   *   · 隐藏 → 可见：容器从 `pointer-events-none` 变成可点，`elementFromPoint` 才认它 ——
+   *     "鼠标已经停在控制栏位置、此时因为 mousemove 才把控制栏唤出来"的那一帧判定必然是"没命中"，
+   *     鼠标若就此停下就再没有第二次判定 → 用户点下去就是击穿。等一两帧让样式落到 DOM 上再算。
+   *   · 可见 → 隐藏（5 秒自动收起）：那块位置已经不可点，判定必须跟着变成"穿透"，
+   *     否则会留下一张**看不见却挡事的网**（用户抱怨过的"画面中间点不动"）。
+   */
+  useEffect(() => {
+    let raf = 0
+    const recheck = (): void => {
+      syncInteractive()
+      raf = window.requestAnimationFrame(() => {
+        syncInteractive()
+      })
+    }
+    recheck()
+    return () => {
+      if (raf !== 0) window.cancelAnimationFrame(raf)
+    }
+  }, [visible, syncInteractive])
+
+  /**
+   * 按下/抬起时刷新锁与命中。
+   *
+   * 用**捕获阶段**的 window 监听：按钮自己 `stopPropagation()` 也不影响这里（拖动时判断必须可靠）。
+   * 用 pointer 事件而不是 mouse 事件：进度条/音量滑杆本来就用 pointer capture。
+   */
+  useEffect(() => {
+    const down = (): void => {
+      holdPointerRef.current = true
+      const w = window as HitProbeWindow
+      w.__sakanaHitLocked = true
+      syncInteractive()
+    }
+    const up = (): void => {
+      holdPointerRef.current = false
+      const w = window as HitProbeWindow
+      w.__sakanaHitLocked = false
+      syncInteractive()
+    }
+    window.addEventListener('pointerdown', down, true)
+    window.addEventListener('pointerup', up, true)
+    window.addEventListener('pointercancel', up, true)
+    return () => {
+      window.removeEventListener('pointerdown', down, true)
+      window.removeEventListener('pointerup', up, true)
+      window.removeEventListener('pointercancel', up, true)
+    }
+  }, [syncInteractive])
+
+  /**
+   * uosc 接管控制栏（见下面的 uoscBar）。
+   *
+   * v0.3.2 起这段的逻辑是"uosc 模式下一律穿透，把鼠标让给 mpv" —— 当时不得不这么做，
+   * 因为整窗接收点击会把 mpv 的鼠标整个吞掉，uosc 永远等不到"鼠标动了"。
+   * v0.3.9 改成按区域命中之后这条特殊规则不需要了：uosc 画的控制栏在视频子窗口里，
+   * 而悬浮窗只在鼠标压到**应用自己的**浮层/按钮上时才接收点击 —— 两边天然不打架。
+   * 这里只保留 uosc 状态供 poke 决定要不要让 uosc 闪一下控制栏。
    */
   const uoscBarRef = useRef(false)
   useEffect(() => {
     uoscBarRef.current = state?.uoscBar === true
-    /*
-     * 刚进播放器时，悬浮窗会在「窗口显示」事件里先 poke 一次（那时还不知道已经交给 uosc），
-     * 于是短暂申请过交互。这里一旦确认 uosc 接管、且没有浮层要点，就**立刻把鼠标还给 mpv**，
-     * 不让用户等那 5 秒的自动隐藏计时。
-     */
-    if (state?.uoscBar === true && !holdRef.current) void api.overlay.setInteractive(false)
   }, [state?.uoscBar])
 
-  /** 唤出控制栏：显示 + 接收鼠标事件；空闲 5 秒后隐藏 + 恢复点击穿透 */
+  /** uosc reveal 的本地节流时间戳（见 poke） */
+  const lastRevealAtRef = useRef(0)
+
+  /** 唤出控制栏：显示 + 5 秒后自动隐藏（"接收鼠标"不再由这里决定，见 syncInteractive） */
   const poke = useCallback(() => {
     setVisible(true)
     /*
@@ -374,20 +1294,27 @@ export default function PlayerOverlay(): React.ReactElement {
      * uosc 的设计是「鼠标靠近底部（默认 40px）才显示控制栏」，在画面中间移动鼠标它按设计不出现；
      * 而用户期望的正是「鼠标一动就出来」。这里每次鼠标移动（poke 由 mousemove 触发）
      * 就让主进程执行 uosc 自带的 flash-ui（强制显示 1 秒），节流在主进程里做（900ms）。
+     *
+     * v0.3.9：**这里再加一道本地节流**。主进程那道节流只能省掉"执行"，省不掉 IPC 本身；
+     * 而 mousemove 每秒能来上百次 —— 每次一个 IPC 正是「控制栏不跟手」的来源之一。
      */
-    if (uoscBarRef.current) void api.uosc.reveal()
-    // uosc 模式下不申请交互：控制栏由 mpv 画，鼠标必须留给它
-    if (!uoscBarRef.current) void api.overlay.setInteractive(true)
+    if (uoscBarRef.current) {
+      const now = Date.now()
+      if (now - lastRevealAtRef.current > 900) {
+        lastRevealAtRef.current = now
+        void api.uosc.reveal()
+      }
+    }
     window.clearTimeout(hideTimer.current)
     hideTimer.current = window.setTimeout(() => {
       if (holdRef.current) return
       setSubMenu(false)
       setAspectMenu(false)
+      setSpeedMenu(false)
       setDanmakuMenu(false)
       // v0.3.3：画质菜单也要一起收起来，否则控制栏藏了、菜单还挂在屏幕上点不到
       setQualityMenu(false)
       setVisible(false)
-      void api.overlay.setInteractive(false)
     }, 5000)
   }, [])
 
@@ -468,32 +1395,30 @@ export default function PlayerOverlay(): React.ReactElement {
     if (state?.showEpisodes && episodes) setBrowseLine(episodes.currentLine)
   }, [state?.showEpisodes, episodes])
 
-  // 浮层/菜单打开时保持可交互，关闭后恢复正常 5 秒自动隐藏
+  // 浮层/菜单打开时不要按 5 秒计时自动隐藏（否则菜单还在屏幕上、控制栏连窗口一起收了）
   useEffect(() => {
     holdRef.current =
       showInfo ||
       subMenu ||
       aspectMenu ||
+      speedMenu ||
       danmakuMenu ||
-      // v0.3.3：画质菜单同理 —— 不把它算进来，菜单开着的时候控制栏会按 5 秒计时收走、
-      // 悬浮窗还会归还点击穿透，用户点菜单就是在点一个「已经不接收点击」的窗口。
+      // v0.3.3：画质菜单同理 —— 不把它算进来，菜单开着的时候控制栏会按 5 秒计时收走，
+      // 用户点菜单就是在点一个「已经不接收点击」的东西。
       qualityMenu ||
       showInfoPanel ||
       state?.showEpisodes === true
-    if (holdRef.current) {
-      setVisible(true)
-      // 浮层是需要点的东西 → 临时接收鼠标（uosc 的控制栏此刻被浮层挡着，不影响）
-      void api.overlay.setInteractive(true)
-    } else {
-      poke()
-    }
+    if (holdRef.current) setVisible(true)
+    else poke()
     /*
      * v0.3.2：依赖数组补全。以前只盯着「应用自己的三个本地菜单」，漏了
      * `danmakuMenu`、`showInfoPanel`（番剧详情）与 `state.showEpisodes`（选集）——
-     * 后三个是从 uosc 菜单/桥接脚本回传过来的，依赖不全时这个 effect 不会重跑，
-     * 于是浮层弹出来了却**没有申请交互**，点上去毫无反应（用户报的「点了没反应」）。
+     * 后三个是从 uosc 菜单/桥接脚本回传过来的，依赖不全时这个 effect 不会重跑。
+     * v0.3.9：补上 `speedMenu`（同一个坑：倍速菜单开着时控制栏会 5 秒收走）；
+     * 并去掉这里过去的 `setInteractive(true)` —— "要不要接收点击"现在**只**看鼠标在哪，
+     * 不再由"哪个面板开着"猜（见 HIT_ATTR 上面的说明）。
      */
-  }, [showInfo, subMenu, aspectMenu, danmakuMenu, qualityMenu, showInfoPanel, state?.showEpisodes, poke])
+  }, [showInfo, subMenu, aspectMenu, speedMenu, danmakuMenu, qualityMenu, showInfoPanel, state?.showEpisodes, poke])
 
   useEffect(() => api.overlay.onState(setState), [])
 
@@ -530,12 +1455,13 @@ export default function PlayerOverlay(): React.ReactElement {
   const a4kShort = A4K_SHORT[a4kMode] ?? a4kMode
   // 透明窗口：给根元素打标记，让全局样式把底色设为透明（否则会盖住整屏画面）
   useEffect(() => {
+    /*
+     * v0.3.9 第六轮：模块作用域已经打过一次（而且要**永不撤销**，见那里面的说明），
+     * 这里只是"再补一遍"地幂等重复，不再在 cleanup 里移除标记 ——
+     * 移除的窗口期正好是"播放页重建、悬浮窗重载"这条最容易出黑屏的路上。
+     */
     document.documentElement.classList.add('sakana-overlay')
     document.body.classList.add('sakana-overlay')
-    return () => {
-      document.documentElement.classList.remove('sakana-overlay')
-      document.body.classList.remove('sakana-overlay')
-    }
   }, [])
   useEffect(() => api.overlay.onPoke(poke), [poke])
   /** 排障探针：把控制栏的真实显隐状态暴露给自检脚本（DOM 上的 opacity 判断不可靠） */
@@ -543,27 +1469,40 @@ export default function PlayerOverlay(): React.ReactElement {
     ;(window as unknown as Record<string, unknown>).__sakanaOverlayVisible = visible
   }, [visible])
   /**
-   * 交互状态心跳（v0.2.8 附加六）。
+   * 界面结构变化时**重新做一次命中判定**（v0.3.9）。
    *
-   * 「切到后台再回来，控制栏按钮全部失灵」的最后一环：主进程会在失焦时复位点击穿透，
-   * 回到前台后如果用户**不移动鼠标直接点**，就收不到 mousemove、交互状态也不会恢复 ——
-   * 表现为控制栏看得见、点不动。这里在控制栏可见期间每 1.5 秒幂等地重申一次
-   * 「我在接收点击」，保证窗口的系统级状态始终与界面状态一致。
+   * 为什么必须补这一步：命中判定只在 mousemove 时才算 —— 而"面板打开/收起、控制栏显隐"
+   * 这些变化发生时鼠标往往**一动不动**（例如按快捷键开菜单、5 秒自动隐藏、详情浮层加载完成）。
+   * 那时如果还拿旧的判定结果，就会出现两种错：
+   *   · 控制栏刚藏起来但窗口还在接收点击 → 又变成"看不见的网"，画面点不动；
+   *   · 面板刚弹出来但窗口还在穿透 → 用户点面板没反应。
+   * 这里用**最后一次已知的光标位置**重算一次即可（位置没变，变的是"那个点上有没有可点的东西"）。
    *
-   * v0.3.2：uosc 接管时不心跳 —— 那时控制栏由 mpv 画，悬浮窗每 1.5 秒申请一次交互
-   * 会把它变成「接收点击」的窗口，从而抢走 mpv 的鼠标（见 poke 上方的长注释）。
+   * 依赖里放的是"会影响 DOM 里可点区域"的那些开关，不放每秒变化的状态本身 ——
+   * 免得每个进度 tick 都白算一次（`elementFromPoint` 会强制一次布局）。 
    */
   useEffect(() => {
-    if (!visible || uoscBar) return
-    const t = window.setInterval(() => {
-      void api.overlay.setInteractive(true)
-    }, 1500)
-    return () => {
-      window.clearInterval(t)
-      // 控制栏收起时归还点击穿透，避免透明窗口挡住画面上的其它操作
-      void api.overlay.setInteractive(false)
-    }
-  }, [visible, uoscBar])
+    syncInteractive()
+  }, [
+    syncInteractive,
+    visible,
+    uoscBar,
+    showInfo,
+    subMenu,
+    aspectMenu,
+    speedMenu,
+    danmakuMenu,
+    qualityMenu,
+    castPanel,
+    clickThrough,
+    showInfoPanel,
+    state?.showEpisodes,
+    state?.resume,
+    state?.error,
+    detail,
+    detailLoading,
+    episodes
+  ])
   /**
    * v0.3.6「点击击穿」自救侦测。
    *
@@ -597,9 +1536,47 @@ export default function PlayerOverlay(): React.ReactElement {
   )
 
   useEffect(() => {
-    // 点击穿透时 mousemove 依然会转发到本窗口，因此可以自行感知鼠标移动
-    const onMove = (): void => poke()
-    window.addEventListener('mousemove', onMove)
+    /*
+     * 鼠标移动：既用来唤出控制栏，也用来做命中判定（两者都要，但频率完全不同）。
+     *
+     * ── v0.3.9 的性能改动（改前 → 改后）──
+     * 改前：**每一个** mousemove 都会 `poke()`，而 poke 里有两处 IPC
+     *   （`overlay.setInteractive(true)` 与 uosc 的 `reveal()`）+ 一次
+     *   `clearTimeout/setTimeout`。鼠标划过控制栏时一秒能来上百次，
+     *   主进程与渲染层就被这些 IPC 反复唤醒 —— 用户感觉就是"控制栏一卡一卡的"。
+     * 改后：
+     *   · 命中的 IPC **只在结果变化时**发（鼠标在画面上时一个字节都不发）；
+     *   · 唤出控制栏（poke）用 rAF 合并到**每帧最多一次**，超出的移动直接丢弃 ——
+     *     控制栏只需要"鼠标动过"这个事实，不需要每一次坐标；
+     *   · uosc 的 reveal 再加一道 900ms 本地节流（主进程那道只省执行、不省 IPC）。
+     */
+    let rafId = 0
+    const onMove = (e: MouseEvent): void => {
+      // 命中判定用真实事件坐标：这是延迟最低的一条路（主进程的轮询是兜底）
+      pointerRef.current = { x: e.clientX, y: e.clientY }
+      syncInteractive()
+      if (rafId !== 0) return
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0
+        poke()
+      })
+    }
+    /*
+     * 鼠标离开窗口：只把坐标标记为"已失效"，**不再自己上报"收回点击"**。
+     *
+     * v0.3.9 补充工单：这里过去会直接 `syncInteractive()`（pointerRef = null → 立刻上报穿透）。
+     * 但 `forward: true` 下光标滑到原生 mpv 子窗口上时 Chromium 也会发
+     * `mouseout(relatedTarget === null)` —— 于是日志里出现「接收点击 → 穿透 → 接收点击」同一秒反复横跳，
+     * 点下去那一刻窗口很可能正停在穿透态，这就是用户实测到的击穿。
+     * 现在"光标是否已离开悬浮窗"只由**主进程**按窗口矩形判定（每 100ms 一次，见 pollCursorHit），
+     * 那是这件事唯一权威的来源；渲染层不再对它下结论。
+     */
+    const onLeave = (): void => {
+      pointerRef.current = null
+    }
+    const onOut = (e: MouseEvent): void => {
+      if (e.relatedTarget === null) onLeave()
+    }
     /*
      * 窗口被隐藏（切到后台）后再显示时，主动把控制栏唤出一次：
      * 否则「看不见 → 回来」之后可能停在既不可见也不可交互的状态（用户反馈过按钮全失灵）。
@@ -607,14 +1584,21 @@ export default function PlayerOverlay(): React.ReactElement {
     const onVisibility = (): void => {
       if (document.visibilityState === 'visible') poke()
     }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseleave', onLeave)
+    window.addEventListener('mouseout', onOut)
     document.addEventListener('visibilitychange', onVisibility)
     poke()
     return () => {
       window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseleave', onLeave)
+      window.removeEventListener('mouseout', onOut)
       document.removeEventListener('visibilitychange', onVisibility)
+      if (rafId !== 0) window.cancelAnimationFrame(rafId)
       window.clearTimeout(hideTimer.current)
     }
-  }, [poke])
+    // syncInteractive 仍被 onMove（命中判定）用到，依赖必须保留
+  }, [poke, syncInteractive])
 
   /** 进度条拖动 */
   const ratioFromEvent = (clientX: number): number => {
@@ -625,17 +1609,119 @@ export default function PlayerOverlay(): React.ReactElement {
     return Math.min(1, Math.max(0, (clientX - r.left) / r.width))
   }
 
+  /**
+   * 拖动时真正下发 seek（节流）。
+   *
+   * 为什么要节流：一次 seek 在 mpv 侧是"冲刷解复用器 + 重新定位"的重动作，
+   * 拖一下发几十次会让解码一直重启 —— 用户感觉是"拖进度条卡、画面一顿一顿"。
+   * 120ms 的间隔既能让画面跟上（约每 8 帧跳一次），又不会把解码器打爆。
+   * `force = true` 用于按下与松手：这两个时刻必须精确落到用户点的位置，不能等节流。
+   */
+  const seekTo = (sec: number, force = false): void => {
+    if (!Number.isFinite(sec) || sec < 0) return
+    const now = Date.now()
+    if (!force && now - lastSeekAtRef.current < SEEK_THROTTLE_MS) return
+    lastSeekAtRef.current = now
+    send({ type: 'seek', time: sec })
+  }
+
   const duration = state?.duration ?? 0
   const current = state?.current ?? 0
-  const percent = duration > 0 ? Math.min(100, (current / duration) * 100) : 0
+  /*
+   * ── 进度条显示的"跟手"问题（v0.3.9）──
+   *
+   * 改前：拖动时 progress 仍取 `state.current`（内核每秒推 2~4 次的真实播放进度），
+   * 于是拖动中滑块会**在手指位置与真实进度之间来回跳**（松手前看到的其实是没跟上的位置），
+   * 同时每一次 pointermove 都发一个 `seek` IPC → 主进程每次都真的去 seek mpv
+   * （seek 要冲刷解复用器） —— 拖一下发几十次，画面就会一顿一顿的，这就是"拖进度条卡"。
+   *
+   * 改后：
+   *   · 拖动期间**用本地值显示**（dragPercent），不再被回推的进度覆盖；
+   *   · 真正发给内核的 seek 节流到 ~120ms 一次（拖动结束一定补发最后那个位置），
+   *     这样每帧都在动的是 UI，mpv 只在必要时真的跳。
+   */
+  const shownPercent = dragging && dragPercent !== null ? dragPercent : duration > 0 ? Math.min(100, (current / duration) * 100) : 0
+  const displayedTime = dragging && dragPercent !== null ? (dragPercent / 100) * duration : current
   const currentSubId = state && state.subIdx >= 0 ? state.subs[state.subIdx]?.id : undefined
 
   return (
     <div
       className="fixed inset-0 select-none"
-      style={{ background: 'transparent' }}
-      onDoubleClick={() => send({ type: 'playPause' })}
+      /*
+       * v0.3.9：显式声明**不是窗口拖拽区**。
+       *
+       * `-webkit-app-region: drag` 的区域会被 Chromium 当成标题栏：指针事件被系统接管、
+       * DOM 收不到点击（这正是用户提的"方案三"担心的那件事）。本项目实测**没有**这个问题 ——
+       * 悬浮窗走的是 App.tsx 里 `api.overlay.isOverlay` 那条早返回分支，根本不渲染 TitleBar
+       * （唯一带 `.drag-region` 的组件），所以整页本来就没有 drag 区域。
+       * 这里仍然显式写上 `no-drag`：一是把"这里绝不能变成拖拽区"这件事钉在代码里，
+       * 二是以后有人往悬浮窗里加外壳组件时，不至于悄悄踩上。
+       */
+      style={{ background: 'transparent', WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+      // 弹幕窗口是永久穿透的，双击暂停这类交互只在 UI 窗口里生效
+      onDoubleClick={isDanmakuPart ? undefined : () => send({ type: 'playPause' })}
     >
+      {isDanmakuPart ? (
+        <>
+          {/*
+           * 弹幕窗口（v0.3.9 第三轮拆出来的那一块）：**只画弹幕**。
+           * 这块窗口铺满主窗口、永远 `setIgnoreMouseEvents(true, {forward:true})`
+           * （由 playerOverlay.ts 设一次，此后绝不切换）—— 于是"要不要吃鼠标"不再有运行期决策。
+           * 为什么弹幕必须单独一块窗口：控制栏那块窗口用 setShape 限定可点区域，而 setShape 同时裁剪绘制，
+           * 铺满画面中部的弹幕会被裁没。
+           */}
+          {state && danmaku && danmaku.settings.enabled && danmaku.comments.length > 0 && !danmaku.pluginActive ? (
+            <DanmakuLayer
+              comments={danmaku.comments}
+              settings={danmaku.settings}
+              time={state.current}
+              playing={state.playing}
+              rect={danmakuRect(state, visible)}
+              scale={window.devicePixelRatio || 1}
+            />
+          ) : null}
+          {/*
+            ── v0.3.9 第六轮修订：加载/过程进度卡搬到**穿透层**（弹幕窗口）来画 ──
+            
+            为什么必须搬走（用户复跑给的实测回归）：`setShape` 裁剪绘制，所以这张卡必须出现在
+            区域里才画得出来；而它是**居中**的（`items-center justify-center`），一旦把它算进 UI 窗口的
+            区域，**画面正中就落进了形状** → 那块像素的点击被 Electron 吃掉、mpv 再也收不到
+            （点画面暂停 / uosc 唤出全部失效）。自检里"画面中部不在形状里"那条断言于是变红，
+            而且它红得对：这张卡不该以"吃掉画面中心"为代价来显示。
+            
+            正解就是画在**弹幕窗口**：它铺满主窗口、永远鼠标穿透、且不受形状裁剪 ——
+            卡片照样看得见，画面中心的点击照样归 mpv。z 序上它在 UI 窗口之下（主窗口 → 弹幕 → UI），
+            但 UI 窗口只有在控制栏/面板那几块矩形里才绘制，所以卡片不会被挡住。
+            卡片本身是 `pointer-events-none`（纯提示），放在穿透层里语义完全一致。
+          */}
+          {state && !state.startedOnce && !state.error ? (
+            <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center">
+              <div className="flex max-w-lg flex-col items-center gap-2 rounded-2xl bg-black/70 px-5 py-4 text-xs text-white backdrop-blur">
+                <div className="flex items-center gap-2 whitespace-nowrap">
+                  <span className="h-2 w-2 animate-pulse rounded-full bg-amber-300" />
+                  {state.flow && state.flow.stages.some((s) => s.startedAt !== null) ? (
+                    // 进度已经在跑：标题直接说「现在在做什么」，不再叠一句「加载中」
+                    <span className="text-white/90">{flowHeadline(state.flow)}</span>
+                  ) : (
+                    <span className="text-white/90">加载中…</span>
+                  )}
+                </div>
+                {/* 三阶段过程进度：全屏下这是唯一能看出「卡在哪一步」的地方 */}
+                <PlayFlowStages flow={state.flow} tone="onVideo" />
+                {state.flow?.reason === 'slow' ? (
+                  <div className="text-[11px] text-amber-300">
+                    资源获取速度过慢，仍在继续等待（有数据在动就不结束）
+                  </div>
+                ) : null}
+                {state.selfCheckNote ? (
+                  <div className="max-w-md text-center text-[10px] text-white/70">{state.selfCheckNote}</div>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+        </>
+      ) : (
+        <>
       {/*
         v0.3.6「点击击穿」自救浮层。
         它必须画在**最上面**（z-[60]，高于选集/详情浮层），因为出现这个提示时
@@ -645,6 +1731,7 @@ export default function PlayerOverlay(): React.ReactElement {
       {clickThrough ? (
         <div
           data-sakana-clickthrough="1"
+          data-sakana-hit="1"
           className="absolute left-1/2 top-4 z-[60] w-[min(560px,90vw)] -translate-x-1/2 rounded-xl border border-warn/50 bg-black/85 px-4 py-3 text-white shadow-2xl backdrop-blur"
         >
           <div className="flex items-start gap-3">
@@ -696,21 +1783,9 @@ export default function PlayerOverlay(): React.ReactElement {
         </div>
       ) : null}
       {/*
-        v0.2.8：弹幕层 —— 画在悬浮窗里才能盖在原生视频之上（页面里的元素会被视频整个挡住）。
-        位置取播放页推送过来的视频区域矩形，再**往里收一圈**：
-        - 顶部让出标题/状态栏的高度（否则最上面几行弹幕会被顶栏盖住 —— 用户反馈过）；
-        - 底部让出控制栏（控制栏隐藏时只留一点点安全边）。
+        v0.2.8：弹幕层已迁到独立的弹幕窗口（见本组件顶部的 part 分支）——
+        控制栏窗口用 setShape 限定可点区域，而 setShape 会裁剪绘制，弹幕必须画在另一块整窗穿透的窗口里。
       */}
-      {state && danmaku && danmaku.settings.enabled && danmaku.comments.length > 0 && !danmaku.pluginActive ? (
-        <DanmakuLayer
-          comments={danmaku.comments}
-          settings={danmaku.settings}
-          time={state.current}
-          playing={state.playing}
-          rect={danmakuRect(state, visible)}
-          scale={window.devicePixelRatio || 1}
-        />
-      ) : null}
 
       {/*
         v0.2.6：选集浮层 —— 半透明浮在画面上，打开时不再改动播放内容区域。
@@ -721,7 +1796,7 @@ export default function PlayerOverlay(): React.ReactElement {
         否则点「选集」后什么都没出现，看起来就像按钮没反应。
       */}
       {state?.showEpisodes && !episodes ? (
-        <div className="absolute inset-0 z-40 flex bg-black/35 backdrop-blur-[2px]">
+        <div data-sakana-hit="1" className="absolute inset-0 z-40 flex bg-black/35 backdrop-blur-[2px]">
           <div className="ml-auto flex h-full w-[380px] max-w-[70vw] flex-col items-center justify-center gap-2 border-l border-white/10 bg-black/72 backdrop-blur-md">
             <span className="text-xs text-white/80">正在读取选集…</span>
             <button
@@ -738,6 +1813,7 @@ export default function PlayerOverlay(): React.ReactElement {
       ) : null}
       {state?.showEpisodes && episodes ? (
         <div
+          data-sakana-hit="1"
           className="absolute inset-0 z-40 flex bg-black/35 backdrop-blur-[2px]"
           onPointerDown={(e) => {
             // 点浮层以外的地方 = 关闭
@@ -811,6 +1887,7 @@ export default function PlayerOverlay(): React.ReactElement {
       {/* v0.2.6：详情浮层（同样盖在画面上；过去画在页面里被视频完全盖住 → 「详情按钮没反应」） */}
       {showInfoPanel ? (
         <div
+          data-sakana-hit="1"
           className="absolute inset-0 z-40 flex bg-black/35 backdrop-blur-[2px]"
           onPointerDown={(e) => {
             if (e.target === e.currentTarget) send({ type: 'toggleInfo' })
@@ -895,7 +1972,10 @@ export default function PlayerOverlay(): React.ReactElement {
         被原生视频窗口挡住根本看不见，只看到一闪而过的 toast。现在画在悬浮窗右下角，10 秒后自动消失。
       */}
       {state?.resume ? (
-        <div className="absolute bottom-24 right-5 z-40 flex w-72 flex-col gap-2 rounded-xl border border-white/15 bg-black/80 p-3 text-white shadow-2xl backdrop-blur">
+        <div
+          data-sakana-hit="1"
+          className="absolute bottom-24 right-5 z-40 flex w-72 flex-col gap-2 rounded-xl border border-white/15 bg-black/80 p-3 text-white shadow-2xl backdrop-blur"
+        >
           <div className="text-xs">已自动跳转到上次观看位置 {fmt(state.resume.target)}</div>
           <div className="text-[11px] text-white/60">如果不想从这里继续，可以回到本集开头。</div>
           <div className="flex flex-wrap justify-end gap-2">
@@ -922,36 +2002,59 @@ export default function PlayerOverlay(): React.ReactElement {
       ) : null}
 
       {/*
-        播放状态覆盖层：捕捉视频流/加载中时给出明确的等待反馈，
+        播放状态覆盖层：还没出画面时给出明确的等待反馈 + **过程进度**，
         失败时给出可点击的退出入口（原生视频窗口会盖住主窗口页面里的同类提示）。
+
+        v0.3.9 重写：用户要求「播放器还没有显示时…在播放器状态里加一个过程进度显示器」，
+        并且「在播放内容没加载出来之前增加一个加载中」。
+        条件从「capturing / loading」改成「本轮还没出过画面且没有错误」——
+        全屏/小窗下画面全是黑的，这一层是用户唯一的反馈来源；
+        而用 `startedOnce` 而不是 `!playing`，是为了不让「暂停」被误判成「加载中」。
+        flow 由播放页跟着那条既有的状态推送带下来（没有新增轮询）。
+
+        v0.3.9 补充（用户报「两重提示叠在一起」）：这张卡现在是**全应用唯一**的加载/进度提示。
+        主窗口页面里那张同内容的居中层已经删掉（见 PlayerPage 里那段说明），
+        所以这里只在一处说话：
+          · 过程进度还没开始（没有任何阶段的 startedAt）→ 标题写「加载中」；
+          · 已经开始跑 → 标题换成本轮的一句话结论（阶段名 + 正在做什么），
+            与下面那三行阶段明细是**同一件事的两个粒度**，不再出现两句同义文案。
+
+        ⚠️ v0.3.9 第六轮修订：**这张卡的 JSX 已经搬到上面 `isDanmakuPart` 的穿透层里**（弹幕窗口）。
+        原因见那段注释：它是居中的，算进 UI 窗口区域就会让"画面正中"落进窗口形状，
+        于是画面中间的点击被 Electron 吃掉（实测回归：`画面中部不在形状里 = false`）。
+        这里只留这段说明 —— 谁要再往 UI 窗口里加"居中提示"，先想清楚它会不会吃掉画面中心的点击。
       */}
-      {state && (state.status.kind === 'capturing' || state.status.kind === 'loading') ? (
-        <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center">
-          <div className="flex items-center gap-2 rounded-full bg-black/65 px-4 py-2 text-xs text-white backdrop-blur whitespace-nowrap">
-            <span className="h-2 w-2 animate-pulse rounded-full bg-warn" />
-            {state.status.text}…
-          </div>
-        </div>
-      ) : null}
       {state?.error ? (
-        <div className="absolute inset-x-0 bottom-24 z-30 flex justify-center">
-          <div className="flex items-center gap-3 rounded-xl bg-black/80 px-4 py-2.5 text-xs text-white backdrop-blur">
-            <span className="max-w-md">{state.error}</span>
-            <button
-              className="rounded-lg bg-white/20 px-3 py-1 hover:bg-white/30 whitespace-nowrap"
-              onPointerDown={(e) => {
-                e.stopPropagation()
-                send({ type: 'exitPlayer' })
-              }}
-            >
-              ✕ 退出播放
-            </button>
+        <div data-sakana-hit="1" className="absolute inset-x-0 bottom-24 z-30 flex justify-center">
+          <div className="flex flex-col gap-2 rounded-xl bg-black/80 px-4 py-2.5 text-xs text-white backdrop-blur">
+            <div className="flex items-center gap-3">
+              <span className="max-w-md">{state.error}</span>
+              <button
+                className="rounded-lg bg-white/20 px-3 py-1 hover:bg-white/30 whitespace-nowrap"
+                onPointerDown={(e) => {
+                  e.stopPropagation()
+                  send({ type: 'exitPlayer' })
+                }}
+              >
+                ✕ 退出播放
+              </button>
+            </div>
+            {/* 失败时把三阶段摊开：用户要的就是「卡在哪一步、为什么」 */}
+            <PlayFlowStages flow={state.flow} tone="onVideo" />
           </div>
         </div>
       ) : null}
 
       {/* 顶部：退出 / 标题 / 状态 / 详情 / 截图（v0.2.18：uosc 接管控制栏后只留标题与状态） */}
       <div
+        /*
+         * v0.3.9：uosc 接管控制栏时，整条顶栏**不再**算可点区域 ——
+         * 那时控制栏由 mpv 画（包括它自己的顶栏），鼠标必须留给 mpv；
+         * 应用只剩「状态药丸」这一个需要点的东西，它自己单独标了 data-sakana-hit。
+         */
+        data-sakana-hit={uoscBar ? undefined : '1'}
+        data-sakana-topbar="1"
+        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
         className={`absolute inset-x-0 top-0 z-30 flex h-14 items-center justify-between bg-gradient-to-b from-black/70 via-black/25 to-transparent px-2 transition-opacity duration-300 ${
           visible ? 'opacity-100' : 'pointer-events-none opacity-0'
         }`}
@@ -974,6 +2077,8 @@ export default function PlayerOverlay(): React.ReactElement {
         {/* 状态药丸：点击查看流详情（地址/播放列表/分辨率/码率） */}
         <button
           title="查看播放状态与流详情"
+          /* v0.3.9：uosc 模式顶栏不算可点区域，这个药丸自己标一个（它仍由应用绘制） */
+          data-sakana-hit="1"
           onPointerDown={(e) => {
             e.stopPropagation()
             setShowInfo(true)
@@ -993,7 +2098,19 @@ export default function PlayerOverlay(): React.ReactElement {
                   : 'animate-pulse bg-warn'
             }`}
           />
-          {state?.status.text ?? '加载中'}
+          {/*
+            v0.3.9 补充：药丸里**同一时刻只说一件事**，而且**只在别处没有进度提示时才说**。
+            用户给的判据是「进播放到出画面这段过程里，屏幕上只出现一处进度/加载提示」，
+            而上面那张居中卡恰好覆盖了「还没出画面」的整段时间 —— 所以那段时间里药丸必须闭嘴，
+            否则就是「卡片 + 药丸」两处同时在报进度。
+            它只在「已经开播过（卡片已消失）× 流程还在跑（例如播放中触发的重嗅探）」时
+            才显示过程进度；其余时候显示状态词（「播放中 / 已暂停」，那不是进度提示）。
+          */}
+          {state?.flow && state.flow.running && state.startedOnce && !state.error ? (
+            <PlayFlowStages flow={state.flow} compact tone="onVideo" />
+          ) : (
+            (state?.status.text ?? '加载中')
+          )}
         </button>
         <div className="flex items-center gap-1">
           {uoscBar ? null : (
@@ -1018,13 +2135,30 @@ export default function PlayerOverlay(): React.ReactElement {
         这里只关显隐、不删代码：设置里把「播放器控制栏」切回旧版即可原样恢复。
       */}
       <div
+        /*
+         * v0.3.9：**整条底栏**都是可点区域（含进度条、按钮、以及挂在它上面的各种菜单/面板）。
+         *
+         * 为什么标在容器上而不是逐个按钮：鼠标在按钮之间的空隙上也应当算"在控制栏上" ——
+         * 否则点空隙会穿透到 mpv（把画面点成暂停），用户会以为又失灵了。
+         * 控制栏收起时容器带 `pointer-events-none`，`elementFromPoint` 会跳过它 → 自动变回穿透，
+         * 不需要额外同步状态（见 HIT_ATTR 的说明）。
+         */
+        data-sakana-hit={uoscBar ? undefined : '1'}
+        data-sakana-bottombar="1"
+        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
         className={`absolute inset-x-0 bottom-0 z-30 flex flex-col gap-1 bg-gradient-to-t from-black/75 via-black/30 to-transparent px-3 pb-2 pt-6 transition-opacity duration-300 ${
           visible && !uoscBar ? 'opacity-100' : 'pointer-events-none opacity-0'
         }`}
       >
         {/* 弹幕设置面板（覆盖区域 / 弹幕数量 / 时间轴 / 别名检测 + 更多设置） */}
         {danmakuMenu ? (
-          <div className="absolute bottom-[86px] right-3 z-40 w-80 rounded-xl border border-white/15 bg-black/85 p-3 text-white shadow-2xl backdrop-blur">
+          <div
+            /* v0.3.9 第六轮：popover 挂在底栏容器里、却**伸到容器上方**（absolute bottom-[86px]）——
+               不打这两个标记，伸出去的部分就会被窗口形状裁掉（用户实测 ①「弹幕设置被遮盖」）。 */
+            data-sakana-hit="1"
+            data-sakana-popover="1"
+            className="absolute bottom-[86px] right-3 z-40 w-80 rounded-xl border border-white/15 bg-black/85 p-3 text-white shadow-2xl backdrop-blur"
+          >
             <div className="mb-2 flex items-center justify-between">
               <span className="text-xs font-medium">弹幕设置</span>
               <button
@@ -1162,27 +2296,56 @@ export default function PlayerOverlay(): React.ReactElement {
 
         <div
           ref={seekRef}
+          data-sakana-hit="1"
+          data-sakana-seek="1"
           className="group relative flex h-6 cursor-pointer items-center"
           onPointerDown={(e) => {
+            if (e.button !== 0) return
             e.stopPropagation()
+            /*
+             * 指针捕获：拖动中指针移出进度条（往上滑到画面、拖到窗口外）时事件仍然回到这里。
+             * 改前没有捕获，靠 `onPointerLeave` 把 dragging 置 false ——
+             * 于是"手往上抖一下就断"，而且要重按一次才能继续拖。
+             * 合成事件（自检里 dispatch 的 PointerEvent）没有真实 pointerId，会抛 NotFoundError，
+             * 所以和音量滑杆一样用 try/catch 兜住。
+             */
+            try {
+              ;(e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId)
+            } catch {
+              /* 拿不到捕获也不影响按位置计算进度 */
+            }
             setDragging(true)
             const r = ratioFromEvent(e.clientX)
-            send({ type: 'seek', time: r * duration })
+            setDragPercent(r * 100)
+            seekTo(r * duration, true)
           }}
           onPointerMove={(e) => {
             if (!dragging) return
+            e.stopPropagation()
             const r = ratioFromEvent(e.clientX)
-            send({ type: 'seek', time: r * duration })
+            setDragPercent(r * 100)
+            seekTo(r * duration, false)
           }}
-          onPointerUp={() => setDragging(false)}
-          onPointerLeave={() => setDragging(false)}
+          onPointerUp={(e) => {
+            if (!dragging) return
+            e.stopPropagation()
+            setDragging(false)
+            const r = ratioFromEvent(e.clientX)
+            setDragPercent(null)
+            // 松手时**一定**把最后的位置补发一次：节流期间被丢掉的中间位置以这次为准
+            seekTo(r * duration, true)
+          }}
+          onPointerCancel={() => {
+            setDragging(false)
+            setDragPercent(null)
+          }}
         >
           <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/25">
-            <div className="h-full rounded-full bg-accent" style={{ width: `${percent}%` }} />
+            <div className="h-full rounded-full bg-accent" style={{ width: `${shownPercent}%` }} />
           </div>
           <div
             className="absolute top-1/2 h-3.5 w-3.5 -translate-y-1/2 rounded-full bg-white shadow"
-            style={{ left: `calc(${percent}% - 7px)` }}
+            style={{ left: `calc(${shownPercent}% - 7px)` }}
           />
         </div>
 
@@ -1204,7 +2367,7 @@ export default function PlayerOverlay(): React.ReactElement {
               <FastForward size={18} />
             </IconBtn>
             <span className="ml-1 text-[11px] tabular-nums text-white/80">
-              {fmt(current)} / {fmt(duration)}
+              {fmt(displayedTime)} / {fmt(duration)}
             </span>
             {/* v0.2.9：音量改为滑杆（用户要求，不加静音键） */}
             <VolumeSlider volume={state?.volume ?? 0} onSet={(nv) => send({ type: 'setVolume', value: nv })} />
@@ -1229,7 +2392,11 @@ export default function PlayerOverlay(): React.ReactElement {
                 <Subtitles size={18} />
               </IconBtn>
               {subMenu && (
-                <div className="absolute bottom-12 right-0 z-40 max-h-64 w-48 overflow-y-auto rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur">
+                <div
+                  data-sakana-hit="1"
+                  data-sakana-popover="1"
+                  className="absolute bottom-12 right-0 z-40 max-h-64 w-48 overflow-y-auto rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur"
+                >
                   <button
                     className="block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 whitespace-nowrap"
                     onClick={() => {
@@ -1280,7 +2447,11 @@ export default function PlayerOverlay(): React.ReactElement {
                 </span>
               </IconBtn>
               {speedMenu && (
-                <div className="absolute bottom-12 right-0 z-40 w-28 rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur">
+                <div
+                  data-sakana-hit="1"
+                  data-sakana-popover="1"
+                  className="absolute bottom-12 right-0 z-40 w-28 rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur"
+                >
                   {SPEED_CHOICES.map((s) => (
                     <button
                       key={s}
@@ -1349,7 +2520,11 @@ export default function PlayerOverlay(): React.ReactElement {
                 )}
               </IconBtn>
               {aspectMenu && (
-                <div className="absolute bottom-12 right-0 z-40 w-40 rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur">
+                <div
+                  data-sakana-hit="1"
+                  data-sakana-popover="1"
+                  className="absolute bottom-12 right-0 z-40 w-40 rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur"
+                >
                   {(['fit', 'cover', 'stretch'] as AspectMode[]).map((m) => (
                     <button
                       key={m}
@@ -1392,7 +2567,11 @@ export default function PlayerOverlay(): React.ReactElement {
                 </span>
               </IconBtn>
               {qualityMenu && (
-                <div className="absolute bottom-12 right-0 z-40 w-60 rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur">
+                <div
+                  data-sakana-hit="1"
+                  data-sakana-popover="1"
+                  className="absolute bottom-12 right-0 z-40 w-60 rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur"
+                >
                   <div className="px-2 py-1 text-[10px] text-white/50">
                     Anime4K 超分（改完立刻生效）
                   </div>
@@ -1489,7 +2668,10 @@ export default function PlayerOverlay(): React.ReactElement {
 
       {/* 投屏面板（v0.3.8）：设备列表 + 手动连接 + 投屏中的遥控 */}
       {castPanel ? (
-        <div className="absolute bottom-[92px] right-4 z-50 w-[330px] rounded-xl border border-white/10 bg-black/85 p-3 text-white/90 shadow-2xl backdrop-blur">
+        <div
+          data-sakana-hit="1"
+          className="absolute bottom-[92px] right-4 z-50 w-[330px] rounded-xl border border-white/10 bg-black/85 p-3 text-white/90 shadow-2xl backdrop-blur"
+        >
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium">投屏</span>
             <button className="rounded px-1.5 py-0.5 text-[11px] text-white/60 hover:bg-white/10" onClick={refreshCastDevices}>
@@ -1577,7 +2759,20 @@ export default function PlayerOverlay(): React.ReactElement {
       ) : null}
 
       {/* 流详情弹窗（与播放页里的那个是同一组件，两处口径一致） */}
-      <StreamInfoModal open={showInfo} onClose={() => setShowInfo(false)} />
+      <div data-sakana-hit="1">
+        <StreamInfoModal
+          open={showInfo}
+          onClose={() => setShowInfo(false)}
+          /*
+           * v0.3.9 补充：详情面板画在悬浮窗里，而「重新解析地址 → 嗅探 → 交给内核」这条链
+           * 在播放页手上（它才有播放页地址、探针取消句柄与看门狗），
+           * 所以这里只把「用户点了重跑」这个意图发回去，由播放页执行。
+           */
+          onRetry={() => send({ type: 'retryStream' })}
+        />
+      </div>
+        </>
+      )}
     </div>
   )
 }

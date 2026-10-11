@@ -1,0 +1,53 @@
+{
+  "_note": [
+    "aafun（月之祠 / moonci.com）—— 内置规则，随应用分发，不依赖首次启动去 git 拉取。",
+    "v1.3-fix 的改动（2026-09 实测，用户报「aafun 最近出了点问题，新番都搜不到」）：",
+    "  根因是**搜索入口**，不是选择器：站点 HTML 搜索页 /search/-------------.html?wd= 走的是站点的全文索引，",
+    "  整串标题常常命中不了 —— 实测「学生会也有洞」0 条、「久留美」0 条，而站点自己的搜索框补全接口",
+    "  /index.php/ajax/suggest 是 SQL LIKE，同样关键词能搜到（久留美 → 《FX战士久留美》id=3291，",
+    "  学生会也有洞 → 《学生会也有洞！》id=3287）。所以搜索改用该接口（type=api）。",
+    "  该接口只返回 id 不返回详情页地址，故用 itemLinkTemplate 由 id 拼出 /anime/<id>.html 供选集使用。",
+    "  详情页与剧集的 XPath 未改动：实测对新番依然有效（无职转生 5 条 / 详情页 42 集链接）。",
+    "  另外记一笔事实：用户举例的《FX战士留美》在站点里的正式标题是《FX战士久留美》（站点没有「留美」这种写法），",
+    "  《学生会也有洞》的正式标题是《学生会也有洞！》—— 这两条现在都能搜到了。"
+  ],
+  "id": "default-aafun",
+  "name": "aafun",
+  "version": "1.3-fix",
+  "baseUrl": "https://www.moonci.com/",
+  "search": {
+    "type": "api",
+    "method": "GET",
+    "url": "https://www.moonci.com/index.php/ajax/suggest?mid=1&wd=@keyword&limit=20",
+    "headers": "{}",
+    "query": "{}",
+    "bodyType": "",
+    "listXPath": "",
+    "itemNameXPath": "",
+    "itemLinkXPath": "",
+    "listJsonPath": "$.list[*]",
+    "itemNameJsonPath": "$.name",
+    "itemSourceJsonPath": "$.id",
+    "itemLinkTemplate": "https://www.moonci.com/anime/@source.html"
+  },
+  "episodes": {
+    "type": "xpath",
+    "method": "GET",
+    "url": "",
+    "headers": "{}",
+    "query": "{}",
+    "bodyType": "",
+    "responseFormat": "",
+    "linesXPath": "",
+    "episodesXPath": "//ul[contains(@class,\"hl-plays-list\")]/li/a",
+    "linesJsonPath": "",
+    "lineNameJsonPath": "",
+    "episodesJsonPath": "",
+    "episodeNameJsonPath": "",
+    "vars": {},
+    "playUrlTemplate": "",
+    "playQuery": {}
+  },
+  "enabled": true,
+  "createdAt": 0
+}

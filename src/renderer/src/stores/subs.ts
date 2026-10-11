@@ -145,7 +145,8 @@ export const useSubs = create<SubsState>((set, get) => ({
     else toast.error(r.error)
   },
   markSubUpdated: async (subId, episode, pubDate) => {
-    const r = await api.subs.markUpdated(subId, episode ?? 0, pubDate ?? '')
+    // v0.3.9 体检 H3：没集号就传 null（以前 `?? 0` 会让界面显示「更新到第 0 集 / 已下载所有资源」）
+    const r = await api.subs.markUpdated(subId, episode ?? null, pubDate ?? '')
     if (r.ok) set({ subscriptions: r.data })
     else toast.error(r.error)
   },

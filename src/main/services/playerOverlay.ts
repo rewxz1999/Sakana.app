@@ -1,4 +1,4 @@
-import { BrowserWindow, app } from 'electron'
+import { BrowserWindow, app, screen } from 'electron'
 import { join } from 'node:path'
 import { CH } from '@shared/channels'
 import { log } from '../log'
@@ -35,19 +35,116 @@ import { log } from '../log'
  *   （Windows 上 owned window 始终在主窗口之上、并随主窗口一起被别的窗口盖住），
  *   主窗口退到后台时它就跟着退到后台，不可能再「抢占最前面的位置」；
  * - 显隐只跟主窗口的最小化/隐藏走，失焦不再改变显隐；
- * - 「是否接收点击」由**主进程**统一裁决：既要渲染层希望可点击（控制栏真的显示着），
- *   也要主窗口确实在前台（`owner.isFocused() && !isMinimized()`）；不满足就是点击穿透。
- *   这样「看得见却点不动」和「点到了看不见的窗口」两类问题都不可能出现。
+ * - 「是否接收点击」不再按"控制栏整条可见不可见"整窗裁决，而是**按鼠标所在的区域**裁决，
+ *   见下面的 v0.3.9 说明。
+ *
+ * ## v0.3.9：整窗切换 → 按区域命中（用户报的「点击击穿」的根治）
+ *
+ * 用户的现象：控制栏就在眼前，按钮点了没反应；而且有时反过来 —— 想点画面暂停/拖 mpv 的进度条，
+ * 却发现「画面中间那一块点不动」。
+ *
+ * 根因（v0.2.x~v0.3.8 一直是这个）：悬浮窗铺满**整个**播放器窗口，而"是否接收点击"是按
+ * 「控制栏显示着没有」整窗切换的。于是两种坏结果必然出现：
+ *   ① 控制栏显示期间，**整窗**（含画面中部）都在吃鼠标 —— mpv 收不到任何鼠标事件，
+ *      「点画面暂停」「拖动 uosc 的进度条」「鼠标移到画面中部唤出控制栏」全部失效；
+ *   ② 控制栏收起/显示的那一瞬间（5 秒自动隐藏、切集、窗口隐藏再显示、切后台再回来），
+ *      窗口的系统级状态与界面状态会错位几十到几百毫秒 —— 用户正好在这段时间点下去，
+ *      事件就落在"看不见的网"或者干脆没人接上，表现就是「按钮看得见、点了没反应」。
+ *      v0.2.8~v0.3.6 加过的「1.5 秒心跳重申」「失焦不算数」「疑似击穿提示」都是在打这个时间差，
+ *      但只要是整窗切换，时间差就永远存在（心跳反而把窗口一直锁在"接收点击"上，让 ① 更严重）。
+ *
+ * 现在改成：**悬浮窗永远 `setIgnoreMouseEvents(true, { forward: true })`**，
+ * 只在鼠标**真的落在需要点的东西上**（控制栏/面板/按钮，渲染层用 `data-sakana-hit` 标出）
+ * 时才临时关掉穿透。鼠标一旦移出这些区域就立刻恢复穿透，鼠标重新落回 mpv 画面。
+ *
+ * 两条路径共同决定「这一帧鼠标落在哪」：
+ *   · **渲染层**：`mousemove`（`forward: true` 时即使穿透也收得到）→ `elementFromPoint` 命中判定
+ *     → 只有**状态变化**时才 IPC 一次（不再是每次移动都发）。延迟最低。
+ *   · **主进程**（本文件）：每 `CURSOR_POLL_MS` 读一次系统光标位置，落在悬浮窗矩形内就问渲染层
+ *     `window.__sakanaHitAt(x,y)`（`executeJavaScript`，不需要新开 IPC 通道）；
+ *     落在矩形外则**强制**恢复穿透。这条路兜住「光标一直没动、渲染层永远收不到 mousemove」
+ *     的冷启动场景（例如按 F 全屏后光标正好停在按钮位置上），也是"渲染层卡住"时的安全网。
+ *
+ * ## v0.3.9 第三轮：**不再用运行期判定决定"吃不吃鼠标"**（用户实测 46% 点击落空后的架构调整）
+ *
+ * 实测证据（`.e2e/verify-overlay-clickthrough.ps1`，真实光标）：
+ *   切换式方案（悬停命中 → `setIgnoreMouseEvents(false)`）**39 次点击丢了 18 次（46%）**，
+ *   未聚焦场景 5 次丢 4 次；而采样点上"可交互=true"一直是对的 —— 说明判定逻辑没错，
+ *   错的是**"从穿透切到接收"本身需要时间**：一轮判定 + 一次 IPC + 一次 `setIgnoreMouseEvents`
+ *   生效，在几十毫秒的窗口里点下去就穿过去了。用户移动鼠标再点击虽然间隔更长，
+ *   但这个窗口永远无法收敛到零 —— 所以这条路**从原理上就走不通**，不是时序参数能补的。
+ *
+ * 现在把"要不要吃鼠标"从运行期决策改成**窗口形状（静态布局）**：
+ *
+ *   ① **UI 窗口**（本文件的 `overlayWin`）：铺满主窗口（保持 CSS 坐标不变），透明、不抢焦点，
+ *      **默认就一直接收鼠标**（不再切 `setIgnoreMouseEvents`），但用 `setShape(rects)`
+ *      把"真正能画、能点"的区域限制成控制栏/面板的实际矩形。
+ *      Electron 文档原话：区域外"no pixels will be drawn and no mouse events will be registered…
+ *      will fall through to whatever is behind the window" ——
+ *      **命中判定由操作系统完成**：控制栏上的点击永远落进 Electron 窗口（零延迟、零竞态），
+ *      画面上的点击永远落到下面的 mpv 子窗口，不需要判定、不需要轮询、不需要迟滞。
+ *   ② **弹幕窗口**（`danmakuWin`）：同样铺满主窗口、永远 `setIgnoreMouseEvents(true, {forward:true})`，
+ *      只画弹幕（与原来的视觉/透明度完全一致），一次都不切换。
+ *
+ * 于是 46% 的落空从原理上消失：点击能不能到控制栏，取决于**窗口区域**这个静态事实，
+ * 而不取决于"这一帧的判定结果 + 状态是否已经下发"。
+ *
+ * 旧的运行期判定（`setOverlayHit` 那套：命中探针 / 迟滞 / 光标轮询 / 来源仲裁）**保留但降级**：
+ *   · 它现在只用于**诊断**，以及 `setShape` 不可用的平台（Electron 标注 win32/linux）上的降级回退；
+ *   · 在 Windows 上（本应用的目标平台）这些代码路径不会被走到 —— 不再有"切换时机"这件事。
  *
  * 职责边界：
- * - 本模块只负责窗口的创建/定位/显示/销毁，以及「状态下行、动作上行」的消息中转；
- * - 控制栏 UI 在渲染层（`#/overlay` 路由），动作最终转给播放页处理，避免状态分叉。
+ * - 本模块负责窗口创建/定位/显隐/形状、以及「状态下行、动作上行」的消息中转；
+ * - 「哪些区域算可交互」由渲染层按 DOM 实际矩形给出（`__sakanaHitRegions()`），
+ *   因为控制栏高度、面板位置只有页面自己最清楚；主进程只负责把它变成窗口形状。
  */
 
 let overlayWin: BrowserWindow | null = null
+/**
+ * 弹幕窗口（v0.3.9 第三轮）。
+ *
+ * 为什么要把弹幕单独拆一个窗口：UI 窗口用 `setShape` 限定可点区域，而 `setShape` 同时**裁剪绘制** ——
+ * 铺满画面中部的弹幕会被裁掉。所以弹幕必须画在另一块"整窗铺满、永久穿透"的窗口里。
+ * 它永远不接收鼠标（`setIgnoreMouseEvents(true, { forward: true })` 只设一次），
+ * z 序在 UI 窗口之下、主窗口之上。
+ */
+let danmakuWin: BrowserWindow | null = null
 let ownerWin: BrowserWindow | null = null
 /** 跟随主窗口尺寸/位置的监听器解绑函数（悬浮窗销毁时必须解绑，否则会泄漏监听） */
 let followDisposers: (() => void)[] = []
+/**
+ * 最近一次**非空**的区域（v0.3.9 第六轮）。
+ *
+ * 为什么必须留着它：`setShape` 会**裁剪绘制**（不只是命中）——区域一旦为空，控制栏、面板、
+ * 「加载中」提示全都会被裁掉不画。用户实测 ④：「选集播放后一片黢黑、连控制栏都不见了」
+ * 就是这条路：渲染层在切换/挂载那一瞬间报了一次空区域 → 我们把窗口藏了 → 控制栏消失，
+ * 而画面此时还是黑的（mpv 还没出画），于是整屏全黑。
+ * 所以：**永远不允许 UI 窗口同时"没有形状 + 不可见"**（见 applyRegions 的 NEVER_DEAD_STATE 注释）。
+ */
+let lastNonEmptyRegions: HitRegion[] = []
+/** 是否正处在"退化兜底"状态（拿不到区域时用上一份/整窗），诊断与自检要看这个 */
+let regionsDegraded = false
+/** 退化兜底的原因（写日志/诊断用） */
+let regionsDegradedReason = ''
+/**
+ * 形状成功下发的累计次数、以及"渲染层报来空区域"的累计次数（v0.3.9 第六轮）。
+ *
+ * 为什么要有计数器：用户实测 ④ 需要的是"进入播放页头 3 秒的日志时间线"——
+ * 光看当前状态看不出"这 3 秒里形状被下发了几次、有没有出现过空区域"。
+ * 有了计数，自检可以把每一帧的状态变化讲清楚（详见 index.ts 的 3 秒健康采样断言）。
+ */
+let shapeApplyCount = 0
+let hollowRegionPulls = 0
+/** 最近一次"渲染层报来空区域"的原因（空字符串 = 没发生过） */
+let lastHollowReason = ''
+/**
+ * 窗口是不是**按设计**被藏起来的（uosc 接管控制栏、整块交还 mpv）。
+ *
+ * 为什么要单独记一个标志：`resyncOverlay` 是"把窗口弄回来"的动作，若它不看这个标志，
+ * 就会把 uosc 模式下**故意藏起来**的窗口又显示出来（并且复用它手里那份旧区域）——
+ * 那就把"整块交还 mpv"这件事给破坏了。所以 resync 只在"不是按设计隐藏"时才强制显示。
+ */
+let hiddenByDesign = false
 
 function stopFollowing(): void {
   for (const off of followDisposers) {
@@ -58,6 +155,12 @@ function stopFollowing(): void {
     }
   }
   followDisposers = []
+}
+
+/** 遍历当前活着的悬浮窗（UI + 弹幕），回调里自行判空 */
+function eachOverlayWindow(fn: (win: BrowserWindow, kind: OverlayKind) => void): void {
+  if (overlayWin && !overlayWin.isDestroyed()) fn(overlayWin, 'ui')
+  if (danmakuWin && !danmakuWin.isDestroyed()) fn(danmakuWin, 'danmaku')
 }
 
 /**
@@ -72,26 +175,32 @@ function stopFollowing(): void {
  */
 function startFollowing(owner: BrowserWindow): void {
   stopFollowing()
-  const sync = (): void => syncBounds()
+  /**
+   * 几何跟随：窗口尺寸/位置一变，**形状也必须重算** ——
+   * 形状坐标是相对窗口客户区的，窗口拉大/全屏后控制栏位置变了，旧形状就会错位
+   * （表现为"控制栏上的点击点不动、画面上的点击被吃掉"）。
+   */
+  const sync = (): void => {
+    syncBounds()
+    void refreshRegions(true)
+  }
   /** 最小化 / 隐藏（关闭到托盘）时跟着主窗口一起收起来 */
   const hideForOwner = (): void => {
-    if (overlayWin && !overlayWin.isDestroyed()) overlayWin.hide()
+    eachOverlayWindow((w) => w.hide())
   }
   const onForegroundChange = (): void => {
     // 主窗口被激活时 Windows 会把主窗口提到同层顶端，悬浮窗要重新插回它上方
-    raiseAboveOwner()
-    applyInteractive()
+    resyncOverlay('主窗口焦点变化')
   }
   const showForOwner = (): void => {
-    if (overlayWin && !overlayWin.isDestroyed()) overlayWin.showInactive()
-    raiseAboveOwner()
     /*
-     * v0.2.12：重新显示后立刻按当前状态重算交互。
-     * `showInactive()` 不会让主窗口获得焦点，而旧的裁决逻辑要求「在前台才可点击」，
-     * 于是「窗口隐藏再显示」之后控制栏一直是点击穿透状态（用户反馈的第二种失灵场景）。
-     * 现在只等渲染层的心跳/下一次鼠标移动就行，但仍然在这里补一次，缩短窗口期。
+     * 主窗口从隐藏/托盘恢复：**必须重新同步一次**（v0.3.9 第六轮）。
+     *
+     * 为什么不能只 showInactive：窗口被隐藏期间渲染层可能已经换了控制栏/面板布局，
+     * 而"窗口恢复显示"这件事本身不会触发任何区域上报 —— 不重下发形状就会出现
+     * "窗口回来了、形状还是旧的甚至没有"（用户报的 ②：显示回来之后按钮完全没反应）。
      */
-    applyInteractive()
+    resyncOverlay('主窗口恢复显示')
   }
   owner.on('minimize', hideForOwner)
   owner.on('hide', hideForOwner)
@@ -140,11 +249,21 @@ function rendererUrl(): string {
  * 这一步是「既要在自己窗口之上、又不许抢别人位置」的正解。
  */
 function raiseAboveOwner(): void {
-  if (!overlayWin || overlayWin.isDestroyed() || !ownerWin || ownerWin.isDestroyed()) return
+  if (!ownerWin || ownerWin.isDestroyed()) return
+  const ownerId = ownerWin.getMediaSourceId()
   try {
-    overlayWin.moveAbove(ownerWin.getMediaSourceId())
+    /*
+     * z 序（自下而上）：主窗口 → 弹幕窗口 → UI 窗口。
+     * 弹幕在控制栏之下（控制栏画在它上面），两者都在主窗口之上（且随主窗口一起被别的窗口盖住）。
+     * 顺序必须显式排：两个悬浮窗都是 owned window，谁后插入谁在上。
+     */
+    if (danmakuWin && !danmakuWin.isDestroyed()) danmakuWin.moveAbove(ownerId)
+    if (overlayWin && !overlayWin.isDestroyed()) {
+      const below = danmakuWin && !danmakuWin.isDestroyed() ? danmakuWin.getMediaSourceId() : ownerId
+      overlayWin.moveAbove(below)
+    }
   } catch (err) {
-    log.append('warn', 'overlay', `把控制栏插到主窗口上方失败: ${String((err as Error)?.message ?? err)}`)
+    log.append('warn', 'overlay', `把悬浮窗插到主窗口上方失败: ${String((err as Error)?.message ?? err)}`)
   }
 }
 
@@ -168,36 +287,24 @@ export function currentOverlayGen(): number {
   return overlayGen
 }
 
-/** 展示控制栏悬浮窗（覆盖整个主窗口区域） */
-export function showOverlay(owner: BrowserWindow): number {
-  ownerWin = owner
-  if (overlayWin && !overlayWin.isDestroyed()) {
-    syncBounds()
-    /*
-     * 窗口还在但**被隐藏**时重新显示。
-     * v0.2.9 起不再需要「只有主窗口在前台才恢复」这个前提：悬浮窗不置顶，
-     * 主窗口在后台时它本来就会被一起盖住，显示了也不会浮在别人窗口上。
-     * 只排除「主窗口已最小化」——那种情况下显示没有任何意义。
-     */
-    if (!overlayWin.isVisible() && !owner.isMinimized()) {
-      overlayWin.showInactive()
-      log.append('info', 'overlay', '悬浮窗此前处于隐藏状态，已重新显示')
-    }
-    raiseAboveOwner()
-    applyInteractive()
-    overlayGen += 1
-    return overlayGen
-  }
-  overlayGen += 1
-  const myGen = overlayGen
-  startFollowing(owner)
-  const ownerBounds = owner.getBounds()
-  overlayWin = new BrowserWindow({
+/** 悬浮窗角色：'ui' = 控制栏/面板（限制形状、一直接收鼠标）；'danmaku' = 弹幕（整窗、永久穿透） */
+type OverlayKind = 'ui' | 'danmaku'
+
+/**
+ * 创建一个悬浮窗（UI / 弹幕两种角色共用同一套窗口参数，只有"吃不吃鼠标"不同）。
+ *
+ * 两者都铺满主窗口：**保持 CSS 坐标与页面完全一致** —— 控制栏/面板的定位、弹幕的视频矩形
+ * 都不需要做坐标换算（换成"只覆盖控制栏的小窗口"就要把整棵 UI 的坐标平移，改动面大、
+ * 而且每次布局变化都要重新算）。UI 窗口靠 `setShape` 限定可点/可画区域，等价于"贴合区域的小窗口"。
+ */
+function createOverlayWindow(owner: BrowserWindow, kind: OverlayKind): BrowserWindow {
+  const b = owner.getBounds()
+  const win = new BrowserWindow({
     parent: owner,
-    x: ownerBounds.x,
-    y: ownerBounds.y,
-    width: ownerBounds.width,
-    height: ownerBounds.height,
+    x: b.x,
+    y: b.y,
+    width: b.width,
+    height: b.height,
     frame: false,
     transparent: true,
     backgroundColor: '#00000000',
@@ -209,6 +316,16 @@ export function showOverlay(owner: BrowserWindow): number {
     fullscreenable: false,
     skipTaskbar: true,
     focusable: false, // 不抢主窗口焦点，避免播放快捷键失效
+    /*
+     * v0.3.9 第六轮（用户实测 ② 的建议之一）：**非活动窗口的第一次点击也要交给网页**。
+     *
+     * 悬浮窗是 `focusable: false` + `showInactive()`，永远不会成为前台窗口。默认情况下
+     * "窗口未激活时的第一次点击"只会用来激活窗口、不投递给网页（Windows 的点击穿透激活语义），
+     * 于是"窗口被别的应用压住/刚从隐藏恢复"之后的第一下点击就白点了 —— 用户报的
+     * 「被压到其它应用后面之后控制栏按钮完全没反应」里就有这一条。
+     * 打开 acceptFirstMouse 后，即使窗口未激活，第一次点击也会直接进入页面。
+     */
+    acceptFirstMouse: true,
     show: false,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -217,62 +334,151 @@ export function showOverlay(owner: BrowserWindow): number {
       sandbox: false,
       /*
        * v0.2.8：**必须关掉后台节流**。
-       * 弹幕画在这个悬浮窗的 canvas 上、靠 requestAnimationFrame 推进，
+       * 弹幕画在悬浮窗的 canvas 上、靠 requestAnimationFrame 推进，
        * 而透明置顶且不可聚焦的窗口很容易被 Chromium 判定为「后台/被遮挡」——
        * 默认的 backgroundThrottling 会把 rAF 与定时器压到几乎不触发，
-       * 实测表现就是「弹幕只画了一秒就冻住、播放时间停住不再前进」（自检里帧数停在 61 不再增长）。
+       * 实测表现就是「弹幕只画了一秒就冻住、播放时间停住不再前进」。
        */
       backgroundThrottling: false,
       additionalArguments: ['--sakana-overlay']
     }
   })
-  // 默认点击穿透（鼠标移动仍会转发给本窗口，用于唤出控制栏）
-  overlayWin.setIgnoreMouseEvents(true, { forward: true })
+  if (kind === 'danmaku') {
+    // 弹幕窗口：**一次性**设为永久穿透（forward 让 hover 类事件仍可用），此后绝不切换
+    win.setIgnoreMouseEvents(true, { forward: true })
+  } else {
+    /*
+     * UI 窗口：**默认就接收鼠标**（此后绝不切换"吃不吃"），能点的范围交给 `setShape` 限定。
+     *
+     * ⚠️ 这里**不预置空形状**：`setShape([])` 的语义在 Electron 文档里没有明确（可能被当成"恢复整窗"），
+     * 一旦理解错，这一小段时间整窗都会吃鼠标（画面上的点击就丢了）。所以：UI 窗口先**保持隐藏**，
+     * 等渲染层报上第一批区域再 `setShape(区域)` + `showInactive()` —— 隐藏的窗口不可能吃鼠标，零风险。
+     */
+    win.setIgnoreMouseEvents(false)
+  }
+  win.on('closed', () => {
+    if (kind === 'ui') overlayWin = null
+    else danmakuWin = null
+  })
+  if (kind === 'ui') {
+    /*
+     * v0.3.6：主进程侧的鼠标活动兜底（`before-input-event` 在浏览器进程侧，不依赖渲染层响应）。
+     * v0.3.9 第三轮起它只做两件事：保活 poke（让控制栏显示出来）与刷新区域缓存。
+     */
+    win.webContents.on('before-input-event', (_e, input) => {
+      if (input.type === 'mouseMove' || input.type === 'mouseDown' || input.type === 'mouseUp') {
+        noteOverlayMouse()
+        pokeOverlayFromInput()
+      }
+    })
+  }
+  win.webContents.on('render-process-gone', (_e, d) => {
+    log.append('warn', 'overlay', `悬浮窗（${kind}）渲染进程结束: ${d.reason}`)
+    destroyOverlay()
+  })
+  const devUrl = process.env['ELECTRON_RENDERER_URL']
+  const hash = `/overlay?part=${kind}`
+  if (!app.isPackaged && devUrl) void win.loadURL(`${devUrl}#${hash}`)
+  else void win.loadFile(rendererUrl(), { hash })
+  win.once('ready-to-show', () => {
+    /*
+     * UI 窗口**不在这里显示**：它要等渲染层报上可交互区域、`setShape` 设好之后才显形
+     * （见 applyRegions）—— 没有形状的"整窗接收鼠标"窗口会把画面上的点击全吃掉。
+     * 弹幕窗口直接显示（它永久穿透，显示出来也不吃鼠标）。
+     */
+    if (kind === 'danmaku') win.showInactive()
+    raiseAboveOwner()
+  })
+  return win
+}
+
+/** 展示控制栏悬浮窗（UI + 弹幕两块，均覆盖整个主窗口区域） */
+export function showOverlay(owner: BrowserWindow): number {
+  ownerWin = owner
+  if (overlayWin && !overlayWin.isDestroyed()) {
+    // 弹幕窗口万一没了（渲染进程崩溃/被关掉）就补一块，否则弹幕会静默消失
+    if (!danmakuWin || danmakuWin.isDestroyed()) danmakuWin = createOverlayWindow(owner, 'danmaku')
+    /*
+     * 窗口还在时**统一走一次幂等重同步**（v0.3.9 第六轮）。
+     *
+     * 为什么不再只 showInactive：切集/重新进入播放页、窗口从隐藏恢复、主窗口从后台回来，
+     * 这些都不会触发渲染层的区域上报 —— 只 show 不重下发形状，就会出现"窗口回来了但形状是旧的
+     * 或干脆没有"（用户报的 ②：显示回来之后按钮完全没反应）。resyncOverlay 里已经包含
+     * "按已知区域先重下发一次 + 异步拉最新区域 + 重新排 z 序 + 按形状确保可见"。
+     */
+    resyncOverlay('再次进入播放页 / 悬浮窗已存在')
+    overlayGen += 1
+    return overlayGen
+  }
+  overlayGen += 1
+  const myGen = overlayGen
+  startFollowing(owner)
+  /*
+   * 先建弹幕窗口再建 UI 窗口：`raiseAboveOwner` 会按"弹幕在下、UI 在上"排序，
+   * 两个都建好后再统一排一次 z 序。
+   */
+  danmakuWin = createOverlayWindow(owner, 'danmaku')
+  overlayWin = createOverlayWindow(owner, 'ui')
   rendererWantsInteractive = false
   overlayInteractive = false
+  /*
+   * v0.3.9 补充：**预置一次光标位置**（降级回退路径要用；形状模式下只影响诊断）。
+   * 否则轮询的第一帧会把"刚拿到一个位置"当成"光标移动了"，把判定权无端推给主进程。
+   */
+  try {
+    const p0 = screen.getCursorScreenPoint()
+    const b0 = overlayWin.getContentBounds()
+    lastCursorLocal = { x: p0.x - b0.x, y: p0.y - b0.y }
+  } catch {
+    lastCursorLocal = null
+  }
+  startCursorHitWatch()
+  watchDisplayChanges()
   /*
    * 注意：这里**故意不调用 setAlwaysOnTop**（任何层级都不调用）。
    * 悬浮窗作为主窗口的 owned window 天然位于主窗口之上、且随主窗口一起被别的窗口盖住，
    * 够用且永远不会「抢占最前面的位置」；理由详见文件头注释。
    */
-  overlayWin.on('closed', () => {
-    overlayWin = null
-  })
-  /*
-   * v0.3.6：主进程侧的鼠标活动兜底。
-   *
-   * `setIgnoreMouseEvents(true, { forward: true })` 会把鼠标移动转发到渲染层，
-   * 但那条路要经过 IPC + React 的 mousemove 监听 —— 页面一旦卡住就断了。
-   * 而「点击击穿」侦测必须知道"鼠标刚刚确实在控制栏上"，所以这里在主进程侧
-   * 再记一次：`before-input-event` 会在渲染层处理之前拿到原始的输入事件，
-   * 鼠标类事件的 `type` 是 `mouseMove` / `mouseDown`。
-   */
-  overlayWin.webContents.on('before-input-event', (_e, input) => {
-    if (input.type === 'mouseMove' || input.type === 'mouseDown' || input.type === 'mouseUp') {
-      noteOverlayMouse()
-    }
-  })
-  overlayWin.webContents.on('render-process-gone', (_e, d) => {
-    log.append('warn', 'overlay', `控制栏悬浮窗渲染进程结束: ${d.reason}`)
-    destroyOverlay()
-  })
-  const devUrl = process.env['ELECTRON_RENDERER_URL']
-  if (!app.isPackaged && devUrl) void overlayWin.loadURL(`${devUrl}#/overlay`)
-  else void overlayWin.loadFile(rendererUrl(), { hash: '/overlay' })
-  overlayWin.once('ready-to-show', () => {
-    overlayWin?.showInactive()
-    raiseAboveOwner()
-  })
-  log.append('info', 'overlay', `控制栏悬浮窗已创建（第 ${myGen} 代，不置顶）`)
+  raiseAboveOwner()
+  log.append('info', 'overlay', `悬浮窗已创建（第 ${myGen} 代，UI 形状模式=${shapeSupported() ? '开' : '关'}，不置顶）`)
   logOverlayOwner('control bar owner')
   return myGen
 }
 
-/** 跟随主窗口位置/尺寸（全屏切换、显示切换时调用） */
+/** 跟随主窗口位置/尺寸（全屏切换、显示切换时调用）—— UI 与弹幕两块都要跟 */
 export function syncBounds(): void {
-  if (!overlayWin || overlayWin.isDestroyed() || !ownerWin || ownerWin.isDestroyed()) return
+  if (!ownerWin || ownerWin.isDestroyed()) return
   const b = ownerWin.getBounds()
-  overlayWin.setBounds(b)
+  eachOverlayWindow((w) => w.setBounds(b))
+}
+
+/**
+ * 显示器变化（分辨率/缩放/换屏）时的重同步（v0.3.9 第六轮）。
+ *
+ * 为什么必须听这些事件：形状坐标要按缩放系数换算（见 SHAPE_UNITS），换屏或改缩放之后旧形状会整体错位 ——
+ * 表现是"控制栏上的点击点不动、画面上的点击被吃掉"。窗口尺寸变化本身有 `resize/move` 监听，
+ * 但"缩放变了、窗口 DIP 尺寸没变"这种情况只有这里能发现。
+ */
+function watchDisplayChanges(): void {
+  const onDisplay = (): void => {
+    resyncOverlay('显示器/缩放变化')
+  }
+  try {
+    screen.on('display-metrics-changed', onDisplay)
+    screen.on('display-added', onDisplay)
+    screen.on('display-removed', onDisplay)
+    followDisposers.push(() => {
+      try {
+        screen.off('display-metrics-changed', onDisplay)
+        screen.off('display-added', onDisplay)
+        screen.off('display-removed', onDisplay)
+      } catch {
+        /* 应用退出中 */
+      }
+    })
+  } catch {
+    /* 极旧的 Electron 没有这些事件：忽略（resize/move 已覆盖大多数情况） */
+  }
 }
 
 /**
@@ -285,50 +491,437 @@ export function destroyOverlay(gen?: number): void {
   if (gen !== undefined && gen !== overlayGen) return
   overlayGen += 1 // 之后到达的旧 hide 请求一律作废
   stopFollowing()
-  if (overlayWin && !overlayWin.isDestroyed()) {
-    overlayWin.destroy()
-  }
+  stopCursorHitWatch()
+  rendererWantsInteractive = false
+  overlayInteractive = false
+  // 兜底判定的依据全部作废：矩形缓存属于刚销毁的那一代窗口，留着会让新窗口误判
+  hitSnapshot = null
+  snapshotAt = 0
+  lastRendererReportAt = 0
+  lastCursorMovedAt = 0
+  mainLastHitAt = 0
+  shapeRectsKey = ''
+  appliedRegions = []
+  appliedShapeRects = []
+  /*
+   * `lastNonEmptyRegions` **故意不清空**：区域是"窗口相对坐标"，与第几代窗口无关，
+   * 留着重开播放页时可以直接用上一份控制栏矩形顶一下（比"整窗形状"温和得多）；
+   * 真正的清空时机是"新的区域报上来"，那时它会被覆盖。
+   */
+  regionsDegraded = false
+  regionsDegradedReason = ''
+  eachOverlayWindow((w) => w.destroy())
   overlayWin = null
+  danmakuWin = null
 }
 
-/** 是否把鼠标事件交给悬浮窗（控制栏可见时=true，可点击；隐藏时=false 点击穿透） */
-/** 当前悬浮窗是否在接收鼠标事件（点击穿透的反面）—— 自检用 */
-let overlayInteractive = false
-/** 渲染层**希望**的交互状态（控制栏是否真的显示着） */
-let rendererWantsInteractive = false
+// ============================================================================
+// 窗口形状（v0.3.9 第三轮）：把"吃不吃鼠标"变成静态布局
+// ============================================================================
+
+/** 渲染层给出的可交互区域（CSS 像素，相对悬浮窗客户区） */
+interface HitRegion {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+/** 当前生效的区域（**CSS/DIP 单位**，渲染层报上来的原样；自检与诊断按这个单位用） */
+let appliedRegions: HitRegion[] = []
+/** 真正传进 `setShape` 的矩形列表（两种单位解释的并集，去重后；见 SHAPE_UNITS 实测史） */
+let appliedShapeRects: HitRegion[] = []
+/** `setShape` 是否真的成功调用过（自检要能区分"记下了区域"和"形状真的生效了"） */
+let shapeApplied = false
+/** 设置形状时用的缩放系数（诊断用） */
+let shapeScaleFactor = 1
+/** 上一次真正下发给 setShape 的区域签名（内容没变就不碰窗口，避免每帧一次系统调用） */
+let shapeRectsKey = ''
+let regionsBusy = false
+let regionsFetchedAt = 0
 
 /**
- * 主进程统一裁决「悬浮窗是否接收鼠标事件」。
+ * 本平台是否支持 `setShape`（Electron 标注 `@platform win32,linux`）。
+ * 支持时"吃不吃鼠标"完全由窗口形状决定，运行期判定只用于诊断；
+ * 不支持（例如 macOS）时退回旧行为（运行期切换 setIgnoreMouseEvents）。
+ */
+function shapeSupported(): boolean {
+  return !!overlayWin && !overlayWin.isDestroyed() && typeof overlayWin.setShape === 'function'
+}
+
+/** 取某个屏幕坐标所在显示器的缩放系数（形状的单位换算要用） */
+function scaleFactorAt(x: number, y: number): number {
+  try {
+    return screen.getDisplayNearestPoint({ x: Math.round(x), y: Math.round(y) }).scaleFactor || 1
+  } catch {
+    return 1
+  }
+}
+
+/**
+ * 下发给 `setShape` 的单位解释（v0.3.9 第五轮修订：**两份都下发，以实测为准**）。
  *
- * ## v0.2.12：去掉「主窗口必须在前台」这个条件（用户第三次反馈按钮失灵的真凶）
+ * Electron 文档没写 `setShape` 矩形的单位（`Rectangle` 也没写，且标注 `@experimental`），
+ * 所以这里不去猜，而是**把两种解释下的矩形都发给 OS**：`r`（DIP/CSS 原值）与 `r × 缩放`（物理像素）。
+ * 哪一份生效由 OS 决定，我们的一份都不缺 —— 于是"OS 按哪种单位解释"这个未知量被消掉了。
  *
- * 用户的现象（这次描述得很具体）：**播放器窗口位于另一个应用窗口之下**时、
- * 以及**窗口被隐藏后再显示**时，控制栏看得见但按钮全都没反应。
+ * ## 实测史（同一台机器、200% 缩放、同一套脚本，v0.3.9 第五轮）
  *
- * 旧规则要求 `ownerWin.isFocused()`，理由写在 v0.2.9 的注释里（怕「点到看不见的窗口」）。
- * 但 v0.2.9 之后悬浮窗已经是 owned window 且**从不 setAlwaysOnTop**，
- * 它不可能浮在别的应用窗口之上 —— 那条理由已经不成立了，而它留下一个**死锁**：
+ *   · 并集（`['dip','physical']`）：`phase 1 sent=19 windowReceived=19 notDelivered=0`
+ *     —— 39 次真实点击**一次不丢**。
+ *   · 只下发物理那一份（上一轮的改动）：`phase 1 sent=27 windowReceived=6 notDelivered=21`、
+ *     `phase 2 sent=20 windowReceived=0 notDelivered=20`，且探针报"形状整体没生效"
+ *     —— 等于形状整体落空。
  *
- *   主窗口不在前台 → 控制栏点击穿透 → 用户点控制栏，点击落到别的窗口上
- *   → 主窗口永远拿不到焦点 → 控制栏永远不可点。
+ * 结论：**并集是实测唯一能让 `notDelivered=0` 的形态**，已经改回来；不要在只跑过两种形态的情况下
+ * 第三次猜"只留某一份"（真要判定哪一份生效，看 `.e2e/verify-overlay-clickthrough.ps1` 里
+ * 那条"决定性探针"——它探测**两份解释互不重叠的那条带**，而不是"并集里有一点属于我们"）。
  *
- * 窗口隐藏后再显示也是同一回事：`showInactive()` 不聚焦，状态一直卡在「不可点」。
- * （渲染层其实每 1.5 秒都在重申「控制栏显示着、我要可点击」，但被这道门槛全部否掉。）
+ * 为什么"并集"在两种解释下都成立（值得记住的几何事实）：
+ * 设窗口客户区在 DIP 空间的真实控制栏点是 p，则
+ *   · OS 按 DIP 解释 → 覆盖点在屏幕 (原点 + N) × 缩放；并集里有 N = p，所以 p 被覆盖；
+ *   · OS 按物理解释 → 覆盖点在屏幕 原点 × 缩放 + N；并集里有 N = p × 缩放，所以 p 仍被覆盖。
+ * 也就是说：**只要下发 `{r, r×sf}` 两份，真实控制栏在哪种解释下都落在形状里**。
  *
- * 现在的规则只有一条：**渲染层说控制栏显示着，就接收点击**，另加两个物理前提 ——
- * 悬浮窗确实可见、主窗口没被最小化。真正被别的窗口盖住时，点击本来就到不了悬浮窗，
- * 不需要（也不应该）用焦点状态去猜。
+ * `'dip'` / `'physical'` 仍然保留在类型里，是为了万一将来在别的机器上探针给出确定结论时，
+ * 可以只改这一行；默认值永远是两份都发（保守且实测有效）。
+ */
+type ShapeUnit = 'dip' | 'physical'
+const SHAPE_UNITS: ShapeUnit[] = ['dip', 'physical']
+
+/**
+ * 区域为空时**绝对不允许**进入的状态（v0.3.9 第六轮，用户实测 ④ 的修复）。
+ *
+ * ## 症状与根因
+ *
+ * 用户原话：「选集播放后进入播放，但是什么也不显示，一片黢黑，连播放器控制栏都不见了。」
+ *
+ * 根因是 `setShape` 的**裁剪是双向的**：Electron 文档说形状外的区域
+ * "no pixels will be drawn and no mouse events will be registered"。也就是说区域一旦为空，
+ * 控 **制栏、面板、以及「加载中」提示全都不再绘制** —— 而此时 mpv 往往还没出第一帧（正是"选集播放"
+ * 之后那几秒），于是整屏全黑、连控制栏都看不见。
+ *
+ * ## 规则（改这块代码必须遵守）
+ *
+ *   · 只要播放页还活着，**任何时候都不允许 UI 窗口同时"没有形状 + 不可见"**；
+ *   · 拿不到区域时：先用**上一份有效区域**，没有历史区域就用**整窗形状**，并写日志说明为什么退化；
+ *   · 宁可短暂多吃鼠标（画面上的点击暂时进不了 mpv），也不能让控制栏/加载提示消失；
+ *   · 只有渲染层**明确**说"应用此刻没有任何可交互元素"（uosc 接管控制栏，`allowHide`）才允许隐藏窗口 ——
+ *     那是设计上的"整块交还 mpv"，不是这次要修的退化场景。
+ */
+
+/** 整窗形状（退化兜底的最后一招：至少让页面能画出来） */
+function wholeWindowRegions(): HitRegion[] {
+  const win = overlayWin
+  if (!win || win.isDestroyed()) return []
+  const b = win.getContentBounds()
+  return [{ x: 0, y: 0, w: b.width, h: b.height }]
+}
+
+/** 渲染层对"为什么这次区域是空的"的自述（渲染层没提供时返回 null） */
+interface RegionsDiag {
+  uosc?: boolean
+  ready?: boolean
+  hasTopBar?: boolean
+  hasBottomBar?: boolean
+  hitCount?: number
+  barVisible?: boolean
+}
+
+async function readRegionsDiag(): Promise<RegionsDiag | null> {
+  const win = overlayWin
+  if (!win || win.isDestroyed()) return null
+  try {
+    return (await win.webContents.executeJavaScript(
+      `typeof window.__sakanaRegionsDiag === 'function' ? window.__sakanaRegionsDiag() : null`,
+      true
+    )) as RegionsDiag | null
+  } catch {
+    return null
+  }
+}
+
+function describeRegionsDiag(d: RegionsDiag | null): string {
+  if (!d) return '渲染层未提供原因'
+  const parts: string[] = []
+  if (d.uosc) parts.push('uosc 接管控制栏')
+  if (d.ready === false) parts.push('页面还没就绪')
+  if (d.hasTopBar === false && d.hasBottomBar === false) parts.push('DOM 里还没有控制栏')
+  if (typeof d.hitCount === 'number') parts.push(`可点容器 ${d.hitCount} 个`)
+  if (d.barVisible === false) parts.push('控制栏此刻处于自动收起')
+  return parts.length > 0 ? parts.join('、') : '渲染层说当前没有任何可交互元素'
+}
+
+/**
+ * 现在**允许**把悬浮窗显示出来吗？
+ *
+ * 主窗口最小化或已经隐藏（例如"关闭到托盘"）时不允许：那种情况下显示悬浮窗没有任何意义，
+ * 而且会让 `hideForOwner` 刚做的隐藏被下一帧的区域拉取立刻撤销 —— 变成"主窗口在托盘里、
+ * 控制栏却挂在桌面上"。
+ * ⚠️ 注意：这只影响"要不要显示"，不影响"要不要下发形状"（形状该更新还是要更新）。
+ */
+function mayShowOverlay(): boolean {
+  if (!ownerWin || ownerWin.isDestroyed()) return true
+  if (ownerWin.isMinimized()) return false
+  return ownerWin.isVisible()
+}
+
+/**
+ * 把渲染层报上来的区域变成窗口形状。
+ *
+ * ## 单位问题（实测踩到的坑，如实写在这里）
+ *
+ * `setShape` 的矩形单位文档里没有（且标注 `@experimental`）：见 SHAPE_UNITS 的实测史。
+ *
+ * 另外两个必须遵守的点：
+ *   · **形状里必须包含控制栏的"热区"**（即使此刻自动收起）—— 否则渲染层收不到鼠标移动，
+ *     控制栏就永远唤不出来（死锁）。热区由渲染层按顶栏/底栏容器的实际矩形给出。
+ *   · **形状同时也决定"画什么"** —— 所以凡是要显示的东西（含 pointer-events:none 的提示条，
+ *     见渲染层的 `data-sakana-draw`）都必须出现在区域里，否则会被裁掉不画。
+ */
+function applyRegions(regions: HitRegion[], opts: { allowHide?: boolean; reason?: string } = {}): void {
+  if (!shapeSupported()) {
+    appliedRegions = regions
+    return
+  }
+  const win = overlayWin
+  if (!win || win.isDestroyed()) return
+  const b = win.getContentBounds()
+  const sf = scaleFactorAt(b.x, b.y)
+  const minimized = !!ownerWin && !ownerWin.isDestroyed() && ownerWin.isMinimized()
+
+  let effective = regions
+  let degraded = false
+  let degradeReason = ''
+  if (regions.length === 0) {
+    if (opts.allowHide) {
+      /* 合法空区域（uosc 接管控制栏）：整块交还 mpv —— 隐藏窗口，而不是留一个空形状
+         （也避开 `setShape([])` 语义不明这个坑）。 */
+      appliedRegions = []
+      appliedShapeRects = []
+      shapeScaleFactor = sf
+      regionsDegraded = false
+      regionsDegradedReason = ''
+      hiddenByDesign = true
+      shapeRectsKey = `${SHAPE_UNITS.join('+')}|${sf}|HIDDEN|`
+      if (win.isVisible()) {
+        win.hide()
+        log.append('info', 'overlay', '控制栏窗口形状已清空并隐藏（应用此刻没有任何可交互元素：uosc 接管/整块交给 mpv）')
+      }
+      return
+    }
+    /* 走到这里说明"区域为空"不是设计上的情况 —— 见 NEVER_DEAD_STATE 的说明，绝不隐藏。 */
+    hollowRegionPulls += 1
+    lastHollowReason = opts.reason ?? '未说明'
+    if (lastNonEmptyRegions.length > 0) {
+      effective = lastNonEmptyRegions.map((r) => ({ ...r }))
+      degradeReason = `渲染层这次报的是空区域（${opts.reason ?? '未说明'}），沿用上一份有效区域 ${effective.length} 块`
+    } else {
+      effective = wholeWindowRegions()
+      degradeReason = `渲染层还没有可交互区域（${opts.reason ?? '未说明'}）且没有历史区域，临时用整窗形状`
+    }
+    degraded = true
+  } else {
+    lastNonEmptyRegions = regions.map((r) => ({ ...r }))
+  }
+
+  const rectKey = effective.map((r) => `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.w)},${Math.round(r.h)}`).join(';')
+  const key = `${SHAPE_UNITS.join('+')}|${sf}|${degraded ? 'D' : 'N'}|${rectKey}`
+  appliedRegions = effective
+  if (key === shapeRectsKey) return
+  shapeRectsKey = key
+  /*
+   * 两种单位解释的**并集**（缩放≈1 时两份重合，去重后只剩一份）。
+   * 去重键取整到像素：两份在同一位置时的重复矩形没有意义，还会让 OS 多做一次命中判定。
+   */
+  const rects: HitRegion[] = []
+  const seen = new Set<string>()
+  for (const unit of SHAPE_UNITS) {
+    const scaled = unit === 'physical' && Math.abs(sf - 1) > 0.01
+    for (const r of effective) {
+      const q = scaled ? { x: r.x * sf, y: r.y * sf, w: r.w * sf, h: r.h * sf } : { x: r.x, y: r.y, w: r.w, h: r.h }
+      const dedupe = `${Math.round(q.x)},${Math.round(q.y)},${Math.round(q.w)},${Math.round(q.h)}`
+      if (seen.has(dedupe)) continue
+      seen.add(dedupe)
+      rects.push(q)
+    }
+  }
+  try {
+    win.setShape(
+      rects.map((r) => ({
+        x: Math.round(r.x),
+        y: Math.round(r.y),
+        width: Math.max(0, Math.round(r.w)),
+        height: Math.max(0, Math.round(r.h))
+      }))
+    )
+    shapeApplied = true
+    appliedShapeRects = rects
+    shapeScaleFactor = sf
+    shapeApplyCount += 1
+    hiddenByDesign = false
+    /* 形状设好了就必须可见：形状决定了"画什么"，隐藏的窗口画不出控制栏（NEVER_DEAD_STATE）。
+       例外：主窗口最小化/隐藏到托盘时不允许显示（见 mayShowOverlay）。 */
+    if (!win.isVisible() && !minimized && mayShowOverlay()) {
+      win.showInactive()
+      log.append('info', 'overlay', `控制栏窗口已显示（形状 ${rects.length} 块矩形）`)
+    }
+    regionsDegraded = degraded
+    regionsDegradedReason = degraded ? degradeReason : ''
+    log.append(
+      degraded ? 'warn' : 'info',
+      'overlay',
+      (degraded ? `⚠️ 形状退化兜底：${degradeReason}；` : '') +
+        `控制栏窗口形状已更新：${rects.length} 块矩形（CSS 区域 ${effective.length} 块 = 渲染层 ${regions.length} 块，` +
+        `单位解释=${SHAPE_UNITS.join('+')}，缩放=${sf}，` +
+        `示例=${JSON.stringify(rects.map((r) => [Math.round(r.x), Math.round(r.y), Math.round(r.w), Math.round(r.h)]).slice(0, 4))}）`
+    )
+  } catch (err) {
+    shapeApplied = false
+    regionsDegraded = true
+    regionsDegradedReason = `setShape 抛错：${String((err as Error)?.message ?? err)}`
+    log.append('warn', 'overlay', `设置窗口形状失败: ${regionsDegradedReason}`)
+    /*
+     * setShape 失败时**也要保证窗口可见**（NEVER_DEAD_STATE）：没有形状的窗口会整窗吃鼠标，
+     * 但"控制栏彻底消失、整屏全黑"是更严重的问题 —— 用户明确要求宁可短暂多吃鼠标。
+     * 这里只显示、不去猜测形状；下一次区域上报会重新尝试 setShape。
+     */
+    if (!win.isVisible() && !minimized && mayShowOverlay()) {
+      win.showInactive()
+      log.append('warn', 'overlay', '控制栏窗口在形状下发失败的情况下被强制显示（避免"控制栏消失"）')
+    }
+  }
+}
+
+/**
+ * 幂等重同步（v0.3.9 第六轮）。
+ *
+ * 为什么需要它：窗口隐藏→显示、切后台→回来、重新进入播放页、显示器变化这些**都不会**触发
+ * 渲染层的区域上报，于是会出现"窗口回来了，但形状/区域/层叠顺序还是上一次的"——
+ * 用户报的 ②「窗口显示回来之后控制栏按钮完全没响应」就是这个。
+ * 这里把"同步几何 + 重新下发形状 + 重新排 z 序 + 重新拉区域"打包成一个可反复调用的动作。
+ */
+export function resyncOverlay(reason: string): void {
+  const win = overlayWin
+  if (!win || win.isDestroyed()) return
+  const canShow = mayShowOverlay()
+  const minimized = !!ownerWin && !ownerWin.isDestroyed() && ownerWin.isMinimized()
+  syncBounds()
+  if (danmakuWin && !danmakuWin.isDestroyed() && !minimized && canShow) danmakuWin.showInactive()
+  if (canShow) {
+    /*
+     * 先按"当前已知区域"重下发一次（立刻可用的那份），再异步拉一次最新的。
+     * 顺序不能反：异步那次要等一个 IPC 往返，用户在这期间已经可能点按钮了。
+     * 例外：窗口是**按设计隐藏**的（uosc 接管控制栏）——那时不要把它弄回来，
+     * 只让下面的 refreshRegions 去按最新区域重新判定一次。
+     */
+    if (hiddenByDesign && appliedRegions.length === 0) {
+      log.append('info', 'overlay', `悬浮窗重同步（${reason}）：当前是"按设计隐藏"（uosc 接管控制栏），只刷新区域`)
+    } else {
+      const known = appliedRegions.length > 0 ? appliedRegions : lastNonEmptyRegions
+      if (known.length > 0) applyRegions(known, { allowHide: false })
+      else applyRegions([], { allowHide: false, reason: '重同步时还没有任何区域' })
+    }
+  }
+  raiseAboveOwner()
+  applyInteractive()
+  void refreshRegions(true)
+  pokeHitCheck()
+  log.append('info', 'overlay', `悬浮窗已重同步（${reason}）：可见=${win.isVisible()} 区域=${appliedRegions.length} 块 退化=${regionsDegraded}`)
+}
+
+/**
+ * 拉一次渲染层的可交互区域（`__sakanaHitRegions()`），内部按 REGION_PULL_MS 节流。
+ * 渲染层每次上报判定结果时都会被叫一次 —— 区域变化（控制栏显隐、面板开合）本来就会触发它的判定，
+ * 所以形状能跟着同步更新，不需要新增 IPC 通道。
+ */
+async function refreshRegions(force = false): Promise<void> {
+  const win = overlayWin
+  if (!win || win.isDestroyed() || regionsBusy) return
+  if (!force && Date.now() - regionsFetchedAt < REGION_PULL_MS) return
+  regionsFetchedAt = Date.now()
+  regionsBusy = true
+  try {
+    const r = (await win.webContents.executeJavaScript(
+      `typeof window.__sakanaHitRegions === 'function' ? window.__sakanaHitRegions() : null`,
+      true
+    )) as HitRegion[] | null
+    if (Array.isArray(r)) {
+      if (r.length > 0) {
+        applyRegions(r)
+      } else {
+        /*
+         * 空区域必须先问清原因再决定藏不藏（第六轮）：
+         *   · uosc 接管控制栏 → 设计上就该隐藏（整块交还 mpv）；
+         *   · 其它任何原因 → 退化兜底，绝不隐藏（否则控制栏消失 + 形状裁剪把整屏画成黑的）。
+         */
+        const diag = await readRegionsDiag()
+        applyRegions(r, { allowHide: diag?.uosc === true, reason: describeRegionsDiag(diag) })
+      }
+    } else {
+      /* 渲染层还没挂载（`__sakanaHitRegions` 不存在）：也要走兜底，不能什么都不做 ——
+         过去这里什么都不做，于是"窗口还没就绪 + 没有形状"就一直停在隐藏态，控制栏再也不出现。 */
+      applyRegions([], { allowHide: false, reason: '渲染层还没挂载（__sakanaHitRegions 不存在）' })
+    }
+  } catch {
+    /* 页面正在销毁/导航中：保持上一次的形状（比清空安全） */
+  } finally {
+    regionsBusy = false
+  }
+}
+
+/**
+ * 悬浮窗当前是否**真的**在接收鼠标事件（点击穿透的反面）—— 自检与日志用
+ */
+let overlayInteractive = false
+/**
+ * 判定结果：鼠标此刻是否落在可点区域上。
+ *
+ * v0.3.9 起这个值**只有一个来源**：渲染层的那个状态机（`__sakanaHitAt` / `setInteractive`），
+ * 它同时管几何（容器级 `data-sakana-hit`）、迟滞（命中后 650ms 内不因一次 miss 就收回）与拖动锁。
+ * 主进程不再自己下结论（早期版本两边各写一个标志，日志里同一秒能看到"接收点击/穿透"反复横跳 ——
+ * 那正是用户实测的击穿窗口），只负责：把结论下发、按窗口矩形兜硬地板、以及把"来源 + 原因"记清楚。
+ */
+let rendererWantsInteractive = false
+/** 自检用：最后一次状态变化是被谁带过来的（'renderer' | 'main' | 'none'） */
+let lastHitSource: 'renderer' | 'main' | 'none' = 'none'
+/** 自检/日志用：最后一次状态变化的原因（渲染层 zone 或主进程硬地板） */
+let lastHitReason = 'none'
+/**
+ * 主进程刚问过渲染层命中判定的时刻。
+ *
+ * 为什么需要：判定结论一律由渲染层给出（见上面的说明），所以"是谁触发的"只能从时间上认 ——
+ * 轮询发出 probe 之后紧接着到达的那条 IPC，就是被这次轮询触发的那次重新判定。
+ * 仅用于日志里的"来源"标注（250ms 窗口），不参与任何判定。
+ */
+let lastProbeAt = 0
+const PROBE_ATTRIBUTION_MS = 250
+/** 上一次已经写进日志的"被迟滞拦住"次数（渲染层计数，只在增长时写一行） */
+let lastLatchedLogged = 0
+let lastLatchedLogAt = 0
+/** 「被迟滞拦住」日志的最小间隔：迟滞窗口 650ms，同一窗口最多写一行，免得又被刷屏 */
+const LATCH_LOG_INTERVAL_MS = 600
+
+/**
+ * 下发「是否接收鼠标事件」，并在**真的变化时**写一行日志。
+ *
+ * ⚠️ v0.3.9 第三轮起这条路**只在没有 `setShape` 的平台**上生效（降级回退）：
+ * 形状模式下 UI 窗口默认就一直接收鼠标，能点的范围由窗口形状决定，
+ * 所以这里根本不需要切换（用户实测的 46% 点击落空就是切换带来的）。
+ * 保留它是为了 macOS 等平台不至于完全没有交互 —— 但那不是本应用的目标平台（构建只出 Windows）。
  */
 function applyInteractive(): void {
+  if (shapeSupported()) return // 形状模式：不切换"吃不吃鼠标"
   const visible = !!overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible()
   const minimized = !!ownerWin && !ownerWin.isDestroyed() && ownerWin.isMinimized()
   const next = rendererWantsInteractive && visible && !minimized
   if (next !== overlayInteractive) {
-    // 只在真正变化时记一行：点击穿透状态是「按钮没反应」的第一嫌疑，排障时需要看到它的切换
+    // 点击穿透状态是「按钮没反应」的第一嫌疑，排障时需要看到它的切换（含是谁、为什么）
     log.append(
       'info',
       'overlay',
       `悬浮窗鼠标交互：${next ? '接收点击' : '点击穿透'}` +
+        `（来源：${lastHitSource === 'main' ? '主进程光标轮询' : '渲染层鼠标移动'}；原因：${lastHitReason}）` +
         (rendererWantsInteractive && !visible ? '（悬浮窗不可见）' : '') +
         (rendererWantsInteractive && visible && minimized ? '（主窗口已最小化）' : '')
     )
@@ -338,9 +931,517 @@ function applyInteractive(): void {
   overlayWin.setIgnoreMouseEvents(!next, { forward: true })
 }
 
+/**
+ * 渲染层（IPC）报告「鼠标此刻是否落在可点区域上」。
+ *
+ * 名字沿用 `setOverlayInteractive`（preload 与契约里的名字），但语义从 v0.3.9 起是
+ * **渲染层那个状态机的结论**（含迟滞与拖动锁），而不是「控制栏整条显示着」。
+ *
+ * 与主进程兜底判定的关系（工单要求：行为确定且可解释）：
+ *   · 判定权归渲染层（判定依据就是它看到的位置）→ 直接采纳；
+ *   · 主进程正在接手（渲染层刚才是收不到鼠标事件的），此时来一条**迟到的"没命中"**不采纳 ——
+ *     它反映的是旧位置，翻回去会让按钮点不动；但**"命中"一律采纳**（宁可短暂吃鼠标）。
+ *     下一次真实光标移动会重新走一遍判定权的规则，不需要用户做任何事。
+ */
 export function setOverlayInteractive(interactive: boolean): void {
+  /*
+   * v0.3.9 第三轮：这条 IPC 现在的**主要作用**是"渲染层有话要说"的信号 ——
+   * 主进程据此立刻拉一次可交互区域（控制栏显隐、面板开合都会触发渲染层的判定），
+   * 于是窗口形状跟着同步更新。判定本身只在没有 setShape 的平台上决定"吃不吃鼠标"。
+   */
+  void refreshRegions()
+  const ownedByRenderer = rendererOwnsDecision()
+  lastRendererReportAt = Date.now()
+  if (shapeSupported()) {
+    // 形状模式：状态切换不再有意义，只记诊断（自检与日志仍能看到渲染层的判定）
+    rendererWantsInteractive = interactive
+    lastHitSource = 'renderer'
+    lastHitReason = interactive ? '渲染层判定命中可点区域（形状模式下不影响吃不吃鼠标）' : '渲染层判定离开可点区域（形状模式下不影响吃不吃鼠标）'
+    return
+  }
+  if (!ownedByRenderer && !interactive && overlayInteractive) {
+    ignoredLateReports += 1
+    if (ignoredLateReports === 1 || ignoredLateReports % 20 === 0) {
+      log.append(
+        'info',
+        'overlay',
+        `悬浮窗鼠标交互：忽略渲染层一条迟到的"没命中"（主进程正在按系统光标接手判定，累计 ${ignoredLateReports} 次）`
+      )
+    }
+    return
+  }
   rendererWantsInteractive = interactive
+  // 结论本身来自渲染层；这里只区分"是被主进程轮询催出来的"还是"鼠标移动直接报上来的"
+  lastHitSource = Date.now() - lastProbeAt < PROBE_ATTRIBUTION_MS ? 'main' : 'renderer'
+  lastHitReason = interactive ? '渲染层判定命中可点区域' : '渲染层判定离开可点区域（超过迟滞/容差）'
   applyInteractive()
+}
+
+// ============================================================================
+// 主进程侧的光标命中轮询（v0.3.9）
+// ============================================================================
+
+/**
+ * 光标轮询间隔。
+ *
+ * 为什么是 100ms（10Hz）而不是更密：这条路只是**兜底**（冷启动时光标没动过、或渲染层卡住），
+ * 跟手的判定由渲染层的 mousemove 负责（事件驱动，零延迟）。再密也只是拿渲染层主线程
+ * 去换一个兜底路径的精度 —— 弹幕画布就在同一个渲染进程里，不值得。
+ */
+const CURSOR_POLL_MS = 100
+let cursorWatchTimer: NodeJS.Timeout | null = null
+/** 上一次轮询到的光标位置（悬浮窗客户区坐标，DIP） */
+let lastCursorLocal: { x: number; y: number } | null = null
+/** 最近一次"系统光标真的动了"的时刻（用来判断渲染层是不是收不到鼠标事件） */
+let lastCursorMovedAt = 0
+let hitQueryBusy = false
+
+/**
+ * 判定参数（**与渲染层 PlayerOverlayPage.tsx 的 HIT_NEAR_PX / HIT_LATCH_MS 必须一致**）。
+ *
+ * 为什么主进程也要有一份：窗口不在前台时渲染层可能收不到鼠标事件（见 decideFromRects 的说明），
+ * 那时只能由主进程拿「系统光标位置 + 渲染层缓存的可点矩形」自己判定。两边的矩形来自同一个来源
+ * （渲染层的 `__sakanaHitSnapshot()`），规则也照抄同一套，所以结论不会互相矛盾。
+ */
+const HIT_NEAR_PX = 24
+const HIT_LATCH_MS = 650
+/** 可点矩形缓存的刷新间隔（主进程兜底判定的依据；页面重排/控制栏显隐后最多滞后这么多） */
+const RECT_TTL_MS = 300
+/**
+ * 向渲染层拉"可交互区域"（窗口形状的来源）的最小间隔。
+ * 区域变化本来就伴随一次渲染层上报（控制栏显隐/面板开合都会触发判定），
+ * 所以这里主要是防抖与安全网：真正决定形状的是那次上报触发的立即拉取。
+ */
+const REGION_PULL_MS = 80
+/** 鼠标输入驱动"保活 poke"的最小间隔（避免每个 mousemove 都发一次 IPC） */
+const INPUT_POKE_MS = 200
+
+/** 渲染层上报的可点矩形快照（主进程兜底判定的原始数据） */
+interface HitRectSnapshot {
+  rects: { x: number; y: number; w: number; h: number; hittable: boolean }[]
+  locked: boolean
+  verdict: boolean
+  zone: string
+  /** 渲染层累计收到的 mousemove 次数（排查"渲染层到底有没有收到鼠标"的硬证据） */
+  moves: number
+}
+
+/**
+ * 渲染层收到的点击统计（v0.3.9 第五轮：把"点击没到"与"到了但没落在按钮上"分开）。
+ *
+ * `sendOverlayAction` 数的是"动作到达主进程"；而落在控制栏**热区空白处**的点击
+ * （自动收起后那一帧、按钮之间的空隙）会到达窗口却没有任何动作。
+ * 只数动作时这两类会混成一个数字，无法定位（上一轮 8/39 说不清就是这个原因）。
+ */
+interface OverlayClickStats {
+  /** 渲染层收到的 pointerdown 总数（= 这一下确实落进了 Electron 窗口） */
+  down: number
+  /** 其中落在 `<button>` 上的（正常应与动作数 1:1） */
+  onButton: number
+  /** 落在可点容器上但不是按钮（热区空白 / 面板留白） */
+  onHitBlank: number
+  /** 落在别处（理论上不该有） */
+  elsewhere: number
+  /** 按按钮 title / 文本归类，用于定位"某个按钮系统性丢" */
+  byTitle: Record<string, number>
+}
+
+let clickStats: OverlayClickStats | null = null
+
+/** 拉一次渲染层的点击统计（HOLD 自检每 0.5 秒一次，成本可忽略） */
+export async function refreshOverlayClickStats(): Promise<void> {
+  const win = overlayWin
+  if (!win || win.isDestroyed()) return
+  try {
+    const r = (await win.webContents.executeJavaScript(
+      `(typeof window.__sakanaClickStats === 'function') ? window.__sakanaClickStats() : null`,
+      true
+    )) as OverlayClickStats | null
+    if (r && typeof r.down === 'number') clickStats = r
+  } catch {
+    /* 页面正在销毁/导航中 */
+  }
+}
+
+/** 自检：渲染层收到的点击统计（down = 真的落进 Electron 窗口的点击数） */
+export function overlayClickStatistics(): OverlayClickStats {
+  return clickStats ?? { down: 0, onButton: 0, onHitBlank: 0, elsewhere: 0, byTitle: {} }
+}
+
+let hitSnapshot: HitRectSnapshot | null = null
+let snapshotAt = 0
+let snapshotBusy = false
+/** 渲染层最近一次上报判定结果的时刻（任何一条 setInteractive IPC 都算） */
+let lastRendererReportAt = 0
+/** 主进程侧迟滞窗口的起点（与渲染层同一套迟滞规则） */
+let mainLastHitAt = 0
+let mainLatchedBlocks = 0
+let lastInputPokeAt = 0
+let lastTickLogAt = 0
+/** 被忽略的"迟到没命中"条数（主进程接手判定期间），只用于日志与诊断 */
+let ignoredLateReports = 0
+
+/**
+ * 拉一次渲染层的可点矩形快照（用 executeJavaScript，不新增 IPC 通道；内部自我节流）。
+ * 失败或页面未就绪时保留上一份缓存 —— 兜底判定宁可慢一点，也不能因为一次查询失败就失去依据。
+ */
+async function refreshHitSnapshot(force = false): Promise<void> {
+  const win = overlayWin
+  if (!win || win.isDestroyed() || snapshotBusy) return
+  if (!force && Date.now() - snapshotAt < RECT_TTL_MS) return
+  snapshotAt = Date.now()
+  snapshotBusy = true
+  try {
+    const r = (await win.webContents.executeJavaScript(
+      `typeof window.__sakanaHitSnapshot === 'function' ? window.__sakanaHitSnapshot() : null`,
+      true
+    )) as HitRectSnapshot | null
+    if (r && Array.isArray(r.rects)) hitSnapshot = r
+  } catch {
+    /* 页面正在销毁/导航中，保留上一份缓存 */
+  } finally {
+    snapshotBusy = false
+  }
+}
+
+/**
+ * 主进程自己判定：**系统光标位置 + 渲染层缓存的可点矩形**（工单要求 2/3）。
+ *
+ * 为什么必须有这条兜底（这就是 4/7 FAIL 的根因）：
+ *   · Electron 的类型文档对 `sendInputEvent` 写得很明确：「承载内容的 BrowserWindow 必须处于聚焦状态」；
+ *     悬浮窗是 `focusable:false` + `showInactive()`，永远不会成为前台窗口 —— 自检里
+ *     "主窗口失焦"（场景①）与"隐藏后再显示"（场景②）投递进去的鼠标事件根本到不了渲染层，
+ *     渲染层一个结论都给不出，主进程保持穿透，用户点下去就是击穿。
+ *   · 真实光标的 hover 虽然由 Chromium 转发，但那条路要经过 IPC + React：页面卡一下、或渲染进程
+ *     还没挂上监听，判定就断了。用户的实际用法正是「播放器不在前台，一边看番一边操作别的窗口」。
+ * 规则与渲染层完全一致（命中 / 贴边 HIT_NEAR_PX / 迟滞 HIT_LATCH_MS / 拖动锁），
+ * 且只在渲染层"不吭声"时启用（见 pollCursorHit），因此两个判定源不会互相打架。
+ */
+/** 只算区间的纯查询（无副作用，日志/诊断用） */
+function zoneFromRects(x: number, y: number): 'hit' | 'near' | 'away' | 'none' {
+  const rects = (hitSnapshot?.rects ?? []).filter((r) => r.hittable)
+  if (rects.length === 0) return 'none'
+  if (rects.some((r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)) return 'hit'
+  const near = rects.some(
+    (r) =>
+      x >= r.x - HIT_NEAR_PX &&
+      x <= r.x + r.w + HIT_NEAR_PX &&
+      y >= r.y - HIT_NEAR_PX &&
+      y <= r.y + r.h + HIT_NEAR_PX
+  )
+  return near ? 'near' : 'away'
+}
+
+function decideFromRects(x: number, y: number, locked: boolean): { hit: boolean; reason: string } {
+  if (locked) return { hit: true, reason: '拖动中（指针已捕获，不收回点击）' }
+  const zone = zoneFromRects(x, y)
+  if (zone === 'none') return { hit: false, reason: '没有可点区域缓存（页面还没就绪）' }
+  const now = Date.now()
+  if (zone === 'hit') {
+    mainLastHitAt = now
+    return { hit: true, reason: '主进程按可点矩形判定：命中' }
+  }
+  if (zone === 'near' && overlayInteractive && now - mainLastHitAt <= HIT_LATCH_MS) {
+    mainLatchedBlocks += 1
+    return { hit: true, reason: '主进程按可点矩形判定：贴着可点区（迟滞内保持）' }
+  }
+  return {
+    hit: false,
+    reason: zone === 'near' ? '主进程按可点矩形判定：贴边但迟滞已过' : '主进程按可点矩形判定：明显离开'
+  }
+}
+
+/**
+ * **判定权**（谁说了算）—— 只有一条规则，确定性、可解释：
+ *
+ *   渲染层在「最近一次真实光标移动」之后有过上报 ⇒ 判定权归渲染层（它确实看到了当前位置）；
+ *   否则（光标动过、但渲染层一直没上报 —— 窗口未聚焦收不到鼠标事件、页面卡住、钩子还没挂上）
+ *   ⇒ 判定权归主进程，由它按「系统光标 + 缓存的可点矩形」判定。
+ *
+ * 为什么必须这样定：兜底判定与渲染层判定都能写状态；如果两边都"随时可以写"，就会出现
+ * 「一个说命中、另一个说没命中」的互相覆盖 —— 自检 #3 上一版 PASS、这一版 FAIL 就是这个。
+ * 加上这条规则后，任何时刻只有一个来源在写状态：
+ *   · 光标从未动过（自检注入的是合成事件，真实光标不动）→ 判定权一直归渲染层，主进程完全不插手；
+ *   · 真实光标一动、渲染层那一瞬还没上报 → 主进程接手（正是"一边看番一边操作别的窗口"的场景）；
+ *   · 渲染层一旦上报（它重新看得见鼠标）→ 判定权立刻交回。
+ * RENDERER_GRACE_MS 给渲染层留出 IPC 往返 + 一帧的时间。
+ */
+const RENDERER_GRACE_MS = 150
+
+function rendererOwnsDecision(): boolean {
+  if (lastRendererReportAt === 0) return false // 渲染层从没上报过（页面还没就绪）
+  if (lastCursorMovedAt === 0) return true // 真实光标没动过：判定依据就是渲染层看到的那个位置
+  if (lastRendererReportAt >= lastCursorMovedAt) return true // 光标动过之后它有上报 → 它看得见
+  return Date.now() - lastCursorMovedAt < RENDERER_GRACE_MS
+}
+
+/** 自检/诊断：主进程当前是否在接手判定（渲染层收不到鼠标事件时为 true） */
+function rendererIsBlind(): boolean {
+  return !rendererOwnsDecision()
+}
+
+/**
+ * 鼠标输入驱动的"保活"：把控制栏唤出来 + 刷新可点矩形缓存（都按 INPUT_POKE_MS 节流）。
+ *
+ * 为什么放在主进程：窗口未聚焦时渲染层收不到 mousemove，它自己的 poke（显示控制栏）也就不会发生；
+ * 而 `before-input-event` 这条钩子在浏览器进程侧，不依赖渲染层是否响应，于是由主进程保证
+ * "鼠标压到控制栏上时控制栏就是显示着的"，兜底判定的矩形缓存也顺带保持新鲜。
+ */
+function pokeOverlayFromInput(): void {
+  const now = Date.now()
+  if (now - lastInputPokeAt < INPUT_POKE_MS) return
+  lastInputPokeAt = now
+  pokeOverlay()
+  void refreshHitSnapshot()
+}
+
+/**
+ * 渲染层命中查询的返回结构（见 probeOverlayHit）。
+ * `zone` / `latched` / `msSinceHit` 来自渲染层的 `__sakanaHitDiag()`，只用于日志与诊断。
+ */
+interface OverlayHitProbe {
+  /** 该点是否落在可点区域（拖动中恒为 true） */
+  hit: boolean
+  /** 渲染层是否正在拖动（指针被捕获，不能收回点击） */
+  locked: boolean
+  /** 渲染层的判定区间：命中 / 贴着边缘 / 明显离开 */
+  zone: 'hit' | 'near' | 'away' | 'unknown'
+  /** 渲染层累计"被迟滞拦住"的次数（单调递增，用于写日志） */
+  latched: number
+  /** 距上次命中可点区域多少毫秒（-1 = 从没命中过） */
+  msSinceHit: number
+}
+
+function stopCursorHitWatch(): void {
+  if (cursorWatchTimer) {
+    clearInterval(cursorWatchTimer)
+    cursorWatchTimer = null
+  }
+  lastCursorLocal = null
+}
+
+function startCursorHitWatch(): void {
+  stopCursorHitWatch()
+  cursorWatchTimer = setInterval(pollCursorHit, CURSOR_POLL_MS)
+}
+
+/**
+ * 读系统光标位置 → 换到悬浮窗客户区坐标 → 问渲染层命中判定。
+ *
+ * 注意坐标单位：Electron 的 `getBounds/getContentBounds` 与 `getCursorScreenPoint` 都是 DIP，
+ * 渲染层的 CSS 像素在 zoomFactor=1 时与 DIP 一一对应（悬浮窗没有缩放，见 showOverlay）。
+ */
+function pollCursorHit(): void {
+  const win = overlayWin
+  if (!win || win.isDestroyed()) return
+  /*
+   * v0.3.9 第三轮：**形状模式下**这里只做两件事，且**不看窗口是否可见** ——
+   * UI 窗口要等第一批区域报上来才会显示（见 applyRegions），若这里先判可见性，
+   * 就会出现"窗口隐藏 → 不拉区域 → 永远没有区域 → 永远不显示"的死锁。
+   *   ① 定期拉一次可交互区域（安全网：万一渲染层某次上报没到）；
+   *   ② 写诊断日志（谁能看清"渲染层收到几次鼠标"）。
+   */
+  if (shapeSupported()) {
+    void refreshRegions()
+    if (!win.isVisible()) return
+    let p0: Electron.Point
+    try {
+      p0 = screen.getCursorScreenPoint()
+    } catch {
+      return
+    }
+    const b0 = win.getContentBounds()
+    const local0 = { x: p0.x - b0.x, y: p0.y - b0.y }
+    const moved0 = !lastCursorLocal || lastCursorLocal.x !== local0.x || lastCursorLocal.y !== local0.y
+    if (moved0) lastCursorLocal = local0
+    void refreshHitSnapshot()
+    if (moved0) logHitTick(local0)
+    return
+  }
+  if (!win.isVisible()) return
+  let p: Electron.Point
+  try {
+    p = screen.getCursorScreenPoint()
+  } catch {
+    return
+  }
+  const b = win.getContentBounds()
+  const local = { x: p.x - b.x, y: p.y - b.y }
+  const inside = local.x >= 0 && local.y >= 0 && local.x < b.width && local.y < b.height
+  const moved =
+    !lastCursorLocal || lastCursorLocal.x !== local.x || lastCursorLocal.y !== local.y
+  // 走到这里说明平台没有 setShape（否则上面已经 return），继续用运行期判定（降级回退）
+  if (!inside) {
+    /*
+     * 光标已经离开悬浮窗：**立刻**恢复点击穿透 —— 这是「绝对不能整窗永久吃鼠标」的硬地板，
+     * 也是迟滞规则明确允许的例外（工单：迟滞只在"还贴着控制栏"时成立，光标离开窗口不受保护）。
+     * 即使渲染层卡死/没上报，也不会留下一张看不见却挡事的网（那正是用户抱怨的
+     * "画面中间、进度条点不动"）。
+     *
+     * 唯一的例外是**正在拖动**（渲染层捕获了指针，例如拖进度条/音量，指针会短暂跑到窗口外）：
+     * 这时收回点击会让拖动中途断掉，所以问一次渲染层的锁状态再决定。
+     */
+    lastCursorLocal = null
+    if (!rendererWantsInteractive) return
+    void probeOverlayHit(local.x, local.y).then((a) => {
+      if (a?.locked) return
+      rendererWantsInteractive = false
+      lastHitSource = 'main'
+      lastHitReason = '光标已离开悬浮窗'
+      applyInteractive()
+    })
+    return
+  }
+  lastCursorLocal = local
+  // 只有**真的动了**才算"光标移动"：首帧由 showOverlay 预置坐标，所以这里不会把静止误判成移动
+  if (moved) lastCursorMovedAt = Date.now()
+  // 顺手刷新可点矩形缓存（内部按 RECT_TTL_MS 自我节流）：主进程兜底判定用的就是它
+  void refreshHitSnapshot()
+  if (!moved) return
+  /*
+   * 光标在窗口内且移动了：
+   *   ① 先"催"一次渲染层按真实光标重新判定（它看得见鼠标时以它为准，顺带读迟滞计数）；
+   *   ② **判定权不在渲染层**时（它收不到鼠标事件：未聚焦窗口、页面卡住、钩子还没挂上），
+   *      主进程按缓存矩形自己判定 —— 用户点下去必须有反应，不能赌渲染层收到事件。
+   * 两条路的规则完全一致（命中 / 贴边 24px / 迟滞 650ms / 拖动锁），且由 rendererOwnsDecision
+   * 保证"同一时刻只有一个来源在写状态"，不会互相覆盖。
+   */
+  void probeOverlayHit(local.x, local.y).then(readLatchedBlocks)
+  if (rendererIsBlind()) {
+    const d = decideFromRects(local.x, local.y, hitSnapshot?.locked === true)
+    if (d.hit !== rendererWantsInteractive) {
+      rendererWantsInteractive = d.hit
+      lastHitSource = 'main'
+      lastHitReason = d.reason
+      applyInteractive()
+    }
+  }
+  logHitTick(local)
+}
+
+/**
+ * 诊断日志（只在 SAKANA_OVERLAY_HIT_TEST=1 时输出，每秒最多一行）。
+ *
+ * 为什么需要它：这次 4/7 FAIL 里最关键的信息是"渲染层到底有没有收到鼠标事件"，
+ * 而只看状态变化是看不出来的。这一行把两条路各自的证据并排打出来：
+ *   · rects/N  —— 渲染层给了几块可点区域（0 就说明页面还没就绪）
+ *   · moves=N  —— 渲染层累计收到的 mousemove 次数（不涨 = 它根本收不到鼠标，窗口未聚焦时的典型表现）
+ *   · blind    —— 主进程是否已接手判定
+ */
+function logHitTick(local: { x: number; y: number }): void {
+  if (!process.env.SAKANA_OVERLAY_HIT_TEST) return
+  const now = Date.now()
+  if (now - lastTickLogAt < 1000) return
+  lastTickLogAt = now
+  const rects = hitSnapshot?.rects.filter((r) => r.hittable).length ?? -1
+  console.log(
+    `[overlay-hit] POLL 光标=(${Math.round(local.x)},${Math.round(local.y)}) 判定区间=${zoneFromRects(local.x, local.y)} ` +
+      `可交互=${overlayInteractive} 来源=${lastHitSource} 原因=${lastHitReason} | ` +
+      `UI窗口可见=${overlayWin?.isVisible() ?? false} 形状区域=${appliedRegions.length} 退化=${regionsDegraded} | ` +
+      `渲染层: rects=${rects} moves=${hitSnapshot?.moves ?? -1} verdict=${hitSnapshot?.verdict ?? 'n/a'} ` +
+      `zone=${hitSnapshot?.zone ?? 'n/a'} | 主进程兜底接手=${rendererIsBlind()}`
+  )
+}
+
+/** 读渲染层的迟滞计数并按需写一行日志（同一迟滞窗口内最多一行，避免又被刷屏） */
+function readLatchedBlocks(a: OverlayHitProbe | null): void {
+  if (!a) return
+  const grown = a.latched - lastLatchedLogged
+  if (grown <= 0) return
+  lastLatchedLogged = a.latched
+  const now = Date.now()
+  if (now - lastLatchedLogAt < LATCH_LOG_INTERVAL_MS) return
+  lastLatchedLogAt = now
+  log.append(
+    'info',
+    'overlay',
+    `悬浮窗鼠标交互：保持接收点击（被迟滞拦住 ${grown} 次；当前命中区=${a.zone}，` +
+      `距上次命中 ${a.msSinceHit >= 0 ? `${a.msSinceHit}ms` : '未知'}）`
+  )
+}
+
+/**
+ * 问渲染层「这个点算不算可点区域」。
+ *
+ * 用 `executeJavaScript` 而不是新开一条 IPC：渲染层只要暴露这几个查询
+ *   · `window.__sakanaHitAt(x, y)` → 该点是否落在可点区域（渲染层自己那套 `data-sakana-hit` 判定，
+ *      主进程与它用**同一个函数**，不存在两套判据打架的可能；它会顺带驱动一次重新判定，见下）；
+ *   · `window.__sakanaHitLocked` → 是否正在拖动（指针已被捕获，不能收回点击）；
+ *   · `window.__sakanaHitDiag()` → 判定区间与迟滞计数（只读，用于日志）。
+ * 于是主进程按需查询即可 —— 不必往 preload / 共享契约里加东西，渲染层没挂上钩子时返回 null
+ * （保持上一状态），不会报错。
+ *
+ * v0.3.9 补充：这一问同时会**驱动渲染层按该坐标重新判定一次**（`__sakanaHitAt` 内部读同一个状态机），
+ * 所以主进程不需要、也不应该自己下结论 —— 它只负责"催"与"读诊断"。
+ */
+async function probeOverlayHit(
+  x: number,
+  y: number
+): Promise<OverlayHitProbe | null> {
+  const win = overlayWin
+  if (!win || win.isDestroyed() || hitQueryBusy) return null
+  hitQueryBusy = true
+  // 记下"刚问过"：紧接着到达的那条 setInteractive 就是这个轮询催出来的（仅用于日志来源标注）
+  lastProbeAt = Date.now()
+  try {
+    const r = (await win.webContents.executeJavaScript(
+      `(function () {
+         var f = window.__sakanaHitAt;
+         if (typeof f !== 'function') return null;
+         var hit = !!f(${Math.round(x)}, ${Math.round(y)});
+         var d = typeof window.__sakanaHitDiag === 'function' ? window.__sakanaHitDiag() : null;
+         return {
+           hit: hit,
+           locked: window.__sakanaHitLocked === true,
+           zone: d && typeof d.zone === 'string' ? d.zone : 'unknown',
+           latched: d && typeof d.latched === 'number' ? d.latched : 0,
+           msSinceHit: d && typeof d.msSinceHit === 'number' ? d.msSinceHit : -1
+         };
+       })()`,
+      true
+    )) as OverlayHitProbe | null
+    if (!r || typeof r.hit !== 'boolean') return null
+    return r
+  } catch {
+    return null // 页面正在销毁/导航中，忽略
+  } finally {
+    hitQueryBusy = false
+  }
+}
+
+/**
+ * 悬浮窗刚显示/重新显示时催一次（此时光标可能一直没动过，渲染层收不到 mousemove）。
+ *
+ * v0.3.9 补充：这里同时做两件事 ——
+ *   ① 强制刷新可点矩形缓存（新窗口/新布局，旧缓存不能再用）；
+ *   ② 渲染层没回应（还没挂上钩子、或收不到鼠标事件）时，主进程直接按缓存矩形判一次，
+ *      否则"按 F 全屏后光标正好停在按钮上、直接点"会点空（用户报过切完集按钮失灵）。
+ */
+function pokeHitCheck(): void {
+  const win = overlayWin
+  if (!win || win.isDestroyed()) return
+  let local: { x: number; y: number }
+  try {
+    const p = screen.getCursorScreenPoint()
+    const b = win.getContentBounds()
+    local = { x: p.x - b.x, y: p.y - b.y }
+    if (local.x < 0 || local.y < 0 || local.x >= b.width || local.y >= b.height) return
+  } catch {
+    return
+  }
+  lastCursorLocal = local
+  void refreshHitSnapshot(true)
+    .then(() => probeOverlayHit(local.x, local.y))
+    .then((a) => {
+      readLatchedBlocks(a)
+      if (a && !rendererIsBlind()) return // 渲染层给了结论，主进程不插手
+      const d = decideFromRects(local.x, local.y, a?.locked === true || hitSnapshot?.locked === true)
+      if (d.hit === rendererWantsInteractive) return
+      rendererWantsInteractive = d.hit
+      lastHitSource = 'main'
+      lastHitReason = d.reason
+      applyInteractive()
+    })
 }
 
 /**
@@ -373,11 +1474,32 @@ export function setOverlayInteractive(interactive: boolean): void {
  *
  * 所以这里做的不是"修复"（无法从主进程单方面修，因为根因是渲染层状态与窗口状态的时间差），
  * 而是**如实告诉用户 + 给出逃生手段**，并把这次事件写进日志便于复现统计。
+ *
+ * ## v0.3.9 补充：根因已修，这段侦测现在是"最后一道兜底"
+ *
+ * 上面那个"时间差"的根源是**整窗切换**：控制栏一显示，整块悬浮窗就变成接收点击的窗口，
+ * 于是它的系统级状态与界面状态之间必然有几十~几百毫秒的错位窗口。v0.3.9 改成
+ * **按区域命中**（鼠标真的落在按钮/面板上才接收点击，见文件头注释）之后，
+ * 这个错位窗口被压到了"鼠标从按钮上移开的那一帧"，用户点空的概率可以忽略。
+ * 这段侦测与自救浮层保留：它的判据（穿透态下收到 pointerdown）在穿透态下本来就不会被触发，
+ * 所以正常情况下永远不会再弹 —— 一旦日志里又出现它，说明窗口叠层又出问题了。
  */
 let clickThroughStreak = 0
 let lastOverlayMouseAt = 0
 let lastOverlayClickAt = 0
 let clickThroughCb: ((payload: { count: number; at: number }) => void) | null = null
+/** 控制栏动作累计条数（自检用它判断"点击真的到达了主进程"，v0.3.9） */
+let overlayActionCount = 0
+
+/** 自检：控制栏动作累计条数 */
+export function overlayActionTotal(): number {
+  return overlayActionCount
+}
+
+/** 自检：清零动作计数（一轮点击实验开始前调用） */
+export function resetOverlayActionTotal(): void {
+  overlayActionCount = 0
+}
 
 /** 渲染层订阅「疑似点击击穿」（用于弹出提示浮层） */
 export function onOverlayClickThrough(cb: ((payload: { count: number; at: number }) => void) | null): void {
@@ -442,13 +1564,182 @@ export function pushOverlayClickThrough(payload: { count: number; at: number }):
 }
 
 /** 自检：当前的穿透状态与计数器 */
-export function overlayInputDiagnostics(): { interactive: boolean; wants: boolean; streak: number } {
-  return { interactive: overlayInteractive, wants: rendererWantsInteractive, streak: clickThroughStreak }
+export function overlayInputDiagnostics(): {
+  interactive: boolean
+  wants: boolean
+  streak: number
+  hitSource: 'renderer' | 'main' | 'none'
+  /** 最后一次状态切换的原因（v0.3.9 补充：日志里也要看得到"为什么"） */
+  reason: string
+  /** 渲染层累计"被迟滞拦住"的次数 */
+  latched: number
+  /** 渲染层累计收到的 mousemove 次数（不涨 = 渲染层收不到鼠标事件） */
+  rendererMoves: number
+  /** 当前缓存到的可点矩形数量（0 = 页面还没就绪） */
+  rects: number
+  /** 主进程兜底判定是否已接手 */
+  blind: boolean
+  /** 主进程自己累计的迟滞保持次数 */
+  latchedMain: number
+  /** 形状模式：'ui-window-shape' = 用窗口形状决定吃不吃鼠标；'runtime-toggle' = 降级回退 */
+  mode: 'ui-window-shape' | 'runtime-toggle'
+  /** 当前生效的 CSS 可交互区域块数（形状模式的唯一依据） */
+  shapeRegions: number
+  /** 形状是否真的成功下发（false = setShape 没生效，吃不吃鼠标仍由运行期判定决定） */
+  shapeApplied: boolean
+  /** 下发形状时使用的显示器缩放系数 */
+  shapeScale: number
+  /** 实际传进 setShape 的矩形块数（两种单位解释的并集去重后） */
+  shapeRects: number
+  /** 下发时用了哪几种单位解释（v0.3.9 第五轮修订后固定为 dip+physical） */
+  shapeUnits: string
+  /** UI 窗口是否可见 */
+  uiVisible: boolean
+  /** 弹幕窗口是否可见 */
+  danmakuVisible: boolean
+  /** v0.3.9 第六轮：是否正处在"区域退化兜底"状态（拿不到区域时用上一份/整窗顶上） */
+  shapeDegraded: boolean
+  /** 退化兜底的原因（空字符串 = 没有退化） */
+  shapeDegradedReason: string
+} {
+  return {
+    // 形状模式下"可交互"是按坐标算的（system 光标落在形状里？），见 interactiveNow
+    interactive: interactiveNow(),
+    wants: rendererWantsInteractive,
+    streak: clickThroughStreak,
+    hitSource: lastHitSource,
+    reason: lastHitReason,
+    latched: lastLatchedLogged,
+    rendererMoves: hitSnapshot?.moves ?? -1,
+    rects: hitSnapshot?.rects.filter((r) => r.hittable).length ?? -1,
+    blind: rendererIsBlind(),
+    latchedMain: mainLatchedBlocks,
+    mode: shapeSupported() ? 'ui-window-shape' : 'runtime-toggle',
+    shapeRegions: appliedRegions.length,
+    /** v0.3.9 第四轮：形状是否真的下发成功 + 缩放系数（单位问题的诊断依据） */
+    shapeApplied,
+    shapeScale: shapeScaleFactor,
+    shapeRects: appliedShapeRects.length,
+    shapeUnits: SHAPE_UNITS.join('+'),
+    uiVisible: !!overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible(),
+    danmakuVisible: !!danmakuWin && !danmakuWin.isDestroyed() && danmakuWin.isVisible(),
+    shapeDegraded: regionsDegraded,
+    shapeDegradedReason: regionsDegradedReason
+  }
+}
+
+/**
+ * 自检（v0.3.9 第六轮）：UI 窗口的"健康状态"。
+ *
+ * 为什么单列一个函数：用户实测 ④ 的判据就是**"任何时候都不允许 UI 窗口同时没有形状又不可见"**。
+ * 自检要能在进入播放页的头几秒里反复采样这个状态，所以把它做成一个纯粹的可读查询。
+ */
+export function overlayUiWindowState(): {
+  visible: boolean
+  regions: number
+  shapeRects: number
+  shapeApplied: boolean
+  degraded: boolean
+  degradedReason: string
+  healthy: boolean
+  shapeApplyCount: number
+  hollowRegionPulls: number
+  lastHollowReason: string
+} {
+  const win = overlayWin
+  const visible = !!win && !win.isDestroyed() && win.isVisible()
+  const regions = appliedRegions.length
+  const shapeRects = appliedShapeRects.length
+  return {
+    visible,
+    regions,
+    shapeRects,
+    shapeApplied,
+    degraded: regionsDegraded,
+    degradedReason: regionsDegradedReason,
+    /* "健康" = 可见且确实有形状（形状块数 > 0）——这正是"控制栏不会消失"的硬条件 */
+    healthy: visible && shapeRects > 0 && shapeApplied,
+    shapeApplyCount,
+    hollowRegionPulls,
+    lastHollowReason
+  }
+}
+
+/**
+ * 自检：当前生效的可交互区域（**CSS/DIP 单位**，与渲染层的 getBoundingClientRect 同源）。
+ * `点是否落在这些区域里` = `这一点上的点击会不会落到 Electron 窗口` —— 由 OS 判定，没有时序问题。
+ */
+export function overlayShapeRegions(): HitRegion[] {
+  return appliedRegions.map((r) => ({ ...r }))
+}
+
+/**
+ * 自检：真正传进 `setShape` 的矩形（v0.3.9 第五轮修订：**两种单位解释的并集**）。
+ *
+ * 名字里不再带单位，因为现在下发的是"不赌单位"的并集（见 SHAPE_UNITS 的实测史）：
+ * 真实控制栏在 DIP 与物理两种解释下都被覆盖，所以自检只应断言"按钮落在**上报的 DIP 区域**里"
+ * （这等价于"无论 OS 按哪种解释，真实控制栏都在形状里"），而不是断言 OS 用了哪一种解释。
+ */
+export function overlayShapeRectsSent(): HitRegion[] {
+  return appliedShapeRects.map((r) => ({ ...r }))
+}
+
+/** 自检：当前下发的是哪几种单位解释（诊断/日志用） */
+export function overlayShapeUnits(): string[] {
+  return [...SHAPE_UNITS]
+}
+
+/** 自检：`setShape` 是否真的成功调用过（false = 形状没生效，吃不吃鼠标仍由运行期判定决定） */
+export function overlayShapeApplied(): boolean {
+  return shapeApplied
+}
+
+/** 自检：设置形状时用的缩放系数 */
+export function overlayShapeScaleFactor(): number {
+  return shapeScaleFactor
+}
+
+/** 自检：某个点是否落在当前的可交互区域里（等价于"这个点上的点击归 Electron 窗口"） */
+export function overlayShapeHitTest(x: number, y: number): boolean {
+  return appliedRegions.some((r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
+}
+
+/** 自检：当前的窗口形状模式（形状模式下"吃不吃鼠标"与运行期判定无关） */
+export function overlayShapeMode(): 'ui-window-shape' | 'runtime-toggle' {
+  return shapeSupported() ? 'ui-window-shape' : 'runtime-toggle'
+}
+
+/** 自检：弹幕窗口是否永久穿透（它是唯一"整窗铺满但永不接收鼠标"的窗口） */
+export function isDanmakuWindowPassthrough(): boolean {
+  return !!danmakuWin && !danmakuWin.isDestroyed()
 }
 
 /** 自检：读当前是否可交互 */
 export function isOverlayInteractive(): boolean {
-  return overlayInteractive
+  return interactiveNow()
+}
+
+/**
+ * 「此刻鼠标位置上的点击会不会落到悬浮窗」—— 两种架构下同一个语义。
+ *
+ * 形状模式：把系统光标位置丢进窗口形状里判（等价于操作系统的命中判定）；
+ * 降级模式：用运行期切换出来的状态。
+ *
+ * 为什么要算而不是直接返回状态：形状模式下"吃不吃鼠标"是**按坐标**决定的，
+ * 没有一个全局的 true/false 状态；但自检脚本（SAKANA_PLAYER_INPUT_TEST / SAKANA_UOSC_TEST）
+ * 问的正是"鼠标压到控制栏上时算不算可交互" —— 用坐标算出来的答案才是它想知道的。
+ */
+function interactiveNow(): boolean {
+  if (!shapeSupported()) return overlayInteractive
+  const win = overlayWin
+  if (!win || win.isDestroyed() || !win.isVisible()) return false
+  try {
+    const p = screen.getCursorScreenPoint()
+    const b = win.getContentBounds()
+    return overlayShapeHitTest(p.x - b.x, p.y - b.y)
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -459,32 +1750,62 @@ export function isOverlayAlwaysOnTop(): boolean {
   return !!overlayWin && !overlayWin.isDestroyed() && overlayWin.isAlwaysOnTop()
 }
 
-/** 播放页 → 悬浮窗：同步控制栏所需状态 */
-export function pushOverlayState(state: unknown): void {
-  if (!overlayWin || overlayWin.isDestroyed()) return
-  overlayWin.webContents.send(CH.overlayState, state)
+/**
+ * 把一条消息发给所有悬浮窗（v0.3.9 第三轮拆窗口后需要）。
+ * 弹幕窗口与 UI 窗口都要状态/弹幕数据；动作类只发给 UI 窗口（弹幕窗口没有任何按钮）。
+ */
+function broadcastOverlay(channel: string, payload?: unknown): void {
+  eachOverlayWindow((w) => {
+    try {
+      if (payload === undefined) w.webContents.send(channel)
+      else w.webContents.send(channel, payload)
+    } catch {
+      /* 窗口正在销毁 */
+    }
+  })
 }
 
-/** 播放页 → 悬浮窗：同步选集数据（低频） */
+/** 播放页 → 悬浮窗：同步控制栏所需状态（弹幕窗口用它算弹幕区域，UI 窗口用它画控制栏） */
+export function pushOverlayState(state: unknown): void {
+  broadcastOverlay(CH.overlayState, state)
+}
+
+/** 播放页 → 悬浮窗：同步选集数据（低频，只有 UI 窗口会画选集面板） */
 export function pushOverlayEpisodes(payload: unknown): void {
-  if (!overlayWin || overlayWin.isDestroyed()) return
-  overlayWin.webContents.send(CH.overlayEpisodes, payload)
+  broadcastOverlay(CH.overlayEpisodes, payload)
 }
 
 /** 播放页 → 悬浮窗：同步弹幕数据与设置（v0.2.8，换集/改设置时才推） */
 export function pushOverlayDanmaku(payload: unknown): void {
-  if (!overlayWin || overlayWin.isDestroyed()) return
-  overlayWin.webContents.send(CH.overlayDanmaku, payload)
+  broadcastOverlay(CH.overlayDanmaku, payload)
 }
 
-/** 播放页 → 悬浮窗：唤出控制栏（鼠标移动） */
+/**
+ * 播放页 → 悬浮窗：唤出控制栏（鼠标移动）。
+ * 两块窗口都发：UI 窗口要显示控制栏，弹幕窗口要知道"控制栏是否显示"来算弹幕下边界
+ * （它自己收不到鼠标移动 —— 弹幕窗口是永久穿透的）。
+ */
 export function pokeOverlay(): void {
-  if (!overlayWin || overlayWin.isDestroyed()) return
-  overlayWin.webContents.send(CH.overlayPoke)
+  broadcastOverlay(CH.overlayPoke)
 }
 
 /** 悬浮窗 → 播放页：控制栏动作 */
 export function sendOverlayAction(action: Record<string, unknown>): void {
+  /*
+   * v0.3.9：动作计数 + 可选逐条日志。
+   *
+   * 为什么要计数：验证「按钮到底有没有接住点击」只能看**动作有没有到达主进程** ——
+   * 日志里能看到 count 涨、type 变，就说明这一次真实点击穿过了窗口叠层。
+   * 自检脚本（.e2e/verify-overlay-clickthrough.ps1）用真实光标点 6 个按钮 + 连点 20 次，
+   * 就是数这个计数。平时不开这个环境变量，避免刷日志。
+   */
+  overlayActionCount++
+  if (process.env.SAKANA_OVERLAY_HIT_TEST) {
+    console.log(
+      `[overlay-hit] ACTION #${overlayActionCount} type=${String(action.type)} ` +
+        `形状区域=${appliedRegions.length} 模式=${shapeSupported() ? 'ui-window-shape' : 'runtime-toggle'}`
+    )
+  }
   if (!ownerWin || ownerWin.isDestroyed()) {
     /*
      * v0.2.8 附加：这条日志专门用来排查「点了按钮没反应」——

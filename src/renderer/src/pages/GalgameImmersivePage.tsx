@@ -3,6 +3,7 @@ import { motion } from 'framer-motion'
 import {
   Camera,
   CircleCheck,
+  Download,
   Clock,
   Ellipsis,
   FolderPlus,
@@ -10,6 +11,7 @@ import {
   Image as ImageIcon,
   LayoutGrid,
   Minimize2,
+  Music,
   Play,
   RotateCcw,
   Search,
@@ -27,6 +29,8 @@ import { Button, ConfirmModal } from '@/components/ui'
 import {
   Cover,
   fmtPlay,
+  GalBgmModal,
+  GalBgmSavedModal,
   GalContextMenu,
   GalDetailView,
   GalShotsModal,
@@ -62,6 +66,8 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
   const [removing, setRemoving] = useState<GalGame | null>(null)
   const [menu, setMenu] = useState<GalMenuState | null>(null)
   const [ymgalGame, setYmgalGame] = useState<GalGame | null>(null)
+  const [bgmGame, setBgmGame] = useState<GalGame | null>(null)
+  const [bgmSavedGame, setBgmSavedGame] = useState<GalGame | null>(null)
   const [shotsOpen, setShotsOpen] = useState(false)
   const [shotsGame, setShotsGame] = useState<GalGame | null>(null)
   const [bgFailed, setBgFailed] = useState(false)
@@ -174,8 +180,10 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
    */
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key !== 'Escape') return
+      // Esc / F11 都退出沉浸模式（F11 是用户在全屏下习惯按的「退出全屏」键，语义一致）
+      if (e.key !== 'Escape' && e.key !== 'F11') return
       if (menu || ymgalGame || shotsOpen || shotsGame || removing || detailGame || overflowOpen) return
+      e.preventDefault()
       onBack()
     }
     window.addEventListener('keydown', onKey)
@@ -291,6 +299,8 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
         label: '从月幕galgame中搜索详情',
         onSelect: () => setYmgalGame(g)
       },
+      { key: 'bgm', icon: Music, label: '查看最近识别的 bgm 名称（可复制）', onSelect: () => setBgmGame(g) },
+      { key: 'bgmSaved', icon: Download, label: '最近保存的 bgm', onSelect: () => setBgmSavedGame(g) },
       { key: 'cover', icon: ImageIcon, label: '自定义游戏封面', onSelect: () => void setCustom(g, 'cover') },
       // 沉浸模式保留「自定义背景图」：整屏壁纸就是这张图，卡片库那边的右键菜单才去掉它
       { key: 'banner', icon: ImageIcon, label: '自定义背景图', onSelect: () => void setCustom(g, 'banner') }
@@ -516,6 +526,10 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
 
       {/* 月幕搜索弹窗 */}
       <GalYmgalSearchModal game={ymgalGame} onClose={() => setYmgalGame(null)} onApplied={load} />
+
+      {/* 最近识别 BGM 面板（只读内存识别） */}
+      <GalBgmModal game={bgmGame} onClose={() => setBgmGame(null)} />
+      <GalBgmSavedModal game={bgmSavedGame} onClose={() => setBgmSavedGame(null)} />
 
       {/* 最近截图：顶栏按钮看全部，右键菜单里的那一项只看该游戏自己的目录 */}
       <GalShotsModal open={shotsOpen} onClose={() => setShotsOpen(false)} />

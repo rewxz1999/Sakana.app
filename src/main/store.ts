@@ -24,6 +24,24 @@ class JsonStore {
   private cache = new Map<string, unknown>()
   private timers = new Map<string, NodeJS.Timeout>()
 
+  /**
+   * 落盘失败的回调（v0.3.9 体检 M4）。
+   *
+   * 为什么用回调而不是直接 import 日志服务：`log.ts` 反过来 import 本模块（日志要落盘），
+   * 直接互相 import 会形成循环依赖；由 `index.ts` 在启动时把两边接起来最干净。
+   * 接的时候要**跳过 `logs` 这个命名空间**（否则磁盘满时会"写日志失败 → 再写日志"无限递归）。
+   */
+  onFlushError: ((ns: string, err: unknown) => void) | null = null
+
+  /**
+   * 某个命名空间被写入后的回调（v0.3.9 体检 H1）。
+   *
+   * 用途：`settings` 有两个写入方（渲染层 + 主进程十几处），谁后写谁赢会丢配置。
+   * 广播挂在这里，主进程那十几处写入点就**自动**被覆盖，不需要逐个去改。
+   * 回调要便宜（这里只做 `if (ns === 'settings')` 判断），因为 `set()` 调用非常频繁（日志、下载进度…）。
+   */
+  onNamespaceWritten: ((ns: string) => void) | null = null
+
   init(): void {
     this.dir = join(app.getPath('userData'), 'data')
     mkdirSync(this.dir, { recursive: true })
@@ -93,6 +111,8 @@ class JsonStore {
         this.flush(ns)
       }, 250)
     )
+    // 写入即通知（见 onNamespaceWritten 的说明）；回调内部只对 settings 做实际动作
+    this.onNamespaceWritten?.(ns)
     return data
   }
 
@@ -107,6 +127,13 @@ class JsonStore {
       renameSync(tmp, f)
     } catch (err) {
       console.error(`[store] 落盘 ${ns} 失败:`, err)
+      /*
+       * v0.3.9 体检 M4：以前这里只 console.error —— 打包后没有终端，等于**彻底静默**：
+       * 磁盘满/权限不足/被杀软拦住时，界面显示"已保存"、实际什么都没写。
+       * 现在把它交给外部回调（index.ts 接到日志服务上，会出现在错误日志页）。
+       * 注意：这里不直接 import log，因为 log 又 import 本模块，会形成循环依赖。
+       */
+      this.onFlushError?.(ns, err)
     }
   }
 

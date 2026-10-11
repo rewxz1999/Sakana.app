@@ -1,9 +1,11 @@
 import { BrowserWindow, session } from 'electron'
 import { CH } from '@shared/channels'
+import { ONLINE_PLAY_TIMEOUT_MS } from '@shared/onlinePlay'
 import { log } from '../log'
 import { BROWSER_UA } from '../net'
 import { addProbeListeners } from './probeEvents'
 import { noteCapturedStream } from './playerInfo'
+import { beginStage, flowDetail, pushStep, succeedStage } from './playFlow'
 import {
   MEDIA_EXT_RE,
   extractStreamCandidates,
@@ -12,6 +14,9 @@ import {
   rememberStream,
   resolveFirstPlayable
 } from './ruleProbe'
+
+/** 本实现同样属于「获取播放资源」阶段（与 ruleProbe 共用同一阶段，二者是同一件事的两种做法） */
+const STAGE = 'acquire' as const
 
 /**
  * Kazumi 式在线播放（useWebview）：
@@ -91,6 +96,8 @@ function reportFound(url: string, kind: string, referer?: string): void {
   foundUrls.push(target)
   noteCapturedStream({ url: target, kind, referer, channel: 'webview', capturedAt: Date.now() })
   log.append('info', 'rule-webview', `捕获媒体流(${kind}): ${target.slice(0, 130)}`)
+  pushStep(STAGE, `网页播放器捕获媒体流（${kind}）：${target.slice(0, 70)}`)
+  succeedStage(STAGE, '已获取播放资源（网页播放器嗅探）')
   // 异步补齐 Cookie 后再上报，避免播放器取流时缺少站点会话
   void collectCookies(target).then((cookies) => {
     emit({ type: 'found', url: target, kind, referer, cookies })
@@ -192,6 +199,8 @@ export function openRuleWebview(
   emitWin = mainWin
   hostWin = mainWin
   const myGen = ++viewGen
+  beginStage(STAGE, '正在打开网页嗅探窗口（真实可见窗口，让站点播放器跑起来）')
+  pushStep(STAGE, `打开网页嗅探：${url.slice(0, 90)}`)
 
   /*
    * 用「屏幕外可见的 BrowserWindow」而不是 WebContentsView。
@@ -453,6 +462,8 @@ export function openRuleWebview(
       .catch(() => undefined)
   }
   wc.on('dom-ready', () => {
+    flowDetail(STAGE, '播放页 DOM 就绪，正在自动点击播放按钮并等待站点播放器取流')
+    pushStep(STAGE, '播放页 DOM 就绪，开始自动点击')
     for (const d of [300, 1200, 2600, 5000]) setTimeout(runAutoPlay, d)
   })
   wc.on('did-finish-load', () => {
@@ -469,7 +480,11 @@ export function openRuleWebview(
     })
   })
 
-  // 30 秒兜底：仍未命中则收尾（渲染层据此显示失败+退出）
+  // 收尾兜底（v0.3.9：30 秒 → 60 秒，与在线播放链路口径统一）
+  //
+  // 为什么拉长：这个计时器决定「什么时候告诉界面『没抓到』」。
+  // 30 秒对慢站点是不够的 —— 播放页首屏 + 广告脚本 + 播放器取流请求排队，
+  // 实测经常要 40 秒以上才发出真正的媒体请求；提前收尾等于把能播的这一集判成失败。
   doneTimer = setTimeout(() => {
     // 代号必须还是自己：否则这是上一轮残留的兜底，会给新一轮发一个假的「结束」
     if (!active || viewGen !== myGen) return
@@ -477,13 +492,41 @@ export function openRuleWebview(
     emit({
       type: 'done',
       found: !!best,
-      message: best ? '已捕获视频流' : '未捕获到视频流',
+      message: best
+        ? '已捕获视频流'
+        : `等待 ${ONLINE_PLAY_TIMEOUT_MS / 1000} 秒仍未捕获到视频流（站点可能已失效、需要登录，或播放器未初始化）`,
       url: best ?? undefined
     })
-  }, 30000)
+  }, ONLINE_PLAY_TIMEOUT_MS)
 
   log.append('info', 'rule-webview', `打开网页视图嗅探: ${url.slice(0, 120)}`)
   return true
+}
+
+/**
+ * 自检读数的现场快照（v0.3.9）。
+ *
+ * 与 `ruleProbe.ruleProbeDiagnostics()` 对应：用户报的「换源/换集后播放失败」
+ * 必须能判定是不是**上一轮的嗅探窗口还没销毁**（它会盖在画面区域上，
+ * 表现为「有声音没画面」或「抓到流却播不出来」）。
+ */
+export function ruleWebviewDiagnostics(): {
+  active: boolean
+  viewAlive: boolean
+  viewDestroyed: boolean
+  listenersRegistered: boolean
+  doneTimerPending: boolean
+  gen: number
+} {
+  const v = view
+  return {
+    active,
+    viewAlive: !!v && !v.isDestroyed(),
+    viewDestroyed: !!v && v.isDestroyed(),
+    listenersRegistered: disposeListeners !== null,
+    doneTimerPending: doneTimer !== null,
+    gen: viewGen
+  }
 }
 
 /** 当前嗅探窗口的代号：调用方在**发关闭请求**时取一次，延迟执行时用它判断是否已被新窗口取代 */
@@ -552,5 +595,6 @@ export function closeRuleWebview(gen?: number): void {
       /* ignore */
     }
     log.append('info', 'rule-webview', '嗅探窗口已销毁')
+    pushStep(STAGE, '嗅探窗口已销毁（释放资源）')
   })
 }

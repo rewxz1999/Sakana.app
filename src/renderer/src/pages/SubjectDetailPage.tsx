@@ -5,10 +5,8 @@ import {
   CalendarDays,
   CircleCheck,
   CirclePlay,
-  Clapperboard,
   Copy,
   Download,
-  ExternalLink,
   FilePlay,
   Heart,
   Play,
@@ -18,25 +16,23 @@ import {
   X
 } from 'lucide-react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import type {
-  BatchProbeUpdate,
-  EpisodeProgress,
-  MikanItem,
-  PlayRule,
-  RuleEpisodeGroup,
-  RuleSearchEntry,
-  SubjectDetail
-} from '@shared/types'
-// 值导入（不是 type）：推荐名单与置顶排序都是运行时要用的，见来源选择弹窗里的用法
-import { RECOMMENDED_RULES, sortRulesPinnedFirst } from '@shared/types'
+import type { EpisodeProgress, MikanItem, PlayRule, SubjectDetail } from '@shared/types'
+// 值导入（不是 type）：置顶排序是运行时要用的 —— 来源列表的顺序就由它决定（v0.3.7）
+import { sortRulesPinnedFirst } from '@shared/types'
 import { api } from '@/lib/api'
 import { useLibrary } from '@/stores/library'
 import { useSubs } from '@/stores/subs'
 import { toast } from '@/stores/app'
-import { epKey, onlineKey, progressSummary, useWatchProgress } from '@/stores/watchProgress'
+import { progressSummary, useWatchProgress } from '@/stores/watchProgress'
 import { fmtDateTime } from '@/lib/format'
 import { Badge, Button, ConfirmModal, EmptyState, Modal, ProgressBar, Spinner } from '@/components/ui'
 import { CoverImage } from '@/components/CoverImage'
+/*
+ * 「选择数据源-选集界面」（v0.3.9）：三列级联（源 → 结果 → 选集）取代了原来的
+ * 「选择播放源」+「在线播放」两级弹窗接力。失败原因归类与键盘导航都在它自己内部，
+ * 因此本文件里原来那两个弹窗的实现（约 460 行）已随这次改造删除，不再留死代码。
+ */
+import { PlayerSourcePage } from '@/components/playerSource/PlayerSourcePage'
 
 
 /** 时间戳 → YYYY-MM-DD（用于看完时间手动修改） */
@@ -110,7 +106,15 @@ export function SubjectDetailPage() {
   const [ruleOpen, setRuleOpen] = useState(false)
   const [mikanOpen, setMikanOpen] = useState(false)
   const [rules, setRules] = useState<PlayRule[]>([])
-  const [playRule, setPlayRule] = useState<PlayRule | null>(null)
+  /**
+   * 过完人机验证后要**自动选中并重新搜索**的那条线路（v0.3.9）。
+   *
+   * 旧实现是两个弹窗接力：验证回来直接 `setPlayRule(rule)` 打开「在线播放」弹窗。
+   * 现在只有一个「选择数据源-选集界面」，于是改成带上这条线路并打开它 ——
+   * 用户过完验证落在**结果列**上（而不是回到源列表第一列再自己点一次），
+   * 与 v0.3.7「验证状态已保留，正在用这条线路重新搜索…」的承诺一致。
+   */
+  const [initialRule, setInitialRule] = useState<PlayRule | null>(null)
   /** 需要人机验证的那条规则（非空时弹出验证窗口，v0.3.7） */
   const [verify, setVerify] = useState<{ rule: PlayRule } | null>(null)
   /** 全屏状态（原生窗口全屏 / 页面级全屏）：全屏时返回按钮改为悬浮定位，避免贴边 */
@@ -320,26 +324,23 @@ export function SubjectDetailPage() {
   const [showAllInfo, setShowAllInfo] = useState(false)
   const infoShown = showAllInfo ? infoRows : infoRows.slice(0, 12)
 
-  const openRules = async () => {
+  /**
+   * 打开「选择数据源-选集界面」（v0.3.9 起是**一个**三列级联的页面，不再是两级弹窗接力）。
+   *
+   * 规则列表仍然在这里备好：过滤启用项 + 按 PINNED_RULES 置顶排序都只做一次，
+   * 页面里只负责渲染与级联，避免"同一份顺序在两处各排一遍"（v0.3.7 的教训：
+   * 以前这里写死过一份 preferred 名单，与规则管理页的置顶不一致，用户以为置顶没生效）。
+   */
+  const openRules = async (preselect?: PlayRule | null) => {
     const r = await api.store.get('rules')
     const list: PlayRule[] = r.ok && Array.isArray(r.data) ? (r.data as PlayRule[]) : []
-    /*
-     * v0.3.7：置顶顺序统一由 shared 的 PINNED_RULES 决定（用户要求 aafun / AGE / sorani 置顶）。
-     *
-     * 以前这里写死了一份 preferred 名单，只影响本弹窗 —— 于是「置顶」在规则管理页看不到，
-     * 用户会以为置顶没生效。现在两处都调同一个 sortRulesPinnedFirst()。
-     */
     const enabled = sortRulesPinnedFirst(list.filter((rule) => rule.enabled))
     setRules(enabled)
+    setInitialRule(preselect ?? null)
     if (enabled.length === 0) {
       toast.warn('暂无启用的播放规则，请先在「设置 → 规则管理」中添加')
     }
     setRuleOpen(true)
-  }
-
-  const pickRule = (rule: PlayRule) => {
-    setRuleOpen(false)
-    setPlayRule(rule)
   }
 
   /**
@@ -575,28 +576,24 @@ export function SubjectDetailPage() {
         </motion.div>
       ) : null}
 
-      <RuleSelectModal
+      {/*
+        「选择数据源-选集界面」（v0.3.9）：三列级联同屏，取代原来的
+        「选择播放源」+「在线播放」两级弹窗接力。
+        人机验证仍然走同一个 VerifyModal（`onNeedVerify`），验证回来后带上那条线路重新打开本页。
+      */}
+      <PlayerSourcePage
         open={ruleOpen}
-        onClose={() => setRuleOpen(false)}
-        rules={rules}
-        keyword={detail?.name_cn || detail?.name || ''}
-        /* 探针判定这条线路要人机验证时，点它就先把验证过了再进搜索（v0.3.7） */
-        onNeedVerify={(rule) => {
+        onClose={() => {
           setRuleOpen(false)
-          setVerify({ rule })
+          setInitialRule(null)
         }}
-        onPick={pickRule}
-      />
-      <RulePlayModal
-        open={!!playRule}
-        onClose={() => setPlayRule(null)}
-        rule={playRule}
+        rules={rules}
         keyword={detail?.name_cn || detail?.name || ''}
         title={detail?.name_cn || detail?.name || '播放'}
         subjectId={detail?.id}
-        /* 搜索结果报「人机验证」时，给用户一个现场过验证的出口（v0.3.7） */
+        initialRule={initialRule}
         onNeedVerify={(rule) => {
-          setPlayRule(null)
+          setRuleOpen(false)
           setVerify({ rule })
         }}
       />
@@ -610,7 +607,8 @@ export function SubjectDetailPage() {
           setVerify(null)
           if (r) {
             toast.success('验证状态已保留，正在用这条线路重新搜索…')
-            setPlayRule(r)
+            // 重新打开选集界面，并把这条线路预选中 → 用户直接落在「搜索结果」列
+            void openRules(r)
           }
         }}
       />
@@ -637,11 +635,11 @@ export function SubjectDetailPage() {
  * 所以这里弹一层说明蒙层，把中间那块矩形报给主进程，主进程开一个属于本窗口的子窗口盖在那里
  * （与播放页把探针网页视图摆在画面区域上是同一个手法）。
  * 用户过完验证点「继续」，那之后这条线路就带上验证 Cookie 了（主进程用同一个会话）。
+ *
+ * 备注（v0.3.9）：原来这里还有一个局部函数 `VerifyNeedles()`（一组「这条消息是不是验证墙」
+ * 的正则）。它随两级弹窗一起消失了 —— 现在判验证墙的是
+ * `components/playerSource/sourceFailure.ts` 的 `isVerifyWall()`，那才是唯一一份。
  */
-function VerifyNeedles(): RegExp {
-  return /人机验证|安全验证|验证码|403|forbidden/i
-}
-
 function VerifyModal({
   open,
   rule,
@@ -732,466 +730,6 @@ function VerifyModal({
         </div>
       </div>
     </div>
-  )
-}
-
-// ---------------- 规则选择弹窗（方案 5.1） ----------------
-
-function RuleSelectModal({
-  open,
-  onClose,
-  rules,
-  keyword,
-  onPick,
-  onNeedVerify
-}: {
-  open: boolean
-  onClose: () => void
-  rules: PlayRule[]
-  /** 用来预嗅探的关键词（番剧名）：弹窗一打开就按它逐条探测各线路有没有资源 */
-  keyword: string
-  onPick: (rule: PlayRule) => void
-  /** 探针判定这条线路需要人机验证时，先让用户去验证（v0.3.7） */
-  onNeedVerify: (rule: PlayRule) => void
-}) {
-  /**
-   * 每条规则的探测结果（v0.3.7）。
-   *
-   * 用户要求「在选择播放源页就自动加载所有规则下是否嗅探到资源、嗅探到多少资源」——
-   * 以前这里只有规则的静态元数据（版本/类型/baseUrl），哪条能播全靠用户一条条点进去试，
-   * 试错成本极高（尤其某些线路根本没有这部番，点进去只会得到"未搜索到"）。
-   */
-  const [probe, setProbe] = useState<Record<string, BatchProbeUpdate>>({})
-  /** 本批探测是吃缓存还是真跑；以及缓存时间（界面要如实说明结果有多旧） */
-  const [probeMeta, setProbeMeta] = useState<{ cached: boolean; probedAt?: number; running: boolean }>({
-    cached: false,
-    running: false
-  })
-  useEffect(() => {
-    if (!open || !keyword || rules.length === 0) return
-    let alive = true
-    setProbe({})
-    // 先订阅再启动：批量任务是逐条推的，订阅晚一步就会漏掉第一条的结果
-    const off = api.ruleBatchProbe.onUpdate((ev) => {
-      if (!alive) return
-      setProbe((prev) => ({ ...prev, [ev.ruleId]: ev }))
-    })
-    void runProbe(false)
-    return () => {
-      alive = false
-      off()
-      // 关掉弹窗就停探测：批量探测会开真实窗口访问站点，不该在用户离开后继续跑
-      void api.ruleBatchProbe.stop()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, keyword, rules])
-
-  /**
-   * 发起一批探测（v0.3.7 加缓存）。
-   *
-   * `force=false` 时主进程会先看 30 分钟内的结果缓存 —— 命中就直接回放，
-   * 不开窗口、不打扰站点；用户想拿最新结论时点「重新探测」（force=true）。
-   */
-  const runProbe = async (force: boolean): Promise<void> => {
-    if (force) setProbe({})
-    setProbeMeta({ cached: false, running: true })
-    const r = await api.ruleBatchProbe.start({
-      keyword,
-      rules: rules.map((x) => ({ id: x.id, name: x.name, baseUrl: x.baseUrl })),
-      force
-    })
-    setProbeMeta({
-      cached: r.ok ? r.data.cached : false,
-      probedAt: r.ok ? r.data.probedAt : undefined,
-      running: !(r.ok && r.data.cached)
-    })
-  }
-
-  /** 把一条规则的结果翻成一句人话 + 颜色（三种"没资源"要分得清，见 BatchProbeUpdate 的说明） */
-  const probeBadge = (ruleId: string): React.ReactElement => {
-    const p = probe[ruleId]
-    if (!p) return <Badge tone="neutral">待探测</Badge>
-    if (p.phase === 'search') return <Badge tone="neutral">搜索中…</Badge>
-    if (p.phase === 'sniff') return <Badge tone="neutral">嗅探中…</Badge>
-    if (p.count > 0) return <Badge tone="ok">命中 {p.count} 个资源</Badge>
-    if (p.hit && p.episodes > 0) return <Badge tone="warn">有剧集·未抓到流</Badge>
-    if (p.hit) return <Badge tone="neutral">有番剧·无剧集</Badge>
-    return <Badge tone="neutral">没有这部番</Badge>
-  }
-
-  return (
-    <Modal open={open} onClose={onClose} title="选择播放源" width={460}>
-      {rules.length === 0 ? (
-        <EmptyState
-          icon={Clapperboard}
-          title="暂无可用播放规则"
-          desc="在「设置 → 规则管理」中添加播放规则（Kazumi 风格），即可在线播放"
-        />
-      ) : (
-        <div className="flex flex-col gap-2">
-          {rules.map((rule, i) => {
-            /*
-             * 推荐标记（v0.3.6）：名单收敛到 `@shared/types` 的 `RECOMMENDED_RULES`
-             * （产品指定 aafun / sorani）。
-             * 老实现是 `/^(aafun|akianime|mxdm)$/i.test(...) || i < 3` ——
-             * 那个 `|| i < 3` 会让**前三条一律标推荐**（哪怕它是搜不到的站），
-             * 等于推荐位被"列表顺序"而不是"可用性"决定，用户按推荐点进去常常搜不到番。
-             * 现在只认名单，名单里没有就老老实实不标。
-             */
-            const recommended = RECOMMENDED_RULES.includes(rule.name.toLowerCase())
-            void i
-            const p = probe[rule.id]
-            /*
-             * 探针说这条线路「需要人机验证」时（消息里带 403/验证字样），
-             * 点它就先弹验证窗口 —— 直接进去只会再吃一次 403，用户会以为是"这条线路坏了"（v0.3.7）。
-             */
-            const needVerify = !!p && (p.count === 0 || p.hit) && VerifyNeedles().test(p.message ?? '')
-            return (
-              <button
-                key={rule.id}
-                onClick={() => (needVerify ? onNeedVerify(rule) : onPick(rule))}
-                /* 探测详情挂在 title 上：一句"为什么没资源"比一个灰徽章有用得多 */
-                title={p?.message}
-                className="flex items-center justify-between rounded-xl border border-border bg-elev2/60 px-4 py-3 text-left transition-colors hover:border-accent hover:bg-accent-soft"
-              >
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-sm font-medium">{rule.name}</span>
-                    <Badge tone="neutral">v{rule.version}</Badge>
-                    <Badge tone="accent">{rule.search.type === 'xpath' ? 'XPath' : 'API'}</Badge>
-                    {recommended ? <Badge tone="ok">推荐</Badge> : null}
-                    {/* v0.3.7：这条线路有没有资源（自动预嗅探的结果） */}
-                    {probeBadge(rule.id)}
-                    {needVerify ? <Badge tone="warn">需人机验证</Badge> : null}
-                  </div>
-                  <div className="mt-0.5 max-w-[320px] truncate text-[11px] text-faint">
-                    {p?.phase === 'done' && p.message ? p.message : rule.baseUrl}
-                  </div>
-                </div>
-                <Play size={15} className="shrink-0 text-accent" />
-              </button>
-            )
-          })}
-          <div className="mt-1 flex items-start justify-between gap-3 text-[10px] leading-relaxed text-faint">
-            <span>
-              提示：打开这张列表时会自动探测各线路有没有资源（「命中 N 个资源」= 抓到 N 个候选视频地址）。
-              {probeMeta.cached && probeMeta.probedAt
-                ? ` 当前显示的是 ${new Date(probeMeta.probedAt).toLocaleTimeString()} 的探测结果（30 分钟内不重复探测）。`
-                : ' 探测只做搜索与嗅探、不会播放。'}
-            </span>
-            <button
-              className="shrink-0 rounded-md border border-border px-2 py-0.5 text-[10px] text-dim transition-colors hover:border-accent hover:text-accent disabled:opacity-50"
-              disabled={probeMeta.running}
-              onClick={() => void runProbe(true)}
-            >
-              {probeMeta.running ? '探测中…' : '重新探测'}
-            </button>
-          </div>
-        </div>
-      )}
-    </Modal>
-  )
-}
-
-// ---------------- 规则播放弹窗：搜索 → 选集 → 播放 ----------------
-
-function RulePlayModal({
-  open,
-  onClose,
-  rule,
-  keyword,
-  title,
-  subjectId,
-  onNeedVerify
-}: {
-  open: boolean
-  onClose: () => void
-  rule: PlayRule | null
-  keyword: string
-  title: string
-  subjectId?: number
-  /** 搜索被站点的人机验证挡住时，交给上层弹验证窗口（v0.3.7） */
-  onNeedVerify: (rule: PlayRule) => void
-}) {
-  const navigate = useNavigate()
-  const [results, setResults] = useState<RuleSearchEntry[]>([])
-  const [searching, setSearching] = useState(false)
-  const [searchError, setSearchError] = useState('')
-  const [entry, setEntry] = useState<RuleSearchEntry | null>(null)
-  const [groups, setGroups] = useState<RuleEpisodeGroup[]>([])
-  const [vars, setVars] = useState<Record<string, string>>({})
-  const [loadingEps, setLoadingEps] = useState(false)
-  const [lineIndex, setLineIndex] = useState(0)
-  const [manualKw, setManualKw] = useState(keyword)
-  const progressItems = useWatchProgress((s) => s.items)
-
-  /** 当前条目的观看进度键：规则 + 条目链接（watchProgress store 的在线约定） */
-  const progressKey = rule && entry ? onlineKey(rule.id, entry.link) : ''
-  const progressItem = useMemo(
-    () => (progressKey ? progressItems.find((i) => i.id === progressKey) ?? null : null),
-    [progressItems, progressKey]
-  )
-  /** 已看集数键集合（`${groupIndex}:${episodeIndex}`，与下方剧集按钮的索引一致） */
-  const watchedKeys = useMemo(() => new Set(progressItem?.watched ?? []), [progressItem])
-  /** 上次观看的线路 / 集序号（-1 表示没有记录） */
-  const lastLine = progressItem ? progressItem.groupIndex : -1
-  const lastEp = progressItem ? progressItem.episodeIndex : -1
-  const lastPercent =
-    progressItem && progressItem.durationSec > 0
-      ? Math.min(100, Math.round((progressItem.positionSec / progressItem.durationSec) * 100))
-      : 0
-
-  useEffect(() => {
-    if (open && rule) {
-      setResults([])
-      setSearchError('')
-      setEntry(null)
-      setGroups([])
-      setLineIndex(0)
-      void doSearch(rule)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, rule?.id])
-
-  const doSearch = async (r: PlayRule, overrideKeyword?: string) => {
-    const kw = (overrideKeyword ?? manualKw).trim() || keyword
-    setSearching(true)
-    const res = await api.rules.search(r.id, kw)
-    setSearching(false)
-    if (res.ok) {
-      setResults(res.data.items)
-      if (res.data.error) setSearchError(res.data.error)
-      else if (res.data.items.length === 0) setSearchError(`未搜索到「${kw}」相关条目，可手动修改关键词重试`)
-    } else {
-      setSearchError(res.error)
-    }
-  }
-
-  /** 手动搜索：规则自动搜索无结果时，允许用户输入关键词重试 */
-  const manualSearch = async () => {
-    if (!rule) return
-    const kw = manualKw.trim()
-    if (!kw) {
-      toast.warn('请输入搜索关键词')
-      return
-    }
-    setEntry(null)
-    await doSearch(rule, kw)
-  }
-
-  const doEpisodes = async (item: RuleSearchEntry) => {
-    if (!rule) return
-    setEntry(item)
-    setLoadingEps(true)
-    const res = await api.rules.episodes(rule.id, item)
-    setLoadingEps(false)
-    if (res.ok) {
-      setGroups(res.data.groups)
-      setVars(res.data.vars)
-      setLineIndex(0)
-      if (res.data.error) toast.warn(res.data.error)
-    } else {
-      toast.error(res.error)
-    }
-  }
-
-  const doPlay = async (groupIdx: number, epIdx: number, episodeLink: string) => {
-    if (!rule || !entry) return
-    const res = await api.rules.play(rule.id, entry, groupIdx, epIdx, episodeLink, vars)
-    if (!res.ok) {
-      toast.error(res.error)
-      return
-    }
-    /*
-     * v0.2.7 附加（进入播放提速）：先去后台预取这一集的直链，再跳转播放器。
-     * 跳转 + 播放页挂载大约要几百毫秒，而预取（抓播放页 HTML + 校验候选）刚好跑在这段时间里；
-     * 播放器挂载后来查缓存时若预取还在飞会短暂等一下 —— 命中就完全跳过
-     * 「建嗅探窗口 → 加载播放页 → 等站点播放器发请求」这 1.5~3 秒。
-     */
-    void api.rules.prefetchStream(rule.id, entry, groupIdx, epIdx, episodeLink, vars)
-    /*
-     * v0.2.8 附加：**同时预取这一集的弹幕**（用户建议：从规则页进入某一集播放时就把弹幕准备好）。
-     * 弹幕要「搜索弹幕库 → 拉取弹幕」两步网络请求，正好利用跳转与播放页挂载这段时间；
-     * 播放器随后取弹幕时直接命中缓存，几乎零等待。
-     */
-    void api.danmaku.prefetch(title, epIdx + 1)
-    onClose()
-    navigate('/player', {
-      state: {
-        mode: 'rule',
-        title,
-        url: res.data.url,
-        subjectId,
-        ruleId: rule.id,
-        entry,
-        vars,
-        groups,
-        referer: rule.baseUrl,
-        /*
-         * v0.2.7：必须把「当前是第几线路第几集」一并带进去。
-         * 过去只带播放页地址，播放器内部 ruleCurrent 为 null 就默认按第 1 集算 ——
-         * 于是用户在看第 3 集时左上角显示第 1 集，自动连播还会从第 1 集往后跳（用户反馈的「跳回第二集」）。
-         */
-        startLine: groupIdx,
-        startEp: epIdx
-      }
-    })
-  }
-
-  /** 继续观看：切回上次观看的线路并直接播放那一集（复用 doPlay 的跳转逻辑） */
-  const continueWatch = async (): Promise<void> => {
-    const ep = groups[lastLine]?.episodes[lastEp]
-    if (!ep) {
-      toast.warn('上次观看的线路已不可用，请在剧集列表中选择')
-      return
-    }
-    setLineIndex(lastLine)
-    await doPlay(lastLine, lastEp, ep.link)
-  }
-
-  const group = groups[lineIndex] ?? null
-
-  return (
-    <Modal open={open} onClose={onClose} title={`在线播放 · ${rule?.name ?? ''}`} width={640}>
-      {searching ? (
-        <div className="flex items-center justify-center gap-2 py-10 text-sm text-dim">
-          <Spinner /> 正在 {rule?.name} 搜索《{keyword}》…
-        </div>
-      ) : !entry ? (
-        <div className="flex max-h-[52vh] flex-col gap-1.5 overflow-y-auto pr-1">
-          {results.map((item) => (
-            <button
-              key={item.link + item.source}
-              onClick={() => void doEpisodes(item)}
-              className="flex items-center justify-between rounded-lg border border-border bg-elev2/50 px-3.5 py-2.5 text-left transition-colors hover:border-accent hover:bg-accent-soft"
-            >
-              <span className="line-clamp-2 flex-1 text-[13px]">{item.name || '（无名称）'}</span>
-              <Play size={14} className="ml-2 shrink-0 text-accent" />
-            </button>
-          ))}
-          {!searching && (searchError || results.length === 0) ? (
-            <div className="flex flex-col gap-3 rounded-xl border border-border bg-elev2/40 p-3.5">
-              <div className="flex items-center gap-2 text-xs text-dim">
-                <Search size={13} className="text-accent" />
-                {searchError || '没有搜索结果'}
-              </div>
-              <div className="flex gap-2">
-                <input
-                  value={manualKw}
-                  onChange={(e) => setManualKw(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') void manualSearch()
-                  }}
-                  placeholder="手动输入番剧名称重新搜索…"
-                  className="h-9 flex-1 rounded-lg border border-border bg-elev1 px-3 text-sm outline-none transition-colors placeholder:text-faint focus:border-accent"
-                />
-                <Button size="sm" icon={Search} onClick={() => void manualSearch()}>
-                  手动搜索
-                </Button>
-              </div>
-              {/*
-                人机验证出口（v0.3.7）：站点给非浏览器请求返回验证页时，
-                界面上以前只有一句「403」，用户完全无从下手。
-                这里给一个按钮，把这条线路的搜索页在应用内打开让用户自己过验证。
-              */}
-              {VerifyNeedles().test(searchError) && rule ? (
-                <Button variant="outline" size="sm" icon={Play} onClick={() => onNeedVerify(rule)}>
-                  这条线路需要人机验证 · 点这里去验证
-                </Button>
-              ) : null}
-              <div className="text-[10px] leading-relaxed text-faint">
-                提示：部分站点使用不同译名，可尝试日文原名、别名或去掉季数后缀。
-              </div>
-            </div>
-          ) : null}
-        </div>
-      ) : loadingEps ? (
-        <div className="flex items-center justify-center gap-2 py-10 text-sm text-dim">
-          <Spinner /> 正在解析播放线路与剧集…
-        </div>
-      ) : (
-        <div>
-          <div className="mb-3 flex items-center gap-2">
-            <Button size="sm" variant="ghost" onClick={() => setEntry(null)}>
-              ← 返回搜索结果
-            </Button>
-            <span className="line-clamp-1 text-xs text-dim">{entry.name}</span>
-          </div>
-          {groups.length > 1 ? (
-            <div className="mb-3 flex flex-wrap gap-1.5">
-              {groups.map((g, i) => (
-                <button
-                  key={i}
-                  onClick={() => setLineIndex(i)}
-                  className={`rounded-lg px-2.5 py-1 text-[11px] transition-colors ${
-                    i === lineIndex ? 'bg-accent-soft text-accent' : 'bg-elev2 text-dim hover:text-text'
-                  } whitespace-nowrap `}
-                >
-                  {g.lineName ?? `线路 ${i + 1}`}
-                </button>
-              ))}
-            </div>
-          ) : null}
-          {group && group.episodes.length > 0 ? (
-            <div>
-              {/* 继续观看：直接跳到上次观看的线路与集数 */}
-              {progressItem && lastLine >= 0 && lastEp >= 0 ? (
-                <div className="mb-3 flex flex-wrap items-center gap-2 rounded-xl border border-accent/40 bg-accent-soft/50 px-3 py-2">
-                  <Button size="sm" icon={CirclePlay} onClick={() => void continueWatch()}>
-                    继续观看第 {lastEp + 1} 集
-                  </Button>
-                  <span className="text-[11px] text-dim">
-                    已看 {watchedKeys.size} 集
-                    {lastPercent > 0 ? ` · 上次进度 ${lastPercent}%` : ''}
-                    {groups.length > 1 ? ` · 上次在第 ${lastLine + 1} 条线路` : ''}
-                  </span>
-                </div>
-              ) : null}
-              <div className="grid max-h-[42vh] grid-cols-5 gap-1.5 overflow-y-auto px-1.5 pb-1 pt-2 sm:grid-cols-6 md:grid-cols-8">
-                {group.episodes.map((ep, i) => {
-                  const seen = watchedKeys.has(epKey(lineIndex, i))
-                  const isLast = lastLine === lineIndex && lastEp === i
-                  return (
-                    <button
-                      key={i}
-                      onClick={() => void doPlay(lineIndex, i, ep.link)}
-                      className={`relative truncate rounded-lg border px-2 py-2 text-center text-[11px] transition-colors ${
-                        isLast
-                          ? 'border-accent bg-accent font-semibold text-white'
-                          : seen
-                            ? 'border-accent/60 bg-accent-soft font-medium text-accent'
-                            : 'border-border bg-elev2/60 text-dim hover:border-accent hover:bg-accent-soft hover:text-accent'
-                      }`}
-                      title={isLast ? `${ep.name} · 上次看到这里` : seen ? `${ep.name} · 已看` : ep.name}
-                    >
-                      {ep.name || `第 ${i + 1} 集`}
-                      {isLast ? (
-                        <span className="absolute -right-1 -top-1 rounded-full bg-white px-1.5 py-px text-[9px] font-semibold text-accent shadow whitespace-nowrap">
-                          继续
-                        </span>
-                      ) : null}
-                    </button>
-                  )
-                })}
-              </div>
-            </div>
-          ) : (
-            <EmptyState icon={Clapperboard} title="未解析到剧集列表" desc="该规则可能已失效，请到规则配置页检查 XPath / JSONPath" />
-          )}
-          <div className="mt-3 flex items-center justify-between text-[11px] text-faint">
-            <span>若播放页无法在应用内加载，可点右下角「在浏览器打开」</span>
-            <a
-              className="flex items-center gap-1 text-accent hover:underline"
-              onClick={() => {
-                if (rule) window.open(rule.baseUrl, '_blank')
-              }}
-            >
-              <ExternalLink size={11} /> 打开站点
-            </a>
-          </div>
-        </div>
-      )}
-    </Modal>
   )
 }
 

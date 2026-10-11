@@ -1,0 +1,53 @@
+{
+  "_note": [
+    "sorani（sorani.net）—— 内置规则，随应用分发（用户要求：AGE / sorani / aafun 三条必须内置）。",
+    "这条来自 KazumiRules 仓库的 sorani 定义（仓库版本 1.0），内容与仓库一致，未做改动。",
+    "它是纯 API 型规则（搜索与选集都走 JSON 接口），2026-09 实测可用：",
+    "  搜索「无职转生」→ 5 条（首条《无职转生～到了异世界就拿出真本事～ 第2部分》），",
+    "  选集 → 1 条线路 / 13 集；搜索「葬送的芙莉莲」→ 2 条，选集 → 28 集。",
+    "为什么 episodes.linesJsonPath 写 $.data（而不是线路数组）：Kazumi 的 format:\"nested\" 里 roadsPath 指向",
+    "**单个对象**，剧集列表就在这个对象里；应用侧 ruleEpisodesRaw 已把「单个对象」当作一条线路处理。",
+    "播放地址模板用 @source（搜索条目的 id）与 @episodeUrl（每集的 episodeOrder 字段）。"
+  ],
+  "id": "default-sorani",
+  "name": "sorani",
+  "version": "1.0",
+  "baseUrl": "https://www.sorani.net/",
+  "search": {
+    "type": "api",
+    "method": "GET",
+    "url": "https://api.sorani.cc/sorani-cms/api/video",
+    "headers": "{}",
+    "query": "{\"page\":1,\"size\":50,\"keyword\":\"@keyword\",\"enabled\":true,\"sortMode\":\"latest\",\"sortDesc\":false}",
+    "bodyType": "",
+    "listXPath": "",
+    "itemNameXPath": "",
+    "itemLinkXPath": "",
+    "listJsonPath": "$.data.records[*]",
+    "itemNameJsonPath": "$.title",
+    "itemSourceJsonPath": "$.id"
+  },
+  "episodes": {
+    "type": "api",
+    "method": "GET",
+    "url": "https://api.sorani.cc/sorani-cms/api/video/@source",
+    "headers": "{}",
+    "query": "{}",
+    "bodyType": "",
+    "responseFormat": "",
+    "linesXPath": "",
+    "episodesXPath": "",
+    "linesJsonPath": "$.data",
+    "lineNameJsonPath": "",
+    "episodesJsonPath": "$.episodes[*]",
+    "episodeNameJsonPath": "$.episodeLabel",
+    "vars": {
+      "episodeUrl": "$.episodeOrder"
+    },
+    "playUrlTemplate": "https://www.sorani.net/anime/mal/@source/episode/@episodeUrl",
+    "playQuery": {},
+    "episodeUrlPath": "$.episodeOrder"
+  },
+  "enabled": true,
+  "createdAt": 0
+}

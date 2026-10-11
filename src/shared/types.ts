@@ -4,6 +4,10 @@
 
 import type { Anime4kMode, Anime4kTier } from './anime4k'
 import type { AudioSettings } from './audio'
+// 「导入工具」的容错解析产物（v0.3.9）：ToolMeta 会把它们存下来供界面复查
+import type { ToolImportNote, ToolRunMeta } from './toolImport'
+// 内置规则三件套（AGE / sorani / aafun）：规则内容在 resources/rules/*.json，这里只做汇总
+import { BUILTIN_RULES } from './builtinRules'
 
 /**
  * Anime4K 超分辨率与画面微调（v0.3.1）。
@@ -529,6 +533,276 @@ export interface SearchHistoryItem {
 /** 播放器顶部状态栏展示的状态 */
 export type PlayStatus = 'idle' | 'searching' | 'capturing' | 'loading' | 'playing' | 'failed' | 'ended'
 
+// ---------------- 播放过程进度（v0.3.9） ----------------
+//
+// 用户原话：「播放器还没有显示时，在控制栏顶部的播放器状态里加一个过程进度显示器，
+// 显示找播放资源、获取播放资源、将播放资源注入播放器这一过程，这样我就能判定播放卡在哪个步骤，
+// 而且必需是实时更新的，详细显示问题所在」。
+//
+// 所以这里的状态**不是**给动画用的假进度，而是三个阶段各自的真实起止时间与结论：
+// 每一段的 startedAt/endedAt 由真正做那件事的代码写下（规则解析 / 嗅探 / 内核注入），
+// 没发生的阶段就一直是 pending —— 进度显示因此能如实反映「卡在哪一步」。
+
+/** 三个阶段：找资源 → 取资源 → 注入播放器 */
+export type PlayFlowStageKey = 'locate' | 'acquire' | 'inject'
+
+export type PlayFlowStageStatus = 'pending' | 'running' | 'ok' | 'failed' | 'timeout'
+
+/**
+ * 失败归因（v0.3.9）。
+ *
+ * 存在的意义：用户明确要求「不许只说播放失败」，必须区分
+ * 「网站问题/资源失效」与「资源获取速度过慢」—— 这两者的处置方式完全相反
+ * （前者该换源，后者该继续等）。
+ */
+export type PlayFlowReason =
+  /** 一点数据都拿不到：HTTP 报错 / DNS 解析失败 / TLS 失败 / 连接被拒 */
+  | 'site'
+  /** 能拿到数据但速率长期过低：**不算失败**，继续等并显示实时速率 */
+  | 'slow'
+  /** 拿到了但解不出：容器/编码不被支持 */
+  | 'format'
+  /** 等够了仍无结论（首字节超时） */
+  | 'timeout'
+  /** 我们自己的问题（内核未就绪、参数错误…） */
+  | 'internal'
+  | 'none'
+
+export interface PlayFlowStep {
+  /** 毫秒时间戳 */
+  at: number
+  text: string
+}
+
+export interface PlayFlowStage {
+  key: PlayFlowStageKey
+  label: string
+  status: PlayFlowStageStatus
+  startedAt: number | null
+  endedAt: number | null
+  /** 实时耗时：running 时由主进程按「现在 - startedAt」算，不是定时器凑出来的 */
+  elapsedMs: number
+  /** 当前正在做的事（实时刷新，例如「等待首字节… 已收 128 KB」） */
+  detail: string
+  /** 失败/超时的原因（人话，一行以内） */
+  error?: string
+  /** 该阶段的归因 */
+  reason?: PlayFlowReason
+  /** 该阶段的关键步骤流水（谁在什么时候做了什么） */
+  steps: PlayFlowStep[]
+}
+
+/** 资源可达性采集到的网络指标（失败分析的证据） */
+export interface PlayFlowMetrics {
+  /** 累计收到的字节数（可达性探测采样，不是播放器解码量） */
+  bytes: number
+  /** 实时速率（字节/秒） */
+  rateBps: number
+  /** 首字节耗时（毫秒），还没到就是 null */
+  ttfbMs: number | null
+  /** HTTP 状态码 */
+  status?: number
+  contentType?: string
+  /** 网络层错误类别：dns / tls / refused / timeout / http / network */
+  errorKind?: string
+  /** 最近一次错误原文（含 HTTP 状态、DNS/TLS 说明） */
+  lastError?: string
+  /** 响应头里挑出来的关键几行 */
+  headers?: Record<string, string>
+}
+
+export interface PlayFlowSnapshot {
+  /** 每开一轮新流程 +1：渲染层据此识别「换了一集/换了一条线」，而不是同一轮的抖动 */
+  id: number
+  mode: string
+  title: string
+  startedAt: number
+  endedAt: number | null
+  running: boolean
+  stages: PlayFlowStage[]
+  /** 当前正在进行（或失败）的阶段 key，界面高亮用 */
+  activeStage: PlayFlowStageKey | null
+  metrics: PlayFlowMetrics
+  /** 一句话结论：正在做什么 / 卡在哪一步 / 为什么失败 */
+  summary: string
+  reason: PlayFlowReason
+}
+
+/**
+ * 渲染层 → 主进程的「我进到哪一步了」标记（v0.3.9）。
+ *
+ * 为什么阶段切换要由渲染层发：三阶段的边界是**页面流程**决定的
+ * （规则搜索 / 取集 / 解析播放页 → 建嗅探窗口 → 把直链交给内核），
+ * 这套顺序只有播放页知道；而状态只能有一份，所以渲染层只发标记、主进程持有状态。
+ * 底层服务（ruleProbe / ruleWebview / mpv）则直接往同一个状态里写细节，
+ * 于是详情面板看到的是「页面视角 + 底层证据」合起来的一条时间线。
+ */
+export type PlayFlowMark =
+  | { kind: 'begin'; mode: string; title: string }
+  | { kind: 'stage'; stage: PlayFlowStageKey; detail?: string }
+  | { kind: 'detail'; stage?: PlayFlowStageKey; text: string }
+  | { kind: 'step'; stage?: PlayFlowStageKey; text: string }
+  | { kind: 'ok'; stage: PlayFlowStageKey; detail?: string }
+  | { kind: 'fail'; stage: PlayFlowStageKey; error: string; reason: PlayFlowReason }
+  | { kind: 'done'; ok: boolean; summary?: string; reason?: PlayFlowReason }
+  | { kind: 'metrics'; patch: PlayFlowMetrics }
+  /** 清空当前流程：播放页在没有真实播放目标时被打开（托盘/小窗口/上个会话残留）用它，
+   *  否则状态区会一直挂着「找播放资源 进行中」这种**假进度**（v0.3.9 自查） */
+  | { kind: 'reset' }
+
+/** 隐藏窗口嗅探（ruleProbe）的现场读数 */
+export interface ProbeDiagnostics {
+  active: boolean
+  windowAlive: boolean
+  windowDestroyed: boolean
+  listenersRegistered: boolean
+  timeoutPending: boolean
+  foundCount: number
+}
+
+/** 网页视图嗅探（ruleWebview）的现场读数 */
+export interface WebviewDiagnostics {
+  active: boolean
+  viewAlive: boolean
+  viewDestroyed: boolean
+  listenersRegistered: boolean
+  doneTimerPending: boolean
+  gen: number
+}
+
+/** 播放内核（libmpv）的现场读数 */
+export interface EngineDiagnostics {
+  nativeLoaded: boolean
+  ready: boolean
+  attached: boolean
+  attachedDestroyed: boolean
+  hasBounds: boolean
+  surfaceVisible: boolean
+  hasPicture: boolean
+  timePumpRunning: boolean
+}
+
+export interface PlaySelfCheckFinding {
+  id: string
+  title: string
+  /** ok=正常 / warn=发现异常 / fixed=发现并已修复 */
+  level: 'ok' | 'warn' | 'fixed'
+  detail: string
+}
+
+/** 在线播放自检结果（v0.3.9） */
+export interface PlaySelfCheckResult {
+  at: number
+  reset: boolean
+  findings: PlaySelfCheckFinding[]
+  problems: number
+  probeReset: boolean
+  /** 内核侧发现错配：渲染层应重新 attach（重建播放器） */
+  needsReattach: boolean
+  engineDestroyed: boolean
+  probe: ProbeDiagnostics
+  webview: WebviewDiagnostics
+  engine: EngineDiagnostics
+}
+
+/** 资源可达性取证的结论（v0.3.9） */
+export interface StreamReachabilityReport {
+  reason: PlayFlowReason
+  /** 直接显示给用户的结论 */
+  verdict: string
+  metrics: PlayFlowMetrics
+  container?: string
+}
+
+/** 在线播放加速档位（v0.3.9）：见 `@shared/streamBoost` 的实测依据与阈值 */
+export type StreamBoostMode = 'auto' | 'off' | 'force'
+
+/**
+ * 加速器当前状态（设置页与自检读它，主进程是唯一写入方）。
+ *
+ * `active` 只有在本机中转**真的在给播放器供流**时才为 true ——
+ * 界面上「是否正在加速」不允许靠档位猜（档位是 auto 时可能这次直连更快，那就是没在加速）。
+ */
+export interface StreamBoostStatus {
+  /** 当前档位 */
+  mode: StreamBoostMode
+  /** 是否正在通过本机中转供流 */
+  active: boolean
+  /** 加速形态：hls=并发预读分片 / file=并发 Range 分段拉取 */
+  kind: 'hls' | 'file' | 'none'
+  /** 当前会话的源地址（截断） */
+  origin: string
+  /** 交给播放器的本机地址（截断） */
+  local: string
+  /** 并发连接数（0 = 未加速） */
+  parallel: number
+  /** 实时速率（字节/秒，1 秒窗口） */
+  rateBps: number
+  /** 最近 5 秒平均速率（字节/秒）—— 判「过慢」用这个，避免被瞬时抖动带偏 */
+  avg5sBps: number
+  /** 首字节耗时（毫秒），还没测到就是 null */
+  ttfbMs: number | null
+  /** 本次会话已转发给播放器的字节数 */
+  bytes: number
+  /** 本轮为什么这么决定（人话，一行） */
+  reason: string
+  /** 会话开始时间（毫秒时间戳） */
+  startedAt: number | null
+}
+
+/**
+ * 一条「优化记录」（v0.3.9 补充更新）。
+ *
+ * ## 只记真实量到的值
+ *
+ * 这里的每个数字都来自主进程**真实测量**：
+ * · `direct*` 是决策阶段对源站实际发请求量出来的（`measureThroughput` / HLS 第 1 片）；
+ * · `boostedRateBps` 是**真正转发给播放器**的字节数 ÷ 从开始处理到现在的墙钟
+ *   （分母含决策 + 预热：预热进来的那几 MB 播放器是瞬间拿到的，若算成"白送"会把提升系统性高估）；
+ * · `localTtfbMs` 是播放器从本机拿到首字节的实测耗时。
+ * 任何一项没测到就是 `null`（界面上显示「—」）—— 不允许用估算值凑出一个好看的对比。
+ *
+ * `coldStartSavedMs` 只算「首字节」这一段的差（源站首字节 − 本机首字节）：
+ * 它**不包含**决策 + 预热那几秒（那部分是真实成本，单独记在 `decisionMs` 里，
+ * 界面上也一并显示，免得把「加速 = 起播一定更快」说成无条件成立）。
+ */
+export interface StreamBoostRecord {
+  /** 会话 id：同一会话的多次落盘按它覆盖，避免同一次播放记成好几条 */
+  id: string
+  /** 开始加速的时间戳 */
+  at: number
+  /** 结束时间；还在播时是 null */
+  endedAt: number | null
+  /** 片源域名（HLS 取媒体列表所在的 CDN 域名，file 取直链域名）—— 优化记录要能看出「救的是哪个源」 */
+  host: string
+  /** 站点域名（Referer 的 host）：规则名没传进播放链路，用站点域名代替，如实标注 */
+  site: string
+  /** 加速形态 */
+  kind: 'hls' | 'file'
+  /** 生效的档位（auto/force） */
+  mode: StreamBoostMode
+  /** 并发路数 */
+  parallel: number
+  /** 决策时量到的直连速率（字节/秒） */
+  directRateBps: number | null
+  /** 加速速率（字节/秒）：转发给播放器的字节 ÷ **从开始处理到现在**的墙钟（含决策 + 预热） */
+  boostedRateBps: number | null
+  /** 源站首字节（毫秒） */
+  directTtfbMs: number | null
+  /** 播放器从本机拿到首字节（毫秒） */
+  localTtfbMs: number | null
+  /** 首字节节省（directTtfbMs - localTtfbMs），两项都缺就是 null */
+  coldStartSavedMs: number | null
+  /** 决策 + 预热花了多久（真实成本，毫秒） */
+  decisionMs: number | null
+  /** 本次会话转发给播放器的字节数 */
+  bytes: number
+  /** 中途退化为单连接直连的原因；没退化就是 null */
+  degraded: string | null
+  /** HLS 取片失败次数（>0 说明源站有抖动） */
+  segFailed: number
+}
+
 /** 播放状态栏点开后的详细流信息（媒体地址 / 播放列表 / 分辨率 / 编码 / 码率） */
 export interface StreamInfo {
   url: string
@@ -550,6 +824,34 @@ export interface StreamInfo {
   bitrate?: number
   engine?: string
   capturedAt?: number
+  /**
+   * 播放过程进度快照（v0.3.9）。
+   *
+   * 挂在 `StreamInfo` 上是**故意的**：播放状态详情面板已经在按 1 秒轮询这个接口
+   * （见 StreamInfoModal 的实时刷新），把过程进度并进同一个快照，
+   * 就不需要再为它单开一条每帧轮询 —— 用户要的「实时更新」复用同一条链路。
+   */
+  flow?: PlayFlowSnapshot
+  /**
+   * 嗅探 / 内核的现场读数（v0.3.9 自检）。
+   *
+   * 放在同一个快照里同样是复用考虑：详情面板本来就是每秒拉一次，
+   * 顺带就能显示「嗅探窗口还在不在、内核挂载有没有错配」——
+   * 用户报的「换源后播放失败」要排查时，这一组布尔值是最直接的证据。
+   */
+  selfCheck?: {
+    probeWindowAlive: boolean
+    probeActive: boolean
+    probeListeners: boolean
+    webviewAlive: boolean
+    webviewActive: boolean
+    engineReady: boolean
+    engineAttached: boolean
+    engineAttachedDestroyed: boolean
+    engineHasPicture: boolean
+    engineVideoWidth: number
+    timePumpRunning: boolean
+  }
   message?: string
 }
 
@@ -728,6 +1030,64 @@ export interface ToolMeta {
   scriptPath: string
   version: string | null
   importedAt: number
+  /**
+   * v0.3.9：以下字段都是"放宽导入"时解析出来的信息，全部可选（老数据没有，照常工作）。
+   * 之所以要存下来：工具卡片/详情要显示"从哪来、什么语言、能不能跑"，
+   * 而这些结论是读脚本内容得到的 —— 不存的话每次都要重新读盘解析。
+   */
+  /** 脚本种类（python / shell / javascript / other…），见 shared/toolImport.ts */
+  kind?: string
+  /** 该种类在界面上显示的名字（中英各一份，菜单语言不同也不怕） */
+  kindLabel?: string
+  kindLabelEn?: string
+  /** 是否能在 Sakana 里直接运行（目前只有 Python 有运行时） */
+  runnable?: boolean
+  /** 脚本里声明的作者 */
+  author?: string | null
+  /** 脚本里声明的封面（相对路径或绝对路径，优先于同名图片） */
+  coverHint?: string | null
+  /** docstring 所在行号（1 起） */
+  docstringLine?: number | null
+  /** 版本号来自哪一行（1 起），用于在界面上说明"版本是从哪读到的" */
+  versionLine?: number | null
+  /** 导入时产生的提示（已入库，工具卡片上可复查） */
+  notes?: ToolImportNote[]
+  /** 解析出的脚本语言信息（binary / shebang 版本要求等） */
+  run?: ToolRunMeta
+}
+
+/**
+ * 单份文件的导入结果。
+ *
+ * 为什么 import 返回"一次多份"：用户要"能尽量吃进去"，就得允许一次拖/选多个文件，
+ * 并且**每份单独结算**（某一份失败不该让其它份也不导入）。
+ */
+export interface ToolImportItem {
+  /** 源文件绝对路径 */
+  path: string
+  /** 文件名（提示里用） */
+  fileName: string
+  status: 'imported' | 'updated' | 'failed' | 'canceled'
+  /** 成功入库的元数据（failed/canceled 时为 null） */
+  tool: ToolMeta | null
+  /** 失败原因（failed 时必有） */
+  error?: string
+  /** 解析提示：成功也带（"成功导入 N 条，其中 M 条带警告"就靠它统计） */
+  notes: ToolImportNote[]
+  /** 有多少条 warn 级提示 */
+  warnCount: number
+  /** 这次是新增还是覆盖了同路径的旧记录 */
+  replaced: boolean
+}
+
+export interface ToolImportReport {
+  items: ToolImportItem[]
+  /** 成功（含覆盖）的份数 */
+  imported: number
+  /** 失败的份数 */
+  failed: number
+  /** 用户取消对话框 */
+  canceled: boolean
 }
 
 export interface ToolRunResult {
@@ -753,6 +1113,16 @@ export interface RuleSearchDef {
   listJsonPath: string
   itemNameJsonPath: string
   itemSourceJsonPath: string
+  /**
+   * 可选（v0.3.9）：api 型搜索时，用条目的 `source` 字段拼**详情页地址**的模板，`@source` 占位。
+   *
+   * 为什么需要它：MacCMS 系站点的搜索补全接口（如 aafun 用的 `/index.php/ajax/suggest`）
+   * 只返回条目的 id，而选集要靠详情页 HTML（XPath）—— 过去 api 型搜索的条目 link 恒为空，
+   * 选集就只能拿 id 去拼 URL，拼出来的地址是错的（`https://站点/3291`）。
+   * 有了这个模板，规则可以直接写 `https://站点/anime/@source.html`，
+   * 搜索→选集整条链就通了，也不必为此再写一个专用规则类型。
+   */
+  itemLinkTemplate?: string
 }
 
 export interface RuleEpisodesDef {
@@ -784,6 +1154,17 @@ export interface RuleEpisodesDef {
   playQuery: Record<string, string> // @roadIndex / @episodeIndex 占位
 }
 
+/**
+ * 规则来源（v0.3.9，用户要求「界面要如实显示当前用的是 git 版还是本地版」）。
+ * - builtin：随应用分发的内置规则（resources/rules）
+ * - repo：从 git 规则仓库（KazumiRules）导入/更新来的
+ * - local：当前内容来自**本地库**（用户改过的版本，或从本地库替换回来的）
+ *
+ * 这是"这条规则现在是谁的版本"的**事实记录**，不是推断：写入方在导入/替换时就落下来，
+ * 界面直接显示它，避免靠 id 前缀猜（用户完全可以改掉 id）。
+ */
+export type RuleOrigin = 'builtin' | 'repo' | 'local'
+
 export interface PlayRule {
   id: string
   name: string
@@ -793,6 +1174,11 @@ export interface PlayRule {
   episodes: RuleEpisodesDef
   enabled: boolean
   createdAt: number
+  /**
+   * 可选：来源标记。老数据没有这个字段，界面按 id 前缀兜底显示
+   * （default- → 内置、repo- → 仓库），所以这里是可选的、不需要数据迁移。
+   */
+  origin?: RuleOrigin
 }
 
 export function emptyRule(): PlayRule {
@@ -838,122 +1224,21 @@ export function emptyRule(): PlayRule {
   }
 }
 
+/**
+ * 内置规则总表 = 「用户点名必须内置」的三条 + 其余三条。
+ *
+ * 为什么 AGE / sorani / aafun 不写在这里，而是放到 `resources/rules/*.json`：
+ *  这三条是要**随应用分发**的（用户原话：「AGE、sorani、aafun 是默认规则，这三个规则一定要内置到应用中」），
+ *  规则本体是一堆 XPath/JSONPath **数据**，放在 resources/rules 下谁都能一眼看到应用到底带了哪几条、内容是什么；
+ *  而且以后要加内置规则只需丢一个 json 进去，不必动这个两千行的类型文件。
+ *  它们由 builtinRules.ts 打包进应用（app.asar，开发态与安装态同一份内容），不依赖首次启动去 git 拉取。
+ *
+ * 剩下的三条（TvTFun / 樱之空 / 7sefun）暂时仍写在这里：它们不在用户点名范围内，
+ * 一并搬走会让这次改动的面变大，收益却只是"文件更整齐"。
+ */
 export const DEFAULT_RULES: PlayRule[] = [
-  {
-    id: 'default-age',
-    name: 'AGE',
-    /*
-     * AGE 动漫（agedm.io）—— v0.3.5 按**站点当前真实结构**整条重写。
-     *
-     * 为什么必须重写（2026-09 实测，全部用应用自己那套 HTTP+XPath 栈复现）：
-     *  ① 搜索能出结果，但**名字恒为空**：`itemNameXPath` 指的是封面那个
-     *     `<a class="d-block" title="…"><img …></a>` —— 里面只有图没有文字，
-     *     而 `extractName()` 是取节点内**文本**（`title` 属性不参与）。
-     *     实际剧名在 `<h5 class="card-title"><a>…</a></h5>` 里（第一条 `<a>` 就有全集数）。
-     *  ② 选集恒为空：老的 `linesXPath`（`//div[2]/div/section/…`）在当前页面上命中 **0** 个节点，
-     *     而剧集链接其实有 70 条，结构是 Bootstrap pill：
-     *       `<ul><li><button data-bs-target="#playlist-source-xigua">西瓜</button></li>…</ul>`
-     *       `<div class="tab-content"><div class="tab-pane" id="playlist-source-xigua"><ul class="video_detail_episode">…`
-     *     每条线路就是一个 `<div class="tab-pane" id="playlist-source-xigua">`（里面装 `ul.video_detail_episode`），
-     *     所以 `linesXPath` 指向这 7 个 tab-pane、`lineNameXPath` 取 `@id`
-     *     （`playlist-source-xigua` 这种，等于站点自己的线路标识）。
-     *     ⚠️ 踩过的坑：**不要**写成 `//div[contains(@class,"tab-content")]/div[…class,"tab-pane"]`
-     *     —— xpath-html（parse5 → xmlserializer）这条链上「斜杠子轴 + class 谓词」会恒为 0，
-     *     实测 `//div[contains(@class,"tab-content")]/*` 反而能出 7 个；`parent::*` / `/..`
-     *     这类轴则直接抛 XPath parse error。宁可用平铺的 `//div[contains(@class,"tab-pane")]`，
-     *     也不要用看起来更精确的父子写法。
-     *  ③ 播放地址**不可能**靠 HTTP 算出来：`/play/{id}/{line}/{ep}` 页面里没有任何 m3u8，
-     *     真正的地址在一个第三方解析站（`jx.wuzhoupai.com:8443`）的 ArtPlayer 里，
-     *     它把请求参数用 **WASM 加密**、并带 `Video-Parse-Time/-Sign/-Uuid` 签名头 POST 换取播放地址。
-     *     所以播放这一步只能走应用的「网页视图嗅探」（打开真实浏览器 → 抓媒体请求），
-     *     这也是 AGE 唯一现实的通路。
-     *  ④ 站点页面里的链接是 **http 绝对地址**（`http://www.agedm.io/detail/…`），
-     *     而该域名只提供 https —— 实测 http:80 直连 ETIMEDOUT（不是 301）。
-     *     已在 `resolveUrl()` 里加了「同站 http→https 升级」统一处理，规则这里不用管。
-     */
-    version: '1.6-fix',
-    baseUrl: 'https://www.agedm.io/',
-    search: {
-      type: 'xpath',
-      method: 'GET',
-      url: 'https://www.agedm.io/search?query=@keyword',
-      headers: '{}',
-      query: '{}',
-      bodyType: '',
-      listXPath: '//div[contains(@class,"cata_video_item")]',
-      // 剧名：卡片标题里的链接（相对条目求值，且能避开封面 `<a>`）
-      itemNameXPath: './/h5[contains(@class,"card-title")]/a',
-      // 链接仍取封面那个 `<a>`：它带 title 属性、一定是详情页地址（实测 /detail/<id>）
-      itemLinkXPath: './/a[contains(@class,"d-block")]',
-      listJsonPath: '',
-      itemNameJsonPath: '',
-      itemSourceJsonPath: ''
-    },
-    episodes: {
-      type: 'xpath',
-      method: 'GET',
-      url: '',
-      headers: '{}',
-      query: '{}',
-      bodyType: '',
-      responseFormat: '',
-      // 一条线路一个 tab-pane（7 个播放源：西瓜 / 非凡 / 暴风 / 无尽 / 红牛 / 计算云 / 凤雏云）
-      linesXPath: '//div[contains(@class,"tab-pane")]',
-      // 线路内剧集：相对线路取 li/a（实测 7 条线路各 10 集）
-      episodesXPath: './/li/a',
-      // 线路名 = tab-pane 的 id（playlist-source-xigua / -ffm3u8 / -wolong …）
-      lineNameXPath: '@id',
-      linesJsonPath: '',
-      lineNameJsonPath: '',
-      episodesJsonPath: '',
-      episodeNameJsonPath: '',
-      vars: {},
-      playUrlTemplate: '',
-      playQuery: {}
-    },
-    enabled: true,
-    createdAt: 0
-  },
-  {
-    id: 'default-aafun',
-    name: 'aafun',
-    version: '1.2',
-    baseUrl: 'https://www.moonci.com/',
-    search: {
-      type: 'xpath',
-      method: 'GET',
-      url: 'https://www.moonci.com/search/-------------.html?wd=@keyword&submit=',
-      headers: '{}',
-      query: '{}',
-      bodyType: '',
-      listXPath: '//ul[contains(@class,"hl-one-list")]/li',
-      itemNameXPath: '//div[contains(@class,"hl-item-title")]/a',
-      itemLinkXPath: '//div[contains(@class,"hl-item-title")]/a',
-      listJsonPath: '',
-      itemNameJsonPath: '',
-      itemSourceJsonPath: ''
-    },
-    episodes: {
-      type: 'xpath',
-      method: 'GET',
-      url: '',
-      headers: '{}',
-      query: '{}',
-      bodyType: '',
-      responseFormat: '',
-      linesXPath: '',
-      episodesXPath: '//ul[contains(@class,"hl-plays-list")]/li/a',
-      linesJsonPath: '',
-      lineNameJsonPath: '',
-      episodesJsonPath: '',
-      episodeNameJsonPath: '',
-      vars: {},
-      playUrlTemplate: '',
-      playQuery: {}
-    },
-    enabled: true,
-    createdAt: 0
-  },
+  // 内置三条：AGE / sorani / aafun（顺序 = 列表展示顺序，且都在 PINNED_RULES 置顶名单里）
+  ...BUILTIN_RULES,
   {
     id: 'default-tvtfun',
     name: 'TvTFun',
@@ -1149,6 +1434,47 @@ export interface QbitConfig {
   url: string
   username: string
   password: string
+  /**
+   * qBittorrent 程序路径（.exe）。
+   *
+   * 外部 qb 不归应用管，但没在跑的时候任务一个也下不动，所以允许应用拉起它来自动化下载。
+   * 便携版请填 `qBittorrentPortable.exe`（PortableApps 启动器会自己拉起真正的 qbittorrent.exe）。
+   */
+  exePath?: string
+  /**
+   * 用户已授权应用启动 qBittorrent（在授权弹窗里点过「启动」就记住，之后不再每次询问）。
+   * 旧设置文件没有该字段时按「未授权」处理：第一次需要启动时会问一次。
+   */
+  launchAuthorized?: boolean
+  /** 每次下载前都询问是否启动 qBittorrent（授权框里的勾选，或设置页的开关） */
+  askBeforeLaunch?: boolean
+}
+
+/**
+ * 外部 qBittorrent 的实时状态（设置页据此如实显示「为什么连不上」，不留假按钮）。
+ *
+ * qb 的 WebUI 端口/密码/免密白名单都在 qb 自己的设置里，应用只能探测、不能代为修改，
+ * 所以这里把「探测到什么」全部摊开给界面。
+ */
+export interface QbitStatus {
+  /** WebUI 是否答话 */
+  reachable: boolean
+  /** 当前设置里的地址 */
+  url: string
+  version?: string
+  webapiVersion?: string
+  /** 程序路径（设置里填的，或自动探测到的常见安装位置） */
+  exePath: string
+  exeExists: boolean
+  exeSource: 'setting' | 'auto' | 'none'
+  /** 用户是否已授权应用启动 qb */
+  launchAuthorized: boolean
+  /** 是否每次下载都询问 */
+  askBeforeLaunch: boolean
+  /** 设置里的地址连不上时，探测到的其它可用端口（界面可一键采用） */
+  detectedPorts: number[]
+  /** 连不上时的中文原因，可直接显示 */
+  error?: string
 }
 
 export interface DataSourcesConfig {
@@ -1189,6 +1515,8 @@ export interface AppSettings {
   language: 'zh' | 'en'
   autoCheckUpdate: boolean
   galgameDetect: boolean // 游戏信息检测（读取游戏窗口标题，用于记录游玩进度）
+  /** 内存识别 BGM / 章节（只读：仅读取游戏内存中的音频文件名与章节名，不修改游戏任何数据） */
+  galgameMemRead: boolean
   /**
    * 在线播放 HLS 时剔除贴片广告分片（默认开启）。
    * 判据保守：只删「被 #EXT-X-DISCONTINUITY 夹住的 4~60s 短区段」，
@@ -1196,6 +1524,8 @@ export interface AppSettings {
    * 可选字段：旧设置文件缺省该键时按「开启」处理（见 adFilter.adFilterEnabled）。
    */
   hlsAdFilter?: boolean
+  /** 在线播放加速档位（v0.3.9）：auto=先直连测到慢再加速（默认）/ off=完全直连 / force=强制加速 */
+  streamBoost?: StreamBoostMode
   /**
    * 自建反代（Cloudflare Worker，见 deploy/bangumi-proxy-README.md）。
    *
@@ -1278,14 +1608,14 @@ export interface AppSettings {
    *   · `transcode`：交给 FFmpeg 转码后中转（电视解不了 HEVC 时才用，会明显增加延迟与画质损失）。
    */
   castStrategy?: 'auto' | 'direct' | 'relay' | 'transcode'
-  /**
-   * 搜索页空态轮播图（展示位）的自动切换间隔，单位秒（v0.3.0 附加）。
+  /*
+   * v0.3.9：这里原来的 `searchCarouselSec`（搜索页空态「自定义轮播展示位」的切换间隔）
+   * 已随那块展示位一起删除 —— 它的唯一读者是渲染层那个被删掉的轮播组件与 SearchPage，
+   * 设置页里从来也没有它的入口（滑块画在组件自己身上）。留一个没人读的设置键就是死代码。
    *
-   * 可选字段：老设置文件里没有这个键，渲染层按 6 秒兜底（见 ImageCarousel 的 DEFAULT_INTERVAL_SEC）。
-   * 轮播图片列表不在这里：它是一串绝对路径、条数不定，历史上就存在同一个 store 的
-   * `searchShowcase` 键里（stores/marks.ts），换键会让老用户已选的图片全部丢失，故保持不动。
+   * 老设置文件里残留的 `searchCarouselSec` 不会报错也不会被读取：
+   * 设置是「整体存整体取」，多出来的键只是被忽略（详见 stores/app.ts 的 load 合并逻辑）。
    */
-  searchCarouselSec?: number
   /**
    * Anime4K 超分辨率与画面微调（v0.3.1）。
    *
@@ -1348,19 +1678,35 @@ export const DEFAULT_SETTINGS: AppSettings = {
     type: 'aria2',
     dual: false,
     aria2: { host: '127.0.0.1', port: 6800, secret: '', binaryPath: '', autoStart: true, maxConcurrent: 5 },
-    qbit: { url: 'http://127.0.0.1:8080', username: '', password: '' }
+    qbit: {
+      url: 'http://127.0.0.1:8080',
+      username: '',
+      password: '',
+      exePath: '',
+      // 默认不授权 + 不每次询问：第一次需要启动时问一次，点过「启动」就记住
+      launchAuthorized: false,
+      askBeforeLaunch: false
+    }
   },
   language: 'zh',
   autoCheckUpdate: false,
-  galgameDetect: false,
+  /*
+   * galgame 的两个检测开关（v0.3.9 用户要求：默认开启）。
+   *
+   * 「未设置过=开，显式关=关」：`getSettings()` 是 `{...DEFAULT_SETTINGS, ...磁盘设置}`，
+   * 老用户的设置文件里没有这两个键时就会取到这里的 true；用户显式关过（磁盘上是 false）
+   * 时磁盘值覆盖默认值，仍然保持关闭 —— 不会把用户关掉的开关又偷偷打开。
+   */
+  galgameDetect: true,
+  galgameMemRead: true,
   hlsAdFilter: true,
+  /** 在线播放加速：默认「自动」，与 `@shared/streamBoost` 的 BOOST_FAST_BPS 判定配套 */
+  streamBoost: 'auto',
   // 自建反代（默认启用，可在「设置 → 数据源配置」改回公共镜像）
   bangumiCustomApi: 'https://sankana-bangumi.de5.net/api',
   bangumiCustomImg: 'https://sankana-bangumi.de5.net/img',
   // 番剧表「显示范围」筛选默认全关 = 全部显示
-  scheduleFilters: { hideWatched: false, hideDropped: false, onlyWatching: false },
-  // 搜索页空态轮播图默认 6 秒/张（与 ImageCarousel 里的 DEFAULT_INTERVAL_SEC 一致）
-  searchCarouselSec: 6
+  scheduleFilters: { hideWatched: false, hideDropped: false, onlyWatching: false }
 }
 
 // ---------------- 工具数据导出 ----------------
@@ -1716,6 +2062,8 @@ export interface GalGame {
   finished: boolean
   finishedAt?: number
   lastRouteInfo?: string // last non-empty game window title captured by detection
+  /** 内存识别到的当前章节名（只读扫描；空=未识别） */
+  chapterName?: string
   importedAt: number
   /** 月幕Galgame 中文数据源（优先用于中文展示） */
   ymgal?: {
@@ -1740,6 +2088,24 @@ export interface GalRecentShot {
   path: string
   mtime: number
   name: string
+}
+
+/**
+ * galgame BGM 识别结果（gal:bgm-read）。
+ *
+ * 悬浮按钮「读取 BGM」调它。识别服务由另一模块提供（只读内存识别），
+ * 未开启 / 未识别到时 `name` 为 null、`message` 给出中文提示，前端据此显示，
+ * 绝不用假数据占位。
+ */
+export interface GalBgmResult {
+  /** 真实曲名（游戏数据里有映射时）；没有映射时与 code 相同 */
+  name: string | null
+  /** 代号（音频资源文件名，如 bgm01_a.ogg）——悬浮窗「保存这首」要用它定位档案里的资源 */
+  code?: string | null
+  /** 附加信息（识别来源 / 识别于几秒前 / 引擎等） */
+  detail?: string
+  /** 未开启 / 未识别到时的中文提示 */
+  message?: string
 }
 
 /**
@@ -1783,9 +2149,53 @@ export interface GalLaunchResult {
   started: boolean
 }
 
-/** galgame 截图助手 / 工具配置（electron-store key: galgameTools） */
+// ---------------- galgame 内存识别（只读） ----------------
+
+/** 一次识别到的 BGM / 章节条目（只读扫描结果缓存） */
+export interface GalMemEntry {
+  time: number // 识别时间戳
+  name: string // 文件名（音频资源名 / 代号）
+  engine: string // 来源引擎（空 = 未识别）
+  /**
+   * 真实曲名（来自游戏自己的数据：明文曲目表，或档案里的 soundlist.csv 之类）。
+   * 空串 = 游戏数据里没有「代号→曲名」的映射，界面必须如实显示"只有代号"，不许编曲名。
+   */
+  title?: string
+  /**
+   * 这条是怎么来的（只读扫描的三种来源，界面必须区分，不能都当成"正在播放"）：
+   * - 'playing'：出现签名刚发生变化 —— 真机实测这就是游戏刚切/刚播放某首 BGM 的信号；
+   * - 'new'：本轮扫描新出现的名字；
+   * - 'candidate'：游戏内存里现存的音乐类候选（很多游戏一启动就把 BGM 名单常驻内存）。
+   */
+  kind?: 'playing' | 'new' | 'candidate'
+}
+
+/** 某款游戏最近的 BGM 识别结果（供右键面板展示） */
+export interface GalMemRecent {
+  entries: GalMemEntry[]
+  engine: string // 当前识别引擎（空 = 未识别）
+  lastError: string // 最近一次错误（空 = 正常；含权限不足的中文提示）
+  /** 当前判定为在播的那首（null = 还没捕捉到切曲信号） */
+  playing?: GalMemEntry | null
+  /** 判定时间（界面显示"识别于 N 秒前"） */
+  playingAt?: number
+  /** 曲名来源说明（例如「档案 main/soundlist.csv」；空 = 没找到映射） */
+  titleSource?: string
+  /** true = 游戏数据里没有曲名映射，只有代号（界面如实提示） */
+  codeOnly?: boolean
+}
+
+/** 已保存的 BGM 文件（gal:bgm-saved） */
+export interface GalBgmSaved {
+  path: string
+  name: string
+  mtime: number
+  size: number
+}
+
+/** galgame galgame 助手 / 工具配置（electron-store key: galgameTools） */
 export interface GalToolsConfig {
-  screenshotEnabled: boolean // 启动截图助手
+  screenshotEnabled: boolean // 启动galgame 助手
   hideIcon: boolean // 启动后是否隐藏图标（仅快捷键截图）
   hotkey: string // 全局截图快捷键，如 CommandOrControl+Shift+G
   dir: string // 截图保存位置（空则使用 userData/screenshots/galgame）
@@ -1802,6 +2212,7 @@ export const DEFAULT_GAL_TOOLS: GalToolsConfig = {
 export type GalEvent =
   | { type: 'games'; games: GalGame[] }
   | { type: 'running'; gameId: string; running: boolean }
+  | { type: 'mem'; gameId: string; error?: string; chapter?: string; engine?: string }
 
 // ---------------- 规则仓库（KazumiRules）自动更新元信息 ----------------
 
@@ -1813,8 +2224,9 @@ export type GalEvent =
  * 但产品并没有推荐它」这种对不上的情况。名单只此一份，组件引用它即可。
  *
  * ⚠️ 注意：名单里的名字必须能在**本地规则库**里找到才有意义 ——
- * 内置 DEFAULT_RULES 只有 AGE / aafun / TvTFun / 樱之空 / 7sefun，**没有 sorani**，
- * 因此 sorani 只有先从规则仓库导入（启动自动更新或「从仓库导入」）之后才会出现在搜索结果里。
+ * 内置 DEFAULT_RULES 现在包含 AGE / sorani / aafun / TvTFun / 樱之空 / 7sefun
+ * （前三条来自 `resources/rules/*.json`，见 builtinRules.ts），
+ * 所以这两个名字在全新安装上就已经存在，不需要先去规则仓库导入。
  */
 export const RECOMMENDED_RULES = ['aafun', 'sorani']
 
@@ -1868,6 +2280,58 @@ export interface RulesRepoMeta {
   failed?: string[]
   /** 远端索引条目总数（便于一眼看出"检测到了多少条"） */
   remoteTotal?: number
+}
+
+// ---------------- 规则本地库（v0.3.9，用户要求） ----------------
+
+/**
+ * 本地库快照的入库原因 —— 界面上要能回答"这条是从哪来的"，所以原因必须落盘而不是靠猜。
+ * - builtin：内置版本（随应用分发的那份），是"出问题时最可靠的兜底"
+ * - first-seen：第一次见到这条规则（装应用/首次导入时记个底）
+ * - before-change / after-change：一次修改前的旧版 / 修改后的新版
+ * - repo-import：从 git 规则仓库导入或更新（覆盖前先把被覆盖的那版存下来）
+ * - auto-fix：应用启动时按站点改版修正表改写的版本
+ * - local-replace：用户用本地库版本替换当前规则（被替换掉的那版同样留档）
+ * - removed：这条规则被删掉了（留档，方便找回）
+ */
+export type LocalRuleReason =
+  | 'builtin'
+  | 'first-seen'
+  | 'before-change'
+  | 'after-change'
+  | 'repo-import'
+  | 'auto-fix'
+  | 'local-replace'
+  | 'removed'
+
+/**
+ * 本地库条目：某条规则在某个时刻的完整快照。
+ *
+ * 为什么要有这个东西（用户原话）："所有有问题的规则你都可以修改，修改到跑通，
+ * 另外规则设置中新增本地库，修改过的规则全部放在本地库中（任何修改都是），
+ * 当从 git 规则库中导入的规则或者从 git 规则库中更新的规则跑不通时，我们还有本地库可以替换使用。"
+ *
+ * 为什么单独一个 store 命名空间（`rulesLocal`）而不是塞进 `rules`：
+ * `rules` 会被"从仓库导入/启动自动更新"整条覆盖掉，本地库混在里面就会被一起冲走 ——
+ * 那就正好失去了"仓库版本跑不通时还能退回本地版本"的意义。
+ */
+export interface LocalRuleEntry {
+  /** 条目 id：`<ruleId>#<内容哈希>`，同一内容天然去重（不会重复入库） */
+  id: string
+  /** 对应规则的 id（替换时用它保持规则身份：启用状态、创建时间都不变） */
+  ruleId: string
+  name: string
+  version: string
+  /** 快照本体（完整规则，替换时直接写回 store） */
+  rule: PlayRule
+  /** 入库时间（毫秒时间戳） */
+  savedAt: number
+  /** 入库原因 */
+  reason: LocalRuleReason
+  /** 入库时这条内容的来源（界面显示"当前用的是 git 版还是本地版"） */
+  origin: RuleOrigin
+  /** 内容哈希（名字+版本+地址+搜索/选集定义），用于判断"当前规则是不是就是这个快照" */
+  hash: string
 }
 
 // ---------------- 搜索页空态：随机推荐番剧 ----------------

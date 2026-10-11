@@ -36,6 +36,9 @@ export const useGal = create<GalState>((set, get) => ({
         set((s) => ({
           running: { ...s.running, [ev.gameId]: ev.running }
         }))
+      } else if (ev.type === 'mem' && ev.error) {
+        // 只读内存识别错误（如权限不足）→ 明确中文提示，不静默失败
+        toast.error(ev.error)
       }
     }),
   importGame: async () => {

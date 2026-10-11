@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
-import { CheckCircle2, Copy, Download, Link2, MonitorPlay, RefreshCw, Sparkles, TriangleAlert, XCircle } from 'lucide-react'
+import { CheckCircle2, MonitorPlay, RefreshCw, Sparkles, TriangleAlert, XCircle } from 'lucide-react'
 import type { PlayerAssets } from '@shared/api'
-import type { CastDevice } from '@shared/types'
 import {
   ANIME4K_MODES,
   ANIME4K_TIERS,
@@ -30,9 +29,8 @@ import {
 import { api } from '@/lib/api'
 import { useSettings } from '@/stores/app'
 import { toast } from '@/stores/app'
-import { Button, Input, Switch } from '@/components/ui'
-import { AssetLink, Card, SubPage, type BuiltinAsset } from '@/components/SettingsShell'
-import { ShortcutsPanel } from './ShortcutsPage'
+import { Button, Switch } from '@/components/ui'
+import { AssetLink, Card, SubPage } from '@/components/SettingsShell'
 
 /** 内置组件状态行 */
 function AssetRow({ name, ok, hint }: { name: string; ok: boolean | null; hint: string }) {
@@ -217,71 +215,13 @@ export function PlayerSettingsPage() {
   const { settings, save } = useSettings()
   const [assets, setAssets] = useState<PlayerAssets | null>(null)
   const [checking, setChecking] = useState(false)
-  /** 投屏：手动连接的地址输入、已连接的移动端、本机同步地址（v0.3.8） */
-  const [castAddr, setCastAddr] = useState('')
-  const [castTarget, setCastTarget] = useState<CastDevice | null>(null)
-  const [syncUrl, setSyncUrl] = useState('')
 
-  /**
-   * 接收端工程的仓库地址（用户要求"投屏设置里增加下载地址"）。
-   *
-   * 前两条分别是"直接下载可安装的 APK"与"看源码/构建说明"：
-   * `dist/` 下的 APK 是 debug 签名（能直接装，适合自用）；要正式分发得自己换 keystore 重新签名。
+  /*
+   * v0.3.9：投屏（含手动连接 / 双端同步 / 接收端下载）整块搬到了独立的
+   * `/cast-settings`「投屏设置」；FFmpeg 与控制栏搬到了 `/experimental-settings`「测试性设置」；
+   * B 站弹幕搬到了「弹幕设置」；快捷键入口本就在「快捷键」里（本页不再内嵌那一大段面板）。
+   * 本页只保留用户点名的五块：播放器内核 / 超分辨率 / 音频 / 画面比例 / 内置组件。
    */
-  const RECEIVER_REPO = 'https://github.com/rewxz1999/Sakana.app/tree/main/android-receiver'
-  const RECEIVER_APK =
-    'https://github.com/rewxz1999/Sakana.app/raw/main/android-receiver/dist/SakanaReceiver-0.3.8-debug.apk'
-
-  const refreshSync = async (): Promise<void> => {
-    const [url, devices] = await Promise.all([api.cast.syncUrl(), api.cast.discover()])
-    if (url.ok) setSyncUrl(url.data)
-    if (devices.ok) setCastTarget(devices.data.find((d) => d.kind === 'sakana') ?? null)
-  }
-
-  const connectByHand = async (): Promise<void> => {
-    const addr = castAddr.trim()
-    if (!addr) {
-      toast.warn('请先填接收端的 IP:端口（接收端主界面顶部就显示着）')
-      return
-    }
-    const r = await api.cast.addManual(addr)
-    if (!r.ok) {
-      toast.error(`连接失败：${r.error}`)
-      return
-    }
-    if (!r.data) {
-      toast.error('连不上这个地址：确认接收端已打开、且与本机在同一网络（或已 USB 共享网络）')
-      return
-    }
-    await api.cast.setTarget(r.data.id)
-    setCastTarget(r.data)
-    setCastAddr('')
-    toast.success(`已连接 ${r.data.name}`)
-  }
-
-  const openReceiverRepo = (): void => {
-    // 走系统浏览器：主进程的 setWindowOpenHandler 会把 http 外链交给默认浏览器
-    window.open(RECEIVER_REPO, '_blank')
-  }
-
-  /** 直接下载 APK（浏览器打开 raw 链接即可下载） */
-  const openReceiverApk = (): void => {
-    window.open(RECEIVER_APK, '_blank')
-  }
-
-  const copyReceiverUrl = async (): Promise<void> => {
-    // 纯文本复制直接用 Chromium 的剪贴板 API（Electron 里可用，也不需要额外 IPC）
-    try {
-      await navigator.clipboard.writeText(RECEIVER_REPO)
-      toast.success('已复制接收端仓库地址')
-    } catch (err) {
-      toast.error(`复制失败：${String((err as Error)?.message ?? err)}`)
-    }
-  }
-
-  useEffect(() => {
-    void refreshSync()
-  }, [])
 
   const detect = async (): Promise<void> => {
     setChecking(true)
@@ -295,10 +235,8 @@ export function PlayerSettingsPage() {
     void detect()
   }, [])
 
-  const builtinOf = (a: BuiltinAsset): boolean | null => {
-    if (!assets) return null
-    return a === 'ffmpeg' ? assets.ffmpeg : assets.aria2
-  }
+  // v0.3.9：FFmpeg 的下载链接卡片已经搬到「测试性设置」，这里只剩内置组件卡片里的那一个链接
+  const ffmpegBuiltin: boolean | null = assets ? assets.ffmpeg : null
 
   // libmpv 可用（运行时 + 原生插件都在）——VLC 内核已删除，这里只用于提示是否缺运行时
   const mpvUsable = !!assets?.mpv
@@ -331,7 +269,7 @@ export function PlayerSettingsPage() {
     <SubPage
       icon={MonitorPlay}
       title="播放器设置"
-      desc="播放内核（libmpv）、FFmpeg 路径与播放器快捷键"
+      desc="播放内核、Anime4K 超分辨率、音频（音质调控）、画面比例与内置组件；FFmpeg 与快捷键等已拆到同区域下的其它设置项"
       actions={
         <Button size="sm" variant="outline" icon={RefreshCw} loading={checking} onClick={() => void detect()}>
           重新检测
@@ -587,50 +525,6 @@ export function PlayerSettingsPage() {
         </div>
       </Card>
 
-      {/* 播放器控制栏（v0.2.18 引入 uosc；**v0.3.3 起默认改回应用自己的控制栏**） */}
-      <Card
-        title="播放器控制栏"
-        desc="默认使用应用自己的悬浮窗控制栏（含超分/画质按钮）；也可切换成 mpv 的 uosc 控制栏"
-      >
-        <div className="flex flex-col gap-2.5">
-          <label className="flex items-center gap-2 text-xs text-text">
-            <input
-              type="checkbox"
-              checked={settings.uoscControlBar === true}
-              onChange={(e) => save({ uoscControlBar: e.target.checked })}
-              className="h-3.5 w-3.5 accent-accent"
-            />
-            改用 mpv 的 uosc 控制栏（实验性）
-          </label>
-          <p className="text-[11px] leading-relaxed text-faint">
-            <span className="font-semibold text-text">默认（不勾选）：</span>
-            用应用自己的悬浮窗控制栏 —— 进度条、播放控制、选集、字幕、倍速、画面比例、弹幕、
-            <span className="text-dim">画质（Anime4K 超分）</span>、全屏与退出都在里面，
-            按钮与菜单都是应用自己的界面，改起来、查起来都最直接。
-          </p>
-          <p className="text-[11px] leading-relaxed text-faint">
-            <span className="font-semibold text-text">勾选后：</span>
-            控制栏改由 mpv 的 uosc 绘制（画在视频画面上）。布局与时间显示在
-            <code className="mx-1 font-mono">resources/mpv-config/script-opts/uosc.conf</code>
-            ，快捷键在
-            <code className="mx-1 font-mono">resources/mpv-config/input.conf</code>
-            ，按钮与菜单由
-            <code className="mx-1 font-mono">resources/mpv-scripts/sakana-uosc-ctrl.lua</code>
-            驱动。
-            <span className="text-dim">
-              {' '}
-              切换在<strong className="font-medium">下次进入播放器</strong>时生效；无论用哪一个，
-              弹幕画布、番剧详情浮层、选集抽屉都不受影响。
-            </span>
-          </p>
-          <p className="text-[11px] leading-relaxed text-faint">
-            <span className="font-semibold text-text">uosc 模式怎么唤出：</span>
-            鼠标移到画面下方（或任意位置移动，应用会主动唤出），控制栏就会浮现；
-            <span className="text-dim">键盘兜底：</span>按 <code className="font-mono">Tab</code> 可显隐整条控制栏。
-          </p>
-        </div>
-      </Card>
-
       {/*
         ── 音频（音质调控）（v0.3.6）──────────────────────────────────────────────
         全部设置都存在 `settings.audio`，由 `@shared/audio` 收窄并拼成 ffmpeg 的 `af` 滤镜链，
@@ -832,7 +726,11 @@ export function PlayerSettingsPage() {
           </SwitchRow>
         </div>
 
-        {/* ⑤ 音色响应曲线 + 截图剪贴板 */}
+        {/*
+          ⑤ 音色响应曲线。
+          v0.3.9：「截图后自动复制到剪贴板」原在本卡片最下面，但它跟音频毫无关系，
+          已搬到「下载与播放」设置项（播放/截图行为那一段）。
+        */}
         <RowDivider />
         <div className="py-2">
           {/*
@@ -847,15 +745,6 @@ export function PlayerSettingsPage() {
           </div>
           <EqCurve gains={audio.eqEnabled ? (audio.eqGains ?? []) : []} />
         </div>
-
-        <RowDivider />
-        <SwitchRow
-          id="clipboard"
-          title="截图后自动复制到剪贴板"
-          desc="在聊天/文档里直接 Ctrl+V 就能粘贴；同时会进入 Win+V 剪贴板历史。注意这会顶掉剪贴板里原有的内容（截图本身照常存盘）"
-          checked={settings.screenshotClipboard !== false}
-          onChange={(v) => save({ screenshotClipboard: v })}
-        />
 
         {/* 说明：如实交代哪些没做 */}
         <RowDivider />
@@ -885,103 +774,6 @@ export function PlayerSettingsPage() {
         </div>
       </Card>
 
-      {/*
-        投屏（v0.3.8，用户要求「投屏相关设置记得添加到设置中」）。
-        这里的策略直接决定投屏流畅度，所以每一项都写清代价。
-      */}
-      <Card title="投屏" desc="把当前这一集投到电视（DLNA）或本仓库的安卓接收端；控制栏「投屏」按钮里选设备">
-        <div className="flex flex-col gap-2.5">
-          <div className="flex gap-2">
-            {(
-              [
-                { v: 'auto' as const, label: '自动（推荐）', desc: '给电视时重封装成 MP4（-c:v copy，不重编码）以兼容大多数电视；Sakana 接收端直连' },
-                { v: 'direct' as const, label: '只用直连', desc: '电脑完全不参与传输，但站点校验 Referer 时电视会 403' },
-                { v: 'relay' as const, label: '只用中转（HLS 直通）', desc: '电脑只转发字节、不重封装；电视确认支持 HLS 时用它，能拖进度' },
-                { v: 'transcode' as const, label: '中转并转码', desc: '转成 H.264/AAC；电视解不了 HEVC 时才用，会明显增加延迟与画质损失' }
-              ] as const
-            ).map((o) => (
-              <button
-                key={o.v}
-                onClick={() => save({ castStrategy: o.v })}
-                className={`flex-1 rounded-xl border px-3 py-2.5 text-left transition-colors ${
-                  (settings.castStrategy ?? 'auto') === o.v
-                    ? 'border-accent bg-accent-soft'
-                    : 'border-border hover:border-accent/50'
-                }`}
-              >
-                <div className="text-xs font-semibold text-text">{o.label}</div>
-                <div className="mt-0.5 text-[10px] leading-snug text-faint">{o.desc}</div>
-              </button>
-            ))}
-          </div>
-          <p className="text-[11px] leading-relaxed text-faint">
-            投屏时本机播放会自动暂停，把带宽让给电视（同一路流在两处同时拉会互相抢带宽）。
-            中转服务只监听局域网、端口 52890，不做任何重编码；投屏结束后自动停止。
-            有线共享网络或跨网段时自动发现不生效，请用下面的「手动连接」填接收端显示的 IP:端口。
-          </p>
-          {/*
-            手动连接（v0.3.8：按用户要求从播放器的投屏面板**挪到设置里**）。
-            广播发现到不了的地方（USB 网络共享、跨网段、AP 隔离）只能手填地址，
-            所以它是"兜底入口"而不是装饰。
-          */}
-          <div className="rounded-xl border border-border px-3 py-2.5">
-            <div className="text-xs font-semibold text-text">手动连接移动端</div>
-            <div className="mt-1.5 flex gap-2">
-              <Input
-                placeholder="接收端显示的 IP，例如 192.168.42.129:52889"
-                value={castAddr}
-                onChange={(e) => setCastAddr(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') void connectByHand()
-                }}
-              />
-              <Button size="sm" icon={Link2} onClick={() => void connectByHand()}>
-                连接
-              </Button>
-            </div>
-            <p className="mt-1.5 text-[11px] leading-relaxed text-faint">
-              地址在接收端应用的主界面顶部（点一下即可复制）。连接成功后电脑会记住它，之后投屏默认给这台设备。
-              {castTarget ? ` 当前已连接：${castTarget.name}` : ' 当前未连接任何移动端。'}
-            </p>
-          </div>
-          {/* 同步状态：手机端靠这个地址拉收藏/历史（也会随投屏自动告诉手机） */}
-          <div className="rounded-xl border border-border px-3 py-2.5">
-            <div className="text-xs font-semibold text-text">双端同步</div>
-            <p className="mt-1 text-[11px] leading-relaxed text-faint">
-              连上移动端后会自动同步：把电脑的收藏与观看历史给它，也接收它那边的观看历史合并回来。
-              手机端会把这个地址（本机局域网地址）连同投屏一起收到，无需手动配置。
-            </p>
-            <div className="mt-1.5 flex items-center gap-2">
-              <code className="min-w-0 flex-1 truncate rounded bg-elev2 px-2 py-1 text-[11px] text-dim">
-                {syncUrl || '同步服务未启动'}
-              </code>
-              <Button size="sm" variant="outline" onClick={() => void refreshSync()}>
-                刷新
-              </Button>
-            </div>
-          </div>
-          {/* 接收端下载入口（用户要求：投屏设置里给出下载地址） */}
-          <div className="rounded-xl border border-border px-3 py-2.5">
-            <div className="text-xs font-semibold text-text">安卓接收端</div>
-            <p className="mt-1 text-[11px] leading-relaxed text-faint">
-              极简的安卓投屏接收端（约 1 MB 的 release 包，装到手机/平板/盒子上打开即可被搜到）。
-              仓库地址：github.com/rewxz1999/Sakana.app 的 <code>android-receiver/</code> 目录。
-            </p>
-            <div className="mt-1.5 flex flex-wrap gap-2">
-              <Button size="sm" icon={Download} onClick={() => openReceiverApk()}>
-                下载安卓接收端 APK
-              </Button>
-              <Button size="sm" variant="outline" onClick={() => openReceiverRepo()}>
-                仓库目录 / 构建说明
-              </Button>
-              <Button size="sm" variant="ghost" icon={Copy} onClick={() => void copyReceiverUrl()}>
-                复制地址
-              </Button>
-            </div>
-          </div>
-        </div>
-      </Card>
-
       {/* 画面比例 */}
       <Card title="画面比例" desc="视频与屏幕比例不一致时的填充方式（播放器控制栏右下角也可随时切换）">
         <div className="flex gap-2">
@@ -1005,98 +797,6 @@ export function PlayerSettingsPage() {
               <div className="mt-0.5 text-[10px] leading-snug text-faint">{o.desc}</div>
             </button>
           ))}
-        </div>
-      </Card>
-
-      {/* FFmpeg 配置 */}
-      <Card title="FFmpeg 配置" desc="转码回退与在线流中转使用（留空自动使用内置 FFmpeg）">
-        <div className="flex flex-col gap-2.5">
-          <Input
-            placeholder="FFmpeg 路径（留空使用内置，用于转码回退）"
-            value={settings.ffmpegPath}
-            onChange={(e) => save({ ffmpegPath: e.target.value })}
-          />
-          <p className="text-[11px] leading-relaxed text-faint">
-            当内置解码器无法直接播放（如 HEVC / 10bit / 非常规封装）时，应用会调用 FFmpeg 进行转码或 remux；留空时优先使用随包内置的 FFmpeg，
-            填写路径可改用自行安装的版本（指向 ffmpeg.exe 所在目录或可执行文件）。
-          </p>
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px]">
-            <AssetLink asset="ffmpeg" url="https://www.gyan.dev/ffmpeg/builds/" builtin={builtinOf('ffmpeg')} />
-          </div>
-        </div>
-      </Card>
-
-      {/* 播放器快捷键（原独立小窗口内容已并入本页） */}
-      <Card title="播放器快捷键" desc="自定义播放器控件快捷键（播放/暂停、快进、音量、选集、截屏等）">
-        <ShortcutsPanel />
-      </Card>
-
-      {/* B 站弹幕（mpv 脚本，v0.2.8 附加七） */}
-      <Card title="B 站弹幕（mpv 脚本）" desc="播放 B 站视频时用 yt-dlp + biliass 抓取并显示弹幕（仅 libmpv 内核生效）">
-        <div className="flex flex-col gap-2.5">
-          <label className="flex items-center gap-2 text-xs text-text">
-            <input
-              type="checkbox"
-              checked={settings.biliDanmaku?.enabled === true}
-              onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, enabled: e.target.checked } })}
-              className="h-3.5 w-3.5 accent-accent"
-            />
-            启用 B 站弹幕（需要自行准备 yt-dlp 与 biliass）
-          </label>
-          <Input
-            placeholder="yt-dlp 可执行文件路径（留空按 PATH 里的 yt-dlp）"
-            value={settings.biliDanmaku?.ytdlpPath ?? ''}
-            onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, ytdlpPath: e.target.value } })}
-          />
-          <Input
-            placeholder="biliass 可执行文件路径（留空按 PATH 里的 biliass）"
-            value={settings.biliDanmaku?.biliassPath ?? ''}
-            onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, biliassPath: e.target.value } })}
-          />
-          <Input
-            placeholder="临时目录 tmpdir（必填；留空用应用数据目录下的 tmp/danmaku）"
-            value={settings.biliDanmaku?.tmpdir ?? ''}
-            onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, tmpdir: e.target.value } })}
-          />
-          <Input
-            placeholder="自定义 mpv 脚本路径（留空使用内置的 sakana-bdanmaku.lua；也可指向你下载的 bdanmaku.lua）"
-            value={settings.biliDanmaku?.scriptPath ?? ''}
-            onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, scriptPath: e.target.value } })}
-          />
-          <p className="text-[11px] leading-relaxed text-faint">
-            管线：yt-dlp 取弹幕字幕（xml）→ biliass 转 ASS → 挂到播放器上。
-            <span className="text-dim"> biliass 在 Windows 上必须有一个可写的临时目录</span>，否则弹幕下载会失败 ——
-            留空时应用会自动用「应用数据目录/tmp/danmaku」并把它通过 <code className="font-mono">script-opts=tmpdir=…</code> 传给脚本。
-            <span className="text-dim">开关或路径改动在下次进入播放器时生效</span>（libmpv 启动时才加载脚本）。
-            运行日志里能看到 <code className="font-mono">[mpv] B 站弹幕脚本已启用</code> 与脚本自己的进度；
-            脚本日志写在上面 tmpdir 下的 <code className="font-mono">sakana-bdanmaku.log</code>。
-          </p>
-          <p className="text-[11px] leading-relaxed text-faint">
-            <span className="text-dim">与「弹幕 → 渲染方式」的关系</span>：如果同时把渲染方式选成了 mpv 插件
-            （uosc_danmaku），同一部 B 站番剧会出现两份弹幕（一份由本脚本挂成字幕、一份由插件画在画面上），
-            建议按需二选一。
-          </p>
-          <div className="rounded-lg border border-border bg-elev2/50 px-3 py-2 text-[11px] leading-relaxed text-faint">
-            需要自行下载的两个组件（本机网络到 GitHub Release 不通，无法随包分发）：
-            <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1">
-              <button
-                className="text-accent hover:underline whitespace-nowrap"
-                onClick={() => void api.app.openPath('https://github.com/yt-dlp/yt-dlp/releases')}
-              >
-                yt-dlp 下载页
-              </button>
-              <button
-                className="text-accent hover:underline whitespace-nowrap"
-                onClick={() => void api.app.openPath('https://github.com/yutto-dev/biliass/releases')}
-              >
-                biliass 下载页
-              </button>
-            </div>
-            <div className="mt-1">
-              也可以直接使用社区里的 <code className="font-mono">bdanmaku</code> 脚本：把它下载到本地后填进上面的「自定义 mpv 脚本路径」，
-              应用会自动把 tmpdir / ytdlp / biliass 三个参数拼进 <code className="font-mono">script-opts</code> 一并传过去。
-            </div>
-          </div>
         </div>
       </Card>
 
@@ -1129,7 +829,7 @@ export function PlayerSettingsPage() {
               asset="ffmpeg"
               url="https://www.gyan.dev/ffmpeg/builds/"
               label="下载 FFmpeg（可选）"
-              builtin={builtinOf('ffmpeg')}
+              builtin={ffmpegBuiltin}
             />
           </div>
         </div>

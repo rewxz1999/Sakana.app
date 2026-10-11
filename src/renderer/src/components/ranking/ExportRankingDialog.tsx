@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { CircleAlert, FolderOpen, ImageDown } from 'lucide-react'
-import { Button, Input, Modal, Select } from '@/components/ui'
+import { Button, Input, Modal, Select, Switch } from '@/components/ui'
 import { api } from '@/lib/api'
 import { toast } from '@/stores/app'
 import {
@@ -37,8 +37,10 @@ export function ExportRankingDialog({
 }) {
   const [author, setAuthor] = useState('')
   const [scale, setScale] = useState<number>(DEFAULT_EXPORT_SCALE)
+  /** 锚点默认不画（用户要求：给开关，默认关） */
+  const [showAnchors, setShowAnchors] = useState(false)
   const [exporting, setExporting] = useState(false)
-  const layout = exportLayout(table)
+  const layout = exportLayout(table, { showAnchors })
   const [result, setResult] = useState<{
     path: string
     width: number
@@ -49,11 +51,11 @@ export function ExportRankingDialog({
   async function doExport(): Promise<void> {
     setExporting(true)
     setResult(null)
-    const { html, images } = buildRankingExportHtml(table, author)
+    const { html, images } = buildRankingExportHtml(table, author, { showAnchors })
     const r = await api.tools.exportCardImage({
       title: '导出排名表为图片',
       // 宽度按内容算（用户要求"右侧不要留大片空白"）：与 HTML 内部用的是同一个函数，两处不会漂移
-      width: exportLayout(table).width,
+      width: exportLayout(table, { showAnchors }).width,
       html,
       images,
       defaultName: `${table.name}-排名表`,
@@ -117,6 +119,19 @@ export function ExportRankingDialog({
             点导出后会弹出系统保存对话框，位置和文件名都由你自己选。
             {layout.width * scale > 8000 ? ' 当前尺寸偏大，觉得过大可以降到 2 倍。' : ''}
           </div>
+        </div>
+
+        {/* 锚点：界面上的锚点默认不画进图片（用户要求给开关、默认关） */}
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-elev1 px-3 py-2">
+          <div className="min-w-0">
+            <div className="text-xs font-semibold">导出时显示锚点</div>
+            <div className="mt-0.5 text-[11px] leading-relaxed text-faint">
+              {table.anchors.length === 0
+                ? '这张表还没有锚点（在分界线上右键可以添加）'
+                : `关掉时图片里不出现锚点标记（共 ${table.anchors.length} 个）`}
+            </div>
+          </div>
+          <Switch checked={showAnchors} onChange={setShowAnchors} disabled={table.anchors.length === 0} />
         </div>
 
         {result ? (

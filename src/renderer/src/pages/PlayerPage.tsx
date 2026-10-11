@@ -33,11 +33,13 @@ import type {
   LocalVideoFile,
   MediaInspectResult,
   PlayStatus,
+  PlayFlowSnapshot,
   RuleEpisodeGroup,
   RuleSearchEntry,
   SubjectDetail
 } from '@shared/types'
 import { resolveDanmakuSettings } from '@shared/types'
+import { ENGINE_ATTACH_TIMEOUT_MS, ONLINE_PLAY_TIMEOUT_MS, RELAY_READY_TIMEOUT_MS } from '@shared/onlinePlay'
 import { api } from '@/lib/api'
 import { fmtDuration, localSubUrl, localVideoUrl } from '@/lib/format'
 import { useLibrary } from '@/stores/library'
@@ -48,6 +50,7 @@ import { toast, useSettings } from '@/stores/app'
 import { Badge, Spinner } from '@/components/ui'
 import { CoverImage } from '@/components/CoverImage'
 import { StreamInfoModal } from '@/components/StreamInfoModal'
+import { PlayFlowStages } from '@/components/PlayFlowProgress'
 
 interface PlayerState {
   mode: 'local' | 'online' | 'rule'
@@ -232,6 +235,25 @@ export function PlayerPage() {
   /** 顶部状态栏文案（捕捉视频流中 / 加载中 / 播放中 / 播放失败…） */
   const [statusLog, setStatusLog] = useState<string[]>([])
   const [showStreamInfo, setShowStreamInfo] = useState(false)
+  /**
+   * 播放过程进度（v0.3.9）：三阶段（找资源 / 取资源 / 注入播放器）的实时快照。
+   *
+   * 数据完全来自主进程（`api.player.flow()` 是纯内存读），这里只负责显示。
+   * 刷新挂在**既有的**「尚未开播时每 800ms 问一次内核」那条轮询上，
+   * 不新开定时器 —— 用户明确要求「复用现有播放状态详情的实时推送，别再开一条每帧轮询」。
+   */
+  const [flow, setFlow] = useState<PlayFlowSnapshot | null>(null)
+  /** 最近一次自检的结果（v0.3.9）：非空时在状态区显示「自检做了什么」，用户要求不许静默 */
+  const [selfCheckNote, setSelfCheckNote] = useState('')
+  /**
+   * 本轮流程是否**成功出过画面**（v0.3.9）。
+   *
+   * 为什么必须有它：「加载中」这一层不能只看 `!playing` ——
+   * 用户暂停之后 `playing` 也是 false，那时再盖一层「加载中 + 过程进度」就成了严重的误报
+   * （暂停的画面被一块半透明黑罩住，还写着加载中）。
+   * 所以判据是「本轮还没有真正开播过」。
+   */
+  const [startedOnce, setStartedOnce] = useState(false)
   /** 自动续播提示：非空时右下角显示「是否撤销本次跳转」 */
   const [resumeHint, setResumeHint] = useState<{ at: number; target: number } | null>(null)
   const [switching, setSwitching] = useState(false)
@@ -268,6 +290,15 @@ export function PlayerPage() {
   const seekTimerRef = useRef<number | undefined>(undefined)
   const ruleStreamRef = useRef<string | null>(null)
   const probeCancelRef = useRef<(() => void) | null>(null)
+  /**
+   * 上一轮嗅探的**完整**清理函数（v0.3.9 体检 M3）。
+   *
+   * 为什么单独立一个 ref：`startRuleProbe()` 内部会注册 `onFound/onDone` 两个 ipcRenderer 监听
+   * （每次调用都是**新的一对**）并返回清理函数。但看门狗里的「重新嗅探」以前直接把它调掉、返回的清理函数丢掉，
+   * 于是每重嗅探一次就多两个永不注销的监听，长会话下会积累到 `MaxListenersExceededWarning`，
+   * 而且已卸载实例的闭包被长期持有。现在统一存进这个 ref，并在下一轮开始前先清干净。
+   */
+  const probeDisposeRef = useRef<(() => void) | null>(null)
   const pokeRef = useRef<(() => void) | null>(null)
   /** 当前播放页地址（重试嗅探时要用，state 里读不到最新值） */
   const rulePageUrlRef = useRef('')
@@ -386,13 +417,15 @@ export function PlayerPage() {
     /*
      * 中转成功的判定要给足时间：FFmpeg 需要先连上源站、缓冲一段才会开始出数据，
      * 24 分钟的长片在冷启动 + 慢 CDN 下超过 12 秒很常见。
-     * 这里放宽到 30 秒，期间界面仍是「加载中」。
+     * v0.3.9：30 秒 → 60 秒，与在线播放链路统一（见 @shared/onlinePlay）。
      */
     window.setTimeout(() => {
       if (!playingRef.current) {
-        setVideoError('在线播放失败：该站点的视频流无法播放，请切换其它规则或退出')
+        setVideoError(
+          `在线播放失败：该站点的视频流在中转 ${RELAY_READY_TIMEOUT_MS / 1000} 秒内仍未出数据，请切换其它规则或退出`
+        )
       }
-    }, 30000)
+    }, RELAY_READY_TIMEOUT_MS)
   }
   const subtitlesLoadedRef = useRef('')
 
@@ -449,15 +482,85 @@ export function PlayerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engineState, currentFile?.path, ruleStreamUrl])
 
+  /**
+   * 播放过程进度：本轮流程开始 + 「找播放资源」阶段（v0.3.9）。
+   *
+   * 为什么阶段边界由渲染层划：三阶段的顺序是**页面流程**决定的
+   * （先准备好播放页地址 / 扫描本地文件 → 再嗅探直链 → 最后交给内核），
+   * 这套顺序只有播放页自己知道。但状态只保留一份（在主进程），
+   * 所以这里只发「标记」，由主进程维护时间线，
+   * 详情面板（每秒轮询 streamInfo）与状态栏看到的因此永远是同一份数据。
+   */
+  useEffect(() => {
+    /*
+     * ⚠️ 没有真实播放目标时**不要**开一轮流程（v0.3.9 自查补的）。
+     *
+     * 这个 effect 在挂载时无条件跑，而播放页也可能被**直接打开**（托盘、小窗口列表、
+     * 上个会话残留、或者只是路由切错）——那种情况下流程永远推进不到第二步，
+     * 状态区就会一直显示「找播放资源 进行中 4.0s」：这是**假进度**，比不显示更糟
+     * （用户会以为卡在找资源，而实际上根本没有在找）。
+     */
+    const hasTarget =
+      state.mode === 'local' ? files.length > 0 : Boolean((state.url ?? '').trim() || rulePageUrl.trim())
+    if (!hasTarget) {
+      void api.player.flowMark({ kind: 'reset' })
+      setFlow(null)
+      setSelfCheckNote('')
+      setStartedOnce(false)
+      return
+    }
+    void api.player.flowMark({ kind: 'begin', mode: state.mode, title: state.title })
+    void api.player.flowMark({
+      kind: 'stage',
+      stage: 'locate',
+      detail: state.mode === 'local' ? '正在扫描本地视频文件' : '正在解析播放页地址（规则搜索 / 取集）'
+    })
+    setFlow(null)
+    setSelfCheckNote('')
+    setStartedOnce(false)
+    // 切集是重新挂载播放页，所以这个 effect 每次换集都会重跑一轮流程
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.mode, state.title, state.url])
+
   // 尝试嵌入 libmpv 播放内核；失败回退 HTML5 + FFmpeg 管线
   useEffect(() => {
     let alive = true
     /*
-     * 进播放页先把可能残留的探针网页视图关掉（v0.3.7）。
-     * 那个窗口是**盖在画面区域上的独立窗口**：万一上一轮退出时它没被销毁干净，
-     * 这一轮就会挡住画面 —— 表现正好是「正在播放但没有画面」。这里补一道保险。
+     * 进播放页先做一次**嗅探自检 + 重置**（v0.3.9）。
+     *
+     * 这里过去只有一句 `api.ruleWebview.close()`（v0.3.7 的保险）。
+     * 但用户报的问题是**两类**：①上一路播完后嗅探程序没反应过来（残留窗口/残留监听）；
+     * ②播放器销毁后没重建。只关一次网页视图覆盖不了 ②，也不会告诉用户发生了什么。
+     * 现在换成完整的自检：它会查残留探针窗口、残留 webRequest 监听、残留收尾计时器，
+     * 以及内核挂载是否指向已销毁的窗口；发现异常就地重置，并把「做了什么」回报上来
+     * （用户明确要求不许静默）。
      */
-    void api.ruleWebview.close()
+    void api.player
+      .selfCheck({ reset: true })
+      .then((r) => {
+        if (!r.ok) return
+        const problems = r.data.findings.filter((f) => f.level !== 'ok')
+        if (problems.length > 0) {
+          setSelfCheckNote(
+            `自检已重置：${problems.map((f) => f.title).join('；')}${
+              r.data.needsReattach ? '（已销毁错配内核，正在重建播放器）' : ''
+            }`
+          )
+        }
+        /*
+         * 内核侧发现错配 → 主进程已经把死掉的实例销毁了，这里重新挂载一次。
+         * 「重建播放器」只由渲染层做：attach 需要视频区域的屏幕矩形，那个矩形只有页面知道。
+         */
+        if (r.data.needsReattach) {
+          void api.player.attach({
+            x: 0,
+            y: 56,
+            width: window.innerWidth,
+            height: Math.max(120, window.innerHeight - 120)
+          })
+        }
+      })
+      .catch(() => undefined)
     void (async () => {
       // 视频区域矩形：libmpv 用它定位画面子窗口
       const hostRect = (): { x: number; y: number; width: number; height: number } => {
@@ -468,14 +571,22 @@ export function PlayerPage() {
         }
         return { x: 0, y: 56, width: window.innerWidth, height: Math.max(120, window.innerHeight - 120) }
       }
-      // 防卡死：attach 若 20 秒内无响应（内核初始化异常），直接降级，避免播放器界面卡住
+      /*
+       * 防卡死：attach 若迟迟不响应（内核初始化异常）就降级，避免播放器界面卡住。
+       *
+       * v0.3.9：20 秒 → 60 秒，与在线播放链路统一（见 @shared/onlinePlay）。
+       * 为什么敢放宽：libmpv 初始化 + 创建原生子窗口在低端机上偶发很慢，
+       * 20 秒投降的结果是「慢机器上第一次进播放页必失败、第二次就好」——
+       * 用户只会觉得播放器时好时坏。放宽到 60 秒后，真正卡死的仍然是 60 秒给结论，
+       * 但慢机器不再被误判。
+       */
       const attachResult = await Promise.race([
         api.player.attach(hostRect()),
-        new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 20000))
+        new Promise<null>((resolve) => window.setTimeout(() => resolve(null), ENGINE_ATTACH_TIMEOUT_MS))
       ])
       if (!alive) return
       if (attachResult === null) {
-        const msg = '播放内核初始化超时（20 秒无响应）'
+        const msg = `播放内核初始化超时（${ENGINE_ATTACH_TIMEOUT_MS / 1000} 秒无响应）`
         setEngineError(msg)
         if (state.mode === 'rule') setVideoError(`在线播放初始化失败：${msg}`)
         else setEngineState('fallback')
@@ -511,6 +622,11 @@ export function PlayerPage() {
    * 4 秒内没开播就自动回到完整嗅探（缓存直链有时效，失败不能让用户干等）。
    */
   const startRuleProbe = (pageUrl: string, opts?: { skipCache?: boolean }) => {
+    // 先彻底拆掉上一轮（含它的两个 IPC 监听与看门狗），再开新的 —— 否则重嗅探会越积越多（体检 M3）
+    if (probeDisposeRef.current) {
+      probeDisposeRef.current()
+      probeDisposeRef.current = null
+    }
     if (probeCancelRef.current) probeCancelRef.current()
     // 新一轮嗅探：重置播放/中转状态并停掉上一条中转流
     playingRef.current = false
@@ -529,6 +645,17 @@ export function PlayerPage() {
     setRuleProbing(true)
     probingRef.current = true
     setVisible(true)
+    /*
+     * 过程进度（v0.3.9）：播放页地址已经拿到 = 「找播放资源」完成，进入「获取播放资源」。
+     * 后面的窗口建立/页面加载/自动点击等细节由主进程的 ruleProbe/ruleWebview 直接补进同一阶段。
+     */
+    void api.player.flowMark({ kind: 'ok', stage: 'locate', detail: '播放页地址已就绪' })
+    void api.player.flowMark({
+      kind: 'step',
+      stage: 'acquire',
+      text: `播放页：${pageUrl.slice(0, 80)}`
+    })
+    void api.player.flowMark({ kind: 'stage', stage: 'acquire', detail: '正在嗅探播放页里的媒体地址' })
     let cancelled = false
     let usedWebview = false
     /** 缓存直链是否命中（命中时先不建嗅探窗口，等看门狗判定失败再建） */
@@ -666,6 +793,27 @@ export function PlayerPage() {
         }
         void playWithRetry()
         /*
+         * v0.3.9：地址交给内核之后**并行**做一次资源可达性取证。
+         *
+         * 用户要求「拿到媒体地址后仍然播放失败…显示原因，是网站问题，还是网速太慢」。
+         * 关键在**并行**：这一步绝不能挡「把地址交给 mpv」（否则最快能播的那条路也要多等一次往返）。
+         * 正常情况下用户完全感觉不到它（确认数据在流动就立刻收手，不会把整集拉下来）；
+         * 播不出来时它已经量好首字节耗时/速率/HTTP 状态，结论可以直接给用户。
+         */
+        void api.player
+          .diagnose(ev.url, refForPlay, ev.cookies)
+          .then((r) => {
+            if (!r.ok) return
+            /*
+             * 「速度过慢」不结束播放（用户明确要求：还有数据在动就继续等，并显示实时速率），
+             * 只在状态区把它说出来；主进程那边已经把它记进过程进度里了。
+             */
+            if (r.data.reason === 'slow') {
+              toast.info(`资源获取速度过慢（约 ${Math.round(r.data.metrics.rateBps / 1024)} KB/s），仍在继续等待…`)
+            }
+          })
+          .catch(() => undefined)
+        /*
          * 记进会话直链缓存（v0.2.7 附加）：同一集来回切、退出再进、以及切集预取命中时
          * 都能跳过整轮嗅探。缓存有 6 分钟 TTL，过期或一次性令牌失效时看门狗会重新嗅探。
          */
@@ -675,32 +823,47 @@ export function PlayerPage() {
          * 一次嗅探会推多个候选，旧计时器不该在新候选已经接手之后继续倒计时。
          */
         if (streamWatchdogRef.current !== undefined) window.clearTimeout(streamWatchdogRef.current)
-        // 直连 15 秒仍未开播 → 先用新地址重试（对付短时效直链），再不行才切 FFmpeg 中转
+        /*
+         * 直连迟迟未开播 → 先用新地址重试（对付短时效直链），再不行才切 FFmpeg 中转。
+         *
+         * v0.3.9：15 秒 → 60 秒，与在线播放链路统一（见 @shared/onlinePlay 的说明）。
+         * 为什么必须放宽：15 秒对慢 CDN + 长片冷启动是明显不够的
+         * （实测 20–40 秒才出首帧的站点不少），提前重嗅探会把**正在正常拉流**的那一集顶掉，
+         * 用户看到的就是「明明在放，突然重新捕捉视频流」。
+         * 现在 60 秒才动，而只要数据还在动，可达性取证也会如实报「过慢但仍在等」。
+         */
         streamWatchdogRef.current = window.setTimeout(() => {
           streamWatchdogRef.current = undefined
           if (cancelled || playingRef.current || relayTriedRef.current) return
+          void api.player.flowMark({
+            kind: 'detail',
+            stage: 'inject',
+            text: `交给内核后 ${ONLINE_PLAY_TIMEOUT_MS / 1000} 秒仍未出画面，正在重新解析地址`
+          })
           if (!retriedCaptureRef.current) {
             retriedCaptureRef.current = true
             const pageUrl = rulePageUrlRef.current || state.url
             if (pageUrl) {
-              toast.info('视频流可能已过期，正在重新解析…')
+              toast.info(`视频流 ${ONLINE_PLAY_TIMEOUT_MS / 1000} 秒未出画面，正在重新解析…`)
               console.log('[player] 直连未开播：重新嗅探获取新的直链')
-              startRuleProbe(pageUrl)
+              // 返回的清理函数必须留下来（体检 M3）：下一轮开始前要先把这一轮的两个 IPC 监听拆掉
+              probeDisposeRef.current = startRuleProbe(pageUrl) ?? null
               /*
                * 重嗅探也要有上限：站点有时不再给出新地址（或直接限流），
                * 那就退回到 FFmpeg 中转再试一次，而不是让用户一直盯着「捕捉视频流中」。
+               * 同样按 60 秒口径（原来是 12 秒）。
                */
               probeFallbackTimerRef.current = window.setTimeout(() => {
                 if (!cancelled && !playingRef.current && !relayTriedRef.current) {
                   console.log('[player] 重嗅探超时，改走 FFmpeg 中转')
                   void startFfmpegRelay(ev.url, refForPlay, ev.cookies)
                 }
-              }, 12000)
+              }, ONLINE_PLAY_TIMEOUT_MS)
               return
             }
           }
           void startFfmpegRelay(ev.url, refForPlay, ev.cookies)
-        }, 15000)
+        }, ONLINE_PLAY_TIMEOUT_MS)
       }
     })
     const offDone = api.ruleProbe.onDone((ev) => {
@@ -718,6 +881,7 @@ export function PlayerPage() {
       if (cancelled) return
       setRuleProbing(true)
       probingRef.current = true
+      void api.player.flowMark({ kind: 'stage', stage: 'acquire', detail: '正在打开播放页并嗅探媒体地址' })
       // 优先走可见网页视图；创建失败则回退到隐藏窗口嗅探
       void api.ruleWebview.open(pageUrl, currentBounds(), state.referer).then((r) => {
         if (cancelled) return
@@ -730,8 +894,13 @@ export function PlayerPage() {
     }
     /*
      * 先看会话直链缓存（v0.2.7 附加）：命中就直接播，省掉整轮嗅探。
-     * 4 秒内没开播（缓存已过期 / 一次性令牌被用掉）就自动回到完整嗅探，
-     * 因此不会出现「点了没反应」——最坏情况只是多等 4 秒。
+     * 缓存直链迟迟没开播（缓存已过期 / 一次性令牌被用掉）就自动回到完整嗅探，
+     * 因此不会出现「点了没反应」——最坏情况只是多等这几秒。
+     *
+     * v0.3.9：这里的 2.5 秒**刻意不跟着 60 秒统一**。
+     * 它不是「失败判定」而是一个**快路试探**：缓存直链要么几秒内就开播（那就省下整轮嗅探），
+     * 要么说明缓存已经失效，早点回到完整嗅探反而更快。
+     * 把它拉长到 60 秒只会让「缓存里是坏地址」这种情况白等一分钟。
      */
     if (!opts?.skipCache) {
       void api.rules.cachedStream(pageUrl).then((r) => {
@@ -747,10 +916,34 @@ export function PlayerPage() {
         setRuleStreamUrl(hit.url)
         setRuleProbing(false)
         probingRef.current = false
+        void api.player.flowMark({
+          kind: 'step',
+          stage: 'acquire',
+          text: `命中会话直链缓存，直接交给播放器：${hit.url.slice(0, 70)}`
+        })
+        void api.player.flowMark({ kind: 'ok', stage: 'acquire', detail: '命中会话直链缓存' })
         void api.player.play(hit.url, hit.referer ?? state.referer, undefined)
+        // 命中缓存这条路也一样要做可达性取证（缓存里的地址常常正是失效的那一条）
+        void api.player
+          .diagnose(hit.url, hit.referer ?? state.referer, undefined)
+          .then((dr) => {
+            if (dr.ok && dr.data.reason === 'site') {
+              // 证据说明这条缓存地址已失效：直接忘记它，下次切到这一集会重新嗅探
+              void api.player.selfCheck({
+                reset: true,
+                failedPageUrl: pageUrl
+              })
+            }
+          })
+          .catch(() => undefined)
         window.setTimeout(() => {
           if (cancelled || playingRef.current || relayTriedRef.current) return
           console.log('[player] 缓存直链未开播，改为完整嗅探')
+          void api.player.flowMark({
+            kind: 'step',
+            stage: 'acquire',
+            text: '缓存直链未开播，回到完整嗅探'
+          })
           runFullProbe()
         }, 2500)
       })
@@ -770,6 +963,38 @@ export function PlayerPage() {
       }
       void cacheHit
     }
+  }
+
+  /**
+   * 「重跑」：播放失败之后重新走一遍「重新解析地址 → 嗅探 → 交给内核」（v0.3.9 补充）。
+   *
+   * 用户原话：「对于播放失败的播放源，在播放详情中增加一个『重跑』按钮，
+   * 播放失败后重新跑一遍来获取资源播放」。
+   *
+   * 关键点是**复用**而不是新写一套：内部就是既有的 `startRuleProbe`
+   * （它管着建窗口、onFound/onDone 订阅、直连看门狗、探针取消句柄），
+   * 这里只做三件失败态特有的收尾：
+   *   ① 清掉界面上的失败文案（否则新的一轮还没开始，界面已经写着「播放失败」）；
+   *   ② 重新开一条过程进度（`kind: 'begin'` → 主进程重开一轮，阶段与失败原因一起清空）；
+   *   ③ **跳过直链缓存**（`skipCache: true`）—— 失败最常见的原因之一就是命中了
+   *      缓存里那条已经失效的直链，重跑还去读它等于原地打转。
+   */
+  const retryStream = (): void => {
+    const pageUrl = rulePageUrlRef.current || state.url || ''
+    if (state.mode !== 'rule' || !pageUrl) {
+      // 本地播放没有「重新解析地址」这一步，不该给重跑入口；给出明确反馈而不是静默
+      toast.info('本地播放不支持重跑，请重新选择文件')
+      return
+    }
+    console.log(`[player] 用户点了「重跑」：重新解析并嗅探 ${pageUrl.slice(0, 90)}`)
+    setVideoError(null)
+    setRuleProbeFailed(false)
+    setSelfCheckNote('')
+    retriedCaptureRef.current = false
+    void api.player.flowMark({ kind: 'begin', mode: state.mode, title: state.title })
+    void api.player.flowMark({ kind: 'stage', stage: 'locate', detail: '重跑：正在重新解析播放页地址' })
+    toast.info('正在重新解析并嗅探该播放源…')
+    startRuleProbe(pageUrl, { skipCache: true })
   }
 
   /** 当前播放对象的进度键：在线用「规则 + 条目链接」，本地用文件路径 */
@@ -1024,18 +1249,48 @@ export function PlayerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current, duration, ruleCurrent, state.mode, state.groups, state.ruleId, state.entry, autoNext])
 
-  /** 嗅探看门狗：超过 45 秒仍在「捕捉视频流中」就给出可操作的失败提示（而不是一直转圈） */
+  /**
+   * 嗅探看门狗：迟迟仍在「捕捉视频流中」就给出可操作的失败提示（而不是一直转圈）。
+   *
+   * v0.3.9：45 秒 → 60 秒，与在线播放链路统一。
+   * 主进程侧的嗅探本身也是按 60 秒收尾的（ruleProbe/ruleWebview 的兜底计时器），
+   * 这里与它同口径之后，界面不会再出现「主进程还在试、界面先判失败」的错位。
+   */
   useEffect(() => {
     if (!ruleProbing) return
     const t = window.setTimeout(() => {
       if (!ruleStreamRef.current) {
         setRuleProbing(false)
         probingRef.current = false
-        setVideoError('捕捉视频流超时：该线路可能已失效，请切换线路或其它规则')
+        setVideoError(
+          `捕捉视频流超时：等待 ${ONLINE_PLAY_TIMEOUT_MS / 1000} 秒仍未捕获到媒体地址，该线路可能已失效，请切换线路或其它规则`
+        )
       }
-    }, 45000)
+    }, ONLINE_PLAY_TIMEOUT_MS)
     return () => window.clearTimeout(t)
   }, [ruleProbing])
+
+  /**
+   * 失败后的收尾（v0.3.9）：跑一次自检重置，并把结论如实说出来。
+   *
+   * 为什么挂在「出现失败提示」这件事上：用户报的正是「换源/换集之后播放失败」，
+   * 而这类失败的成因（残留探针窗口 / 内核错配 / 缓存里是坏直链）
+   * 恰恰是自检能查、也能就地修掉的那几种。修完还要说明做了什么 —— 用户明确要求不许静默。
+   */
+  useEffect(() => {
+    if (!videoError && !ruleProbeFailed) return
+    void api.player
+      .selfCheck({ reset: true, failedPageUrl: rulePageUrlRef.current || state.url })
+      .then((r) => {
+        if (!r.ok) return
+        const problems = r.data.findings.filter((f) => f.level !== 'ok')
+        if (problems.length > 0) {
+          setSelfCheckNote(`失败后自检已重置：${problems.map((f) => f.title).join('；')}`)
+        }
+      })
+      .catch(() => undefined)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoError, ruleProbeFailed])
 
   /**
    * 断点续播（v0.2.6 按集记录）。
@@ -1097,8 +1352,11 @@ export function PlayerPage() {
     const pageUrl = rulePageUrl || state.url
     if (!pageUrl) return
     const cleanup = startRuleProbe(pageUrl)
+    // 记下这一轮的清理函数，供看门狗重嗅探时先拆旧的（体检 M3）
+    probeDisposeRef.current = cleanup ?? null
     return () => {
       cleanup?.()
+      if (probeDisposeRef.current === cleanup) probeDisposeRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engineState, state.mode, rulePageUrl])
@@ -1187,6 +1445,20 @@ export function PlayerPage() {
           }
           // 本集真正开播了：这之后的时间/结束事件才算数
           awaitingStartRef.current = false
+          /*
+           * v0.3.9：把「内核已经在拉流」这一步写进过程进度。
+           *
+           * 注意这里**不**把「注入播放器」判成功 —— 用户要的是「等到真的有画面/首帧」，
+           * 那个判据在主进程（mpv 的 width 属性 > 0，见 mpv.startTimePump）：
+           * `playing` 只说明内核开始拉了，地址失效/CDN 慢的时候它一样会先变成 playing。
+           */
+          void api.player.flowMark({
+            kind: 'detail',
+            stage: 'inject',
+            text: '内核已开始拉流，正在等待首帧画面…'
+          })
+          // 本轮已经真正开播过：此后不再显示「加载中」那一层（暂停不该被当成加载中）
+          setStartedOnce(true)
           // 记录本集开播时刻：自动连播的进度兜底要求「已经播够久」，避免刚开播就被判定为播完
           playStartedAtRef.current = Date.now()
           recordWatch()
@@ -1799,6 +2071,13 @@ export function PlayerPage() {
             if (!playingRef.current) void api.player.togglePause()
           }
           break
+        /**
+         * v0.3.9 补充：详情面板（画在悬浮窗里）点了「重跑」。
+         * 真正的链路在播放页，所以这里只是把意图接回来执行 —— 与 castPlay 同一个道理。
+         */
+        case 'retryStream':
+          retryStream()
+          break
       }
     })
     return off
@@ -1840,6 +2119,18 @@ export function PlayerPage() {
   useEffect(() => {
     if (!overlayActive) return
     const timer = window.setInterval(() => {
+      /*
+       * v0.3.9：**无论开没开播**都顺手拉一次「播放过程进度」。
+       *
+       * 这就是过程进度显示器的实时数据来源，走的是这条**既有**的 800ms 轮询
+       * （它本来就在「尚未开播」时每 800ms 问一次内核）——
+       * 用户明确要求「复用现有播放状态详情的实时推送，别再开一条每帧轮询」，
+       * 所以没有新增任何定时器，只是把同一次 tick 的另一个纯内存接口也读回来。
+       * `api.player.flow()` 不联网、不读磁盘，代价可以忽略。
+       */
+      void api.player.flow().then((fr) => {
+        if (fr.ok) setFlow(fr.data)
+      })
       if (playingRef.current) return
       void api.player.getState().then((r) => {
         if (!r.ok) return
@@ -1850,6 +2141,7 @@ export function PlayerPage() {
         awaitingStartRef.current = false
         if (!playStartedAtRef.current) playStartedAtRef.current = Date.now()
         setPlaying(true)
+        setStartedOnce(true)
         setRuleProbeFailed(false)
         if (probingRef.current) {
           probingRef.current = false
@@ -1927,7 +2219,11 @@ export function PlayerPage() {
        * 内容本身按"流地址 + 集数"缓存（castMediaRef），只有换集/换源时才重建，
        * 所以每一次推送传的都是同一个对象引用，代价可以忽略。
        */
-      castMedia: castMediaPayload()
+      castMedia: castMediaPayload(),
+      // v0.3.9：过程进度与自检说明跟着这条既有推送一起下去（悬浮窗画进度显示器要用）
+      flow,
+      selfCheckNote,
+      startedOnce
     })
   }, [
     overlayActive,
@@ -1954,7 +2250,11 @@ export function PlayerPage() {
     ruleProbeFailed,
     showEpisodes,
     showInfo,
-    resumeHint
+    resumeHint,
+    // v0.3.9：过程进度与自检说明也在这次推送里，必须进依赖表，否则悬浮窗看不到它们变化
+    flow,
+    selfCheckNote,
+    startedOnce
   ])
 
   /**
@@ -2697,6 +2997,9 @@ export function PlayerPage() {
           onToggleFullscreen={toggleFullscreen}
           aspect={aspect}
           onChangeAspect={changeAspect}
+          flow={flow}
+          selfCheckNote={selfCheckNote}
+          startedOnce={startedOnce}
           onTogglePause={() => void api.player.togglePause()}
           onSeek={(t) => {
             // 本地同步进度（暂停时内核不推送进度事件，避免进度条不响应）
@@ -2776,6 +3079,8 @@ export function PlayerPage() {
             className="h-full w-full"
             onPlay={() => {
               setPlaying(true)
+              // 本地 HTML5 回退路径也要标记「本轮已开播」，否则暂停时会被当成还在加载
+              setStartedOnce(true)
               recordWatch()
             }}
             onPause={() => setPlaying(false)}
@@ -3092,7 +3397,16 @@ export function PlayerPage() {
       )}
 
       {/* 流详情弹窗（顶部状态栏点击打开） */}
-      <StreamInfoModal open={showStreamInfo} onClose={() => setShowStreamInfo(false)} extraLog={statusLog} />
+      <StreamInfoModal
+        open={showStreamInfo}
+        onClose={() => setShowStreamInfo(false)}
+        extraLog={statusLog}
+        /*
+         * v0.3.9 补充：只有在线播放才给「重跑」——
+         * 本地播放没有「重新解析地址」这一步，传了回调反而会造出一个点了没用的假按钮。
+         */
+        onRetry={state.mode === 'rule' ? retryStream : undefined}
+      />
       {/* 断点续播的撤销提示（12 秒后自动消失） */}
       {resumeHint ? (
         <ResumeUndoHint
@@ -3178,7 +3492,10 @@ function EngineModeUI({
   subIdx,
   onToggleEpisodes,
   aspect,
-  onChangeAspect
+  onChangeAspect,
+  flow,
+  selfCheckNote,
+  startedOnce
 }: {
   title: string
   files: LocalVideoFile[]
@@ -3222,6 +3539,17 @@ function EngineModeUI({
   subs: { id: number; label: string }[]
   subIdx: number
   onToggleEpisodes: () => void
+  /** v0.3.9：播放过程进度（三阶段实时快照），来源是主进程 */
+  flow: PlayFlowSnapshot | null
+  /** v0.3.9：自检做过什么（非空时显示一行，用户要求不许静默） */
+  selfCheckNote: string
+  /**
+   * v0.3.9 补充：本轮是否**成功出过画面**。
+   *
+   * 这条药丸要靠它判断「悬浮窗那张居中进度卡现在还在不在」——
+   * 卡片只在「还没出过画面」时显示，两者必须互斥，否则屏幕上会同时出现两处进度提示。
+   */
+  startedOnce: boolean
 }) {
   const [subMenuOpen, setSubMenuOpen] = useState(false)
   const [aspectMenuOpen, setAspectMenuOpen] = useState(false)
@@ -3348,7 +3676,22 @@ function EngineModeUI({
                   : 'animate-pulse bg-warn'
             }`}
           />
-          {playStatus.text}
+          {/*
+            v0.3.9 补充：药丸里**同一时刻只说一件事**，而且**只在别处没有进度提示时才说**。
+
+            用户反馈「出现了两重提示：播放过程提示和加载提示…叠在一起」，给到的判据是
+            「进播放到出画面这段过程里，屏幕上只出现一处进度/加载提示」。
+            悬浮窗那张居中卡覆盖了「还没出画面」的整段时间，所以这一条药丸在那一整段时间里
+            必须闭嘴（否则就是卡片 + 药丸两处同时显示进度）。
+            它只在下面两种情况说话：
+              · 已经开播过（居中卡已经消失）× 流程还在跑（例如播放中触发的重嗅探）；
+              · 没有在跑的流程 → 退回原来的状态词（「播放中 / 已暂停」等，那不是进度提示）。
+          */}
+          {flow && flow.running && startedOnce && !videoError ? (
+            <PlayFlowStages flow={flow} compact tone="onVideo" />
+          ) : (
+            playStatus.text
+          )}
         </button>
         <div className="flex items-center gap-1">
           <TopBtn title="番剧详情" onClick={onToggleInfo}>
@@ -3490,22 +3833,17 @@ function EngineModeUI({
               <Camera size={20} />
             </button>
           </div>
-          {ruleProbing && !playing ? (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/60">
-              <Spinner size={26} />
-              <div className="text-xs text-white/70">正在解析视频流…</div>
-              <button
-                onPointerDown={(e) => {
-                  if (e.button !== 0) return
-                  e.stopPropagation()
-                  onExit()
-                }}
-                className="rounded-lg bg-white/15 px-3 py-1.5 text-xs text-white hover:bg-white/25 whitespace-nowrap"
-              >
-                ✕ 退出播放
-              </button>
-            </div>
-          ) : null}
+          {/*
+            v0.3.9 补充：这里**故意不再画**「加载中 + 过程进度」的居中整层。
+            用户反馈「刚进入播放器播放时出现了两重提示：播放过程提示和加载提示，两个相同作用的东西叠在一起」。
+            原因就是这一层与悬浮窗里那张提示卡同时存在：
+            悬浮窗是覆盖整个主窗口的透明窗口，它画在中心的那张卡正好压在这一层上面，
+            两个半透明黑底叠在一起，看起来就是两层提示糊在一块。
+            
+            现在统一成一处：**过程进度只由悬浮窗那张卡承担**（它是唯一保证画在原生视频窗口之上的层，
+            见 PlayerOverlayPage 的说明）。这一层整块去掉 —— 这也正是用户给的第二个选项
+            （「干脆去掉整层、由过程进度承担'正在加载'的表达」）。
+          */}
           {videoError ? (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/60">
               <div className="max-w-md text-center text-sm text-white">{videoError}</div>

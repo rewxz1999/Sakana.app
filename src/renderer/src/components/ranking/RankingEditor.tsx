@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { ArrowLeft, Check, Hash, ImageDown, Layers, Palette, Pencil, Trash2 } from 'lucide-react'
+import { Anchor, ArrowLeft, Check, Hash, ImageDown, Layers, Palette, Pencil, Trash2 } from 'lucide-react'
 import { Button, ConfirmModal, IconButton, Input, Modal } from '@/components/ui'
 import { ContextMenu, type ContextMenuItem } from '@/components/stat/ContextMenu'
 import { TierBoard, type DropTarget } from '@/components/ranking/TierBoard'
@@ -19,6 +19,7 @@ import {
   type RankingPool,
   type RankingTable,
   type RankingWork,
+  type RankingAnchor,
   type RankingSlot,
   type TierDef
 } from '@/stores/rankingTable'
@@ -54,11 +55,22 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
   const moveRanked = useRankingTable((s) => s.moveRanked)
   const removeRanked = useRankingTable((s) => s.removeRanked)
   const clearRanked = useRankingTable((s) => s.clearRanked)
+  const addAnchor = useRankingTable((s) => s.addAnchor)
+  const renameAnchor = useRankingTable((s) => s.renameAnchor)
+  const moveAnchor = useRankingTable((s) => s.moveAnchor)
+  const removeAnchor = useRankingTable((s) => s.removeAnchor)
   const poolVisible = useRankingTable((s) => s.poolVisible)
   const setPoolVisible = useRankingTable((s) => s.setPoolVisible)
 
   const [activePoolId, setActivePoolId] = useState<string | null>(table.pools[0]?.id ?? null)
-  const [drag, setDrag] = useState<{ workId: string; poolId: string | null } | null>(null)
+  /**
+   * 拖动状态：拖作品（可能来自池子或排名区）或拖锚点。
+   * 分成两种 kind 而不是再加一堆布尔，是因为"落点怎么解释"完全取决于拖的是什么：
+   * 拖作品 = 放到档里/分界线上；拖锚点 = 把锚点移到那条分界线的哪一格。
+   */
+  const [drag, setDrag] = useState<
+    { kind: 'work'; workId: string; poolId: string | null } | { kind: 'anchor'; anchorId: string } | null
+  >(null)
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null)
   const [menu, setMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null)
   const [colorPickTier, setColorPickTier] = useState<number | null>(null)
@@ -68,6 +80,8 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
   const [tierNameEdit, setTierNameEdit] = useState<{ index: number; draft: string } | null>(null)
   /** 右键标签 → 自定义颜色：正在挑哪一档的色 */
   const [tierColorEdit, setTierColorEdit] = useState<{ index: number; draft: string } | null>(null)
+  /** 锚点改名弹窗（刚加完锚点也会弹一次，让用户顺手起个名字） */
+  const [anchorNameEdit, setAnchorNameEdit] = useState<{ id: string; draft: string } | null>(null)
 
   const [setupOpen, setSetupOpen] = useState(false)
   const [pendingSetup, setPendingSetup] = useState<{ name: string; tiers: TierDef[]; moved: number } | null>(null)
@@ -90,19 +104,35 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
     if (!table.pools.some((p) => p.id === activePoolId)) setActivePoolId(table.pools[0].id)
   }, [table.pools, activePoolId])
 
-  /** 松手：把拖动项放进目标槽位（锚点为 null = 追加到该槽末尾） */
-  function handleDropWork(slot: RankingSlot, anchorId: string | null): void {
+  /**
+   * 松手：把拖动项放进目标槽位。
+   * `slot.position`（骑缝落在第几格）与 `slot.anchorId`（吸附到哪个锚点）由画布按坐标算好后带上来，
+   * 所以这里不再自己判断位置 —— 所见即所得（ghost 画在哪儿，作品就落在哪儿）。
+   */
+  function handleDropWork(slot: RankingSlot): void {
     const current = drag
     setDrag(null)
     setDropTarget(null)
-    if (!current) return
-    if (current.poolId) placeWork(table.id, current.poolId, current.workId, slot, anchorId)
-    else moveRanked(table.id, current.workId, slot, anchorId)
+    if (!current || current.kind !== 'work') return
+    if (current.poolId) placeWork(table.id, current.poolId, current.workId, slot)
+    else moveRanked(table.id, current.workId, slot)
     if (slot.straddle) {
+      const anchor = slot.anchorId ? table.anchors.find((a) => a.id === slot.anchorId) : null
       toast.success(
-        `已骑缝：同时计入「${table.tiers[slot.tierIndex]?.name}」和「${table.tiers[slot.tierIndex + 1]?.name}」`
+        anchor
+          ? `已钉在锚点「${anchor.name || '未命名'}」上（同时计入上下两档）`
+          : `已骑缝：落在「${table.tiers[slot.tierIndex]?.name}」与「${table.tiers[slot.tierIndex + 1]?.name}」的分界线上`
       )
     }
+  }
+
+  /** 锚点落定：沿分界线（或换一条分界线）移动 */
+  function handleDropAnchor(anchorId: string, tierIndex: number, slot: number): void {
+    setDrag(null)
+    setDropTarget(null)
+    moveAnchor(table.id, anchorId, tierIndex, slot)
+    const anchor = table.anchors.find((a) => a.id === anchorId)
+    toast.success(anchor ? `锚点「${anchor.name || '未命名'}」已移动` : '锚点已移动')
   }
 
   function endDrag(): void {
@@ -112,10 +142,76 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
 
   /** 把某个作品挪到指定槽位（右键菜单里的「移到…」，与拖动等价） */
   function moveToSlot(workId: string, slot: RankingSlot): void {
-    moveRanked(table.id, workId, slot, null)
+    moveRanked(table.id, workId, slot)
     const upper = table.tiers[slot.tierIndex]?.name ?? ''
     const lower = table.tiers[slot.tierIndex + 1]?.name ?? ''
-    toast.success(slot.straddle ? `已骑缝：同时计入「${upper}」和「${lower}」` : `已移到「${upper}」`)
+    toast.success(slot.straddle ? `已骑缝：落在「${upper}」与「${lower}」的分界线上` : `已移到「${upper}」`)
+  }
+
+  /** 分界线的右键菜单：在这条线上加锚点（用户要求"可以给分界线上添加锚点"） */
+  function openBoundaryMenu(e: React.MouseEvent, tierIndex: number, slot: number): void {
+    e.preventDefault()
+    e.stopPropagation()
+    const upper = table.tiers[tierIndex]?.name ?? ''
+    const lower = table.tiers[tierIndex + 1]?.name ?? ''
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        {
+          key: 'add-anchor',
+          label: `在「${upper} / ${lower}」分界线上加锚点`,
+          icon: <Anchor size={13} />,
+          onSelect: () => {
+            const r = addAnchor(table.id, tierIndex, slot)
+            if (!r.ok) {
+              toast.warn(r.message)
+              return
+            }
+            setAnchorNameEdit({ id: r.anchor.id, draft: '' })
+          }
+        }
+      ]
+    })
+  }
+
+  /** 锚点的右键菜单：改名 / 删除（删除后钉着的作品回落到普通骑缝位置，不丢作品） */
+  function openAnchorMenu(e: React.MouseEvent, anchor: RankingAnchor): void {
+    e.preventDefault()
+    e.stopPropagation()
+    const pinned = table.items.filter((it) => it.anchorId === anchor.id).length
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        {
+          key: 'anchor-rename',
+          label: '给锚点改名…',
+          icon: <Pencil size={13} />,
+          onSelect: () => setAnchorNameEdit({ id: anchor.id, draft: anchor.name })
+        },
+        {
+          key: 'anchor-delete',
+          label: '删除锚点',
+          icon: <Trash2 size={13} />,
+          danger: true,
+          divider: true,
+          onSelect: () => {
+            const kept = removeAnchor(table.id, anchor.id)
+            toast.success(
+              kept > 0
+                ? `已删除锚点，${kept} 部作品回落到分界线上的原位置`
+                : '已删除锚点'
+            )
+          }
+        },
+        {
+          key: 'anchor-pinned',
+          label: pinned > 0 ? `（这个锚点钉着 ${pinned} 部作品）` : '（这个锚点还没有作品）',
+          onSelect: () => undefined
+        }
+      ]
+    })
   }
 
   /** 排名区条目的右键菜单（用户明确要求「右键排名区域的作品可以移除」） */
@@ -123,21 +219,24 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
     e.preventDefault()
     e.stopPropagation()
     const work = table.items.find((it) => it.work.id === workId)?.work
+    const item = table.items.find((it) => it.work.id === workId)
     const tierItems: ContextMenuItem[] = table.tiers.map((tier, i) => ({
       key: `tier-${i}`,
       label: `移到「${tier.name}」`,
       onSelect: () => moveToSlot(workId, { tierIndex: i, straddle: false }),
       divider: i === 0
     }))
-    // 骑缝位（两档的分界线）也放进菜单：不想拖拽的用户要能同样精确地表达"同时计入上下两档"
+    // 分界线也放进菜单：不想拖拽的用户要能同样精确地表达"落在分界线上"
     for (let i = 0; i < table.tiers.length - 1; i += 1) {
       tierItems.push({
         key: `straddle-${i}`,
-        label: `骑缝：同时计入「${table.tiers[i].name}」+「${table.tiers[i + 1].name}」`,
-        onSelect: () => moveToSlot(workId, { tierIndex: i, straddle: true }),
+        label: `骑缝：落在「${table.tiers[i].name}」/「${table.tiers[i + 1].name}」分界线`,
+        onSelect: () => moveToSlot(workId, { tierIndex: i, straddle: true, position: item?.slot ?? 0 }),
         divider: i === 0
       })
     }
+    // 钉到锚点：只在同一条分界线上有锚点时给（跨分界线挪锚点没有意义，位置会差很远）
+    const anchorsHere = item?.straddle ? table.anchors.filter((a) => a.tierIndex === item.tierIndex) : []
     const items: ContextMenuItem[] = [
       {
         key: 'remove',
@@ -161,6 +260,51 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
         onSelect: () => setMenu({ x: e.clientX, y: e.clientY, items: tierItems })
       }
     ]
+    if (anchorsHere.length > 0 && item) {
+      items.push({
+        key: 'pin',
+        label: '钉到锚点',
+        icon: <Anchor size={13} />,
+        divider: true,
+        onSelect: () =>
+          setMenu({
+            x: e.clientX,
+            y: e.clientY,
+            items: [
+              ...anchorsHere.map((a) => ({
+                key: `pin-${a.id}`,
+                label: `${item.anchorId === a.id ? '✓ ' : ''}${a.name || '未命名'}（第 ${a.slot + 1} 格）`,
+                onSelect: () => {
+                  moveRanked(table.id, workId, {
+                    tierIndex: item.tierIndex,
+                    straddle: true,
+                    position: a.slot,
+                    anchorId: a.id
+                  })
+                  toast.success(`已钉在锚点「${a.name || '未命名'}」上`)
+                }
+              })),
+              ...(item.anchorId
+                ? [
+                    {
+                      key: 'unpin',
+                      label: '解除锚点（留在分界线原位）',
+                      divider: true,
+                      onSelect: () => {
+                        moveRanked(table.id, workId, {
+                          tierIndex: item.tierIndex,
+                          straddle: true,
+                          position: item.slot
+                        })
+                        toast.success('已解除锚点，作品留在分界线上的原位置')
+                      }
+                    }
+                  ]
+                : [])
+            ]
+          })
+      })
+    }
     setMenu({ x: e.clientX, y: e.clientY, items })
   }
 
@@ -332,6 +476,23 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
     setTierColorEdit(null)
   }
 
+  /** 提交锚点名字（空名字允许 = 界面显示「未命名」；已经建好的锚点不需要再删） */
+  function submitAnchorName(): void {
+    if (!anchorNameEdit) return
+    const draft = anchorNameEdit.draft.trim()
+    if (draft.length === 0) {
+      setAnchorNameEdit(null)
+      return
+    }
+    const r = renameAnchor(table.id, anchorNameEdit.id, draft)
+    if (!r.ok) {
+      toast.warn(r.message)
+      return
+    }
+    toast.success('锚点名字已更新')
+    setAnchorNameEdit(null)
+  }
+
   const poolDialogPool = poolDialog?.poolId ? table.pools.find((p) => p.id === poolDialog.poolId) : null
 
   /** 作品池弹窗的提交（新建 / 重命名共用，靠 poolDialog.mode 区分） */
@@ -465,8 +626,8 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
               setSearchOpen(true)
             }}
             onCollapse={() => setPoolVisible(false)}
-            draggingWorkId={drag?.workId ?? null}
-            onDragStartWork={(workId, poolId) => setDrag({ workId, poolId })}
+            draggingWorkId={drag?.kind === 'work' ? drag.workId : null}
+            onDragStartWork={(workId, poolId) => setDrag({ kind: 'work', workId, poolId })}
             onDragEnd={endDrag}
           />
         ) : (
@@ -480,14 +641,19 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
         <div className="min-h-0 min-w-0 flex-1">
           <TierBoard
             table={table}
-            draggingWorkId={drag?.workId ?? null}
+            draggingWorkId={drag?.kind === 'work' ? drag.workId : null}
+            draggingAnchorId={drag?.kind === 'anchor' ? drag.anchorId : null}
             dropTarget={dropTarget}
             onHover={setDropTarget}
             onDropWork={handleDropWork}
-            onDragStartWork={(workId) => setDrag({ workId, poolId: null })}
+            onDropAnchor={handleDropAnchor}
+            onDragStartWork={(workId) => setDrag({ kind: 'work', workId, poolId: null })}
+            onDragStartAnchor={(anchorId) => setDrag({ kind: 'anchor', anchorId })}
             onDragEnd={endDrag}
             onItemContextMenu={(e, item) => openRankedMenu(e, item.work.id)}
             onTierContextMenu={openTierMenu}
+            onAnchorContextMenu={openAnchorMenu}
+            onBoundaryContextMenu={openBoundaryMenu}
             colorPickTier={colorPickTier}
             onToggleColorPick={(i) => setColorPickTier((cur) => (cur === i ? null : i))}
             onPickColor={(i, color) => setTierColor(table.id, i, color)}
@@ -543,6 +709,37 @@ export function RankingEditor({ table, onBack }: { table: RankingTable; onBack: 
         }}
         onClose={() => setConfirmRemovePool(null)}
       />
+
+      {/* 锚点改名（刚加完锚点会主动弹一次：用户要求锚点"能有名字"） */}
+      <Modal open={anchorNameEdit !== null} onClose={() => setAnchorNameEdit(null)} title="锚点名字" width={420}>
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-dim">
+            <Anchor size={13} className="text-accent" /> 给这个锚点起个名字
+          </div>
+          <Input
+            value={anchorNameEdit?.draft ?? ''}
+            autoFocus
+            maxLength={16}
+            placeholder="例如：神作线 / 本命 / 待定"
+            onChange={(e) => setAnchorNameEdit((cur) => (cur ? { ...cur, draft: e.target.value } : cur))}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') submitAnchorName()
+            }}
+          />
+          <div className="text-[11px] leading-relaxed text-faint">
+            留空也可以（界面会显示「未命名」）。锚点用来把作品钉在分界线的固定位置，
+            拖动锚点会带着它上面的作品一起移动。
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => setAnchorNameEdit(null)}>
+              取消
+            </Button>
+            <Button icon={Check} onClick={submitAnchorName}>
+              保存
+            </Button>
+          </div>
+        </div>
+      </Modal>
 
       {/* 右键标签 → 改标签内容 */}
       <Modal open={tierNameEdit !== null} onClose={() => setTierNameEdit(null)} title="改标签内容" width={420}>

@@ -77,6 +77,8 @@ export function TaskRow({ task }: { task: DownloadTask }) {
           {task.animeTitle}
           {task.episode != null ? ` · 第${task.episode}集` : ''}
           {task.group ? ` · ${task.group}` : ''}
+          {/* 标注任务实际交给哪个下载器（双下载器模式下一眼看出分配结果；老任务没有 engine 则不显示） */}
+          {task.engine ? ` · ${task.engine === 'qbit' ? 'qBittorrent' : 'aria2'}` : ''}
         </div>
         {!done ? (
           <div className="mt-1.5 flex items-center gap-2">
@@ -115,11 +117,28 @@ export function TaskRow({ task }: { task: DownloadTask }) {
             </IconButton>
           ) : controllable ? (
             task.status === 'paused' ? (
-              <IconButton title="继续" className="h-7 w-7" onClick={() => void api.downloads.resume(task.id)}>
+              <IconButton
+                title="继续"
+                className="h-7 w-7"
+                onClick={() => {
+                  void api.downloads.resume(task.id).then((r) => {
+                    // v0.3.9 体检 M5：以前直接 void 掉，下载器挂了时按钮毫无反馈（用户以为点坏了）
+                    if (!r.ok) toast.error(r.error)
+                  })
+                }}
+              >
                 <Play size={13} />
               </IconButton>
             ) : (
-              <IconButton title="暂停" className="h-7 w-7" onClick={() => void api.downloads.pause(task.id)}>
+              <IconButton
+                title="暂停"
+                className="h-7 w-7"
+                onClick={() => {
+                  void api.downloads.pause(task.id).then((r) => {
+                    if (!r.ok) toast.error(r.error)
+                  })
+                }}
+              >
                 <Pause size={13} />
               </IconButton>
             )

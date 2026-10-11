@@ -7,6 +7,7 @@ import type { DanmakuSettings } from '@shared/types'
 import { anime4kChain } from '@shared/anime4k'
 import { BROWSER_UA, getSettings } from '../net'
 import { danmakuApiBase } from './danmaku'
+import { beginStage, failStage, endFlow, flowDetail, flowRunning, pushStep, succeedStage } from './playFlow'
 import { log } from '../log'
 import { store } from '../store'
 
@@ -82,6 +83,14 @@ let lastLength = 0
 let lastEof = false
 /** 上一次同步给渲染层的音量（v0.2.18：uosc 的音量滑杆直接改 mpv 属性，必须同步回来） */
 let lastVolume = -1
+/**
+ * 上一次轮询时画面是否已经就绪（v0.3.9）。
+ *
+ * 「注入播放器」阶段的完成判据是「真的有画面」（见 startTimePump 里的说明），
+ * 这个标志只用来把「第一次解出视频帧」那一刻变成一次 `succeedStage`，
+ * 而不是每 250ms 都调一次。
+ */
+let lastHadPicture = false
 let currentBounds: MpvBounds | null = null
 /** 视频输出窗口是否可见（探针网页视图占用同一区域时置 false） */
 let surfaceVisible = true
@@ -281,6 +290,144 @@ function toPhysical(win: BrowserWindow, b: MpvBounds): MpvBounds {
   }
 }
 
+/**
+ * 当前视频宽度（px），没有画面时返回 0（v0.3.9）。
+ *
+ * 读的是 mpv 的 `width` 属性（等价于 `video-params/w`）：它在**解码器产出第一帧之后**
+ * 才有值，因此是「真的有画面」而不是「地址交出去了」的判据。
+ * 读不到（未 attach / 属性不存在）一并返回 0，调用方不需要区分。
+ */
+function videoWidth(): number {
+  const n = native
+  if (!n || !ready) return 0
+  try {
+    const v = Number(n.getProperty('width'))
+    return Number.isFinite(v) && v > 0 ? Math.round(v) : 0
+  } catch {
+    return 0
+  }
+}
+
+/** 读一个 mpv 字符串属性（容错：内核未就绪 / 属性不存在时返回空串） */
+function mpvStringProp(name: string): string {
+  const n = native
+  if (!n || !ready) return ''
+  try {
+    const v = n.getProperty(name)
+    return typeof v === 'string' ? v : v == null ? '' : String(v)
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 「有声音没画面」的现场状态（v0.3.9）。
+ *
+ * ## 为什么必须把它做成明确状态，而不是让用户描述
+ *
+ * 用户的描述是「把播放资源交给播放内核时卡住，听到了几秒声音但没有任何画面」。
+ * 这句话里藏着**两个完全不同的故障**，而界面当时把它们显示成了同一个「进行中」：
+ *   ① 内核解出了音频、但**视频轨没解出首帧**（画面宽度恒为 0）—— 这才是「没有画面」，
+ *      判据是 mpv 的 `width` 属性；
+ *   ② 视频其实解出来了（width > 0），只是**原生子窗口没显示/被盖住/尺寸不对** ——
+ *      那属于窗口层，得看 `mpvDiagnostics()` + `mpvHitTest`（本文件与 ipc 的 surfaceDebug）。
+ * 只写「等待首帧画面…」既分不清这两类，也让用户以为播放器死了。
+ *
+ * 所以这里只记**真实字段**：`ms`（连续有声无画的时长，现算，不做假进度）与
+ * `videoTrack`（mpv 报的视频轨编码，空 = 这个流根本没有视频轨）。
+ */
+interface AudioOnlyState {
+  /** 音频开始出声的时刻（mpv 的 time 在前进但没有画面）；0 = 当前不处于该状态 */
+  since: number
+  /** 已经连续多久有声无画（ms，现算） */
+  ms: number
+  /** mpv 报出的视频轨编码（空串 = 没有视频轨） */
+  videoTrack: string
+  /** 已经给过结论就不再重复刷阶段与日志 */
+  concluded: boolean
+}
+
+const audioOnly: AudioOnlyState = { since: 0, ms: 0, videoTrack: '', concluded: false }
+
+/**
+ * 连续「有声无画」多久之后给用户一个明确结论。
+ *
+ * 15 秒的依据：正常站点首帧在 1~4 秒内就出来了（实测见 .e2e 的 play-flow 日志「注入播放器=4s/ok」），
+ * 15 秒还没画面就基本可以断定不是"再等等就好"，而是真的缺东西。
+ */
+const AUDIO_ONLY_CONCLUDE_MS = 15000
+
+function resetAudioOnly(): void {
+  audioOnly.since = 0
+  audioOnly.ms = 0
+  audioOnly.videoTrack = ''
+  audioOnly.concluded = false
+}
+
+/**
+ * 每 250ms 由时间泵调用：维护「有声无画」状态，拖太久就给出**可读的结论**。
+ *
+ * 与工单的原则一致：不造假状态、不假装成功。画面真出来了就成功（上层 succeedStage），
+ * 一直没出来就到点说清楚是「流里只有音频」还是「有视频轨但解不出画面」。
+ */
+function trackAudioOnly(playing: boolean, hasPicture: boolean, t: number): void {
+  // 暂停 / 结束不算「有声无画」；但也不清结论，用户可能正看着那条结论
+  if (!playing) return
+  if (hasPicture) {
+    if (audioOnly.since !== 0) {
+      log.append('info', 'mpv', `画面已出现：音频先行了 ${(audioOnly.ms / 1000).toFixed(1)}s 才出首帧`)
+    }
+    resetAudioOnly()
+    return
+  }
+  /*
+   * 内核已经"在播"但音频时间还没往前走（还在建缓冲）：这也是「没有画面」，
+   * 但原因不同（还没开始解码 vs 解出了音频没解出画面），说明文字必须区分开。
+   */
+  if (t <= 0) {
+    if (flowRunning()) flowDetail('inject', '内核已开始拉流，正在等待首帧画面…')
+    return
+  }
+  if (audioOnly.since === 0) {
+    audioOnly.since = Date.now()
+    audioOnly.videoTrack = mpvStringProp('video-codec')
+    log.append(
+      'warn',
+      'mpv',
+      `已开始解码音频但没有画面（音频时间 ${t.toFixed(1)}s，视频轨=${audioOnly.videoTrack || '（内核未报出）'}）`
+    )
+  }
+  audioOnly.ms = Date.now() - audioOnly.since
+  if (audioOnly.concluded || audioOnly.ms < AUDIO_ONLY_CONCLUDE_MS) {
+    // 还没到点：把「现在到底缺什么」如实写进阶段说明，界面就会显示「有声无画 3.2s」
+    if (flowRunning()) {
+      flowDetail(
+        'inject',
+        `已开始解码音频，但画面还没出来（有声无画 ${(audioOnly.ms / 1000).toFixed(1)}s）` +
+          (audioOnly.videoTrack ? `，视频轨 ${audioOnly.videoTrack}` : '，内核未报出视频轨')
+      )
+    }
+    return
+  }
+  audioOnly.concluded = true
+  const sec = (audioOnly.ms / 1000).toFixed(0)
+  const why = audioOnly.videoTrack
+    ? `内核已解出音频 ${sec} 秒，但视频轨（${audioOnly.videoTrack}）没有解出画面：可能是该编码的解码器不可用，或画面窗口没能显示`
+    : `内核已解出音频 ${sec} 秒，但这个流里没有视频轨（只有音频）：站点给的地址很可能不是真正的画面流`
+  log.append(
+    'warn',
+    'mpv',
+    `有声无画结论：${why}｜画面窗口=${JSON.stringify(mpvDiagnosticBounds())} 内核=${JSON.stringify(mpvDiagnostics())}`
+  )
+  if (flowRunning()) {
+    /*
+     * 归因：没有视频轨 = 站点给的地址不对（该换源）；有视频轨但解不出来 = 编码/解码器问题。
+     * 两者都不是「网络慢，再等等」，所以用 failStage 给结论，而不是让它一直转圈。
+     */
+    failStage('inject', why, audioOnly.videoTrack ? 'format' : 'site')
+  }
+}
+
 function startTimePump(win: BrowserWindow): void {
   stopTimePump()
   timeTimer = setInterval(() => {
@@ -356,6 +503,50 @@ function startTimePump(win: BrowserWindow): void {
       }
       if (!st.eof) lastEof = false
       if (playing) sendEvent(win, { type: 'time', time: st.time, length: st.length, playing: true })
+      /*
+       * 「注入播放器」阶段什么时候算完成（v0.3.9）。
+       *
+       * 判据用 **mpv 的 `width` 属性 > 0**：它来自 `video-params`，
+       * 只有解码器真的解出了视频帧才会有值 —— 这正好对应用户要的
+       * 「等到真的有画面/首帧」，而不是「loadfile 返回成功」（那只是把地址交出去了：
+       * 地址失效 / CDN 慢的时候 loadfile 一样成功，但一辈子不会有画面）。
+       * 每 250ms 只读一个属性，开销可忽略；一旦确认就置位到下一次 mpvPlay。
+       */
+      const picW = videoWidth()
+      const hasPicture = playing && picW > 0
+      /*
+       * v0.3.9：先跑「有声无画」跟踪，再写成功/等待说明。
+       *
+       * 顺序有讲究（自检里实测踩到）：如果先写那句通用的「正在等待首帧画面…」，
+       * 那么到点给出结论的那一帧，阶段说明会被这句通用文案覆盖掉 ——
+       * 结论本身（summary）是对的，但详情面板上少了「有声无画 Ns」这个最关键的现场。
+       */
+      trackAudioOnly(playing, hasPicture, st.time ?? 0)
+      if (hasPicture && !lastHadPicture) {
+        lastHadPicture = true
+        succeedStage('inject', `画面已就绪（首帧已解码，视频宽 ${picW}px）`)
+        /*
+         * 首帧出现 = 整轮播放流程达成（v0.3.9）。
+         * 在这里收尾而不是在 `playing` 事件上：`playing` 只说明内核开始拉流，
+         * 地址失效/CDN 慢的时候它一样会先变 playing，但永远不会有画面。
+         */
+        endFlow({ ok: true, summary: `已开始播放（三阶段完成，画面 ${picW}px）` })
+        /*
+         * v0.3.9：首帧出现这一刻**再提升一次**原生子窗口。
+         *
+         * 为什么不能只靠 400ms 的定时提升：mpv 的视频输出窗口是在视频轨初始化时才真正
+         * 开始出画（`mpv` 那个子窗口这时才有内容），而 Chromium 的合成层在这前后随时可能
+         * 把页面提到上层。首帧是「画面必须可见」的唯一时刻，这里补一次成本极低
+         * （SetWindowPos + 一次重绘），却能把「有声音没画面」里属于窗口层的那一类直接消掉。
+         */
+        lastRaiseAt = 0
+        raiseSurface()
+      }
+      /*
+       * 注意这里**没有** else 分支再去写「等待首帧画面…」：
+       * 「有画面之前的说明文字」只有一个主人 —— 上面的 trackAudioOnly，
+       * 否则两处会互相覆盖（自检里实测到过：到点给结论的那一帧被通用文案盖掉）。
+       */
       /*
        * v0.2.18：音量同步。uosc 的竖排音量滑杆直接改 mpv 的 volume 属性
        * （不经过应用的 IPC），不同步的话渲染层那份 playerVolume 会一直是旧值 ——
@@ -1714,6 +1905,33 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
       'load-scripts': 'no',
       // v0.3.6：音量上限抬到 200%（用户反馈 100% 偏小）；不设这条的话 volume 会被夹回 100
       'volume-max': String(VOLUME_MAX),
+      /*
+       * ── v0.3.9：方案二实验开关（默认关闭）──
+       *
+       * 用户在工单里提的方案二：`--input-cursor-passthrough=yes`（mpv 把落在自己窗口上的
+       * 鼠标事件透传给**下面**的窗口，而不是自己处理）。
+       *
+       * 为什么默认关、只做实验开关：
+       *   ① 方向不对症 —— 本项目「按钮点不动」的根因是**悬浮窗在 mpv 之上**（见
+       *      playerOverlay.ts 的文件头）。这个选项解决的是"mpv 在别人之上、想把手让给下面"，
+       *      与"上面那层要不要把手让给 mpv"是相反的箭头；
+       *   ② 它会把鼠标从 mpv 手里拿走（uosc 的按钮/进度条拖动全靠 mpv 收鼠标），
+       *      开着它反而可能让控制栏和 uosc 都点不动。
+       *   ③ **实测结论（v0.3.9，本机）**：这条选项在随包的 libmpv 里**存在**
+       *      （120MB 的 libmpv-2.dll 里有 `input-cursor-passthrough` 字符串），加上它之后
+       *      mpv 也能正常初始化（嵌入成功、uosc 照常加载），但视频子窗口的**扩展样式没有变化**：
+       *      开与不开都是 `ex=0x4`（WS_EX_NOPARENTNOTIFY），**没有出现 `WS_EX_TRANSPARENT(0x20)`**，
+       *      `WindowFromPoint` 的命中结果也完全一样。原因是本项目用 `--wid` 把 mpv 嵌进
+       *      **我们自己创建的**子窗口（native/mpv/src/addon.cc 的 CreateChildWindow），
+       *      mpv 不拥有那个窗口，窗口级选项落不到它身上。
+       *      复现：`SAKANA_UOSC_TEST=<视频> SAKANA_UOSC_HOLD=6 electron .` 跑两次（第二次加
+       *      `SAKANA_MPV_CURSOR_PASSTHROUGH=1`），对比日志里的 `[uosc-test] 窗口树=` 一行（含 `ex`）。
+       *      ⇒ 所以这条**不作为**修复手段，只留成实验开关，默认关闭。
+       *
+       * 注意：addon.cc 里 `mpv_set_option_string` 的返回值是**不检查**的（见 addon.cc:302），
+       * 所以即使这条选项在某个 libmpv 版本里不存在，也只会被忽略，不会导致初始化失败。
+       */
+      ...(process.env.SAKANA_MPV_CURSOR_PASSTHROUGH ? { 'input-cursor-passthrough': 'yes' } : {}),
       ...(cfgDir ? { 'config-dir': slashPath(cfgDir), config: 'yes' } : {}),
       ...(scriptOptsParts.length > 0 ? { 'script-opts': scriptOptsParts.join(',') } : {})
     }
@@ -1809,13 +2027,121 @@ export function mpvDiagnosticBounds(): MpvBounds | null {
   return { ...currentBounds }
 }
 
+/**
+ * 画面区域的最小可用尺寸（CSS px）。
+ *
+ * 为什么需要这条下限：视频不是网页画的，而是主窗口里的一个原生子窗口，
+ * 它**只认渲染层上报的那个矩形**。而页面在「布局还没稳 / 抽屉展开动画中途 /
+ * 全屏切换的两帧之间」会量到一个退化矩形（0 宽或几像素），照它 resize 的后果是
+ * 画面窗口被缩成 1px —— **声音照常、画面看不见**（用户报的「有声音没画面」里最隐蔽的一类）。
+ * 正常播放区的宽高都不可能小于 16px，所以这个判据不会误伤真正的布局变化。
+ */
+const MIN_SURFACE_PX = 16
+
+let lastDegenerateBoundsLog = ''
+
 export function mpvSetBounds(bounds: MpvBounds): void {
   if (!ready || !native || !attachedWin) return
+  if (!(bounds.width >= MIN_SURFACE_PX) || !(bounds.height >= MIN_SURFACE_PX)) {
+    /*
+     * 退化矩形：**忽略，保留上一次可用矩形**（不写 currentBounds，也就不动窗口）。
+     * 记一行日志（同样的退化值只记一次），这样「有没有发生过」「发生的是哪种」事后可查；
+     * 但绝不把它当成新的画面区域 —— 那正是把画面弄丢的做法。
+     */
+    const key = `${Math.round(bounds.x)},${Math.round(bounds.y)},${Math.round(bounds.width)}x${Math.round(bounds.height)}`
+    if (key !== lastDegenerateBoundsLog) {
+      lastDegenerateBoundsLog = key
+      log.append(
+        'warn',
+        'mpv',
+        `忽略退化的画面区域上报（${key}）：低于 ${MIN_SURFACE_PX}px 不可能是真实布局，继续用 ${
+          currentBounds ? `${currentBounds.width}x${currentBounds.height}` : '未设置'
+        }`
+      )
+    }
+    return
+  }
+  lastDegenerateBoundsLog = ''
   currentBounds = toPhysical(attachedWin, bounds)
   try {
     native.resize(currentBounds)
   } catch {
     /* ignore */
+  }
+}
+
+/**
+ * 播放内核的现场读数（v0.3.9 自检用）。
+ *
+ * 用户报的两类现象之一就是「播放器销毁后没重建，界面却以为还在播」。
+ * 判定它必须能看到**主进程侧**的真实情况：内核实例在不在（ready/native）、
+ * 挂载的目标窗口是不是已经销毁（attachedWin.isDestroyed）、有没有留下尺寸记录。
+ * 这几个变量都是模块私有的，所以由模块导出读数，自检再据此决定要不要重建。
+ */
+export function mpvDiagnostics(): {
+  nativeLoaded: boolean
+  ready: boolean
+  attached: boolean
+  attachedDestroyed: boolean
+  hasBounds: boolean
+  surfaceVisible: boolean
+  hasPicture: boolean
+  timePumpRunning: boolean
+} {
+  return {
+    nativeLoaded: native !== null,
+    ready,
+    attached: attachedWin !== null,
+    /*
+     * 「attach 目标窗口已销毁」是最典型的错配：main 这边还攥着一个死窗口，
+     * 渲染层却以为画面在自己的窗口里 —— 于是所有后续 setBounds/raise 都作用在尸体上，
+     * 用户看到的就是「有声音没画面」或「操作没反应」。
+     */
+    attachedDestroyed: !!attachedWin && attachedWin.isDestroyed(),
+    hasBounds: currentBounds !== null,
+    surfaceVisible,
+    hasPicture: lastHadPicture,
+    timePumpRunning: timeTimer !== null
+  }
+}
+
+/**
+ * 「到底有没有画面」的现场（v0.3.9，供 surfaceDebug / 自检读）。
+ *
+ * 这是判「有声音没画面」归属的**唯一硬数据**：
+ *   · `hasPicture=false` 且 `audioOnlyMs>0` → 画面根本没解出来（流/解码问题）；
+ *   · `hasPicture=true` 而用户仍看不到 → 那是窗口层的问题（子窗口被盖住/尺寸/可见性），
+ *     配合 `mpvDiagnostics()` 与 `mpvHitTest()` 继续查。
+ * 没有这两个字段时，用户报「没有画面」我们只能猜；有了它，一次截图就能定性。
+ */
+export function mpvSurfaceInfo(): {
+  width: number
+  height: number
+  videoCodec: string
+  audioCodec: string
+  hasPicture: boolean
+  audioOnlyMs: number
+  audioOnlyReason: string
+} {
+  return {
+    width: videoWidth(),
+    height: (() => {
+      try {
+        const v = Number(native?.getProperty('height'))
+        return Number.isFinite(v) && v > 0 ? Math.round(v) : 0
+      } catch {
+        return 0
+      }
+    })(),
+    videoCodec: mpvStringProp('video-codec'),
+    audioCodec: mpvStringProp('audio-codec'),
+    hasPicture: lastHadPicture,
+    audioOnlyMs: audioOnly.ms,
+    audioOnlyReason: audioOnly.concluded
+      ? audioOnly.videoTrack
+        ? `已解出音频但视频轨（${audioOnly.videoTrack}）没有画面`
+        : '已解出音频但没有视频轨（流里只有音频）'
+      : ''
   }
 }
 
@@ -1833,6 +2159,15 @@ export function mpvPlay(path: string, referer?: string, cookies?: string): void 
   lastPlaying = false
   lastEof = false
   lastLength = 0
+  /*
+   * v0.3.9：「注入播放器」阶段从这里开始计时 ——
+   * 这才是真正「把播放资源交给播放器」的那一刻（loadfile），
+   * 之前的嗅探/校验都属于「获取播放资源」。阶段完成要等 startTimePump 看到首帧。
+   */
+  lastHadPicture = false
+  resetAudioOnly()
+  beginStage('inject', '正在把播放资源交给播放内核（loadfile）')
+  pushStep('inject', `交给内核：${path.slice(0, 100)}${referer ? `（带 Referer）` : ''}${cookies ? '（带 Cookie）' : ''}`)
   // 新媒体的视频输出窗口会在首帧时重建，届时需要再挂一次
   pendingReparent = true
   const loaded = native.command(['loadfile', path, 'replace'])

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Camera,
   CircleCheck,
+  Download,
   Clock,
   ExternalLink,
   FolderOpen,
@@ -9,6 +10,7 @@ import {
   Gamepad2,
   Image as ImageIcon,
   MonitorPlay,
+  Music,
   Play,
   RotateCcw,
   Search,
@@ -24,6 +26,8 @@ import { Button, ConfirmModal, EmptyState, IconButton, Input, Modal, Spinner } f
 import {
   Cover,
   fmtPlay,
+  GalBgmModal,
+  GalBgmSavedModal,
   GalContextMenu,
   GalDetailView,
   GalShotsModal,
@@ -56,6 +60,8 @@ export function GalgameLibraryPage() {
   const [menu, setMenu] = useState<GalMenuState | null>(null)
   const [shotsGame, setShotsGame] = useState<GalGame | null>(null)
   const [ymgalGame, setYmgalGame] = useState<GalGame | null>(null)
+  const [bgmGame, setBgmGame] = useState<GalGame | null>(null)
+  const [bgmSavedGame, setBgmSavedGame] = useState<GalGame | null>(null)
   const [removing, setRemoving] = useState<GalGame | null>(null)
 
   // 站点搜索统计
@@ -188,6 +194,8 @@ export function GalgameLibraryPage() {
     const items: GalMenuItem[] = [
       { key: 'launch', icon: Play, label: running[g.id] ? '游戏中' : '启动游戏', onSelect: () => void onLaunch(g) },
       { key: 'ymgal', icon: Search, label: '从月幕galgame中搜索详情', onSelect: () => setYmgalGame(g) },
+      { key: 'bgm', icon: Music, label: '查看最近识别的 bgm 名称（可复制）', onSelect: () => setBgmGame(g) },
+      { key: 'bgmSaved', icon: Download, label: '最近保存的 bgm', onSelect: () => setBgmSavedGame(g) },
       { key: 'sites', icon: ExternalLink, label: '在资源站搜索该游戏', onSelect: () => searchForGame(g) },
       { key: 'cover', icon: ImageIcon, label: '设置自定义封面', onSelect: () => void setCustomCover(g) },
       { key: 'folder', icon: FolderOpen, label: '打开游戏目录', onSelect: () => void openFolder(g) },
@@ -437,6 +445,11 @@ export function GalgameLibraryPage() {
                     <div className="line-clamp-2 text-[13px] font-medium leading-snug" title={game.titleCn || game.title}>
                       {game.titleCn || game.title}
                     </div>
+                    {game.chapterName ? (
+                      <div className="line-clamp-1 text-[10px] text-faint" title={`章节：${game.chapterName}`}>
+                        章节：{game.chapterName}
+                      </div>
+                    ) : null}
                     <div className="flex items-center gap-2 text-[11px] text-faint">
                       {game.playtimeSec > 0 ? (
                         <span className="inline-flex items-center gap-1">
@@ -479,6 +492,10 @@ export function GalgameLibraryPage() {
 
       {/* 月幕搜索弹窗 */}
       <GalYmgalSearchModal game={ymgalGame} onClose={() => setYmgalGame(null)} onApplied={load} />
+
+      {/* 最近识别 BGM 面板（只读内存识别） */}
+      <GalBgmModal game={bgmGame} onClose={() => setBgmGame(null)} />
+      <GalBgmSavedModal game={bgmSavedGame} onClose={() => setBgmSavedGame(null)} />
 
       {/* 移除确认 */}
       <ConfirmModal

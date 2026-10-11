@@ -1,11 +1,17 @@
 import axios, { type AxiosRequestConfig } from 'axios'
+import { app } from 'electron'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import { SocksProxyAgent } from 'socks-proxy-agent'
 import type { AppSettings, ProxyConfig } from '@shared/types'
 import { DEFAULT_SETTINGS } from '@shared/types'
 import { store } from './store'
 
-export const UA = 'Sakana/0.1.0 (anime desktop client; +https://github.com/sakana)'
+/*
+ * UA 里的版本号从 `app.getVersion()` 取（v0.3.9 体检 L5）。
+ * 以前这里是写死的 '0.1.0'，而同项目里 jikan 写 '0.3.0'、弹幕接口写 '0.2.8' ——
+ * 三处各说各的版本，对端做统计/风控时看到的是三个"不同版本的应用"，排障时也会误导。
+ */
+export const UA = `Sakana/${app.getVersion()} (anime desktop client; +https://github.com/sakana)`
 
 /** 浏览器 UA：bangumi.pro 等镜像站有 Cloudflare 防护，非浏览器 UA 会被 403 */
 export const BROWSER_UA =

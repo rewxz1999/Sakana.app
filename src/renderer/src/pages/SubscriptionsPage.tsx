@@ -41,7 +41,12 @@ function SubCard({ sub }: { sub: Subscription }) {
     if (activeDownloads.length > 0) return <Badge tone="accent">资源更新中 · {activeDownloads.length} 任务</Badge>
     if (sub.status === 'waiting') return <Badge tone="warn">发现新资源，待确认</Badge>
     if (sub.status === 'updating') return <Badge tone="accent">资源更新中</Badge>
-    if (sub.episode != null) return <Badge tone="ok">已下载所有资源</Badge>
+    /*
+     * v0.3.9 体检 H3：以前只判 `!= null`，而 `episode` 曾经被 `?? 0` 写成 0 ——
+     * 一条什么都没下载的订阅（字幕组资源没写集号）会被标成绿色「已下载所有资源」。
+     * 集号**从 1 起算**，所以 0 与 null 一样都表示"还不知道下到第几集"。
+     */
+    if (sub.episode != null && sub.episode > 0) return <Badge tone="ok">已下载所有资源</Badge>
     return <Badge>尚未下载</Badge>
   }
 
@@ -69,7 +74,7 @@ function SubCard({ sub }: { sub: Subscription }) {
             <div className="line-clamp-1 text-[15px] font-semibold">{animeTitle}</div>
             <div className="mt-0.5 text-[11px] text-faint">
               字幕组：{sub.group ?? '未指定'} · 已下载 {doneCount > 0 ? `${doneCount} 个资源` : '—'}
-              {sub.episode != null ? ` · 更新到第 ${sub.episode} 集` : ''}
+              {sub.episode != null && sub.episode > 0 ? ` · 更新到第 ${sub.episode} 集` : ''}
             </div>
           </div>
           <div className="shrink-0">{statusBadge()}</div>

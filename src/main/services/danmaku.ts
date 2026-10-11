@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { app } from 'electron'
 import axios from 'axios'
@@ -76,7 +76,8 @@ function authHeaders(path: string): Record<string, string> {
   headers['X-AppId'] = appId
   headers['X-Timestamp'] = timestamp
   headers['X-Signature'] = createHash('sha256').update(raw).digest('base64')
-  headers['X-AppVersion'] = '0.2.8'
+  // 版本号统一从 app.getVersion() 取（v0.3.9 体检 L5：以前写死 0.2.8，与 UA 里的版本对不上）
+  headers['X-AppVersion'] = app.getVersion()
   return headers
 }
 
@@ -122,11 +123,24 @@ function cacheDir(): string {
 }
 
 function readCache<T>(key: string, ttl: number): T | null {
+  let file = ''
   try {
-    const f = join(cacheDir(), `${createHash('sha1').update(key).digest('hex').slice(0, 20)}.json`)
-    if (!existsSync(f)) return null
-    const parsed = JSON.parse(readFileSync(f, 'utf-8')) as { at: number; data: T }
-    if (!parsed?.at || Date.now() - parsed.at > ttl) return null
+    file = join(cacheDir(), `${createHash('sha1').update(key).digest('hex').slice(0, 20)}.json`)
+    if (!existsSync(file)) return null
+    const parsed = JSON.parse(readFileSync(file, 'utf-8')) as { at: number; data: T }
+    /*
+     * 过期就**顺手删掉**（v0.3.9 体检 M6）。
+     * 以前这里只 `return null`，文件永远留在盘上：看完一季番会攒下成百上千个再也用不到的 JSON，
+     * 而缓存目录只增不减（用户不手动清就一直长）。删掉是安全的——过期数据本来就要重新拉。
+     */
+    if (!parsed?.at || Date.now() - parsed.at > ttl) {
+      try {
+        unlinkSync(file)
+      } catch {
+        /* 删不掉（被占用等）不影响使用 */
+      }
+      return null
+    }
     return parsed.data
   } catch {
     return null

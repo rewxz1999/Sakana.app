@@ -20,7 +20,8 @@ function keyLabel(k: string): string {
 
 /**
  * 播放器快捷键编辑面板（无页面外壳）。
- * 设置主页面不再提供独立入口，本面板现在渲染在「播放器设置」窗口内。
+ * v0.3.9：本面板原来内嵌在「播放器设置」页底部，现在播放器设置只保留内核/超分/音频/画面比例/内置组件，
+ * 快捷键回到独立的「快捷键」设置项（/shortcuts，设置总览「播放与下载」区域里有入口）。
  */
 export function ShortcutsPanel() {
   const { map, loaded, setKey } = useShortcuts()
@@ -84,7 +85,7 @@ export function ShortcutsPanel() {
   )
 }
 
-/** 独立页面包装（/shortcuts 路由保留，主设置页已不再提供入口） */
+/** 独立页面包装（/shortcuts：设置总览「播放与下载」区域的「快捷键」入口指向这里） */
 export function ShortcutsPage() {
   return (
     <SubPage icon={Keyboard} title="播放器快捷键" desc="自定义播放器控件快捷键绑定">

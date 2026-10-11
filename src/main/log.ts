@@ -11,6 +11,55 @@ import { store } from './store'
  */
 const MAX_ENTRIES = 1000
 
+/**
+ * 日志脱敏（用户反复强调的红线：**界面与日志里不许出现内部地址 / 反代地址 / 弹幕接口 / 用户本机路径**）。
+ *
+ * 为什么把脱敏放在 `log.append` 这一层而不是各个调用点：日志是"用户反馈时最常被复制出去"的东西
+ * （日志页有「复制全部」），而写日志的地方有近百处、还在不断增加。逐处记得脱敏迟早会漏，
+ * 所以入口统一处理：**任何进入日志的文本都会先过这里**，调用方不需要（也不该）自己拼脱敏逻辑。
+ *
+ * 保留的诊断价值：
+ *   · 地址 → 保留协议与"这是个域名/IP"的形状，打码主体与端口，路径只留前两段；
+ *   · 本机路径 → 只留最后两段（知道是哪个文件，但看不到用户目录结构）；
+ *   · 局域网/公网 IP → 打码后两段（能判断"是个局域网地址"，但拿不到具体主机）。
+ */
+export function maskLogText(input: string): string {
+  let s = String(input ?? '')
+
+  // ① http(s) 地址：`https://host[:port]/path` → `https://***/path(截断)`
+  s = s.replace(/\b(https?):\/\/([^\s/]+)(\/[^\s]*)?/gi, (_m, scheme: string, host: string, path?: string) => {
+    const keepPath = path ? maskUrlPath(path) : ''
+    /*
+     * 回环地址保留主机与端口：那是**应用自己的服务**（本机中转 / 实时流），
+     * 界面上的诊断面板本来就会显示它，日志里保留端口对排障有用，也不涉及用户隐私。
+     */
+    const loopback = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.exec(host)
+    if (loopback) return `${scheme}://127.0.0.1${loopback[2] ?? ''}${keepPath}`
+    return `${scheme}://***${keepPath}`
+  })
+
+  // ② Windows 本机路径：`E:\a\b\c.txt` → `…\b\c.txt`（只留最后两段）
+  s = s.replace(/\b[A-Za-z]:\\(?:[^\\\s"']+\\)*([^\\\s"']+)(\\)?([^\\\s"']+)?/g, (_m, last: string, sep?: string, last2?: string) => {
+    return sep && last2 ? `…\\${last}\\${last2}` : `…\\${last}`
+  })
+
+  // ③ IP：打码后两段（局域网、公网都算；回环除外）
+  s = s.replace(/\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g, (m, a: string, b: string) => {
+    if (a === '127') return m
+    return `${a}.${b}.*.*`
+  })
+
+  return s
+}
+
+/** URL 路径只留前两段，避免把接口路径/密钥打出去（`/api/v1/xxx?token=...` → `/api/v1/…`） */
+function maskUrlPath(path: string): string {
+  const [clean] = path.split(/[?#]/)
+  const segs = clean.split('/').filter(Boolean)
+  if (segs.length <= 2) return `/${segs.join('/')}`
+  return `/${segs.slice(0, 2).join('/')}/…`
+}
+
 /** 运行日志服务（方案 6：记录应用异常、网络失败、下载器错误，可复制） */
 class LogService {
   private entries: LogEntry[] = []
@@ -21,12 +70,14 @@ class LogService {
   }
 
   append(level: LogEntry['level'], source: string, message: string): void {
-    const entry: LogEntry = { id: randomUUID(), level, source, message, at: Date.now() }
+    // 入口统一脱敏：写盘、控制台、推送给界面三处都是脱敏后的文本（见 maskLogText 的说明）
+    const safe = maskLogText(message)
+    const entry: LogEntry = { id: randomUUID(), level, source, message: safe, at: Date.now() }
     this.entries.push(entry)
     if (this.entries.length > MAX_ENTRIES) this.entries.splice(0, this.entries.length - MAX_ENTRIES)
     store.set('logs', this.entries)
     const fn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log
-    fn(`[${source}] ${message}`)
+    fn(`[${source}] ${safe}`)
     for (const cb of this.targets) {
       try {
         cb(entry)
@@ -44,7 +95,8 @@ class LogService {
   }
 
   list(): LogEntry[] {
-    return [...this.entries]
+    // 老版本写进磁盘的条目没脱敏过，这里再过一遍（幂等），保证「复制全部日志」拿到的是干净的
+    return this.entries.map((e) => (e.message === maskLogText(e.message) ? e : { ...e, message: maskLogText(e.message) }))
   }
 
   clear(): void {

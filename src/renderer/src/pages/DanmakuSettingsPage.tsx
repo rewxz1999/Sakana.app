@@ -2,8 +2,9 @@ import { useEffect, useState } from 'react'
 import { MessageSquare, RotateCcw } from 'lucide-react'
 import type { DanmakuSettings } from '@shared/types'
 import { DEFAULT_DANMAKU_SETTINGS, resolveDanmakuSettings } from '@shared/types'
+import { api } from '@/lib/api'
 import { useSettings, toast } from '@/stores/app'
-import { Button } from '@/components/ui'
+import { Button, Input } from '@/components/ui'
 import { Card, SubPage } from '@/components/SettingsShell'
 
 /**
@@ -12,6 +13,10 @@ import { Card, SubPage } from '@/components/SettingsShell'
  * 播放器悬浮窗里的「弹幕设置」只放最常用的三项（覆盖区域 / 弹幕数量 / 时间轴），
  * 更细的项（字号、不透明度、滚动速度、显示类型、加粗、屏蔽词）都在这里。
  * 两处改的是同一份设置（`settings.danmaku`），关掉窗口立刻在播放器里生效。
+ *
+ * v0.3.9：用户要求「B 站弹幕板块放在弹幕设置中」，于是原「播放器设置」里的
+ * 「B 站弹幕（mpv 脚本）」整块搬到这里 —— 它本来就是弹幕来源相关（yt-dlp + biliass 管线），
+ * 放在播放器设置里既难找、也和画质/音频那几块混在一起。设置字段仍是 `settings.biliDanmaku`。
  */
 export function DanmakuSettingsPage() {
   const { settings, save } = useSettings()
@@ -32,7 +37,7 @@ export function DanmakuSettingsPage() {
     <SubPage
       icon={MessageSquare}
       title="弹幕设置"
-      desc="弹幕来自弹弹play 弹幕库，按番剧名与集数自动匹配；本地播放同样可用"
+      desc="弹幕来自弹弹play 弹幕库，按番剧名与集数自动匹配；本地播放同样可用。下方还有 B 站弹幕（yt-dlp + biliass）配置"
       maxWidth="max-w-xl"
       actions={
         <Button
@@ -156,6 +161,80 @@ export function DanmakuSettingsPage() {
           placeholder="例如：剧透, 广告, 前方高能"
           className="w-full resize-y rounded-lg border border-border bg-elev2 px-3 py-2 text-xs text-text outline-none placeholder:text-faint focus:border-accent"
         />
+      </Card>
+
+      {/* ---------------- B 站弹幕（v0.3.9 从播放器设置搬入） ---------------- */}
+      <Card
+        title="B 站弹幕（mpv 脚本）"
+        desc="播放 B 站视频时用 yt-dlp + biliass 抓取并显示弹幕（仅 libmpv 内核生效）"
+      >
+        <div className="flex flex-col gap-2.5">
+          <label className="flex items-center gap-2 text-xs text-text">
+            <input
+              type="checkbox"
+              checked={settings.biliDanmaku?.enabled === true}
+              onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, enabled: e.target.checked } })}
+              className="h-3.5 w-3.5 accent-accent"
+            />
+            启用 B 站弹幕（需要自行准备 yt-dlp 与 biliass）
+          </label>
+          <Input
+            placeholder="yt-dlp 可执行文件路径（留空按 PATH 里的 yt-dlp）"
+            value={settings.biliDanmaku?.ytdlpPath ?? ''}
+            onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, ytdlpPath: e.target.value } })}
+          />
+          <Input
+            placeholder="biliass 可执行文件路径（留空按 PATH 里的 biliass）"
+            value={settings.biliDanmaku?.biliassPath ?? ''}
+            onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, biliassPath: e.target.value } })}
+          />
+          <Input
+            placeholder="临时目录 tmpdir（必填；留空用应用数据目录下的 tmp/danmaku）"
+            value={settings.biliDanmaku?.tmpdir ?? ''}
+            onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, tmpdir: e.target.value } })}
+          />
+          <Input
+            placeholder="自定义 mpv 脚本路径（留空使用内置的 sakana-bdanmaku.lua；也可指向你下载的 bdanmaku.lua）"
+            value={settings.biliDanmaku?.scriptPath ?? ''}
+            onChange={(e) => save({ biliDanmaku: { ...settings.biliDanmaku, scriptPath: e.target.value } })}
+          />
+          <p className="text-[11px] leading-relaxed text-faint">
+            管线：yt-dlp 取弹幕字幕（xml）→ biliass 转 ASS → 挂到播放器上。
+            <span className="text-dim"> biliass 在 Windows 上必须有一个可写的临时目录</span>，否则弹幕下载会失败 ——
+            留空时应用会自动用「应用数据目录/tmp/danmaku」并把它通过{' '}
+            <code className="font-mono">script-opts=tmpdir=…</code> 传给脚本。
+            <span className="text-dim">开关或路径改动在下次进入播放器时生效</span>（libmpv 启动时才加载脚本）。
+            运行日志里能看到 <code className="font-mono">[mpv] B 站弹幕脚本已启用</code> 与脚本自己的进度；
+            脚本日志写在上面 tmpdir 下的 <code className="font-mono">sakana-bdanmaku.log</code>。
+          </p>
+          <p className="text-[11px] leading-relaxed text-faint">
+            <span className="text-dim">与上面「渲染方式」的关系</span>：如果同时把渲染方式选成了 mpv 插件
+            （uosc_danmaku），同一部 B 站番剧会出现两份弹幕（一份由本脚本挂成字幕、一份由插件画在画面上），
+            建议按需二选一。
+          </p>
+          <div className="rounded-lg border border-border bg-elev2/50 px-3 py-2 text-[11px] leading-relaxed text-faint">
+            需要自行下载的两个组件（本机网络到 GitHub Release 不通，无法随包分发）：
+            <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1">
+              <button
+                className="text-accent hover:underline whitespace-nowrap"
+                onClick={() => void api.app.openPath('https://github.com/yt-dlp/yt-dlp/releases')}
+              >
+                yt-dlp 下载页
+              </button>
+              <button
+                className="text-accent hover:underline whitespace-nowrap"
+                onClick={() => void api.app.openPath('https://github.com/yutto-dev/biliass/releases')}
+              >
+                biliass 下载页
+              </button>
+            </div>
+            <div className="mt-1">
+              也可以直接使用社区里的 <code className="font-mono">bdanmaku</code> 脚本：把它下载到本地后填进上面的「自定义
+              mpv 脚本路径」，应用会自动把 tmpdir / ytdlp / biliass 三个参数拼进{' '}
+              <code className="font-mono">script-opts</code> 一并传过去。
+            </div>
+          </div>
+        </div>
       </Card>
 
       <Card title="说明" desc="关于弹幕来源">

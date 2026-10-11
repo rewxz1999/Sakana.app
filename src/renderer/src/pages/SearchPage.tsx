@@ -24,7 +24,7 @@ import { api } from '@/lib/api'
 import { yearOf } from '@/lib/format'
 import { HISTORY_LIMIT, defaultListName, useMarks } from '@/stores/marks'
 import { isFavorite, useLibrary, type FavoriteSubjectInput } from '@/stores/library'
-import { toast, useSettings } from '@/stores/app'
+import { toast } from '@/stores/app'
 import {
   Badge,
   Button,
@@ -36,24 +36,10 @@ import {
   Spinner
 } from '@/components/ui'
 import { CoverImage } from '@/components/CoverImage'
-import { ImageCarousel } from '@/components/ImageCarousel'
 import { FishStrip, RecommendRail } from '@/components/RecommendRail'
 
 /** 拖拽载荷 MIME：只带最小字段，避免把整个搜索结果对象（含长 summary）塞进 dataTransfer */
 const DRAG_MIME = 'application/x-sakana-subject'
-
-/**
- * 是否小型配置窗口：由主进程启动参数（--sakana-small）在 preload 里决定，
- * 本次进程生命周期内不会变化，所以模块加载时读一次即可，
- * 不必在每次渲染里穿透 bridge 对象取值。
- */
-const SMALL = api.window.isSmallWindow
-
-/**
- * 内容列表底部留白：底部展示位（轮播）是浮在内容之上的绝对定位元素，
- * 不留白就会出现「滚到底也看不到最后一条」的情况。
- */
-const LIST_BOTTOM_PAD = 'pb-40'
 
 /**
  * 书签条离窗口右边缘的距离：至少要越过 8px 的系统滚动条（main.css 里的 ::-webkit-scrollbar），
@@ -80,10 +66,6 @@ const STRIP_ROWS = 8
 
 /** 书签弹窗里的条目预览条数（其余的用「还有 N 条」带过，点「查看条目」看全部） */
 const POPOVER_ROWS = 3
-
-/** 底部展示位（轮播）贴着书签条左侧落位，别和把手/抽出的列表叠在一起 */
-const CAROUSEL_RIGHT = 'right-[56px]'
-const CAROUSEL_RIGHT_OPEN = 'right-[276px]'
 
 /** 主区域视图：搜索结果为默认视图，点书签后切到该书签的条目视图（不再用弹窗承载） */
 type MainView = 'search' | 'bookmark'
@@ -222,17 +204,10 @@ function clearSnapshot(): void {
 
 export function SearchPage() {
   const navigate = useNavigate()
-  /**
-   * 空态轮播图的切换间隔（秒）：存在 settings 里（searchCarouselSec），随设置一起持久化，
-   * 老设置文件没有这个键时由 ImageCarousel 按默认 6 秒兜底。
-   */
-  const carouselSec = useSettings((s) => s.settings.searchCarouselSec)
-  const saveSettings = useSettings((s) => s.save)
   const {
     lists,
     items,
     history,
-    showcase,
     loaded,
     load,
     createList,
@@ -242,10 +217,7 @@ export function SearchPage() {
     removeMark,
     isMarked,
     pushHistory,
-    clearHistory,
-    addShowcase,
-    removeShowcase,
-    clearShowcase
+    clearHistory
   } = useMarks()
 
   /**
@@ -704,74 +676,7 @@ export function SearchPage() {
     return () => document.removeEventListener('mousedown', onDown)
   }, [pinned, activeMark])
 
-  // ---------------- 底部展示位（轮播） ----------------
-
-  /** 上传展示图片：对话框返回绝对路径数组，为空表示用户取消 */
-  const uploadShowcase = async (): Promise<void> => {
-    const r = await api.dialog.pickImages()
-    if (!r.ok) {
-      toast.error(r.error)
-      return
-    }
-    if (r.data.length === 0) return // 用户取消，不打扰
-    /*
-     * 白名单坑（必须过主进程复制一份）：
-     * 图片都走 `sakana-img://local/<base64url>` 加载，而这个协议只读 media.ts
-     * registerDefaultRoots() 注册过的目录。用户从「图片」文件夹挑的图不在白名单里，
-     * 协议直接 403 —— 界面上就是一片空白（galgame 封面曾因同一个原因整批不显示）。
-     * 主进程把图收进 <userData>/search-showcase 后返回新路径，存的就是白名单内的路径，
-     * 重启后仍然能显示。
-     */
-    const imp = await api.showcase.importImages(r.data)
-    if (!imp.ok) toast.warn(`图片未能收进应用目录（${imp.error}），可能显示不出来`)
-    const paths = imp.ok ? imp.data : r.data
-    // 去重交给 store：同一张图重复加入只会让轮播停在同图上
-    const added = addShowcase(paths)
-    if (added === 0) toast.info('所选图片已在展示列表中')
-    else toast.success(`已添加 ${added} 张展示图片`)
-  }
-
   const markedCountOf = (listId: string): number => items.filter((it) => it.listId === listId).length
-
-  // 主区域是否有需要避让底部展示位的内容
-  const hasListContent = view === 'bookmark' ? currentCount > 0 : results.length > 0
-
-  /**
-   * 「空态」判定：搜索视图 + 没有任何结果 + 不在搜索中。
-   * 只有这种时候整片区域是空的，才把轮播图当**主内容**铺上去（用户的诉求就是「空荡」时填空）。
-   * 有结果时它退回到原来那个右下角悬浮小窗，绝不挤占列表（`hasListContent` 时的 pb-40 也是原逻辑）。
-   */
-  const emptyShowcaseOpen = view === 'search' && !hasListContent && !searching
-
-  /**
-   * 空态轮播展示位：撑满剩余高度的一块大轮播图（用户可自定义图片与间隔）。
-   * 外层 `flex-1` 让它在**内容区**（`flex grow flex-col`）里吃掉其它内容之外的空白；
-   * `min-h-[200px]` 保证窗口再矮也有一块像样的图，不够高时整块跟着外层滚动区正常滚动。
-   *
-   * ⚠️ v0.3.7：它必须排在**最后**（文案 → 随机推荐 → 大肥鱼轮播 → 它）。
-   * 它是这一列里唯一会长个儿的元素，排在谁后面就把谁往下推 ——
-   * 之前排中间/排前面时，用户看到的正是「随机推荐和底部轮播离搜索说明太远」。
-   */
-  const emptyShowcase = (
-    <div className="mt-2 min-h-[200px] flex-1">
-      <ImageCarousel
-        images={showcase}
-        onUpload={() => void uploadShowcase()}
-        onDeleteCurrent={(path) => {
-          removeShowcase(path)
-          toast.info('已删除当前展示图片')
-        }}
-        onClearAll={() => {
-          clearShowcase()
-          toast.info('已清空展示图片')
-        }}
-        intervalSec={carouselSec}
-        onIntervalChange={(sec) => saveSettings({ searchCarouselSec: sec })}
-        showcase
-        className="h-full w-full"
-      />
-    </div>
-  )
 
   /** 书签条列表里实际铺出的行（超过上限的部分折进「+N」） */
   const stripLists = showAllMarks ? lists : lists.slice(0, STRIP_ROWS)
@@ -992,7 +897,7 @@ export function SearchPage() {
         <div
           className={`h-full overflow-y-auto overflow-x-hidden py-4 pl-3 sm:pl-5 ${
             stripDocked ? GUTTER_OPEN : GUTTER
-          } ${hasListContent ? LIST_BOTTOM_PAD : ''}`}
+          }`}
         >
           {view === 'bookmark' ? (
             currentList ? (
@@ -1179,117 +1084,54 @@ export function SearchPage() {
             </div>
           ) : (
             /*
-              空态（初次进入 / 没搜到结果）：原来只有一段居中的文案，整页看着很空。
-              现在下面接一块轮播展示位（用户可自定义图片与切换间隔），把空白填满。
-              文案区不缩小、滚动/拖拽等行为都不变 —— 展示位只是补在文案下方。
+              空态（初次进入 / 没搜到结果）：只有「随机推荐番剧」+ 仓库内置的大肥鱼轮播。
 
-              需求 B：**没有进行搜索时**（`!searched`）这块空白还要有内容 ——
-              在文案**正下方**先接「随机推荐番剧」（热门/高分/冷门/当季，四个横向排列的分组），
-              紧接着再放一排大肥鱼图（轮流切换 + 标注来源）；用户自己的展示位排在最后填满剩余空白。
-              搜索过但没结果（`searched`）时保持原样：只给「没有搜索到结果」的提示 + 展示位，
-              推荐区与轮播都不出现（用户已经给过关键词了，这时该做的是换词，不是看推荐）。
+              【v0.3.9 第一轮：删掉「搜索番剧」那块说明，推荐整体上移】
+              用户原话：「删除页面中的『搜索番剧 输入关键词后回车开始搜索…』这句话
+              （这个提示非必要了），同时删除这段话**上面的图标**。这部分位置接受**上移的推荐番剧部分**」。
+              所以：
+                · `!searched` 时**不再渲染**那个 `EmptyState`（图标 + 标题 + 说明整块去掉），
+                  推荐区直接顶到搜索框下面 —— 那块留白连同它的 `py-14` 内边距一起消失；
+                · 搜索过但没结果（`searched`）**保留** `EmptyState`：那时用户需要的是
+                  「换个关键词 / 数据源挂了」这类指引，删掉他就不知道该怎么办了。
 
-              【布局（v0.3.7 第三次调整，用户要求「随机推荐和底部轮播图再往上移动一些，直接紧贴在搜索说明的下面」）】
-              整块是一列 flex（`min-h-full` = 至少占满外层滚动区的可视高度），顺序就是**用户要的顺序**：
-                ① 搜索说明（EmptyState）；
-                ② 随机推荐（RecommendRail）；
-                ③ 大肥鱼轮播（FishStrip，水平居中）；
-                ④ 用户自己的展示位（`flex-1`，吃掉剩下的全部空白）。
-              所以①②③永远紧挨在一起、贴着文案，**窗口再高也不会把它们顶开** ——
-              空白全部由排最后的展示位吸收（它 `min-h-[200px]`，窗口再矮也有一块像样的图）。
-
-              之前两次调整的教训都在这条链上：
-                · 展示位是 `flex-1`，谁排在它后面谁就被推到底部 —— 第一版它夹在推荐区与轮播之间，
-                  于是「离得太远」；第二版挪到推荐区之前，推荐区与轮播相邻了，但整体仍在展示位下面那一大段之后。
-                · 现在干脆把展示位放到**最后**：它是唯一会长大的元素，长个儿只会往下长，不会推开上面三块。
-
-              内容超过一屏时整列跟着外层滚动区一起变高、正常滚动 ——
-              推荐列表始终完整可见，不会被压住或裁掉。
-              ⚠️ 内容区用 `grow`（flex-grow:1 + basis:auto）而**不是** `flex-1`（basis:0）：
-              basis:0 在没有剩余空间（内容超过一屏）时会把自己算成 0 高，
-              里面的文案/推荐列表就会被压扁；basis:auto 没有这个隐患。
+              【v0.3.9 第二轮：删掉用户自己的「自定义轮播展示位」】
+              那块（`ImageCarousel` + 上传/删除/清空 + 间隔滑块）整块移除，原因就是用户的本轮要求；
+              它是这一列里唯一带固定高度（180/220px）的元素，删掉后这里只剩推荐区与内置轮播，
+              一列 `gap-3` 自然收紧，**底部不会多出空白**：这一列既没有 `min-h-full` 也没有 `flex-1`，
+              高度完全由内容决定（多出来的一屏以下才是滚动区的空白，和以前一样）。
             */
-            <div className="flex min-h-full flex-col">
-              <div className="flex grow flex-col">
-                {searched ? (
-                  <EmptyState
-                    icon={Search}
-                    title="没有搜索到结果"
-                    desc={
-                      searchError
-                        ? `${searchError}\n可点下方按钮检查/切换数据源`
-                        : '换个关键词试试；若一直失败，可到设置里检查数据源是否可用'
-                    }
-                  />
-                ) : (
-                  /*
-                    这个 `-mb-14` 是给「直接紧贴在搜索说明的下面」这条要求用的：
-                    共用的 `EmptyState` 自带 `py-14`（上下各 56px），在只有一段文案的页面上
-                    这样留白很好看，但这一页文案**下面紧跟着推荐区与轮播** ——
-                    那 56px 底边距就变成了一段纯粹的空档（实测文案到推荐区 72px）。
-                    这里把那 56px 抵消掉，只留推荐区自己的 `mt-4`（16px）—— 文案与推荐区之间就只剩这一道间距。
-                    ⚠️ 数值与 `EmptyState` 的 `py-14` 是绑定的：那边改了内边距，这里要跟着改
-                    （`.e2e/probe-search-layout.mjs` 会量出实际间距，改歪了一眼能看出来）。
-                  */
-                  <div className="-mb-14">
-                    <EmptyState
-                      icon={Search}
-                      title="搜索番剧"
-                      desc="输入关键词后回车开始搜索，结果可直接拖到右侧书签条；点书签条上的书签可查看详情、重新搜索或管理条目"
-                    />
-                  </div>
-                )}
-                {/*
-                  未搜索：随机推荐区（数据来源与判据见 components/RecommendRail.tsx 的顶部注释）。
-                  `shrink-0`：这一块永远按内容高度完整显示 —— 窗口再矮也只是让外层滚动区变长，
-                  不会被压扁或裁掉。
-                */}
-                {searched ? null : <RecommendRail onOpen={openSubject} className="shrink-0" />}
-                {/*
-                  大肥鱼轮播：**紧跟在推荐区下面**（v0.3.7 用户要求「直接紧贴在搜索说明的下面」）。
-                  它是普通流里的一行（不用 fixed/absolute），所以不会浮在内容上；
-                  上间距只留 8px，水平居中；文件缺失/复制失败时组件自己返回 null（静默隐藏）。
-                */}
-                {searched ? null : (
-                  <div className="flex shrink-0 justify-center pt-2">
-                    <FishStrip />
-                  </div>
-                )}
-                {/*
-                  用户自己的展示位放**最后**：它是这一列里唯一 `flex-1` 的元素，
-                  剩余空白全归它，因此上面的文案 / 推荐区 / 轮播永远紧贴在一起。
-                */}
-                {emptyShowcase}
-              </div>
+            <div className="flex flex-col gap-3">
+              {searched ? (
+                <EmptyState
+                  icon={Search}
+                  title="没有搜索到结果"
+                  desc={
+                    searchError
+                      ? `${searchError}\n可点下方按钮检查/切换数据源`
+                      : '换个关键词试试；若一直失败，可到设置里检查数据源是否可用'
+                  }
+                />
+              ) : null}
+              {/*
+                未搜索：随机推荐区（数据来源与判据见 components/RecommendRail.tsx 的顶部注释）。
+                `shrink-0`：这一块永远按内容高度完整显示 —— 窗口再矮也只是让外层滚动区变长，
+                不会被压扁或裁掉。
+              */}
+              {searched ? null : <RecommendRail onOpen={openSubject} className="shrink-0" />}
+              {/*
+                大肥鱼轮播：**紧跟在推荐区下面**，也是空态的最后一块。
+                图片源是仓库内置素材（见 assets/search-carousel/README.md），7 秒一张；
+                它是普通流里的一行（不用 fixed/absolute），所以不会浮在内容上；水平居中。
+              */}
+              {searched ? null : (
+                <div className="flex shrink-0 justify-center">
+                  <FishStrip />
+                </div>
+              )}
             </div>
           )}
         </div>
-
-        {/*
-          底部展示位：自制小广告窗，定时轮播 + 右键菜单管理（小窗口下缩一档，别把结果列表挤没）。
-          空态时改由上面的「emptyShowcase」以主内容形态呈现（同一份图片列表、同一份间隔设置），
-          这里就不再渲染，避免同屏出现两个轮播。
-        */}
-        {emptyShowcaseOpen ? null : (
-          <ImageCarousel
-            images={showcase}
-            onUpload={() => void uploadShowcase()}
-            onDeleteCurrent={(path) => {
-              removeShowcase(path)
-              toast.info('已删除当前展示图片')
-            }}
-            onClearAll={() => {
-              clearShowcase()
-              toast.info('已清空展示图片')
-            }}
-            intervalSec={carouselSec}
-            className={
-              SMALL
-                ? `absolute bottom-3 h-[96px] w-[200px] ${stripDocked ? CAROUSEL_RIGHT_OPEN : CAROUSEL_RIGHT}`
-                : `absolute bottom-4 h-[110px] w-[240px] sm:h-[124px] sm:w-[320px] ${stripDocked ? CAROUSEL_RIGHT_OPEN : CAROUSEL_RIGHT}`
-            }
-          />
-        )}
 
         {/*
           书签条：贴在结果区右侧的悬浮长条卡片。

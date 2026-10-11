@@ -10,6 +10,7 @@ import { getSettings, httpGetBuffer } from '../../net'
 import { store } from '../../store'
 import { aria2, type Aria2Progress } from './aria2'
 import { qbit, type QbitProgress } from './qbit'
+import { ensureQbitForDownload } from './qbitLauncher'
 import { maybeShowSaveHint } from '../onboarding'
 
 const ACTIVE_STATUSES: DownloadStatus[] = ['queued', 'parsing', 'torrent', 'downloading', 'paused', 'seeding']
@@ -24,8 +25,16 @@ export function downloadRoot(): string {
   const s = getSettings()
   return s.downloadDir || join(app.getPath('userData'), 'downloads')
 }
-/** 允许暂停/继续的状态 */
+/** 允许暂停的状态（已完成的不能暂停：aria2 对 complete 任务调用 pause 会报 400） */
 const PAUSABLE: DownloadStatus[] = ['queued', 'parsing', 'torrent', 'downloading', 'seeding']
+/**
+ * 允许「继续」的状态：只有暂停态。
+ *
+ * 修 bug：这里原本复用 PAUSABLE，而 PAUSABLE 里没有 'paused' —— 任务一旦暂停就再也无法继续
+ * （两个下载器都一样：界面上的「继续」点了没反应而且不报错）。实测 qb 侧 pause 后 state=stoppedDL、
+ * resume() 直接 return false。
+ */
+const RESUMABLE: DownloadStatus[] = ['paused']
 /** 列表排序权重：正在下载的任务置顶 */
 const STATUS_RANK: Record<DownloadStatus, number> = {
   downloading: 0,
@@ -77,10 +86,56 @@ class DownloadManager {
     this.emit()
   }
 
+  /**
+   * 把任务列表推给所有窗口（v0.3.9 体检 M2）。
+   *
+   * 为什么要收拾它：下载轮询每 2 秒对每个活跃任务 `patch()` 一次，而 `patch` 以前**每次都整份推给所有窗口**；
+   * 渲染层又是整数组替换 → 下载页 / 仪表盘 / 托盘三个订阅方全部重渲染。任务多、跑得久时这就是
+   * "越用越卡"的一部分（而且每秒推的往往是"进度只多了 0.1%"这种无关紧要的变化）。
+   *
+   * 现在的策略（不牺牲实时感）：
+   *   ① **指纹没变就不推** —— 状态/进度（0.1 精度）/速度/错误 任一变化才算变；
+   *   ② **最快 800ms 一次**，中间的变化合并到尾部再推；
+   *   ③ 推送时跳过正在销毁的窗口。
+   */
+  private emitFingerprint = ''
+  private lastEmitAt = 0
+  private emitTimer: NodeJS.Timeout | null = null
+
+  private fingerprint(tasks: DownloadTask[]): string {
+    return tasks
+      .map(
+        (t) =>
+          `${t.id}:${t.status}:${Math.round((t.progress ?? 0) * 10)}:${t.speed ?? ''}:${t.error ?? ''}:${t.engine ?? ''}`
+      )
+      .join('|')
+  }
+
   private emit(): void {
     const payload = this.sorted(this.tasks())
+    const fp = this.fingerprint(payload)
+    if (fp === this.emitFingerprint) return
+    const now = Date.now()
+    const gap = now - this.lastEmitAt
+    if (gap < 800) {
+      // 距上次推送太近：合并成一次尾部推送（到点后重新走一遍本函数，那时指纹是最新的）
+      if (!this.emitTimer) {
+        this.emitTimer = setTimeout(() => {
+          this.emitTimer = null
+          this.emit()
+        }, 800 - gap)
+      }
+      return
+    }
+    this.emitFingerprint = fp
+    this.lastEmitAt = now
     for (const w of BrowserWindow.getAllWindows()) {
-      w.webContents.send(CH.evDownloads, payload)
+      if (w.isDestroyed()) continue
+      try {
+        w.webContents.send(CH.evDownloads, payload)
+      } catch {
+        /* 窗口正在销毁时忽略 */
+      }
     }
   }
 
@@ -113,7 +168,7 @@ class DownloadManager {
           results.push(`aria2 失败: ${String((err as { message?: string })?.message ?? err)}`)
         }
         try {
-          results.push(`qBittorrent v${await qbit.test()}`)
+          results.push(`qBittorrent ${await qbit.test()}`)
         } catch (err) {
           results.push(`qBittorrent 失败: ${String((err as { message?: string })?.message ?? err)}`)
         }
@@ -126,7 +181,7 @@ class DownloadManager {
         return { ok: true, message: `aria2 RPC 已连接 (v${v})` }
       }
       const v = await qbit.test()
-      return { ok: true, message: `qBittorrent 已连接 (v${v})` }
+      return { ok: true, message: `qBittorrent 已连接（${v}）` }
     } catch (err) {
       const e = err as { message?: string }
       return { ok: false, message: e?.message ?? String(err) }
@@ -134,10 +189,24 @@ class DownloadManager {
   }
 
   async add(input: AddDownloadInput): Promise<DownloadTask> {
+    const settings = getSettings()
+    let engine: 'aria2' | 'qbit' = settings.downloader.dual ? this.assignEngine() : settings.downloader.type
+    /*
+     * 外部 qBittorrent 不归应用管，它没在运行的话任务一个也下不动。
+     * 添加前先确认可用性（必要时弹一次授权框、由应用把它拉起来，见 qbitLauncher）：
+     * - 双下载器模式且 qb 不可用 → 自动改用内置 aria2，任务照样能下；
+     * - 仅 qb 模式 → 抛出中文原因，由界面 toast 出来，而不是留一条永远 0% 的任务。
+     */
+    if (engine === 'qbit') {
+      const ensured = await ensureQbitForDownload()
+      engine = ensured.engine
+      if (ensured.note) log.append('info', 'download', ensured.note)
+    }
     const task: DownloadTask = {
       id: randomUUID(),
       ...input,
-      engine: getSettings().downloader.dual ? this.assignEngine() : undefined,
+      // 双下载器模式要记录每个任务实际用的引擎；单 qb 模式下也记上，删除/暂停时才知道该找谁
+      engine,
       status: 'queued',
       progress: 0,
       addedAt: Date.now()
@@ -145,7 +214,7 @@ class DownloadManager {
     const tasks = this.tasks()
     tasks.push(task)
     this.save(tasks)
-    log.append('info', 'download', `新增下载任务: ${input.name}`)
+    log.append('info', 'download', `新增下载任务: ${input.name}（引擎 ${engine}）`)
     // 首次下载行为：提示一次保存位置（只显示一次）
     maybeShowSaveHint()
     this.process(task.id).catch((err) => {
@@ -226,7 +295,11 @@ class DownloadManager {
   async resume(id: string): Promise<boolean> {
     const task = this.tasks().find((t) => t.id === id)
     if (!task || !task.downloaderId) return false
-    if (!PAUSABLE.includes(task.status)) return false
+    // 只有「暂停」态才能继续（见 RESUMABLE 注释：这里以前误用 PAUSABLE，导致继续永远失败）
+    if (!RESUMABLE.includes(task.status)) {
+      log.append('warn', 'download', `任务状态为 ${task.status}，无需继续`)
+      return false
+    }
     try {
       if (this.engineOf(task) === 'aria2') await aria2.unpause(task.downloaderId)
       else await qbit.resume(task.downloaderId)
@@ -351,12 +424,22 @@ class DownloadManager {
         const patch: Partial<DownloadTask> = {
           progress: Math.round(st.progress),
           speed: st.speed,
+          // qb 也给了 leech/seed 数，填上以后下载列表里的「已连接 N 个对端」在 qb 模式下同样有值
+          peers: st.peers,
+          seeders: st.seeders,
           eta: st.eta,
           size: st.size,
           status: st.status,
           error: st.error
         }
-        if (st.status === 'seeding' && task.status !== 'seeding' && task.status !== 'done') {
+        /*
+         * 完成判定。
+         * qb 下完会进入 uploading/stalledUP（映射为 seeding）；但如果用户开了「做种到...后停止」
+         * 或「下载完成后停止」，最终状态是 stoppedUP（映射为 paused）——只看 seeding 会永远判不出完成，
+         * 所以进度到 100% 且处于停止/暂停态时同样算完成。
+         */
+        const finished = st.status === 'seeding' || (st.progress >= 99.5 && st.status === 'paused')
+        if (finished && task.status !== 'seeding' && task.status !== 'done') {
           patch.status = 'done'
           patch.progress = 100
           patch.finishedAt = Date.now()

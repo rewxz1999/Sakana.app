@@ -165,6 +165,42 @@ if (!gotLock) {
     store.init()
     log.init()
     /*
+     * v0.3.9 体检 M4：把"落盘失败"接到日志上（以前只 console.error，打包后等于静默）。
+     * ⚠️ 必须跳过 `logs` 这个命名空间：日志本身也要落盘，磁盘满时若还去写日志就会无限递归。
+     */
+    store.onFlushError = (ns, err) => {
+      if (ns === 'logs') return
+      log.append('error', 'store', `数据落盘失败（${ns}）：${String((err as Error)?.message ?? err)}`)
+    }
+    /*
+     * v0.3.9 体检 H1（彻底修法的主进程这一半）：**任何一方**写了 settings 就广播一次。
+     *
+     * 渲染层那份 settings 是"整份缓存 + 整份回写"，而主进程也有十几处直接写 settings
+     * （Anime4K 画质、音频、投屏目标、缓存目录、数据源迁移标记…）。两边互不通知时谁后写谁赢，
+     * 用户遇到的就是"在播放器里调好的画质，回主窗口点个不相关的开关就变回默认"。
+     * 挂在 store 的写入钩子上，主进程那十几处**自动**覆盖，不需要逐个去改。
+     */
+    let settingsBroadcastTimer: NodeJS.Timeout | null = null
+    store.onNamespaceWritten = (ns) => {
+      if (ns !== 'settings') return
+      /*
+       * 合并短时间内的多次写入：设置偶尔会被连续写（数据源迁移 + 用户操作、或主进程几处连锁写），
+       * 每次广播都会让每个窗口重新读一遍文件，没必要。250ms 内的多次写入只广播一次。
+       */
+      if (settingsBroadcastTimer) return
+      settingsBroadcastTimer = setTimeout(() => {
+        settingsBroadcastTimer = null
+        for (const w of BrowserWindow.getAllWindows()) {
+          if (w.isDestroyed()) continue
+          try {
+            w.webContents.send(CH.evSettings)
+          } catch {
+            /* 窗口正在销毁时忽略 */
+          }
+        }
+      }, 250)
+    }
+    /*
      * v0.3.8：修复被早期"手机端历史合并"写坏的观看历史（详见 castSync.repairHistoryShape）。
      * 放在**建窗口之前**：界面第一次读 watchHistory 时拿到的就该是修好的数据。
      */
@@ -265,8 +301,39 @@ if (!gotLock) {
         } catch (err) {
           log.append('warn', 'cast', `投屏服务启动失败：${String((err as Error)?.message ?? err).slice(0, 140)}`)
         }
+        /*
+         * 图片缓存瘦身（v0.3.9 体检 M6）：只在启动时跑一次。
+         * 放在这里（而不是启动最前面）是因为它要读目录、统计大小，没必要和首屏抢时间；
+         * 也不能放进每张图的写入路径 —— 那样每次加载都要扫目录，得不偿失。
+         */
+        try {
+          const { pruneImageCache } = await import('./services/media')
+          /*
+           * `SAKANA_IMG_CACHE_MAX` 是给自检用的上限覆盖（字节）：不设就用默认 1GB。
+           * 有了它，"超限就删最久未用的"这条路径可以真跑一遍（见 .e2e 里的说明），
+           * 而不是只能靠读代码相信它。
+           */
+          const limit = Number(process.env.SAKANA_IMG_CACHE_MAX)
+          pruneImageCache(Number.isFinite(limit) && limit > 0 ? limit : undefined)
+        } catch (err) {
+          log.append('warn', 'img', `图片缓存清理失败：${String((err as Error)?.message ?? err).slice(0, 140)}`)
+        }
       })()
     }, 9000)
+
+    /*
+     * 播放链路自检（v0.3.9，SAKANA_FLOW_TEST=1）：
+     * 真规则跑三阶段（找资源/取资源/注入播放器）+ 失败归因的两条分支验证。
+     * 逻辑在 services/flowSelfTest.ts 里，这里只负责按环境变量触发 ——
+     * 那段脚本也可以被 e2e 直接 import，不必绕过渲染层伪造一次 IPC。
+     */
+    if (process.env.SAKANA_FLOW_TEST) {
+      setTimeout(() => {
+        void import('./services/flowSelfTest')
+          .then((m) => m.runFlowSelfTest())
+          .catch((err) => console.error('[flow-test] 自检脚本异常:', err))
+      }, 6000)
+    }
 
     // 在线播放端到端自检（SAKANA_ONLINE_TEST=关键词）：规则搜索 → 剧集 → 播放页 → 流嗅探
     if (process.env.SAKANA_ONLINE_TEST) {
@@ -469,6 +536,151 @@ if (!gotLock) {
           app.quit()
         })()
       }, 3000)
+    }
+
+    /*
+     * 在线播放加速自检（SAKANA_BOOST_TEST=1，v0.3.9）。
+     *
+     * 为什么必须在应用里跑、而不是外面写个脚本：加速器的输入是**真实直链**，
+     * 而直链只能由嗅探拿到（签名/一次性令牌/站点 Cookie），拿过期地址量出来的数字没有意义。
+     * 所以这里复用在线自检那条链路（规则搜索 → 剧集 → 播放页 → 嗅探窗口拿直链），
+     * 拿到地址后做三件事：① 直连串行取分片（=播放器的行为）② 让加速器决策 ③ 走加速地址再取一遍。
+     * 两次的口径完全一样（同一批分片、同样串行），差别只在「是否经过本机并发中转」。
+     *
+     * 可选：
+     *   SAKANA_BOOST_RULES='baimao,MXdm'  只测这几条规则（默认取启用规则里的前 3 条）
+     *   SAKANA_BOOST_KEYWORD='败犬女主太多了'
+     *   SAKANA_BOOST_FORCE=1              用「强制加速」档位跑（跳过阈值判定）
+     *   SAKANA_BOOST_PLAY=1               最后真让 mpv 播一次（确认中转地址能播，不只是数字好看）
+     */
+    if (process.env.SAKANA_BOOST_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const kw = String(process.env.SAKANA_BOOST_KEYWORD ?? '败犬女主太多了')
+          const wanted = String(process.env.SAKANA_BOOST_RULES ?? '')
+            .split(',')
+            .map((s) => s.trim().toLowerCase())
+            .filter(Boolean)
+          const { ruleSearch, ruleEpisodes, rulePlay } = await import('./services/rules')
+          const { startRuleProbe, stopRuleProbe, setProbeHook } = await import('./services/ruleProbe')
+          const { openRuleWebview, closeRuleWebview } = await import('./services/ruleWebview')
+          const boost = await import('./services/streamBoost')
+          const eng = await import('./services/playerEngine')
+          const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
+          const rules = store
+            .get<import('@shared/types').PlayRule[]>('rules', [])
+            .filter((r) => r.enabled)
+            .filter((r) =>
+              wanted.length === 0 ? true : wanted.some((w) => r.name.toLowerCase().includes(w))
+            )
+            .slice(0, wanted.length === 0 ? 3 : 8)
+          console.log(
+            `[boost-test] 关键词「${kw}」，待测规则 ${rules.length} 条；档位=${boost.boostMode()}`
+          )
+          for (const rule of rules) {
+            try {
+              const s = await ruleSearch(rule.id, kw)
+              if (!s.items.length) {
+                console.log(`[boost-test] ${rule.name}: 搜索无结果，跳过`)
+                continue
+              }
+              const ep = await ruleEpisodes(rule.id, s.items[0])
+              const g = ep.groups[0]
+              if (!g?.episodes?.length) {
+                console.log(`[boost-test] ${rule.name}: 无剧集，跳过`)
+                continue
+              }
+              const play = await rulePlay(rule.id, s.items[0], 0, 0, g.episodes[0].link, ep.vars)
+              const stream = await new Promise<{ url: string; referer?: string; cookies?: string } | null>(
+                (resolve) => {
+                  const timer = setTimeout(() => resolve(null), 40000)
+                  setProbeHook((payload) => {
+                    if (payload.type === 'found' && typeof payload.url === 'string') {
+                      clearTimeout(timer)
+                      resolve({
+                        url: payload.url,
+                        referer: typeof payload.referer === 'string' ? payload.referer : undefined,
+                        cookies: typeof payload.cookies === 'string' ? payload.cookies : undefined
+                      })
+                    }
+                  })
+                  openRuleWebview(win, play.url, { x: 0, y: 60, width: 960, height: 480 }, rule.baseUrl)
+                  startRuleProbe(win, play.url, rule.baseUrl)
+                }
+              )
+              closeRuleWebview()
+              setProbeHook(null)
+              stopRuleProbe()
+              if (!stream) {
+                console.log(`[boost-test] ${rule.name}: 未捕获到直链，跳过`)
+                continue
+              }
+              const headers: Record<string, string> = {}
+              if (stream.referer) headers.Referer = stream.referer
+              if (stream.cookies) headers.Cookie = stream.cookies
+              const isHls = boost.isHlsUrl(stream.url)
+              console.log(`[boost-test] ${rule.name}: 直链 ${stream.url.slice(0, 110)}（${isHls ? 'HLS' : '整段文件'}）`)
+
+              // ① 直连（播放器视角：HLS 一片一片顺序取 / 文件单连接顺序读）
+              const before = isHls
+                ? await boost.measureHlsThroughput(stream.url, headers, { segments: 8 })
+                : await boost.measureThroughput(stream.url, headers, {
+                    maxBytes: 8 * 1024 * 1024,
+                    maxMs: 20000
+                  })
+              console.log(`[boost-test] ${rule.name}: 直连 → ${before.note}`)
+
+              // ② 决策（真实走一遍 enginePlay 之前的那一步）
+              const plan = await boost.planStreamBoost(stream.url, {
+                referer: stream.referer,
+                cookies: stream.cookies,
+                userAgent: undefined
+              })
+              console.log(
+                `[boost-test] ${rule.name}: 决策 → ${plan.boosted ? '加速' : '直连'}（${plan.reason}）`
+              )
+              if (plan.boosted && plan.url) {
+                // ③ 走加速地址再取一遍（同一个口径）
+                const after = isHls
+                  ? await boost.measureHlsThroughput(plan.url, {}, { segments: 8 })
+                  : await boost.measureThroughput(plan.url, {}, {
+                      maxBytes: 8 * 1024 * 1024,
+                      maxMs: 20000
+                    })
+                console.log(`[boost-test] ${rule.name}: 加速后 → ${after.note}`)
+                const gain =
+                  before.rateBps > 0 ? ((after.rateBps / before.rateBps - 1) * 100).toFixed(0) : '?'
+                console.log(
+                  `[boost-test] ${rule.name}: 结论 直连 ${Math.round(before.rateBps / 1024)}KB/s → 加速 ${Math.round(after.rateBps / 1024)}KB/s（${Number(gain) >= 0 ? '+' : ''}${gain}%）`
+                )
+                const st = boost.getStreamBoostStatus()
+                console.log(
+                  `[boost-test] ${rule.name}: 状态 active=${st.active} kind=${st.kind} 并发=${st.parallel} 实时=${Math.round(st.rateBps / 1024)}KB/s 平均5s=${Math.round(st.avg5sBps / 1024)}KB/s`
+                )
+                // ④（可选）真播一次，确认中转地址不是「数字好看但播不了」
+                if (process.env.SAKANA_BOOST_PLAY) {
+                  await eng.engineAttach(win, { x: 0, y: 60, width: 960, height: 480 })
+                  eng.enginePlay(stream.url, stream.referer, stream.cookies)
+                  let playing = false
+                  for (let i = 0; i < 10 && !playing; i++) {
+                    await new Promise((r) => setTimeout(r, 1500))
+                    const s2 = eng.engineGetState()
+                    playing = !!s2?.playing && s2.length > 0
+                  }
+                  console.log(`[boost-test] ${rule.name}: 内核经加速中转播放成功=${playing}`)
+                  eng.engineDetach()
+                }
+              }
+              boost.stopAllBoost()
+            } catch (err) {
+              console.log(`[boost-test] ${rule.name}: 异常 ${String((err as Error)?.message ?? err).slice(0, 160)}`)
+            }
+          }
+          console.log('[boost-test] 完成')
+          markQuitting()
+          app.quit()
+        })()
+      }, 5000)
     }
 
     /*
@@ -2566,13 +2778,22 @@ if (!gotLock) {
     }
 
     /*
-     * 控制栏交互回归自检（SAKANA_OVERLAY_TEST=1）——v0.2.12 新增。
+     * 控制栏交互回归自检（SAKANA_OVERLAY_TEST=1）——v0.2.12 新增，v0.3.9 扩成"区域命中"版。
      *
      * 为什么单独做一个：用户反馈的「控制栏按钮失灵」有两个明确场景
      * （①播放器窗口在别的应用窗口之下 ②窗口被隐藏后再显示），
      * 根因是主进程那条「主窗口必须在前台才接收点击」的规则造成的死锁。
      * 原有的 SAKANA_PLAYER_INPUT_TEST 需要在线播放（依赖第三方站点，不稳定），
-     * 这个自检直接驱动悬浮窗服务，不需要任何网络，专门盯住这两条回归。
+     * 这个自检直接驱动悬浮窗服务，不需要任何网络。
+     *
+     * v0.3.9 加了最关键的两条（用户报的「点击击穿」）：鼠标落在**控制栏上**要接收点击、
+     * 落在**画面中部**必须保持穿透（整窗吃鼠标正是过去"点画面没反应"的原因）。
+     * 断言全部走真实窗口 + 真实状态查询，不依赖任何 mock。
+     *
+     * 加 `SAKANA_OVERLAY_HOLD=25` 会额外：全屏置顶 → 把可点按钮的屏幕坐标写进
+     * `.e2e/overlay-hit-points.json` → 打印 `HIT_TEST_READY` → 保持 25 秒不退出，
+     * 期间每秒报告"可交互/动作条数"。外部脚本 `.e2e/verify-overlay-clickthrough.ps1`
+     * 就是拿真实光标去点那些坐标（这才是"按钮到底点得动点不动"的最终判据）。
      */
     if (process.env.SAKANA_OVERLAY_TEST) {
       setTimeout(() => {
@@ -2583,12 +2804,41 @@ if (!gotLock) {
             setOverlayInteractive,
             isOverlayInteractive,
             isOverlayAlwaysOnTop,
-            overlayWindow
+            overlayWindow,
+            overlayInputDiagnostics,
+            overlayActionTotal,
+            resetOverlayActionTotal,
+            pushOverlayState,
+            pokeOverlay,
+            // v0.3.9 第三轮：断言改成量"窗口形状"（吃不吃鼠标由 OS 按形状判定）
+            overlayShapeHitTest,
+            overlayShapeRegions,
+            // v0.3.9 第四轮：形状是否真的下发 + 实际传入的矩形（单位问题的诊断依据）
+            overlayShapeApplied,
+            overlayShapeScaleFactor,
+            // v0.3.9 第五轮修订：下发的是两种单位解释的并集，导出名去掉单位（见 playerOverlay 实测史）
+            overlayShapeRectsSent,
+            overlayShapeUnits,
+            // v0.3.9 第六轮：UI 窗口的"健康状态"（可见 + 有形状 + 是否退化兜底）
+            overlayUiWindowState,
+            // v0.3.9 第五轮：点击口径（窗口收到 vs 落在按钮上 vs 产生动作）
+            overlayClickStatistics,
+            refreshOverlayClickStats
           } = await import('./services/playerOverlay')
+          const { screen } = await import('electron')
           const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
           const say = (ok: boolean, name: string, extra = ''): void => {
             console.log(`[overlay-test] ${ok ? 'PASS' : 'FAIL'} ${name}${extra ? ` | ${extra}` : ''}`)
           }
+          /*
+           * v0.3.9 补充：**"测不了"要如实标成 SKIP，不能以 FAIL 的形态留在输出里** ——
+           * 否则看日志的人分不清"产品坏了"和"这条断言根本测不到"。
+           * 目前只有一种情况会用到它：向**未聚焦窗口**注入合成鼠标事件。
+           */
+          const skip = (name: string, reason: string): void => {
+            console.log(`[overlay-test] SKIP ${name} | ${reason}`)
+          }
+          const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
           if (!win) {
             console.log('[overlay-test] 没有可用窗口')
             markQuitting()
@@ -2609,71 +2859,625 @@ if (!gotLock) {
             setTimeout(resolve, 6000)
           })
           const bounds = ov.getContentBounds()
-          /** 模拟鼠标移入控制栏区域：渲染层据此把控制栏显示出来并声明「我要可点击」 */
-          const pokeBar = async (): Promise<void> => {
-            ov.webContents.sendInputEvent({
-              type: 'mouseMove',
-              x: Math.round(bounds.width / 2),
-              y: Math.max(10, bounds.height - 140)
-            })
-            await new Promise((r) => setTimeout(r, 2200)) // 等 1.5 秒一次的心跳
-          }
-
-          await pokeBar()
-          say(isOverlayInteractive(), '控制栏显示时可接收点击', `可见=${ov.isVisible()}`)
+          /**
+           * 控制栏上的一点：底部往上 40px（落在按钮行里），横向取中间。
+           * 控制栏容器本身就是可交互区域，所以按钮之间的空隙同样算"在控制栏上"。
+           */
+          const barPoint = { x: bounds.width / 2, y: Math.max(10, bounds.height - 40) }
+          /** 画面中部：这里**必须**不在可交互区域里，否则 mpv 收不到鼠标（点画面暂停/uosc 拖动全废） */
+          const videoPoint = { x: bounds.width / 2, y: bounds.height / 2 }
+          /** 等一次区域刷新：主进程每次收到渲染层上报就会拉一次区域，另有 100ms 轮询兜底 */
+          const settle = (): Promise<void> => sleep(500)
 
           /*
-           * 场景 ①：主窗口**真正失焦**（用户说的「播放器窗口位于另一个应用窗口之下」）。
+           * ── v0.3.9 第三轮：断言改成"窗口形状"（架构换了，判据也换了）──
            *
-           * 关键：`win.blur()` 在 Windows 上并不足以让窗口失去焦点（实测调用后 isFocused 仍为 true，
-           * 那样断言会「假通过」），用外部进程的窗口抢焦点在这台机器上也不稳定。
-           * 这里改成**开一个我们自己的普通窗口并让它聚焦** —— 焦点转移是确定性的，
-           * 并且会**先验证前提成立**（主窗口确实不聚焦了）再断言，避免测试自己骗自己。
+           * 为什么不再有"鼠标在控制栏上 → 接收点击"这类断言：那条路已经被实测否定
+           * （真实光标 39 次点击丢 18 次：判定没错，错在"从穿透切到接收"需要时间）。
+           * 现在"吃不吃鼠标"是**窗口形状**这个静态事实 —— 由操作系统做命中判定，
+           * 所以断言可以直接量它：控制栏的点在形状里、画面中部的点不在形状里。
+           * 这两条比原来的运行期断言强得多：它们不依赖任何时序。
            */
-          const focusThief = new BrowserWindow({
-            width: 420,
-            height: 260,
-            title: '接管焦点的测试窗口',
-            show: true
-          })
-          focusThief.focus()
-          await new Promise((r) => setTimeout(r, 1500))
-          const unfocused = !win.isFocused()
-          await pokeBar()
+          /**
+           * 推一份"正在播放"的假状态：控制栏、按钮、面板才会真的渲染出来（第六轮起在自检最前面就推一次，
+           * 因为"每个面板是否落在形状里"必须**真的有面板可打开**才测得出来）。
+           */
+          const fakeState = (showEpisodes: boolean, started = false): void =>
+            pushOverlayState({
+              uoscBar: false,
+              playing: true,
+              title: '形状自检',
+              subtitle: '窗口形状随面板开合变化',
+              current: 30,
+              duration: 120,
+              volume: 100,
+              muted: false,
+              speed: 1,
+              aspect: 'fit',
+              fullscreen: true,
+              hasEpisodes: true,
+              canPrev: false,
+              canNext: false,
+              subs: [],
+              subIdx: -1,
+              status: { kind: 'playing', text: '播放中' },
+              error: null,
+              showEpisodes,
+              showInfo: false,
+              resume: null,
+              startedOnce: started,
+              videoRect: { x: 0, y: 0, width: bounds.width, height: bounds.height }
+            })
+          fakeState(false)
+          await settle()
+          /*
+           * ── v0.3.9 第六轮（用户实测 ④）：**进入播放页头 3 秒，UI 窗口绝不允许"没有形状又不可见"** ──
+           *
+           * 用户原话：「选集播放后进入播放，但是什么也不显示，一片黢黑，连播放器控制栏都不见了。」
+           * 根因：`setShape` 的裁剪是双向的（区域外不画也不收鼠标），所以"区域为空 → 隐藏窗口"
+           * 这条老逻辑一旦在页面还没就绪的那一瞬间被触发，控制栏与「加载中」提示会**一起消失**，
+           * 而此时 mpv 还没出第一帧 → 整屏全黑。
+           *
+           * 这条断言就是那个场景的守门人：进播放页头 3 秒每 250ms 采样一次，
+           * 逐帧打印"可见/区域块数/形状块数/形状下发次数/退化"，任何一帧出现
+           * "不可见 且 没有形状"就 FAIL。日志本身就是工单要的**时间线**。
+           */
+          const deadFrames: string[] = []
+          const timeline: string[] = []
+          let prevVisible: boolean | null = null
+          for (let i = 0; i < 12; i++) {
+            const st = overlayUiWindowState()
+            const dead = !st.visible && st.shapeRects === 0
+            if (dead) deadFrames.push(`t=${((i + 1) * 0.25).toFixed(2)}s`)
+            if (prevVisible === null || prevVisible !== st.visible) {
+              timeline.push(`t=${((i + 1) * 0.25).toFixed(2)}s ${st.visible ? '显示' : '隐藏'}`)
+              prevVisible = st.visible
+            }
+            console.log(
+              `[overlay-test] HEALTH t=${((i + 1) * 0.25).toFixed(2)}s 可见=${st.visible} 区域=${st.regions} 形状块=${st.shapeRects} ` +
+                `形状下发次数=${st.shapeApplyCount} 空区域次数=${st.hollowRegionPulls} 退化=${st.degraded}` +
+                (st.degradedReason ? ` 退化原因=${st.degradedReason}` : '') +
+                (st.lastHollowReason ? ` 最近空区域原因=${st.lastHollowReason}` : '')
+            )
+            await sleep(250)
+          }
+          const stFinal = overlayUiWindowState()
           say(
-            unfocused && isOverlayInteractive(),
-            '主窗口失焦后控制栏仍可点击（用户场景①）',
-            `主窗口聚焦=${win.isFocused()}${unfocused ? '' : ' ← 前提未成立，本次断言不算数'}`
+            deadFrames.length === 0 && stFinal.healthy,
+            '进播放页头 3 秒内 UI 窗口从未"既没有形状又不可见"（形状裁剪不会把控制栏/加载提示裁没）',
+            `死状态帧=${deadFrames.length}${deadFrames.length ? `（${deadFrames.join(',')}）` : ''} ` +
+              `末态: 可见=${stFinal.visible} 区域=${stFinal.regions} 形状块=${stFinal.shapeRects} 形状下发次数=${stFinal.shapeApplyCount} ` +
+              `空区域次数=${stFinal.hollowRegionPulls} 退化=${stFinal.degraded} 可见性变化=${timeline.join(' → ') || '无'}`
           )
-          focusThief.close()
-          await new Promise((r) => setTimeout(r, 800))
 
           /*
-           * 场景 ②：窗口隐藏后再显示，且**显示时不抢焦点**（`showInactive`）。
-           * 这是我们「从托盘/隐藏状态恢复」的真实路径 —— 旧逻辑要求前台才可点击，
-           * 于是恢复后控制栏看得见却点不动。
+           * ── v0.3.9 第六轮（用户实测 ①）：**每个控制栏面板打开后都必须落在下发的形状里** ──
+           *
+           * 用户原话：「控制栏按钮选项被遮盖，例如画质、画面比例、弹幕设置、字幕、倍速，其它倒是没问题。」
+           * 根因：这些 popover 挂在底栏容器里、视觉上伸到容器上方（`absolute bottom-12`），
+           * 而形状只收了底栏容器自己的矩形 → 伸出去的部分被裁剪（既看不见也点不到）。
+           *
+           * 这条断言不看标记打得对不对，而是**真的把每个面板打开、量它的真实矩形**再比对上报区域
+           * （`__sakanaPanelProbe` 在渲染层里做这件事）。逐面板给出结论，失败时能看到缺口比例。
            */
-          win.hide()
-          await new Promise((r) => setTimeout(r, 1200))
-          win.showInactive()
-          await new Promise((r) => setTimeout(r, 1200))
-          await pokeBar()
+          const panels = (await ov.webContents.executeJavaScript(
+            `typeof window.__sakanaPanelProbe === 'function' ? window.__sakanaPanelProbe() : null`,
+            true
+          )) as
+            | {
+                kind: string
+                title: string
+                found: boolean
+                covered: boolean
+                rect: { x: number; y: number; w: number; h: number } | null
+                missing: number
+                status: 'pass' | 'fail' | 'skip'
+                reason: string
+              }[]
+            | null
+          const panelList = panels ?? []
+          /*
+           * v0.3.9 第六轮修订：面板探测的结论分三类，**SKIP 不算失败**。
+           *
+           * 用户复跑时留下三条 FAIL：`选集` / `番剧详情` / `查看播放状态与流详情`。
+           * 前两条是**自检环境没有真实播放会话**（面板由主进程的播放状态驱动，点了当然没反应）——
+           * 那是"环境测不了"，不是产品坏了，必须如实标 SKIP 并写出原因；
+           * 第三条其实是我的探测器盲点（流详情是 `fixed inset-0`，外层 `data-sakana-hit` 包装器
+           * 自己没有尺寸 → "没找到浮层"），已按"容器里够大的后代"补上查找。
+           * 判据只看 `status === 'fail'`。
+           */
+          const panelFail = panelList.filter((p) => p.status === 'fail')
+          const panelSkip = panelList.filter((p) => p.status === 'skip')
+          const panelPass = panelList.filter((p) => p.status === 'pass')
+          for (const p of panelList) {
+            console.log(
+              `[overlay-test] PANEL ${p.status.toUpperCase()} '${p.title}' kind=${p.kind} ` +
+                `矩形=${p.rect ? `${p.rect.x},${p.rect.y},${p.rect.w}x${p.rect.h}` : 'none'} 缺口=${Math.round(p.missing * 100)}% | ${p.reason}`
+            )
+          }
           say(
-            isOverlayInteractive(),
-            '窗口隐藏再显示后控制栏仍可点击（用户场景②）',
-            `悬浮窗可见=${ov.isVisible()} 主窗口聚焦=${win.isFocused()}`
+            panelList.length >= 5 && panelPass.length >= 5 && panelFail.length === 0,
+            '每个能从控制栏打开的面板/菜单，打开后的矩形都完整落在下发的窗口形状里（用真实 DOM 矩形比对，不看标记）',
+            `探测=${panelList.length} 通过=${panelPass.length} 失败=${panelFail.length} 跳过=${panelSkip.length}` +
+              (panelFail.length ? ` 失败项=${panelFail.map((p) => `${p.title}(缺口${Math.round(p.missing * 100)}%)`).join('、')}` : '') +
+              (panelSkip.length ? ` 跳过项=${panelSkip.map((p) => p.title).join('、')}（原因见上面 PANEL 行）` : '')
           )
+
+          const barIn = overlayShapeHitTest(barPoint.x, barPoint.y)
+          const videoIn = overlayShapeHitTest(videoPoint.x, videoPoint.y)
+          const diag0 = overlayInputDiagnostics()
+          say(
+            diag0.mode === 'ui-window-shape',
+            '走的是"窗口形状"架构（不再是运行期切换吃不吃鼠标）',
+            `模式=${diag0.mode} 区域块数=${diag0.shapeRegions} UI可见=${diag0.uiVisible} 弹幕可见=${diag0.danmakuVisible}`
+          )
+          say(barIn, '控制栏在窗口形状里 → 控制栏上的点击必然落进 Electron 窗口（零延迟）', `区域块数=${diag0.shapeRegions} 区域=${JSON.stringify(overlayShapeRegions()).slice(0, 180)}`)
+          say(!videoIn, '画面中部不在窗口形状里 → 那里的点击由系统直接交给 mpv', `是否命中=${videoIn}`)
+
+          /*
+           * ── v0.3.9 第六轮修订：**两种状态都要量"画面中部"**（用户复跑给的回归）──
+           *
+           * 上一轮为了让"加载中/过程进度"卡画出来，把它算进了 UI 窗口的区域；而那张卡是**居中**的，
+           * 于是画面正中落进形状 → 该像素的点击被 Electron 吃掉、mpv 收不到（复跑结果：
+           * `画面中部不在窗口形状里 = false`，区域块数也从 2 变 3）。
+           * 修法是把它搬到**穿透层（弹幕窗口）**去画，与形状无关。这条断言把两种状态都钉住：
+           *   · 加载中（`startedOnce=false`，卡片正在显示）→ 画面中部必须仍然自由；
+           *   · 开播后（`startedOnce=true`，卡片已从穿透层移除）→ 同样自由。
+           * 两条都不依赖"单位解释"或时序，只依赖"区域里有没有那块矩形"。
+           */
+          fakeState(false, true)
+          await settle()
+          const centreAfterStart = overlayShapeHitTest(videoPoint.x, videoPoint.y)
+          say(
+            !videoIn && !centreAfterStart,
+            '加载中与开播后两种状态下画面中部都不在窗口形状里（加载提示画在穿透层，不占画面中心的点击）',
+            `加载中=${videoIn} 开播后=${centreAfterStart} 区域块数=${overlayShapeRegions().length}`
+          )
+
+          /*
+           * 动态调整：控制栏/面板开合时形状要跟着变（用户明确要求"跟着显隐/开合动态调整矩形"）。
+           * 这里推一份"选集面板已打开"的状态 —— 面板是全屏遮罩，形状应当扩到画面中部；
+           * 再推一份关闭的状态，形状应当收回（中部重新变成 mpv 的）。
+           */
+          fakeState(true)
+          await settle()
+          const panelIn = overlayShapeHitTest(videoPoint.x, videoPoint.y)
+          fakeState(false)
+          await settle()
+          const afterClose = overlayShapeHitTest(videoPoint.x, videoPoint.y)
+          say(
+            panelIn && !afterClose,
+            '面板打开时形状扩到面板范围、关闭后收回（画面中部重新归 mpv）',
+            `打开=${panelIn} 关闭后=${afterClose}`
+          )
+
+          /*
+           * ── v0.3.9 第四轮：加两条能量化"形状到底有没有盖住按钮"的断言 ──
+           *
+           * 为什么需要：上一轮实测出现「顶栏按钮点得到、底栏按钮点不到、WindowFromPoint 返回 pid=0」，
+           * 而 `setShape` 的文档没写矩形单位（DIP 还是物理像素，标注 @experimental）。
+           * 这两条断言把"OS 那边收到的矩形"和"按钮的屏幕位置"直接对起来，
+           * 单位或时机一旦再出错，这里会立刻红，而不是等到真实光标点击丢一半才发现。
+           */
+          const sf = screen.getDisplayNearestPoint({ x: bounds.x + 10, y: bounds.y + 10 }).scaleFactor
+          /** 底栏按钮的 CSS 矩形（相对悬浮窗客户区）与换算后的物理中心点 */
+          const btnInfo = (await ov.webContents.executeJavaScript(
+            `(function () {
+               var bar = document.querySelector('[data-sakana-bottombar]');
+               if (!bar) return null;
+               var nodes = bar.querySelectorAll('button');
+               var out = [];
+               for (var i = 0; i < nodes.length; i++) {
+                 var r = nodes[i].getBoundingClientRect();
+                 if (r.width < 6 || r.height < 6) continue;
+                 out.push({ cx: r.left + r.width / 2, cy: r.top + r.height / 2, bottom: r.bottom, barTop: bar.getBoundingClientRect().top });
+               }
+               return out;
+             })()`,
+            true
+          )) as { cx: number; cy: number; bottom: number; barTop: number }[] | null
+          const cssRegions = overlayShapeRegions()
+          const sentRects = overlayShapeRectsSent()
+          const inAny = (rects: { x: number; y: number; w: number; h: number }[], x: number, y: number): boolean =>
+            rects.some((r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
+          /*
+           * v0.3.9 第五轮修订：断言回到"上报的 DIP 区域"这一侧。
+           *
+           * 形状现在下发的是**两种单位解释的并集**（`r` 与 `r×缩放`，见 playerOverlay 的 SHAPE_UNITS
+           * 实测史）。设真实控制栏上的点是 p（DIP，相对客户区），则
+           *   · OS 按 DIP 解释 → 覆盖点 = 原点×缩放 + N，并集里有 N=p → p 被覆盖；
+           *   · OS 按物理解释 → 覆盖点 = 原点×缩放 + N，并集里有 N=p×缩放 → p 仍被覆盖。
+           * 所以"底栏按钮落在上报区域里"这一条**等价于**"无论 OS 按哪种解释，真实底栏都在形状里"，
+           * 是一条不依赖单位结论的可证伪断言。
+           *
+           * 上一轮把断言写成"只按物理像素解释"是错的：那把一个**未证实的单位推断**写进了断言，
+           * 结果物理那一份单独下发时形状整体落空（实测 21/39 点击丢失），而断言还是绿的。
+           * 教训：断言只能依赖实测过的事实，不能依赖推理出来的中间结论。
+           */
+          const misses = (btnInfo ?? []).filter((btn) => !inAny(cssRegions, btn.cx, btn.cy))
+          const compact = (rs: { x: number; y: number; w: number; h: number }[]): string =>
+            JSON.stringify(rs.map((r) => [Math.round(r.x), Math.round(r.y), Math.round(r.w), Math.round(r.h)]))
+          const rectText = (r: { x: number; y: number; w: number; h: number } | null): string =>
+            r ? `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.w)},${Math.round(r.h)}` : 'none'
+          const bottomMost = (
+            rs: { x: number; y: number; w: number; h: number }[]
+          ): { x: number; y: number; w: number; h: number } | null =>
+            rs.length === 0 ? null : rs.reduce((a, c) => (c.y > a.y ? c : a), rs[0])
+          const topMost = (
+            rs: { x: number; y: number; w: number; h: number }[]
+          ): { x: number; y: number; w: number; h: number } | null =>
+            rs.length === 0 ? null : rs.reduce((a, c) => (c.y < a.y ? c : a), rs[0])
+          /*
+           * 单位探针点（v0.3.9 第五轮修订：**由主进程算成绝对物理屏幕坐标**，ps1 只做 WindowFromPoint）。
+           *
+           * 上一轮的探针有两处缺陷，如实记下：
+           *   ① 把"窗口原点的 DIP 值"和"矩形数字"当同一单位相加 —— 窗口不在 (0,0) 时会偏；
+           *   ② 只用"并集里某一点属于我们"反推整组矩形的单位解释 —— 这个推断**不成立**：
+           *      并集在两种解释下都覆盖真实控制栏，"被覆盖"说明不了是哪一份盖住的。
+           * 现在给出四个用途明确的点：
+           *   · trueTop / trueBottom —— 控制栏在屏幕上的**真实**位置 (原点+矩形)×缩放。两种解释下都
+           *     应被覆盖（分别由两份矩形之一负责）→ 判据是"控制栏到底在不在形状里"；
+           *   · videoCentre —— 画面正中，**必须不在**形状里（否则 mpv 收不到鼠标）；
+           *   · cssAsPhys —— **决定性探针**：把 CSS 组最靠下那块矩形的数字**当物理像素**放到屏幕上。
+           *     这条带只有"OS 按物理像素解释"时才被覆盖；OS 按 DIP 解释时它空着（这条带就是实测里
+           *     "吃视频点击的多余带"）。于是"这一点是否属于 UI 悬浮窗"直接给出单位结论；
+           *   · physAsDip —— 反向对照：物理组的数字**当 DIP** 放在屏幕上的位置（DIP 解释下它落在窗口
+           *     之外）。只作记录，不参与判定。
+           */
+          const physOf = (x: number, y: number): { x: number; y: number } => ({
+            x: Math.round((bounds.x + x) * sf),
+            y: Math.round((bounds.y + y) * sf)
+          })
+          const asPhysical = (r: { x: number; y: number; w: number; h: number }): { x: number; y: number } => ({
+            x: Math.round(bounds.x * sf + r.x + r.w / 2),
+            y: Math.round(bounds.y * sf + r.y + r.h / 2)
+          })
+          const bottomRegion = bottomMost(cssRegions)
+          const topRegion = topMost(cssRegions)
+          const trueBottom = physOf(
+            bottomRegion ? bottomRegion.x + bottomRegion.w / 2 : bounds.width / 2,
+            bottomRegion ? bottomRegion.y + bottomRegion.h / 2 : bounds.height - 20
+          )
+          const trueTop = physOf(
+            topRegion ? topRegion.x + topRegion.w / 2 : bounds.width / 2,
+            topRegion ? topRegion.y + topRegion.h / 2 : 20
+          )
+          /*
+           * 画面里"必须不属于悬浮窗"的探针点：取窗口高度 30% 处，**不用正中**。
+           * 为什么不用正中：按物理解释时 CSS 组底栏矩形会落在窗口内 y≈546~574（物理）那条带上，
+           * 而窗口正中（高度 50% → 物理 574）正好压在那条带的**边缘**上，会让"画面是否被吃"
+           * 这条判据偶发为假。取 30% 处离上下两条带都远。
+           */
+          const videoCentre = physOf(bounds.width / 2, bounds.height * 0.3)
+          const cssAsPhys = bottomRegion ? asPhysical(bottomRegion) : { x: -1, y: -1 }
+          const scaledBottom = bottomRegion
+            ? Math.abs(sf - 1) > 0.01
+              ? { x: bottomRegion.x * sf, y: bottomRegion.y * sf, w: bottomRegion.w * sf, h: bottomRegion.h * sf }
+              : { ...bottomRegion }
+            : null
+          const physAsDip = scaledBottom
+            ? physOf(scaledBottom.x + scaledBottom.w / 2, scaledBottom.y + scaledBottom.h / 2)
+            : { x: -1, y: -1 }
+          const pt = (p: { x: number; y: number }): string => `${p.x},${p.y}`
+          say(
+            !!btnInfo && btnInfo.length > 0 && misses.length === 0,
+            '底栏按钮落在上报的可交互区域里（下发 r 与 r×缩放 的并集，OS 按 DIP 或物理像素解释都覆盖真实底栏）',
+            `按钮=${btnInfo?.length ?? -1} 未覆盖=${misses.length} 缩放=${sf} 单位解释=${overlayShapeUnits().join('+')} ` +
+              `CSS区域=${compact(cssRegions)} 下发矩形=${compact(sentRects).slice(0, 200)} ` +
+              // 下面这些点给 ps1 的探针用：**绝对物理屏幕坐标**，ps1 只负责 WindowFromPoint 与归属比较
+              `UNITPROBE trueTop=${pt(trueTop)} trueBottom=${pt(trueBottom)} videoCentre=${pt(videoCentre)} ` +
+              `cssAsPhys=${pt(cssAsPhys)} physAsDip=${pt(physAsDip)} ` +
+              `cssBottomRect=${rectText(bottomRegion)} sentRects=${sentRects.length}`
+          )
+          say(
+            overlayShapeApplied(),
+            'setShape 调用成功（形状真的下发到 OS，而不是只记在内存里）',
+            `applied=${overlayShapeApplied()} 缩放=${overlayShapeScaleFactor()} 单位解释=${overlayShapeUnits().join('+')} 矩形块=${sentRects.length}`
+          )
+
+          /*
+           * 控制栏**自动淡出**后必须仍有一份非空区域、且包含上下两条热区 ——
+           * 否则那两条位置上的鼠标移动渲染层收不到、控制栏永远唤不出来（死锁），
+           * 而且窗口会被 hide()，那两条上的点击就全都落空了（正是实测的现象之一）。
+           * 自动收起是 5 秒，所以这里等 6 秒再看。
+           */
+          pokeOverlay()
+          await sleep(6000)
+          const hiddenRegions = overlayShapeRegions()
+          const topHot = hiddenRegions.some((r) => r.y <= 4 && r.h >= 20)
+          const bottomHot = hiddenRegions.some((r) => r.y + r.h >= bounds.height - 4 && r.h >= 20)
+          say(
+            hiddenRegions.length > 0 && topHot && bottomHot && ov.isVisible(),
+            '控制栏淡出后仍保留上下两条热区（非空区域 + 窗口不被 hide）',
+            `区域=${hiddenRegions.length} 顶部热区=${topHot} 底部热区=${bottomHot} 可见=${ov.isVisible()}`
+          )
+
+          /*
+           * 渲染层必须真的标出了可点区域，并且暴露了区域/诊断接口 ——
+           * 缺一个，"区域 → 窗口形状"这条链就会静默失效。
+           */
+          const hitRegions = (await ov.webContents.executeJavaScript(
+            `document.querySelectorAll('[data-sakana-hit]').length`,
+            true
+          )) as number
+          const probeTypes = (await ov.webContents.executeJavaScript(
+            `[typeof window.__sakanaHitRegions, typeof window.__sakanaHitAt, typeof window.__sakanaHitDiag].join('/')`,
+            true
+          )) as string
+          say(
+            hitRegions >= 2 && probeTypes === 'function/function/function',
+            '渲染层已标注可点区域并暴露区域/诊断接口',
+            `标记=${hitRegions} 接口=${probeTypes}`
+          )
+          /* 面板自检会开合浮层、也可能触发 main 的状态回推；这里把假状态复位一次，
+             让下面的几何断言读到的是"只有控制栏"那份区域（避免读到残留浮层）。 */
+          fakeState(false)
+          await sleep(500)
 
           say(!isOverlayAlwaysOnTop(), '悬浮窗从不置顶（不抢别人窗口的位置）')
 
+
           /*
-           * 收起时必须恢复点击穿透：透明悬浮窗铺满整个窗口，
-           * 若一直接收点击，页面本身的控件就点不到了。
-           * 渲染层的心跳是 1.5 秒一次，这里只等 600ms，避免被心跳覆盖。
+           * ── 可选：真实光标点击实验（SAKANA_OVERLAY_HOLD=秒数）──
+           *
+           * 前面所有断言用的都是"直投渲染层"的合成事件，能证明渲染层与主进程的判定正确，
+           * 但证明不了"Windows 真的把点击交给了悬浮窗"。这一段把窗口全屏置顶、
+           * 把可点按钮的**屏幕物理坐标**写盘，等外部 PowerShell 用真实光标去点
+           * （见 .e2e/verify-overlay-clickthrough.ps1），并把每次点击到达主进程的动作数打出来。
            */
-          setOverlayInteractive(false)
-          await new Promise((r) => setTimeout(r, 600))
-          say(!isOverlayInteractive(), '控制栏收起后恢复点击穿透')
+          const hold = Number(process.env.SAKANA_OVERLAY_HOLD) > 0 ? Number(process.env.SAKANA_OVERLAY_HOLD) : 0
+          if (hold > 0) {
+            const { writeFileSync, renameSync } = await import('node:fs')
+            const { join: pjoin } = await import('node:path')
+            win.setAlwaysOnTop(true)
+            win.setFullScreen(true)
+            win.focus()
+            // 推一份最小状态：让控制栏按"正在播放"的样子渲染（按钮齐全、进度条有值）
+            const pushFakeState = (): void =>
+              pushOverlayState({
+                uoscBar: false,
+                playing: true,
+                title: '点击自检',
+                subtitle: '真实光标点击实验',
+                current: 30,
+                duration: 120,
+                volume: 100,
+                muted: false,
+                speed: 1,
+                aspect: 'fit',
+                fullscreen: true,
+                hasEpisodes: false,
+                canPrev: false,
+                canNext: false,
+                subs: [],
+                subIdx: -1,
+                status: { kind: 'playing', text: '播放中' },
+                error: null,
+                showEpisodes: false,
+                showInfo: false,
+                resume: null,
+                videoRect: { x: 0, y: 0, width: bounds.width, height: bounds.height }
+              })
+            for (let i = 0; i < 4; i++) {
+              pushFakeState()
+              pokeOverlay()
+              await sleep(400)
+            }
+            const b2 = ov.getContentBounds()
+            const sf = screen.getDisplayNearestPoint({ x: b2.x + 10, y: b2.y + 10 }).scaleFactor
+            /*
+             * v0.3.9 第五轮（修上一轮选错目标的问题）：给外部脚本标一个**安全的连点目标**。
+             *
+             * 上一轮用 `/暂停|播放|继续/` 去匹配，结果选中了「查看播放状态与流详情」——
+             * 名字里带"播放"但不是播放键 ✗。它一点就开面板，之后所有 dumped 坐标都被面板盖住，
+             * 于是连点段 20 次里 10 次落在面板上、actions=0 —— 那是测试自己的锅。
+             * 现在改成**精确白名单 + 排除面板类关键词**双保险：
+             *   · 白名单：只有标题正好是「暂停 / 播放 / 继续播放 / 播放/暂停」才算安全（来回切换、点多少次都无害）；
+             *   · 排除：标题里带 状态/详情/选集/字幕/倍速/画质/比例/投屏/设置/菜单/弹幕/截图/全屏/退出 的一律不要。
+             * 找不到安全目标就返回 -1（外部脚本据此**跳过**连点段，而不是去点会改状态的按钮）。
+             * 同时把每个按钮按类别标出来（toggle / panel / exit / other），让外部脚本能跳过会改布局的。
+             * （中文匹配只能写在主进程里：ps1 必须保持 ASCII-only，否则 PS 5.1 按 ANSI 读会解析失败。）
+             */
+            type BtnKind = 'toggle' | 'panel' | 'exit' | 'other'
+            const SAFE_TITLES = ['暂停', '播放', '继续播放', '播放/暂停']
+            const UNSAFE_RE = /状态|详情|选集|字幕|倍速|画质|比例|投屏|设置|菜单|弹幕|截图|全屏|退出|统计/
+            const classifyBtn = (title: string): BtnKind => {
+              if (UNSAFE_RE.test(title)) {
+                if (/退出|全屏/.test(title)) return 'exit'
+                return 'panel'
+              }
+              return SAFE_TITLES.includes(title.trim()) ? 'toggle' : 'other'
+            }
+            /**
+             * 收集可点区域里所有可见按钮的中心点（CSS 像素 → 屏幕物理像素）。
+             *
+             * `kind` 是给外部脚本的**安全分类**：点 `panel`/`exit` 会改变布局（面板盖住旧坐标、
+             * 或直接退出全屏），旧坐标立刻作废 —— 这类按钮要么用"重新 dump 的坐标"再点，
+             * 要么跳过并记录原因，绝不能拿旧坐标硬点。
+             */
+            const collectPoints = async (): Promise<
+              { title: string; kind: BtnKind; css: { x: number; y: number }; phys: { x: number; y: number } }[]
+            > => {
+              const raw = (await ov.webContents.executeJavaScript(
+                `(function () {
+                   var out = [];
+                   var nodes = document.querySelectorAll('[data-sakana-hit] button');
+                   for (var i = 0; i < nodes.length; i++) {
+                     var b = nodes[i];
+                     var r = b.getBoundingClientRect();
+                     if (r.width < 6 || r.height < 6) continue;
+                     out.push({
+                       title: b.getAttribute('title') || (b.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 16),
+                       x: r.left + r.width / 2,
+                       y: r.top + r.height / 2
+                     });
+                   }
+                   return out;
+                 })()`,
+                true
+              )) as { title: string; x: number; y: number }[]
+              return raw.map((r) => ({
+                title: r.title,
+                kind: classifyBtn(r.title),
+                css: { x: Math.round(r.x), y: Math.round(r.y) },
+                phys: { x: Math.round((b2.x + r.x) * sf), y: Math.round((b2.y + r.y) * sf) }
+              }))
+            }
+            /**
+             * v0.3.9 第五轮：**重新 dump 几何**（原子替换 + 递增 seq）。
+             *
+             * 为什么需要：逐个点按钮时，点到"查看播放状态/选集/字幕"这类按钮会**打开面板**，
+             * 面板一开就盖住原来的坐标 → 后面每一次点击都落在面板上（窗口收到了点击、但没有动作）。
+             * 上一轮把这当成"产品落空"是误判。外部脚本现在可以在每次点击后等一次新 dump
+             * （seq 变大），按 **title** 重新取坐标（title 稳定、索引不稳定），
+             * 于是面板开合不会再污染测量；主进程侧的动作变化也会触发重 dump，
+             * 保证"会改状态的按钮"后面拿到的一定是新几何。
+             *
+             * 原子替换（先写 .tmp 再 rename）是因为这个文件在 HOLD 期间会被 ps1 反复读：
+             * 直接覆写会让读到半截 JSON 的脚本抛解析错误。
+             */
+            let dumpSeq = 0
+            const pointsFile = pjoin(process.cwd(), '.e2e', 'overlay-hit-points.json')
+            type HitDump = {
+              seq: number
+              points: { title: string; kind: BtnKind; css: { x: number; y: number }; phys: { x: number; y: number } }[]
+              stressIndex: number
+              stressTitle: string
+              skipped: { i: number; title: string; kind: BtnKind }[]
+            }
+            const dumpGeometry = async (
+              pre?: { title: string; kind: BtnKind; css: { x: number; y: number }; phys: { x: number; y: number } }[]
+            ): Promise<HitDump> => {
+              const pts2 = pre ?? (await collectPoints())
+              const stressIdx2 = pts2.findIndex((p) => p.kind === 'toggle')
+              dumpSeq += 1
+              const dump: HitDump = {
+                seq: dumpSeq,
+                points: pts2,
+                stressIndex: stressIdx2,
+                stressTitle: stressIdx2 >= 0 ? pts2[stressIdx2].title : '',
+                skipped: pts2.map((p, i) => ({ i, title: p.title, kind: p.kind })).filter((p) => p.kind === 'panel' || p.kind === 'exit')
+              }
+              const tmp = `${pointsFile}.tmp`
+              writeFileSync(
+                tmp,
+                JSON.stringify(
+                  {
+                    ...dump,
+                    win: b2,
+                    sf,
+                    at: Date.now(),
+                    /* 窗口句柄给外部脚本用：它需要把自检窗口提到前台，否则别的程序盖在上面时
+                       光标根本到不了悬浮窗（实测本机自检环境里那个点上是 msedge 的窗口） */
+                    mainHwnd: win.getNativeWindowHandle().readUInt32LE(0),
+                    overlayHwnd: ov.getNativeWindowHandle().readUInt32LE(0)
+                  },
+                  null,
+                  2
+                ),
+                'utf8'
+              )
+              renameSync(tmp, pointsFile)
+              console.log(
+                `[overlay-test] GEOMETRY seq=${dumpSeq} buttons=${pts2.length} ` +
+                  `stress=${stressIdx2 >= 0 ? pts2[stressIdx2].title : 'none'}`
+              )
+              return dump
+            }
+            const firstDump = await dumpGeometry()
+            resetOverlayActionTotal()
+            console.log(
+              `[overlay-test] HIT_TEST_READY 可点按钮 ${firstDump.points.length} 个已写入 .e2e/overlay-hit-points.json` +
+                `（窗口 ${b2.width}x${b2.height} @${b2.x},${b2.y} 缩放=${sf} seq=${firstDump.seq}）`
+            )
+            /*
+             * v0.3.9 第五轮：**HOLD 期间的几何保鲜**。
+             *
+             * 问题（上一轮实测数据）：ps1 按下标点按钮，点到「查看播放状态与流详情」会**打开面板**，
+             * 面板一盖住旧坐标，后面 10 次点击全落在面板上（窗口收到点击、但没有任何动作），
+             * 于是连点段 actions=0 —— 看起来像产品坏了，其实是坐标过期。
+             *
+             * 现在主进程自己保证"几何永远新"：每个 500ms 的 tick 都算一次**几何签名**
+             * （每个可点按钮的 title + 取整后的 CSS 坐标 + 分类），只要
+             *   · 签名变了（面板开/关、控制栏收起/展开、按钮增删），或
+             *   · 动作数变了（某个按钮真的产生了动作），或
+             *   · 距上次 dump 超过 1 秒（心跳，保证 ps1 的"等新 seq"不会永久阻塞）
+             * 就重新 dump（原子替换 + seq 递增），并在日志里写清**是哪个按钮的点击触发的**。
+             * tick 本身就是 500ms 节流，不需要额外防抖。
+             *
+             * 这样"每个会改状态的按钮"后面都能拿到一份新几何 —— 要么被重 dump 覆盖，
+             * 要么在 ps1 侧按 kind 跳过并记录原因，不会再有"拿旧坐标硬点"。
+             */
+            const signatureOf = (pts: { title: string; kind: string; css: { x: number; y: number } }[]): string =>
+              pts.map((p) => `${p.title}@${p.css.x},${p.css.y},${p.kind}`).join('|')
+            const HOLD_REDUMP_HEARTBEAT_MS = 1000
+            let lastSig = signatureOf(firstDump.points)
+            let lastActions = overlayActionTotal()
+            let lastDumpAt = Date.now()
+            let lastByTitle: Record<string, number> = {}
+            for (let i = 0; i < hold * 2; i++) {
+              await sleep(500)
+              pushFakeState()
+              const d = overlayInputDiagnostics()
+              console.log(
+                `[overlay-test] HIT t=${((i + 1) * 0.5).toFixed(1)}s 可交互=${d.interactive} 模式=${d.mode} ` +
+                  `形状区域=${d.shapeRegions} 动作数=${overlayActionTotal()} 可见=${d.uiVisible} 退化=${d.shapeDegraded}`
+              )
+              /*
+               * v0.3.9 第五轮：**机器可读**的统计行，给 ps1 做分段统计用（按阶段取差值）。
+               * 关键是把两个口径并排打出来：
+               *   · clicks  —— 渲染层收到的 pointerdown 数（= 点击真的落进了 Electron 窗口）
+               *   · onButton—— 其中落在按钮上的（正常应与 actions 1:1）
+               *   · blank   —— 落在热区空白处（自动收起后那一帧/按钮之间空隙）→ 到窗口但无动作
+               * 这样"点击没到"和"点击到了但没落在按钮上"就不会再混成一个数字。
+               */
+              await refreshOverlayClickStats()
+              const cs = overlayClickStatistics()
+              console.log(
+                `[overlay-hit] STATS actions=${overlayActionTotal()} clicks=${cs.down} onButton=${cs.onButton} ` +
+                  `blank=${cs.onHitBlank} else=${cs.elsewhere} byTitle=${JSON.stringify(cs.byTitle)}`
+              )
+              const actNow = overlayActionTotal()
+              const clickedTitles = Object.entries(cs.byTitle)
+                .filter(([t, n]) => n > (lastByTitle[t] ?? 0))
+                .map(([t, n]) => `${t}x${n - (lastByTitle[t] ?? 0)}`)
+              lastByTitle = { ...cs.byTitle }
+              const ptsNow = await collectPoints()
+              const sigNow = signatureOf(ptsNow)
+              const sigChanged = sigNow !== lastSig
+              const actChanged = actNow !== lastActions
+              const stale = Date.now() - lastDumpAt >= HOLD_REDUMP_HEARTBEAT_MS
+              if (sigChanged || actChanged || stale) {
+                /*
+                 * 触发原因要写全：ps1 的逐按钮报告会把这行当"该按钮没有让几何失效"的依据，
+                 * 所以既要说清是什么变了，也要带上"这一 tick 里点到了哪些按钮"。
+                 */
+                const why = sigChanged
+                  ? '几何变化（面板开合/按钮增删/位置改变）'
+                  : actChanged
+                    ? `动作数变化 ${lastActions} → ${actNow}`
+                    : '心跳（1s 无变化）'
+                /* tag 是 ASCII：ps1 要按它判断"这次重 dump 是几何真的变了，还是心跳"，
+                   而 ps1 必须保持 ASCII-only（PS 5.1 按 ANSI 读会解析失败） */
+                const tag = sigChanged ? 'geometry' : actChanged ? 'actions' : 'heartbeat'
+                const dumped = await dumpGeometry(ptsNow)
+                lastSig = signatureOf(dumped.points)
+                lastDumpAt = Date.now()
+                console.log(
+                  `[overlay-test] REDUMP tag=${tag} 原因=${why}` +
+                    ` 触发点击=${clickedTitles.length ? clickedTitles.join('、') : '无'}` +
+                    ` 新 seq=${dumped.seq} 按钮数=${dumped.points.length}`
+                )
+              }
+              lastActions = actNow
+            }
+            const csFinal = overlayClickStatistics()
+            console.log(
+              `[overlay-test] CLICK SUMMARY windowReceived=${csFinal.down} onButton=${csFinal.onButton} ` +
+                `blank=${csFinal.onHitBlank} else=${csFinal.elsewhere} actions=${overlayActionTotal()} ` +
+                `byTitle=${JSON.stringify(csFinal.byTitle)}`
+            )
+          }
 
           destroyOverlay()
           console.log('[overlay-test] done')
@@ -4266,6 +5070,17 @@ if (!gotLock) {
     await step('本机中转服务', async () => {
       const { closeLiveServer } = await import('./services/transcode')
       closeLiveServer()
+    })
+    /*
+     * ⑦ 投屏中转服务（v0.3.9 体检 M1）。
+     *
+     * `stopCastServer()` 早就写好了，却**从来没有被调用过**：投屏中转是绑在 0.0.0.0 上的 HTTP 服务，
+     * 还带一个 spawn 出来的 ffmpeg 子进程 —— 用户直接退出应用时它们会一直留到系统回收为止，
+     * 表现就是"应用关了，端口还被占着、ffmpeg 还在跑"。放在最后一步收，是因为它可能正在推流。
+     */
+    await step('投屏中转服务', async () => {
+      const { stopCastServer } = await import('./services/castRelay')
+      stopCastServer()
     })
   }
 

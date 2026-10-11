@@ -14,10 +14,25 @@ interface SettingsState {
   saveDeep: (patch: (s: AppSettings) => AppSettings) => void
 }
 
+/**
+ * 是否已订阅"设置被任意一方改过"的通知（v0.3.9 体检 H1）。
+ * 与 library 里的 storeSubscribed 同理：这是**进程级只订阅一次**的副作用，不是界面状态。
+ */
+let settingsSubscribed = false
+
 export const useSettings = create<SettingsState>((set, get) => ({
   settings: { ...DEFAULT_SETTINGS, theme: DEFAULT_THEME },
   loaded: false,
   load: async () => {
+    /*
+     * v0.3.9 体检 H1（渲染层这一半）：主进程（或另一个窗口）改了设置后，我们必须跟着重读。
+     * 不做这一步的话，本窗口那份旧快照会在用户下一次点任何开关时把对方的改动整份覆盖掉。
+     * 重读不会再写盘（load 只 set 本地状态），所以不存在"广播 → 写 → 再广播"的循环。
+     */
+    if (!settingsSubscribed) {
+      settingsSubscribed = true
+      api.store.onSettingsChanged(() => void get().load())
+    }
     const r = await api.store.get('settings')
     let next: AppSettings = DEFAULT_SETTINGS
     let storedTheme: string | undefined
@@ -57,14 +72,44 @@ export const useSettings = create<SettingsState>((set, get) => ({
     const next = { ...get().settings, ...patch }
     set({ settings: next })
     if (patch.theme) applyTheme(patch.theme)
-    void api.store.set('settings', next)
+    writeSettingsMerged(patch)
   },
   saveDeep: (fn) => {
     const next = fn(get().settings)
     set({ settings: next })
-    void api.store.set('settings', next)
+    /*
+     * 与 save() 同一套合并策略：先把磁盘上的最新值取回来，再对它应用这次变换。
+     * 这样"本窗口启动时那份快照"就不会把别的窗口/主进程刚写的设置整份抹掉。
+     */
+    void api.store.get('settings').then((cur) => {
+      const base = cur.ok && cur.data && typeof cur.data === 'object' ? (cur.data as Partial<AppSettings>) : {}
+      const merged = fn({ ...get().settings, ...base } as AppSettings)
+      set({ settings: merged })
+      void api.store.set('settings', merged)
+    })
   }
 }))
+
+/**
+ * 写设置时**先读磁盘、再按字段合并**（v0.3.9 体检 H1，渲染层这一半）。
+ *
+ * 为什么必须这样：`settings` 有**两个写入方** —— 渲染层（设置页、播放器浮层）与主进程
+ * （十几处：Anime4K 画质、音频、投屏目标、缓存目录、数据源迁移标记…），两边互不通知。
+ * 以前渲染层是拿"本窗口启动那一刻的对象"整份回写，谁后写谁赢：
+ * 典型表现是"在播放器里调好的画质/音频，回主窗口点一个不相关的开关就变回默认"。
+ *
+ * 这里做的是**最小可用**的修法（读-合并-写）：把丢设置的概率压到极低。
+ * 彻底的做法是主进程广播 `ev:settings` + 按字段 patch，那要动 IPC 契约与 17 处写入点，
+ * 留给能和 main 一起改的时机（已记在体检清单里，不是"忘了"）。
+ */
+function writeSettingsMerged(patch: Partial<AppSettings>): void {
+  void api.store.get('settings').then((cur) => {
+    const base = cur.ok && cur.data && typeof cur.data === 'object' ? (cur.data as Partial<AppSettings>) : {}
+    const merged: AppSettings = { ...useSettings.getState().settings, ...base, ...patch }
+    useSettings.setState({ settings: merged })
+    void api.store.set('settings', merged)
+  })
+}
 
 // ---------------- 日志（供设置页展示 + 全局推送） ----------------
 

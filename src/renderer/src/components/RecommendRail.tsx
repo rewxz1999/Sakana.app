@@ -23,7 +23,7 @@ import {
 import { seasonOfDate, seasonShortLabel } from '@shared/season'
 import { blockReason } from '@shared/scheduleBlock'
 import { api } from '@/lib/api'
-import { localImgUrl, yearOf } from '@/lib/format'
+import { yearOf } from '@/lib/format'
 import { useScheduleBlock, useScheduleTags } from '@/stores/schedule'
 import { Spinner } from '@/components/ui'
 
@@ -612,126 +612,64 @@ export function RecommendRail({
 // ---------------- 空态最底部的大肥鱼轮播 ----------------
 
 /**
- * 大肥鱼图片来源（**路径来自用户配置**，所以必须写在代码里）。
+ * 轮播图片来源：**仓库内置素材**（v0.3.9 用户要求「下面的轮播图图片源内置」）。
  *
- * ⚠️ 这些文件在用户在 D 盘的表情包目录下，**不在仓库里、也不在图片协议白名单里**，
- * 因此渲染层不能直接用 file:// 或裸路径引用（sakana-img://local 只放行
- * media.ts registerDefaultRoots() 注册过的目录，D:\ME 不在其中 → 直接引用必然 403）。
- * 文件缺失 / 复制失败时**静默隐藏整块图区**，其余推荐内容照常显示（见下方 alive 的判空）。
+ * 为什么从「本机绝对路径」改成内置：旧实现存的是 `D:\ME\表情包\…`，再经
+ * `api.showcase.importImages()` 复制进应用数据目录才能显示（`sakana-img://local` 只放行
+ * media.ts 注册过的白名单目录）。那套做法有两个硬伤：
+ *   ① **换一台机器就全空** —— 路径来自某一台机器，别人 clone 下来根本没有这几张图，
+ *      只能靠下面那条「静默隐藏」的降级链路兜着（用户看到的就是底部什么都没有）；
+ *   ② 每次都要复制一份 17MB 的副本进用户数据目录，还得靠 localStorage 缓存路径。
+ * 现在改成 `import fish1 from '@/assets/search-carousel/fish-1.png'`：Vite 会把它们输出到
+ * `out/renderer/assets/`，**跟着安装包分发**，任何机器上都有图，也不再需要
+ * 白名单 / importImages / 路径缓存这一整套东西（素材来源与文件对应关系见该目录的 README.md）。
  */
-const FISH_SOURCES = [
-  'D:\\ME\\表情包\\deepseek大肥鱼.png',
-  'D:\\ME\\表情包\\deepseek大肥鱼表情1.gif',
-  'D:\\ME\\表情包\\deepseek大肥鱼表情2.gif',
-  'D:\\ME\\表情包\\deepseek大肥鱼表情3.gif',
-  'D:\\ME\\表情包\\deepseek大肥鱼表情4.gif'
-]
+import fish1 from '@/assets/search-carousel/fish-1.png'
+import fish2 from '@/assets/search-carousel/fish-2.gif'
+import fish3 from '@/assets/search-carousel/fish-3.gif'
+import fish4 from '@/assets/search-carousel/fish-4.gif'
+import fish5 from '@/assets/search-carousel/fish-5.gif'
 
-/** 图片来源标注（用户指定文案） */
+/** 轮播顺序 = 用户给定的顺序（png → 表情 1..4） */
+const FISH_SOURCES: string[] = [fish1, fish2, fish3, fish4, fish5]
+
+/** 图片来源标注（用户指定文案；素材来自这里，常驻显示） */
 const FISH_SOURCE_NOTE = '图片来源：蓝色大肥鱼.com'
 
 /**
- * 落盘缓存的键：存的是**复制进应用目录后的白名单路径**，不是 D:\ME 的原始路径。
- * 与 stores/marks.ts 的 migrateShowcase 同一个思路（那边是轮播图的历史迁移）。
+ * 轮播间隔（用户要求：**7 秒一张**）与淡入淡出时长。
+ * 淡入淡出远小于切换间隔，避免两张图长时间半透明叠在一起糊成一团。
  */
-const FISH_CACHE_KEY = 'sakana.recommendFish'
-
-/** 缓存有效期：24 小时内不再重复调用 importImages（复制本身是幂等的，纯粹省一次 IPC） */
-const FISH_CACHE_TTL = 24 * 3600 * 1000
-
-/** 轮播间隔与淡入淡出时长（用户要求「轮流切换展示」，3~4 秒一张） */
-const FISH_ROTATE_MS = 3500
+const FISH_ROTATE_MS = 7000
 const FISH_FADE_S = 0.6
 
-/** 读缓存：任何异常/过期都当成「没有缓存」，下次进入重新复制一次，不影响渲染 */
-function readFishCache(): string[] {
-  try {
-    const raw = localStorage.getItem(FISH_CACHE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw) as { at?: unknown; paths?: unknown }
-    if (typeof parsed?.at !== 'number' || Date.now() - parsed.at > FISH_CACHE_TTL) return []
-    return Array.isArray(parsed.paths)
-      ? parsed.paths.filter((p): p is string => typeof p === 'string' && p.length > 0)
-      : []
-  } catch {
-    return []
-  }
-}
-
 /**
- * 把这些图收进应用数据目录，返回**白名单内**的新路径。
- *
- * 走的是路线 1（`api.showcase.importImages` 复制进 `<userData>/search-showcase`，再用 localImgUrl 显示）：
- * 复制后路径在 media.ts 白名单里，图片协议能正常读，重启也不会失效。
- * **不走路线 2**（`api.dialog.pickImages()` 让用户自己选）：那会在空态里弹一个文件选择框，
- * 直接打断「一进页面就有内容」的体验，而这几张图本来就是用户指定好的。
- *
- * 主进程对**复制失败**的处理是「原样返回源路径」（见 settingsExt.importShowcaseImages 的注释），
- * 那种路径就是白名单外的 D:\ME 地址、显示必然 403 —— 所以这里把它们滤掉，
- * 只留下真正复制成功的（路径 ≠ 源路径）。
- */
-async function importFish(): Promise<string[]> {
-  const r = await api.showcase.importImages(FISH_SOURCES)
-  if (!r.ok) return []
-  const src = new Set(FISH_SOURCES)
-  return r.data.filter((p) => typeof p === 'string' && p.length > 0 && !src.has(p))
-}
-
-/**
- * 空置区域最底部的大肥鱼图：轮流切换 + 淡入淡出，旁边标注来源。
+ * 空置区域最底部的大肥鱼图：轮流切换 + 淡入淡出，下面标注来源。
  *
  * ## 「按图片大小来优化样式」（v0.3.6 用户反馈）
  *
  * 老实现是「固定 140px 高的框 + `object-contain`」：这些表情包有方形也有宽扁的，
  * contain 之后横向留一大块空白、图本身很小（用户看到的就是"图挤在中间"）。
  * 现在做三件事：
- *   ① **按每张图的实际宽高比**给它算一个合适的显示高度（方图给 180、宽图给 120，图越大越显眼），
+ *   ① **按每张图的实际宽高比**给它算一个合适的显示高度（方图给 150、宽图给 110，竖图给 180），
  *      用 CSS 的 `aspect-ratio` 表达，不再用一个死高度；
  *   ② 一次只显示**一张**（用户要求"轮流切换"），所以不需要网格；
- *   ③ 框**贴合图片**（`w-fit` + 图片自己的比例），不做成整行宽 —— 宽扁的图不会再把两侧拉空。
- * 读不到尺寸时回退到 object-contain + 固定高度，行为与老版本一致（不会崩、也不会跳）。
+ *   ③ 框**贴合图片**（宽高比 = 图片自身比例），不做成整行宽 —— 宽扁的图不会再把两侧拉空。
+ * 读不到尺寸时退化为「150px 高 + 16/9」的兜底，行为与老版本一致（不会崩、也不会跳）。
+ *
+ * 失败降级：某张图解码失败就把它移出轮播（`onError`），**全部失败时整块返回 null 静默隐藏**，
+ * 其余推荐内容照常显示 —— 内置素材虽然不会像外部路径那样"必然缺失"，但文件被替换/损坏时同样不能崩。
  */
 export function FishStrip({ className = '' }: { className?: string }) {
-  const [images, setImages] = useState<string[]>([])
   /** 加载失败的图片：直接移出轮播，别让它在「破图」和「好图」之间来回闪 */
   const [broken, setBroken] = useState<string[]>([])
   /** 每张图的原始宽高比（w/h）；读不到就不设，走 CSS 兜底 */
   const [ratios, setRatios] = useState<Record<string, number>>({})
   const [idx, setIdx] = useState(0)
 
-  // 首次进入复制一次并缓存结果；命中缓存就不再调 IPC
-  useEffect(() => {
-    let alive = true
-    const cached = readFishCache()
-    if (cached.length > 0) {
-      setImages(cached)
-      return () => {
-        alive = false
-      }
-    }
-    void (async () => {
-      let paths: string[] = []
-      try {
-        paths = await importFish()
-      } catch {
-        paths = [] // IPC 失败：静默隐藏
-      }
-      if (!alive || paths.length === 0) return
-      setImages(paths)
-      try {
-        localStorage.setItem(FISH_CACHE_KEY, JSON.stringify({ at: Date.now(), paths }))
-      } catch {
-        /* 存不下就算了：下次进来再复制一次（幂等，代价只是一次 IPC） */
-      }
-    })()
-    return () => {
-      alive = false
-    }
-  }, [])
+  const alive = useMemo(() => FISH_SOURCES.filter((p) => !broken.includes(p)), [broken])
 
-  const alive = useMemo(() => images.filter((p) => !broken.includes(p)), [images, broken])
-
-  // 只有一张时不启动计时器（省掉无意义的 setState），与 ImageCarousel 的取法一致
+  // 只有一张时不启动计时器（省掉无意义的 setState）
   useEffect(() => {
     if (alive.length <= 1) return
     const timer = window.setInterval(() => setIdx((i) => i + 1), FISH_ROTATE_MS)
@@ -768,7 +706,9 @@ export function FishStrip({ className = '' }: { className?: string }) {
         <AnimatePresence initial={false}>
           <motion.img
             key={current}
-            src={localImgUrl(current)}
+            /* 内置素材是构建产物里的普通 URL（file:// 或 dev server 同源），
+               不经过 sakana-img 协议，也就没有白名单那一层 */
+            src={current}
             alt=""
             draggable={false}
             initial={{ opacity: 0 }}

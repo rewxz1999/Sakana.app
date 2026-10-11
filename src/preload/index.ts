@@ -31,6 +31,7 @@ const api: SakanaApi = {
     close: () => ipcRenderer.invoke(CH.winClose),
     isMaximized: () => ipcRenderer.invoke(CH.winIsMaximized),
     setFullscreen: (full: boolean) => ipcRenderer.invoke(CH.winSetFullscreen, full),
+    setImmersive: (immersive: boolean) => ipcRenderer.invoke(CH.winImmersive, immersive),
     isFullscreen: () => ipcRenderer.invoke(CH.winIsFullscreen),
     showMain: () => ipcRenderer.invoke(CH.winShowMain),
     hideTrayPanel: () => ipcRenderer.invoke(CH.winHideTrayPanel),
@@ -41,13 +42,16 @@ const api: SakanaApi = {
   },
   clipboard: {
     copyImage: (file) => call(CH.clipboardCopyImage, file),
-    hasImage: () => call(CH.clipboardHasImage)
+    hasImage: () => call(CH.clipboardHasImage),
+    copyText: (text) => call(CH.clipboardCopyText, text)
   },
   store: {
     get: (ns) => call(CH.storeGet, ns),
     set: (ns, data) => call(CH.storeSet, ns, data),
     /** 库数据（收藏/历史）被主进程改过（v0.3.8：手机端同步回来）时通知界面重新读 */
-    onChanged: (cb) => subscribe<[]>(CH.evLibrary, cb)
+    onChanged: (cb) => subscribe<[]>(CH.evLibrary, cb),
+    /** 设置被**任意一方**（含主进程内部）改过时通知界面重新读（v0.3.9 体检 H1） */
+    onSettingsChanged: (cb) => subscribe<[]>(CH.evSettings, cb)
   },
   bangumi: {
     calendar: (force) => call(CH.bgmCalendar, force),
@@ -91,6 +95,9 @@ const api: SakanaApi = {
     localDir: (input) => call(CH.dlLocalDir, input),
     deleteLocal: (input) => call(CH.dlDeleteLocal, input),
     removeRecords: (input) => call(CH.dlRemoveRecords, input),
+    // 外部 qBittorrent：状态（连不上时给中文原因 + 探测到的端口）/ 由应用启动并等 WebUI 就绪
+    qbitStatus: () => call(CH.qbitStatus),
+    qbitLaunch: () => call(CH.qbitLaunch),
     onChanged: (cb) => subscribe(CH.evDownloads, cb)
   },
   rules: {
@@ -131,6 +138,23 @@ const api: SakanaApi = {
     screenshot: (title, episode) => call(CH.playerScreenshot, title, episode),
     assets: () => call(CH.playerAssets),
     streamInfo: () => call(CH.playerStreamInfo),
+    // v0.3.9：在线播放加速器状态（是否真的在加速 / 实时速率 / 决策原因），纯内存读
+    boostStatus: () => call(CH.playerBoostStatus),
+    // v0.3.9 补充更新：优化记录（读最近 N 条 / 清空），只碰 <userData>/data/streamBoostLog.json
+    boostRecords: () => call(CH.playerBoostRecords),
+    boostClearRecords: () => call(CH.playerBoostClearRecords),
+    /*
+     * v0.3.9：播放过程进度（三阶段实时状态）。
+     * flow 是纯内存读，可以按秒拉；flowMark 把渲染层知道的阶段边界写回主进程。
+     */
+    flow: () => call(CH.playerFlow),
+    flowMark: (mark) => call(CH.playerFlowMark, mark),
+    /** 资源可达性取证：网站问题 / 速度过慢 / 格式不支持 */
+    diagnose: (url, referer, cookies) => call(CH.playerDiagnose, url, referer, cookies),
+    /** 嗅探残留 + 内核错配自检（可按需自动重置） */
+    selfCheck: (opts) => call(CH.playerSelfCheck, opts),
+    /** 一键重置整条播放链路 */
+    hardReset: () => call(CH.playerHardReset),
     detach: () => call(CH.playerDetach),
     notifyLayout: (bounds) => call(CH.playerNotifyLayout, bounds),
     setAspect: (mode, areaW, areaH) => call(CH.playerSetAspect, mode, areaW, areaH),
@@ -197,7 +221,9 @@ const api: SakanaApi = {
     pickSubtitle: () => call(CH.dialogPickSubtitle),
     pickDir: (defaultPath) => call(CH.pickDir, defaultPath),
     pickVideo: () => call(CH.dialogPickVideo),
-    pickVideoDir: () => call(CH.dialogPickVideoDir)
+    pickVideoDir: () => call(CH.dialogPickVideoDir),
+    // 选 .exe（qBittorrent 程序路径）
+    pickExe: (defaultPath) => call(CH.dialogPickExe, defaultPath)
   },
   showcase: {
     // 搜索页展示位（空态轮播图）：把选中的图片收进应用数据目录（白名单内）后返回新路径
@@ -266,6 +292,11 @@ const api: SakanaApi = {
     pickDir: () => call(CH.galPickDir),
     screenshotNow: () => call(CH.galScreenshotNow),
     overlayShot: () => call(CH.galOverlayShot),
+    overlayResize: (open, height) => ipcRenderer.invoke(CH.galOverlayResize, open, height),
+    readBgm: () => call(CH.galBgmRead),
+    memRecent: (gameId) => call(CH.galMemRecent, gameId),
+    saveBgm: (gameId, code) => call(CH.galBgmSave, gameId, code),
+    savedBgm: (gameId, gameName) => call(CH.galBgmSaved, gameId, gameName),
     dirsGet: () => call(CH.galDirsGet),
     dirsSet: (dir) => call(CH.galDirsSet, dir),
     recentShots: () => call(CH.galRecentShots),

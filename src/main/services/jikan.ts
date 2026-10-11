@@ -1,4 +1,5 @@
 import axios, { type AxiosRequestConfig } from 'axios'
+import { app } from 'electron'
 import { log } from '../log'
 import { buildProxyAgents, getSettings } from '../net'
 
@@ -33,7 +34,8 @@ import { buildProxyAgents, getSettings } from '../net'
  */
 
 const JIKAN_BASE = 'https://api.jikan.moe/v4'
-const UA = 'Sakana/0.3.0 (https://github.com/rewxz1999/Sakana.app)'
+// 版本号统一从 app.getVersion() 取（v0.3.9 体检 L5：以前这里写死 0.3.0，和 net.ts / 弹幕接口各说各的）
+const UA = `Sakana/${app.getVersion()} (https://github.com/rewxz1999/Sakana.app)`
 
 /** 每秒最多 3 次 */
 const PER_SECOND = 3

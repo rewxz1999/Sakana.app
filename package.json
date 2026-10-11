@@ -1,6 +1,6 @@
 {
   "name": "sakana",
-  "version": "0.3.8",
+  "version": "1.0.0",
   "description": "Sakana - 鐣墽绠＄悊鍙婃挱鏀炬闈㈠鎴风",
   "main": "./out/main/index.js",
   "author": "Sakana Team",
@@ -18,6 +18,7 @@
     "ffmpeg:fetch": "node scripts/fetch-ffmpeg.js",
     "libmpv:fetch": "node scripts/fetch-libmpv.js",
     "mpv:build": "node-gyp rebuild --directory native/mpv",
+    "galmem:test": "node scripts/test-galmem.js",
     "verify:audio": "node .e2e/verify-audio-chain.mjs",
     "verify:schedule-block": "node scripts/verify-schedule-block.mjs",
     "verify:favorites-season": "node scripts/verify-favorites-season.mjs"
@@ -37,6 +38,10 @@
       "!**/*.md",
       "!**/*.d.mts",
       "!**/{test,tests,__tests__,example,examples,docs,doc}/**"
+    ],
+    "asarUnpack": [
+      "node_modules/koffi/**",
+      "node_modules/@koromix/**"
     ],
     "extraResources": [
       {
@@ -108,6 +113,7 @@
     "https-proxy-agent": "^9.1.0",
     "iconv-lite": "^0.7.3",
     "jsonpath-plus": "^10.4.0",
+    "koffi": "^3.3.3",
     "lucide-react": "^1.37.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",

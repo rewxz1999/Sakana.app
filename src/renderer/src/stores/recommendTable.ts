@@ -180,12 +180,17 @@ export function normalizeCrop(raw: unknown): CropRect | null {
 }
 
 /**
- * 页面尺寸（用户手填）的上下限：720–4096。
- * 比 720 窄的话内容怎么排都会挤（封面 300 + 信息列）；4096 是导出与离屏截图的实用上限
- * （再大文件体积与内存都不划算）。
+ * 页面尺寸（用户手填）的上下限：720–4000。
+ * 比 720 窄的话内容怎么排都会挤（封面 300 + 信息列）。
+ *
+ * 上界为什么是 **4000**（v0.3.9 从 4096 改小）：导出链路里主进程会把宽度夹到
+ * `[600, 4000]`（见 `src/main/services/cardExport.ts` 的 `exportCardImage`），
+ * 而页面宽度**就是**导出窗口的宽度。允许填 4096 的话，"导出 PNG 的像素尺寸 = 页面尺寸 × 清晰度"
+ * 这句承诺在 4001–4096 这一段就不成立了（成图会被压窄），所以上界跟着那边走。
+ * 高度不用管这条：高度只受离屏截图的 `MAX_HEIGHT`（16000）约束，3200×3 还够用。
  */
 export const PAGE_SIZE_MIN = 720
-export const PAGE_SIZE_MAX = 4096
+export const PAGE_SIZE_MAX = 4000
 
 /** 一页的手填尺寸 */
 export interface PageSize {
@@ -204,15 +209,30 @@ export function normalizePageSize(raw: unknown): PageSize | null {
   return { w: clamp(w), h: clamp(h) }
 }
 
-/** 背景图的位置：左 / 右 / 上（用户只提了这三个，没有"下"） */
-export type ImagePos = 'left' | 'right' | 'top'
+/**
+ * 版面图片（图区）的位置：左 / 右 / 上 / 下。
+ *
+ * v0.3.8 只有左/右/上（用户当时只提了这三个）；v0.3.9 的编辑模式左菜单明确要求
+ * **上/下/左/右四个方向都要能放**，所以补上 `bottom`。
+ * 老数据里不会有 `bottom`，`normalizeBackground` 对认不出的值仍然回落到 `left`。
+ */
+export type ImagePos = 'left' | 'right' | 'top' | 'bottom'
 
-/** 位置选项（界面与校验共用一份） */
+/** 位置选项（界面与校验共用一份；顺序 = 编辑模式左菜单 Ⅰ 的按钮顺序） */
 export const IMAGE_POS_NAMES: { key: ImagePos; label: string }[] = [
+  { key: 'top', label: '上方' },
+  { key: 'bottom', label: '下方' },
   { key: 'left', label: '左侧' },
-  { key: 'right', label: '右侧' },
-  { key: 'top', label: '上方' }
+  { key: 'right', label: '右侧' }
 ]
+
+/** 方向的中文短名（一句话里说"图区在××侧"时用，避免各处写三元表达式） */
+export const IMAGE_POS_SHORT: Record<ImagePos, string> = {
+  top: '上',
+  bottom: '下',
+  left: '左',
+  right: '右'
+}
 
 /** 渐变色标：色值 + 位置（0–100%）+ 不透明度（0–1） */
 export interface GradientStop {
@@ -342,7 +362,9 @@ export function normalizeBackground(raw: unknown): RecommendBackground | undefin
   const blur = Math.min(MAX_BLUR, Math.max(0, blurRaw))
   // 图片位置：老数据（第一轮做的背景）没有这个字段 → 默认「左侧」
   const imagePos: ImagePos =
-    r.imagePos === 'right' || r.imagePos === 'top' || r.imagePos === 'left' ? r.imagePos : 'left'
+    r.imagePos === 'right' || r.imagePos === 'top' || r.imagePos === 'bottom' || r.imagePos === 'left'
+      ? r.imagePos
+      : 'left'
   /*
    * 注意：第一轮存过的 `overlay`（叠加渐变层）在这里被**有意丢弃** ——
    * 它的作用已经由「图区 → 内容区」的交融渐变承担（见文件头的说明与 styles.ts 的 blendStyle）。
@@ -379,7 +401,7 @@ export function normalizeBackground(raw: unknown): RecommendBackground | undefin
 }
 
 // ------------------------------------------------------------------
-// 模块（v0.3.8：用户方向调整后**只保留显示 / 隐藏**）
+// 模块（v0.3.9：显隐 + 自由摆放坐标 + 每块的字体字号）
 // ------------------------------------------------------------------
 
 /**
@@ -422,7 +444,116 @@ export const MODULE_KINDS: ModuleKind[] = [
   'foot'
 ]
 
-/** 一个模块的位置与尺寸（**只由版式算出来**，用户不可改；见 styles.ts 的 moduleRectsOf） */
+// ------------------------------------------------------------------
+// 字体白名单（v0.3.9：右菜单 Ⅲ「选中模块后设置字体大小与字体样式」）
+// ------------------------------------------------------------------
+
+/**
+ * 默认字体栈（= styles.ts 里的 `FONT`）。定义放在数据层，是因为**白名单本身是数据**：
+ * 编辑面板要把它列出来、收窄函数要按它校验，而 styles 只能从这里取一份。
+ */
+export const DEFAULT_FONT_STACK =
+  '"Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Segoe UI", system-ui, sans-serif'
+
+/**
+ * ⚠️ 字体**只允许系统字体**，这是硬约束，不要扩成"任意字体名输入框"。
+ *
+ * 导出链路是「渲染层拼 HTML → 主进程离屏窗口渲染 → 截图」，那个离屏窗口
+ * **不加载任何外部资源**（见 exportHtml.ts 文件头）。于是：
+ *   · 系统字体（宋体/黑体/楷体…）在离屏窗口里一定画得出来，字体名写错也只是回落到默认；
+ *   · 用户装的第三方字体（或随便填一个字体名）在离屏窗口里**取不到**，
+ *     结果是**预览里有字、导出图里掉字/变样** —— 用户看到的和导出的是两张不同的图，
+ *     这比"少几种字体"严重得多。
+ * 所以这里给一份白名单（key → 字体栈），界面上只能从这几种里选，收窄也只认这些 key。
+ *
+ * 每个 key 都给一串候补：同一款字体在不同 Windows 版本 / 不同语言包里的名字不一样
+ * （例如行楷是 `STXingkai`，楷体是 `KaiTi`/`STKaiti`），写一串就不会因为名字差异掉字。
+ */
+export type ModuleFontKey = 'default' | 'song' | 'hei' | 'heiSim' | 'kai' | 'xingkai' | 'fangsong' | 'dengxian'
+
+/** 字体白名单（界面下拉/按钮与校验共用一份；顺序 = 界面上的顺序） */
+export const MODULE_FONTS: { key: ModuleFontKey; label: string; css: string }[] = [
+  { key: 'default', label: '默认（雅黑）', css: DEFAULT_FONT_STACK },
+  { key: 'song', label: '宋体', css: '"SimSun", "Songti SC", "STSong", serif' },
+  { key: 'hei', label: '黑体（雅黑）', css: '"Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif' },
+  { key: 'heiSim', label: '黑体（SimHei）', css: '"SimHei", "Heiti SC", "Microsoft YaHei", sans-serif' },
+  { key: 'kai', label: '楷体', css: '"KaiTi", "STKaiti", "Kaiti SC", serif' },
+  { key: 'xingkai', label: '行楷', css: '"STXingkai", "KaiTi", "STKaiti", cursive' },
+  { key: 'fangsong', label: '仿宋', css: '"FangSong", "STFangsong", "Fangsong", serif' },
+  { key: 'dengxian', label: '等线', css: '"DengXian", "Microsoft YaHei", sans-serif' }
+]
+
+/** 白名单 key 列表（收窄时用 Set 判成员，别每次线性找） */
+export const MODULE_FONT_KEYS: ModuleFontKey[] = MODULE_FONTS.map((f) => f.key)
+
+/** key → CSS 字体栈；认不出 / 没设 → 默认字体栈（宁可用默认，也不要把非法字体名塞进 CSS） */
+export function fontCssOf(key: unknown): string {
+  const hit = MODULE_FONTS.find((f) => f.key === key)
+  return hit ? hit.css : DEFAULT_FONT_STACK
+}
+
+/** 字体 key 收窄：不在白名单里 → undefined（= 用默认字体） */
+export function normalizeFontKey(raw: unknown): ModuleFontKey | undefined {
+  return MODULE_FONT_KEYS.includes(raw as ModuleFontKey) ? (raw as ModuleFontKey) : undefined
+}
+
+/**
+ * 每个模块的**基准字号**（px，= 那套默认版式里该模块主文字的字号）。
+ *
+ * 「模块字号」在数据里只存**一个数**（`ModuleLayout.fontSize`），渲染时按
+ * `fontSize / 基准` 得到该模块内部的缩放比 —— 这样模块里"标题比正文大"的相对层次不会被打乱，
+ * 用户调的也是他真正看得见的那行字的大小。基准值必须与 styles.ts 的 RL 常量一致。
+ */
+export const MODULE_FONT_BASE: Record<ModuleKind, number> = {
+  title: 34,
+  cover: 19,
+  ratings: 19,
+  level: 19,
+  meta: 19,
+  reason: 18,
+  photos: 18,
+  foot: 13
+}
+
+/** 模块字号范围（px）：小于 10 导出图上已经认不出，大于 72 一块字就撑满整页 */
+export const MODULE_FONT_SIZE_MIN = 10
+export const MODULE_FONT_SIZE_MAX = 72
+
+/** 模块字号收窄：非有限数 → undefined（= 用基准字号） */
+export function normalizeFontSize(raw: unknown): number | undefined {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined
+  return Math.min(MODULE_FONT_SIZE_MAX, Math.max(MODULE_FONT_SIZE_MIN, Math.round(raw)))
+}
+
+// ------------------------------------------------------------------
+// 图区 : 内容区 的占比（v0.3.9：左菜单 Ⅳ 的滑杆）
+// ------------------------------------------------------------------
+
+/**
+ * 用户可调的「图区 : 内容区」比例范围。
+ *
+ * 默认 1.5（`IMAGE_CONTENT_RATIO`，老数据没有这个字段时就是它，外观一字不变）。
+ * 下界 0.4：再小图区就细得看不出内容；上界 4：再大内容区会被挤到放不下任何模块。
+ * 数值存的是**比值**（图区/内容区）而不是占比，因为界面上写的是「图区 60% : 内容区 40%」
+ * 这种口径，"1.5 : 1" 比 "0.6" 更接近用户的原话。
+ */
+export const BAND_RATIO_MIN = 0.4
+export const BAND_RATIO_MAX = 4
+
+/** 占比收窄：非有限数 / 非正数 → undefined（= 用默认 1.5） */
+export function normalizeBandRatio(raw: unknown): number | undefined {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return undefined
+  const v = Math.round(raw * 100) / 100
+  return Math.min(BAND_RATIO_MAX, Math.max(BAND_RATIO_MIN, v))
+}
+
+/**
+ * 一个模块的位置与尺寸（px，页面坐标系）。
+ *
+ * 来源有两条：默认由版式算出来（`styles.moduleRectsOf`），用户拖动/填坐标之后由数据给出。
+ * 两条路最终都汇进同一个 `Record<ModuleKind, ModuleRect>`，界面与导出都只读它 ——
+ * **没有"界面一套坐标、导出一套坐标"这回事**（导出是 HTML→图片，两套一定会分叉）。
+ */
 export interface ModuleRect {
   x: number
   y: number
@@ -433,15 +564,47 @@ export interface ModuleRect {
 /**
  * 一个模块在一页上的状态。
  *
- * v0.3.8 第二轮（用户方向调整）之后**只剩显示 / 隐藏**：
- * 原来那套 `x/y/w/h/z/scale`（自由拖动 + 缩放）已经整条撤掉，位置一律由版式决定。
- * 好处是"界面看到的就是导出的"这件事再也不依赖两份坐标同步 —— 两边都从
- * `styles.moduleRectsOf(frame)` 现算同一份矩形。
+ * ## 字段的两种语义（v0.3.9 又把坐标加回来了，这行注释就是那次取舍的结论）
+ *
+ *   · `visible`：**永远有意义**，`false` = 用户主动隐藏；
+ *   · `x/y/w/h/z`：**可选的**。`undefined` = "从没动过"，位置按版式默认算；
+ *     有值 = 用户在编辑模式里拖过或填过坐标，渲染时优先用它（并夹进页面范围）。
+ *
+ * v0.3.8 第三轮曾经把坐标整条撤掉（"取消自定义移动模块"），v0.3.9 用户又要回来
+ * （编辑模式左菜单 Ⅶ「自定义内容区域模块排版位置」，拖动 + 坐标输入）。
+ * 这次的差别是：坐标**只在编辑模式里写**，翻阅模式不会碰它们 ——
+ * 也就是"自由摆放是这个工具的一个模式"，而不是"默认处处生效"。
+ *
+ * `z` 是绘制层级（大者盖在上）：不填就按 `MODULE_KINDS` 的顺序，与加这个功能之前完全一致。
+ *
+ * `fontSize` / `fontFamily`：这一块的字号（px，见 `MODULE_FONT_BASE`）与字体
+ * （白名单 key，见 `MODULE_FONTS`）。字体只认白名单，理由写在 `MODULE_FONTS` 的注释里。
  */
 export interface ModuleLayout {
   id: ModuleKind
   visible: boolean
+  x?: number
+  y?: number
+  w?: number
+  h?: number
+  z?: number
+  fontSize?: number
+  fontFamily?: ModuleFontKey
 }
+
+/** 模块尺寸的上下限（px）：比这更小的框什么都放不下，比页面还大的框会被夹回页面内 */
+export const MODULE_W_MIN = 40
+export const MODULE_H_MIN = 24
+
+/**
+ * 摆放补丁（`setModuleRect` 的入参）。
+ *
+ * 比 `Partial<ModuleRect>` 多一个 `z`：层级不是矩形的组成部分（不影响它画在哪、多大），
+ * 但"拖动/改坐标"与"改层级"是同一类操作（都在编辑模式的摆放面板里），
+ * 分成两个 store 方法会让左侧面板要多传一个回调、多一条写盘路径。
+ * 只传部分字段（例如只调大小）时，其余字段沿用当前值，见 `setModuleRect` 的实现。
+ */
+export type ModuleRectPatch = Partial<ModuleRect> & { z?: number }
 
 /**
  * **默认摆放**（px，坐标系是 1200 × 920 的"整页无图"版式）。
@@ -469,16 +632,51 @@ export const DEFAULT_MODULES: Record<ModuleKind, ModuleRect> = {
 }
 
 /**
- * 布局收窄：**只留下 `id` 与 `visible`**，坐标一类字段一律丢掉。
+ * 单块布局收窄：`id`/`visible` 必留，坐标与字体**只保留有限数**。
  *
- * ## 老数据兼容的做法（二选一里选了"丢掉坐标"）
+ * 坐标不做"夹进页面"这件事（收窄函数拿不到页面尺寸，只有 `styles.frameOf` 知道），
+ * 这里只保证数值本身可用：非负、有下限、不超过 `PAGE_SIZE_MAX`。
+ * 真正的夹取在 `styles.moduleRectsOf(frame, layout)` 里做 —— 那里才知道这一页多大。
+ */
+function normalizeModuleItem(o: Record<string, unknown>, id: ModuleKind): ModuleLayout {
+  const num = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : undefined
+  const pos = (v: unknown): number | undefined => {
+    const n = num(v)
+    return n === undefined ? undefined : Math.max(0, Math.min(PAGE_SIZE_MAX, n))
+  }
+  const size = (v: unknown, min: number): number | undefined => {
+    const n = num(v)
+    return n === undefined ? undefined : Math.max(min, Math.min(PAGE_SIZE_MAX, n))
+  }
+  const out: ModuleLayout = { id, visible: o.visible !== false }
+  const x = pos(o.x)
+  const y = pos(o.y)
+  const w = size(o.w, MODULE_W_MIN)
+  const h = size(o.h, MODULE_H_MIN)
+  if (x !== undefined) out.x = x
+  if (y !== undefined) out.y = y
+  if (w !== undefined) out.w = w
+  if (h !== undefined) out.h = h
+  // z 只影响绘制层级，给个宽松但有限的范围即可（负数也允许 = 沉到最底下）
+  const z = num(o.z)
+  if (z !== undefined) out.z = Math.max(-99, Math.min(999, z))
+  const fontSize = normalizeFontSize(o.fontSize)
+  if (fontSize !== undefined) out.fontSize = fontSize
+  const fontFamily = normalizeFontKey(o.fontFamily)
+  if (fontFamily !== undefined) out.fontFamily = fontFamily
+  return out
+}
+
+/**
+ * 布局收窄：逐项只留合法字段。
  *
- * 上一版允许用户自由拖动模块，磁盘上已经存在带 `x/y/w/h/z/scale` 的布局。
- * 两种兼容方式：① 留着字段但渲染时无视；② 收窄时直接丢掉。
- * 这里选 **②**，理由是：留着不生效的坐标会让人误以为"拖动还在、只是没显示"，
- * 以后维护者也可能不小心又把它们接回渲染（`resolveModules` 那种"以为是缺失就补默认"的坑刚踩过）。
- * 丢掉之后数据里只剩下真正生效的东西（显隐），语义干净；而**用户自定义过的位置本来就要清掉**
- * （这次方向调整就是"取消自定义移动模块"），所以丢掉也不算信息损失。
+ * ## 老数据兼容
+ *
+ * v0.3.8 第二轮曾经**主动丢掉**坐标（那时用户取消了自由移动）。v0.3.9 用户又要回来，
+ * 所以这里改成**保留**有限坐标 —— 磁盘上那份老数据（如果还有带坐标的）会重新生效，
+ * 而 v0.3.8 第三轮之后存下来的数据里本来就没有坐标，读出来就是"按版式默认算"，行为不变。
+ * 丢掉 `scale`（老版本的分块缩放）仍然是对的：那套已经被模块字号取代，留着不生效更容易误导。
  */
 export function normalizeModules(raw: unknown): ModuleLayout[] | undefined {
   if (!Array.isArray(raw)) return undefined
@@ -490,10 +688,29 @@ export function normalizeModules(raw: unknown): ModuleLayout[] | undefined {
     const id = MODULE_KINDS.includes(o.id as ModuleKind) ? (o.id as ModuleKind) : null
     if (!id || seen.has(id)) continue
     seen.add(id)
-    // visible 缺省 = 显示（只有显式 false 才算隐藏；老数据里可能根本没有这个字段）
-    out.push({ id, visible: o.visible !== false })
+    out.push(normalizeModuleItem(o, id))
   }
   return out.length > 0 ? out : undefined
+}
+
+/**
+ * 一页的布局**是否还是默认值**（显隐全开、没有任何自定义坐标/字体）。
+ *
+ * 是的话就写 `undefined` 而不是一份"全是默认值"的数组：磁盘上的数据越接近"只有用户真改过的东西"，
+ * 以后改默认版式时受影响的面就越小（这一点在 `setModuleVisible` 里踩过）。
+ */
+export function isDefaultLayout(list: ModuleLayout[]): boolean {
+  return list.every(
+    (m) =>
+      m.visible &&
+      m.x === undefined &&
+      m.y === undefined &&
+      m.w === undefined &&
+      m.h === undefined &&
+      m.z === undefined &&
+      m.fontSize === undefined &&
+      m.fontFamily === undefined
+  )
 }
 
 /**
@@ -506,8 +723,8 @@ export function normalizeModules(raw: unknown): ModuleLayout[] | undefined {
  * 判据写成 `stored.has(id)`（看**存在性**），不能拿 `stored.get(id)` 的真假判断
  * —— 把"存在的对象"当假值处理，隐藏就会失效。
  *
- * 位置不再来自数据（用户不能自定义移动了）：要画在哪由 `styles.moduleRectsOf(frame)` 算，
- * 这里只回答"这一页哪些模块开着"。
+ * 位置：`x/y/w/h` 有值就用它（用户在编辑模式里拖过/填过），没有就由
+ * `styles.moduleRectsOf(frame, layout)` 按版式算出来 —— 界面与导出走的是同一个函数。
  */
 export function resolveModules(page: { layout?: ModuleLayout[] }): ModuleLayout[] {
   const stored = new Map<ModuleKind, ModuleLayout>()
@@ -588,6 +805,26 @@ export interface RecommendPage {
    * 不再被自动公式覆盖 —— 这是这个功能最容易出 bug 的点，优先级写在 `frameOf` 的注释里。
    */
   size?: PageSize
+  /**
+   * 「图区 : 内容区」的占比（v0.3.9，左菜单 Ⅳ）。
+   *
+   * `undefined` = 沿用默认的 1.5 : 1（`IMAGE_CONTENT_RATIO`）—— 老数据没有这个字段，
+   * 读出来就是原来那套比例，外观一字不变。范围见 `BAND_RATIO_MIN/MAX`。
+   * 只设了纯色/渐变背景（没有图片）时这个值**不产生任何影响**（那时整页都是内容区）。
+   */
+  bandRatio?: number
+  /**
+   * 内容区域的渐变底色（v0.3.9，左菜单 Ⅵ）。
+   *
+   * 画在**内容区**那块矩形上（页面底色与图区之上、模块之下）。
+   * 没有图片背景时内容区 = 整页，所以它等价于"整页渐变底色"。
+   * `null` / `undefined` = 不画这一层（内容区就是页面底色）。
+   *
+   * 为什么和 `background`（页面底色）分成两个字段而不是复用：
+   * 页面底色是**整页**的（图区露出的部分也归它），内容区渐变只覆盖内容区那一块 ——
+   * 混成一个字段后，"图区旁边要不要跟页面同色"就没法表达了。
+   */
+  contentGradient?: GradientLayer | null
 }
 
 /** 一张推荐表 */
@@ -643,6 +880,8 @@ export type RecommendPagePatch = Partial<
     | 'background'
     | 'layout'
     | 'size'
+    | 'bandRatio'
+    | 'contentGradient'
   >
 >
 
@@ -737,7 +976,11 @@ export function normalizePage(raw: unknown, index: number): RecommendPage | null
     // 布局：只有合法的条目会留下，缺的模块渲染时补默认摆放（见 resolveModules）
     layout: normalizeModules(r.layout),
     // 手填尺寸：非法/没填就回成"跟随内容自适应"（不猜一个尺寸）
-    size: normalizePageSize(r.size) ?? undefined
+    size: normalizePageSize(r.size) ?? undefined,
+    // 占比：非法/没填就回默认 1.5 : 1
+    bandRatio: normalizeBandRatio(r.bandRatio),
+    // 内容区渐变：色标不足 2 个算非法 → 清掉（宁可不画，也不要把半截 CSS 塞进页面）
+    contentGradient: normalizeLayer(r.contentGradient)
   }
 }
 
@@ -857,6 +1100,56 @@ export function pageInputFromFavorite(fav: FavoriteItem): RecommendPageInput {
 }
 
 // ------------------------------------------------------------------
+// 页面补丁的收窄（updatePage 与 applyPagePatch 共用一份，别写成两套夹取规则）
+// ------------------------------------------------------------------
+
+/**
+ * 把一段补丁收窄后套到一页上。
+ *
+ * 逐字段收窄而不是直接展开 patch：
+ * 面板是异步保存的（保存那一刻用户可能已经改了别的），这里保证**任何来源**的补丁
+ * 都过一遍同样的夹取规则 —— 落盘的数据永远是合法的。
+ */
+export function narrowPage(p: RecommendPage, patch: RecommendPagePatch): RecommendPage {
+  const next: RecommendPage = { ...p }
+  if ('myRating' in patch) next.myRating = clampRating(patch.myRating)
+  if ('recommendLevel' in patch) next.recommendLevel = clampLevel(patch.recommendLevel)
+  if ('reason' in patch) next.reason = clampReason(patch.reason)
+  if ('photos' in patch) next.photos = toStringList(patch.photos, MAX_PHOTOS)
+  if ('genres' in patch) next.genres = toStringList(patch.genres, MAX_GENRES)
+  if ('airDate' in patch) {
+    next.airDate = typeof patch.airDate === 'string' && patch.airDate ? patch.airDate : null
+  }
+  // background 允许为 null/undefined（= 清掉背景回白底），所以这里先收窄再赋值
+  if ('background' in patch) next.background = normalizeBackground(patch.background)
+  // layout 同理：undefined = 整页回默认摆放
+  if ('layout' in patch) next.layout = normalizeModules(patch.layout)
+  // size 允许为 null/undefined（= 回到跟随内容自适应）
+  if ('size' in patch) next.size = patch.size ? (normalizePageSize(patch.size) ?? undefined) : undefined
+  // bandRatio：undefined/null = 回到默认 1.5 : 1
+  if ('bandRatio' in patch) next.bandRatio = normalizeBandRatio(patch.bandRatio)
+  // contentGradient：undefined/null = 不画内容区渐变层
+  if ('contentGradient' in patch) next.contentGradient = normalizeLayer(patch.contentGradient)
+  return next
+}
+
+/**
+ * 把一页的布局改成"某一项变了"的新数组，并顺手决定要不要写成 `undefined`。
+ *
+ * 抽出来是因为 v0.3.9 有三处都要做同一件事（显隐 / 坐标 / 字体），
+ * 三处各写一遍 `resolveModules(...).map(...)` 极容易在某一处漏掉"其余项要保留原字段"
+ * —— `setModuleVisible` 上一版就是这么把别人的坐标悄悄抹掉的。
+ */
+function layoutPatched(
+  page: RecommendPage,
+  moduleId: ModuleKind,
+  patch: Partial<Omit<ModuleLayout, 'id'>>
+): ModuleLayout[] | undefined {
+  const list = resolveModules(page).map((m) => (m.id === moduleId ? { ...m, ...patch } : m))
+  return isDefaultLayout(list) ? undefined : list
+}
+
+// ------------------------------------------------------------------
 // store
 // ------------------------------------------------------------------
 
@@ -884,10 +1177,32 @@ interface RecommendState extends RecommendStoreData {
    * 另外 7 块还没进过 layout，补全后整体写回 —— 落盘的就是一份完整的显隐表。
    */
   setModuleVisible: (tableId: string, pageId: string, moduleId: ModuleKind, visible: boolean) => void
+  /**
+   * 改一个模块的**摆放**（v0.3.9，编辑模式左菜单 Ⅲ/Ⅶ 拖动与坐标输入）。
+   *
+   * `rect = null` = 这一块回到**版式默认位置**（删掉坐标）。传部分字段也可以（`w`/`h` 单独调大小）。
+   */
+  setModuleRect: (tableId: string, pageId: string, moduleId: ModuleKind, rect: ModuleRectPatch | null) => void
+  /** 改一个模块的**字体 / 字号**（v0.3.9，右菜单 Ⅲ）；`null` 字段 = 回到默认 */
+  setModuleFont: (
+    tableId: string,
+    pageId: string,
+    moduleId: ModuleKind,
+    patch: { fontSize?: number | null; fontFamily?: ModuleFontKey | null }
+  ) => void
+  /** 这一页所有模块的摆放**全部回到版式默认**（字体与显隐保留） */
+  resetModuleRects: (tableId: string, pageId: string) => void
   /** 全部显示（= 清掉 layout，回到默认） */
   resetModules: (tableId: string, pageId: string) => void
   /** 把同一个背景应用到这张表的**所有页**（右键菜单里的背景弹窗用；null = 全部恢复白底） */
   applyBackground: (tableId: string, background: RecommendBackground | null) => number
+  /**
+   * 把一组页面设置应用到这张表的**所有页**（v0.3.9 编辑模式左/右菜单里的「应用到所有页」）。
+   *
+   * 与 `applyBackground` 的区别是它能带 `bandRatio` / `contentGradient` / `size` 这些新字段；
+   * 夹取规则与 `updatePage` 完全共用一份（避免两条写路各夹一套）。返回改了几页。
+   */
+  applyPagePatch: (tableId: string, patch: RecommendPagePatch) => number
   /** 用 bangumi 详情补齐缺少类型标签 / 播出时间的页，返回补齐的页数 */
   backfill: (tableId: string) => Promise<number>
 }
@@ -1050,30 +1365,7 @@ export const useRecommendTable = create<RecommendState>((set, get) => {
       set({
         tables: patchTable(tableId, (t) => ({
           ...t,
-          pages: t.pages.map((p) => {
-            if (p.id !== pageId) return p
-            /*
-             * 逐字段收窄而不是直接展开 patch：
-             * 面板是异步保存的（保存那一刻用户可能已经改了别的），这里保证**任何来源**的补丁
-             * 都过一遍同样的夹取规则 —— 落盘的数据永远是合法的。
-             */
-            const next: RecommendPage = { ...p }
-            if ('myRating' in patch) next.myRating = clampRating(patch.myRating)
-            if ('recommendLevel' in patch) next.recommendLevel = clampLevel(patch.recommendLevel)
-            if ('reason' in patch) next.reason = clampReason(patch.reason)
-            if ('photos' in patch) next.photos = toStringList(patch.photos, MAX_PHOTOS)
-            if ('genres' in patch) next.genres = toStringList(patch.genres, MAX_GENRES)
-            if ('airDate' in patch) {
-              next.airDate = typeof patch.airDate === 'string' && patch.airDate ? patch.airDate : null
-            }
-            // background 允许为 null/undefined（= 清掉背景回白底），所以这里先收窄再赋值
-            if ('background' in patch) next.background = normalizeBackground(patch.background)
-            // layout 同理：undefined = 整页回默认摆放
-            if ('layout' in patch) next.layout = normalizeModules(patch.layout)
-            // size 允许为 null/undefined（= 回到跟随内容自适应）
-            if ('size' in patch) next.size = patch.size ? (normalizePageSize(patch.size) ?? undefined) : undefined
-            return next
-          })
+          pages: t.pages.map((p) => (p.id === pageId ? narrowPage(p, patch) : p))
         }))
       })
       persist()
@@ -1092,19 +1384,101 @@ export const useRecommendTable = create<RecommendState>((set, get) => {
       const table = get().tables.find((t) => t.id === tableId)
       const page = table?.pages.find((p) => p.id === pageId)
       if (!table || !page) return
-      // 先补全再改一项：用户第一次关某一块时，其余 7 块还没进过 layout
-      const next: ModuleLayout[] = resolveModules(page).map((m) =>
-        m.id === moduleId ? { id: m.id, visible } : m
-      )
       /*
-       * 全部显示时写成 `undefined`（= "从没动过"）而不是一份全是 visible:true 的数组：
-       * 这样默认状态永远干净，也不会因为多了一层记录而影响以后改默认行为。
+       * 只改这一项的 `visible`，其余字段（坐标 / 字体）**原样带上**。
+       * v0.3.9 踩过一次：旧实现写的是 `{ id: m.id, visible }`，重建对象会把同页别的模块
+       * 拖好的坐标一起抹掉 —— 表现就是"关一下别的东西，摆放全回去了"。
        */
-      const allVisible = next.every((m) => m.visible)
+      const next = layoutPatched(page, moduleId, { visible })
       set({
         tables: patchTable(tableId, (t) => ({
           ...t,
-          pages: t.pages.map((p) => (p.id === pageId ? { ...p, layout: allVisible ? undefined : next } : p))
+          pages: t.pages.map((p) => (p.id === pageId ? { ...p, layout: next } : p))
+        }))
+      })
+      persist()
+    },
+
+    setModuleRect: (tableId, pageId, moduleId, rect) => {
+      const table = get().tables.find((t) => t.id === tableId)
+      const page = table?.pages.find((p) => p.id === pageId)
+      if (!table || !page) return
+      /*
+       * `rect = null` = 这一块回到版式默认：把 x/y/w/h/z **整个删掉**（不是设成 0）。
+       * 设成 0 会被 moduleRectsOf 当成"用户把它拖到左上角"，那是两回事。
+       */
+      const patch: Partial<ModuleLayout> = rect
+        ? {
+            x: rect.x === undefined ? undefined : Math.round(rect.x),
+            y: rect.y === undefined ? undefined : Math.round(rect.y),
+            w: rect.w === undefined ? undefined : Math.round(rect.w),
+            h: rect.h === undefined ? undefined : Math.round(rect.h),
+            z: rect.z
+          }
+        : { x: undefined, y: undefined, w: undefined, h: undefined, z: undefined }
+      // 部分字段（只调大小）时不能把已有的 x/y 抹掉：先把两者合起来再收窄
+      const cur = resolveModules(page).find((m) => m.id === moduleId)
+      const merged: Partial<ModuleLayout> = rect
+        ? {
+            x: patch.x ?? cur?.x,
+            y: patch.y ?? cur?.y,
+            w: patch.w ?? cur?.w,
+            h: patch.h ?? cur?.h,
+            z: patch.z ?? cur?.z
+          }
+        : patch
+      const next = layoutPatched(page, moduleId, merged)
+      set({
+        tables: patchTable(tableId, (t) => ({
+          ...t,
+          pages: t.pages.map((p) => (p.id === pageId ? { ...p, layout: next } : p))
+        }))
+      })
+      persist()
+    },
+
+    setModuleFont: (tableId, pageId, moduleId, patch) => {
+      const table = get().tables.find((t) => t.id === tableId)
+      const page = table?.pages.find((p) => p.id === pageId)
+      if (!table || !page) return
+      const cur = resolveModules(page).find((m) => m.id === moduleId)
+      const next = layoutPatched(page, moduleId, {
+        // null / undefined 都表示"回到默认"（字号默认 = MODULE_FONT_BASE[id]，字体默认 = 默认栈）
+        fontSize:
+          patch.fontSize === undefined
+            ? cur?.fontSize
+            : patch.fontSize === null
+              ? undefined
+              : normalizeFontSize(patch.fontSize),
+        fontFamily:
+          patch.fontFamily === undefined
+            ? cur?.fontFamily
+            : patch.fontFamily === null
+              ? undefined
+              : normalizeFontKey(patch.fontFamily)
+      })
+      set({
+        tables: patchTable(tableId, (t) => ({
+          ...t,
+          pages: t.pages.map((p) => (p.id === pageId ? { ...p, layout: next } : p))
+        }))
+      })
+      persist()
+    },
+
+    resetModuleRects: (tableId, pageId) => {
+      const table = get().tables.find((t) => t.id === tableId)
+      const page = table?.pages.find((p) => p.id === pageId)
+      if (!table || !page) return
+      // 只清坐标：显隐与字体是另外两件事，一起清掉会让用户"只想摆回去"却丢了字体设置
+      const list = resolveModules(page).map((m) => {
+        const { x: _x, y: _y, w: _w, h: _h, z: _z, ...rest } = m
+        return rest
+      })
+      set({
+        tables: patchTable(tableId, (t) => ({
+          ...t,
+          pages: t.pages.map((p) => (p.id === pageId ? { ...p, layout: isDefaultLayout(list) ? undefined : list } : p))
         }))
       })
       persist()
@@ -1134,6 +1508,23 @@ export const useRecommendTable = create<RecommendState>((set, get) => {
       set({ tables: patchTable(tableId, (t) => ({ ...t, pages: next })) })
       persist()
       return next.length
+    },
+
+    applyPagePatch: (tableId, patch) => {
+      const table = get().tables.find((t) => t.id === tableId)
+      if (!table) return 0
+      if (table.pages.length === 0) return 0
+      /*
+       * 逐页走 `narrowPage`（与 updatePage 完全同一套夹取）：这样"应用到所有页"不会成为
+       * 一条绕过校验的后门 —— 界面与落盘的口径永远只有一份。
+       * 注意**不**动 `layout`：每页的显隐/摆放是那一页自己的事，整表统一它没有意义
+       * （页数不同、番剧不同，硬套一份坐标会把别的页排版搞乱）。
+       */
+      const { layout: _ignored, ...safe } = patch
+      const pages = table.pages.map((p) => narrowPage(p, safe))
+      set({ tables: patchTable(tableId, (t) => ({ ...t, pages })) })
+      persist()
+      return pages.length
     },
 
     backfill: async (tableId) => {

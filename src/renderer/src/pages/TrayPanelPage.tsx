@@ -19,9 +19,14 @@ export function TrayPanelPage() {
   const settings = useSettings((s) => s.settings)
 
   useEffect(() => {
+    /*
+     * 只拉一次（v0.3.9 体检 M2）。
+     *
+     * 以前这里还有个 2.5 秒的 `setInterval(refreshDownloads)`，而 `useSubs` 已经订阅了
+     * `ev:downloads` 推送 —— 同一份数据被两条路各拉一遍（托盘小窗天天开着，纯属白费）。
+     * 上面的 store 订阅会持续把新任务推过来，首帧那次拉取只是为了让刚打开时不空白。
+     */
     void refreshDownloads()
-    const t = setInterval(() => void refreshDownloads(), 2500)
-    return () => clearInterval(t)
   }, [refreshDownloads])
 
   const active = downloads.filter((d) => !['done', 'error'].includes(d.status))
@@ -78,7 +83,12 @@ export function TrayPanelPage() {
                   <button
                     className="shrink-0 text-faint hover:text-text"
                     title="暂停"
-                    onClick={() => void api.downloads.pause(task.id)}
+                    onClick={() => {
+                      // v0.3.9 体检 M5：失败要有反馈（下载器不可用时以前是静默无反应）
+                      void api.downloads.pause(task.id).then((r) => {
+                        if (!r.ok) toast.error(r.error)
+                      })
+                    }}
                   >
                     <Pause size={12} />
                   </button>
@@ -86,7 +96,11 @@ export function TrayPanelPage() {
                   <button
                     className="shrink-0 text-ok"
                     title="继续"
-                    onClick={() => void api.downloads.resume(task.id)}
+                    onClick={() => {
+                      void api.downloads.resume(task.id).then((r) => {
+                        if (!r.ok) toast.error(r.error)
+                      })
+                    }}
                   >
                     <Play size={12} />
                   </button>

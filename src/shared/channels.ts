@@ -10,6 +10,8 @@ export const CH = {
   winShowMain: 'win:show-main',
   winHideTrayPanel: 'win:hide-tray-panel',
   winOpenSmall: 'win:open-small',
+  /** galgame 沉浸模式：进/出时记住窗口几何并切换全屏（退出恢复小窗口） */
+  winImmersive: 'win:immersive',
   evWinMaximize: 'ev:win-maximize',
   evWinFullscreen: 'ev:win-fullscreen',
 
@@ -60,6 +62,12 @@ export const CH = {
   dlDeleteLocal: 'dl:delete-local',
   /** 只删下载记录，不删文件（下载列表综合卡片用） */
   dlRemoveRecords: 'dl:remove-records',
+  /** 外部 qBittorrent 状态：是否可连、版本、程序路径、探测到的可用端口（设置页如实显示原因） */
+  qbitStatus: 'qbit:status',
+  /** 由应用启动 qBittorrent 并等 WebUI 就绪（设置页的手动启动按钮） */
+  qbitLaunch: 'qbit:launch',
+  /** 选择 qBittorrent 程序（.exe） */
+  dialogPickExe: 'dialog:pick-exe',
   evDownloads: 'ev:downloads',
 
   // 播放规则引擎
@@ -107,6 +115,8 @@ export const CH = {
   clipboardCopyImage: 'clipboard:copy-image',
   /** v0.3.6：剪贴板里是否已有图片 */
   clipboardHasImage: 'clipboard:has-image',
+  /** v0.3.9：把一段文本写进系统剪贴板（galgame 悬浮按钮「复制 BGM 名称」用） */
+  clipboardCopyText: 'clipboard:copy-text',
   // 全屏控制栏悬浮窗（原生视频窗口永远盖在网页之上，全屏时控制栏需独立透明窗口叠加）
   overlayShow: 'overlay:show',
   overlayHide: 'overlay:hide',
@@ -192,6 +202,27 @@ export const CH = {
 
   // 播放状态与流详情（播放器顶部状态栏）
   playerStreamInfo: 'player:stream-info',
+  /*
+   * 播放过程进度（v0.3.9）。
+   *
+   * flow：**纯内存读**的三阶段快照（找资源 / 取资源 / 注入播放器，含实时耗时）。
+   *   与 playerStreamInfo 的区别是它不发任何网络请求，所以可以按秒拉而不心疼
+   *   （渲染层在「尚未开播」时本来就已经在轮询内核状态，直接并进那一次轮询）。
+   * flowMark：渲染层把「我现在进到哪一步了」写回主进程 ——
+   *   阶段划分的知识在渲染层（规则搜索/取集/进播放页的顺序），
+   *   而状态必须只有一份（主进程），否则详情面板与状态栏会各说各话。
+   */
+  playerFlow: 'player:flow',
+  playerFlowMark: 'player:flow-mark',
+  /**
+   * 资源可达性取证（v0.3.9）：拿直链真的去请求一次，量首字节/速率/HTTP 状态，
+   * 返回「网站问题 / 速度过慢 / 格式不支持」的判定。在交给播放器之后**并行**调用。
+   */
+  playerDiagnose: 'player:diagnose',
+  /** 在线播放自检（v0.3.9）：查嗅探残留与内核错配，可按需自动重置 */
+  playerSelfCheck: 'player:self-check',
+  /** 一键重置整条播放链路（关嗅探、清直链缓存、销毁内核） */
+  playerHardReset: 'player:hard-reset',
 
   // 更新检查与一键更新（GitHub Releases）
   appUpdateCheck: 'app:update-check',
@@ -268,6 +299,8 @@ export const CH = {
   galUpdateDetail: 'gal:update-detail',
   galSearchYmgal: 'gal:search-ymgal',
   galApplyYmgal: 'gal:apply-ymgal',
+  /** v0.3.9：读取某款游戏最近识别到的 BGM（只读内存识别，供卡片右键面板） */
+  galMemRecent: 'gal:mem-recent',
   galPickImage: 'gal:pick-image',
   galSetCustomImage: 'gal:set-custom-image',
   galClearCustomImage: 'gal:clear-custom-image',
@@ -276,6 +309,14 @@ export const CH = {
   galPickDir: 'gal:pick-dir',
   galScreenshotNow: 'gal:screenshot-now',
   galOverlayShot: 'gal:overlay-shot',
+  /** v0.3.9：悬浮按钮展开/收起选择面板（动态调整悬浮窗尺寸，height=面板所需窗口高度） */
+  galOverlayResize: 'gal:overlay-resize',
+  /** v0.3.9：读取当前正在运行的 galgame 的 BGM（内存识别，服务就绪前返回未开启提示） */
+  galBgmRead: 'gal:bgm-read',
+  /** v0.3.9：把识别到的 BGM 从游戏档案只读提取并保存到本地（代号或曲名） */
+  galBgmSave: 'gal:bgm-save',
+  /** v0.3.9：最近保存的 BGM（卡片右键菜单「最近保存的 bgm」） */
+  galBgmSaved: 'gal:bgm-saved',
   galRecentShots: 'gal:recent-shots',
   /** 某款游戏自己的截图（「最近截图」挂在每张游戏卡片上，只看该游戏目录） */
   galListShots: 'gal:list-shots',
@@ -293,6 +334,15 @@ export const CH = {
    * 渲染层那份 watchHistory 是整份缓存 + 整份写回，不重新读就会被旧数组覆盖掉。
    */
   evLibrary: 'ev:library',
+  /*
+   * v0.3.9 体检 H1：**任何一方**写了设置就广播一次，所有窗口重新读取。
+   *
+   * 为什么必须有它：`settings` 有两个写入方 —— 渲染层（设置页、播放器浮层）与主进程十几处
+   * （Anime4K 画质、音频、投屏目标、缓存目录、数据源迁移标记…），而两边以前都拿自己那份快照
+   * 整份回写，谁后写谁赢。典型表现是"在播放器里调好的画质，回主窗口点一个不相关的开关就变回默认"。
+   * 广播挂在 store 的写入钩子上，主进程那十几处因此**自动**被覆盖，不需要逐个改。
+   */
+  evSettings: 'ev:settings',
   statExportImage: 'stat:export-image',
   /** 详情窗口的剧照来源：番剧截图目录（<截图目录>/<番剧名>图片） */
   statShots: 'stat:shots',
@@ -320,5 +370,16 @@ export const CH = {
    * 搜索页展示位（空态轮播图）：把用户挑的图片复制进应用数据目录并返回新路径。
    * 必须过主进程：`sakana-img://local` 只放行白名单目录，用户随手选的图片路径不在白名单里。
    */
-  showcaseImportImages: 'showcase:import-images'
+  showcaseImportImages: 'showcase:import-images',
+  /**
+   * v0.3.9：在线播放加速器的当前状态（是否在加速 / 实时速率 / 为什么这么决定）。
+   * 只读、纯内存；设置页按秒轮询它显示**真实**状态，而不是按档位猜。
+   */
+  playerBoostStatus: 'player:boost-status',
+  /**
+   * v0.3.9 补充更新：优化记录（每次真正启用加速的真实测量结果）。
+   * 读一次返回最近 N 条（主进程已按 BOOST_RECORD_MAX 截断），另有一个清空入口。
+   */
+  playerBoostRecords: 'player:boost-records',
+  playerBoostClearRecords: 'player:boost-clear-records'
 } as const

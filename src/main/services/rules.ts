@@ -1,12 +1,16 @@
 import axios from 'axios'
+import { createHash } from 'node:crypto'
 import { JSONPath } from 'jsonpath-plus'
 import xhtml from 'xpath-html'
 import type {
+  LocalRuleEntry,
+  LocalRuleReason,
   PlayRule,
   RuleEpisode,
   RuleEpisodeGroup,
   RuleEpisodesDef,
   RuleEpisodesResult,
+  RuleOrigin,
   RulePlayResult,
   RuleSearchDef,
   RuleSearchEntry,
@@ -376,7 +380,17 @@ export async function ruleSearch(ruleId: string, keyword: string): Promise<RuleS
           p && p.trim() ? jpath(p, item) : undefined
         const name = String(rel(def.itemNameJsonPath) ?? (item as { name?: string })?.name ?? '')
         const source = String(rel(def.itemSourceJsonPath) ?? '')
-        items.push({ name, link: '', source })
+        /*
+         * api 型搜索的条目 link（v0.3.9）：
+         * 有些站点的搜索补全接口只给 id、不给详情页地址（aafun 用的
+         * /index.php/ajax/suggest 就是这样），而选集要读详情页 HTML。
+         * 过去 link 恒为空串，选集侧只能拿 id 去拼 URL，拼出来是 `https://站点/3291` —— 必然失败。
+         * 规则里给了 itemLinkTemplate 就用 @source 拼出真实详情页地址（如 /anime/@source.html）。
+         */
+        const link = def.itemLinkTemplate
+          ? fillTemplate(def.itemLinkTemplate, { source, keyword })
+          : ''
+        items.push({ name, link, source })
       }
     }
     // 纯 HTTP 抓不到（结果由 JS 渲染的站点，或站点偶发返回"加载中/安全验证"拦截页）
@@ -619,16 +633,206 @@ export async function rulePlay(
   return { url: qs ? `${url}${url.includes('?') ? '&' : '?'}${qs}` : url, referer: rule.baseUrl }
 }
 
-/** 内置默认规则随应用更新（保留用户自定义规则，仅刷新 default- 前缀的内置规则） */
+// ---------------- 规则本地库（v0.3.9） ----------------
+
+/**
+ * 本地库（store 命名空间 `rulesLocal`）。
+ *
+ * 用户原话：「所有有问题的规则你都可以修改，修改到跑通，另外规则设置中新增本地库，
+ * 修改过的规则全部放在本地库中（任何修改都是），当从 git 规则库中导入的规则或者
+ * 从 git 规则库中更新的规则跑不通时，我们还有本地库可以替换使用。」
+ *
+ * 为什么必须是**独立的 store 命名空间**：`rules` 会被「从仓库导入 / 启动自动更新」整条覆盖，
+ * 本地库如果混在 rules 里就会被一起冲掉 —— 那正好失去"仓库版本跑不通时还能退回本地版本"的意义。
+ */
+const LOCAL_NS = 'rulesLocal'
+/** 同一条规则最多留几个版本（按时间倒序保留）：够回溯"上一版/上上版"，又不会无限膨胀 */
+const LOCAL_MAX_PER_RULE = 8
+/** 本地库总条数上限：超了就丢最旧的（本地库是"最近能用的几版"，不是归档系统） */
+const LOCAL_MAX_TOTAL = 400
+
+/**
+ * 规则**内容**哈希：只算会影响"能不能跑通"的字段（名字/版本/地址/搜索/选集定义）。
+ *
+ * 为什么不直接 JSON.stringify(rule)：
+ *  ① enabled、createdAt、origin 这些是"状态"不是"内容"，用户只是开关一下规则，
+ *     不该因此多出一条"新版本"（否则本地库会被开关操作灌满）；
+ *  ② 字段顺序不稳定时字符串比较会误判为"变了"。
+ */
+function ruleContentHash(rule: PlayRule): string {
+  const basis = JSON.stringify({
+    name: rule.name,
+    version: rule.version,
+    baseUrl: rule.baseUrl,
+    search: rule.search,
+    episodes: rule.episodes
+  })
+  return createHash('sha1').update(basis).digest('hex').slice(0, 12)
+}
+
+/** 读本地库（读取一律返回副本，直接改数组不会污染 store 缓存） */
+export function listLocalRules(): LocalRuleEntry[] {
+  const list = store.get<LocalRuleEntry[]>(LOCAL_NS, [])
+  return Array.isArray(list) ? list : []
+}
+
+/**
+ * 把一条规则的快照存进本地库（按 `ruleId#内容哈希` 去重）。
+ *
+ * 为什么入库的是**当前内容**而不是"上一版"：用户要的语义是"修改到跑通的版本要留在本地库里，
+ * 仓库版跑不通时用它替换回去"。所以每次内容变化都把**新版**记一份；被覆盖掉的旧版同样留档
+ * （`before-change` / `repo-import`），这样任一历史版本都还能找回。
+ */
+export function archiveRuleSnapshot(
+  rule: PlayRule,
+  reason: LocalRuleReason,
+  origin?: RuleOrigin
+): LocalRuleEntry | null {
+  if (!rule?.id || !rule.name) return null
+  try {
+    const hash = ruleContentHash(rule)
+    const id = `${rule.id}#${hash}`
+    const list = listLocalRules()
+    if (list.some((e) => e.id === id)) return null // 同一内容不重复入库
+    const entry: LocalRuleEntry = {
+      id,
+      ruleId: rule.id,
+      name: rule.name,
+      version: rule.version,
+      // 快照本体去掉 origin/localAppliedAt 这类"当前状态"字段：它描述的是当时的内容，
+      // 来源由 entry.origin 单独记，替换回去时再按需重新打标。
+      rule: { ...rule, origin: undefined },
+      savedAt: Date.now(),
+      reason,
+      origin: origin ?? rule.origin ?? guessOrigin(rule),
+      hash
+    }
+    list.push(entry)
+    // 逐条规则裁剪 + 总量裁剪（都是保留最新的那几版）
+    const trimmed = trimLocalRules(list)
+    store.set(LOCAL_NS, trimmed)
+    log.append('info', 'rules', `本地库已留档：${rule.name} v${rule.version}（${reason}）`)
+    return entry
+  } catch (err) {
+    // 留档失败不能影响规则本身的使用：只记一条日志
+    log.append('warn', 'rules', `本地库留档失败（${rule.name}）: ${String(err)}`)
+    return null
+  }
+}
+
+/** 老数据没有 origin 字段时的兜底推断（id 前缀是历史约定） */
+function guessOrigin(rule: PlayRule): RuleOrigin {
+  if (rule.origin) return rule.origin
+  if (rule.id.startsWith('default-')) return 'builtin'
+  if (rule.id.startsWith('repo-')) return 'repo'
+  return 'local'
+}
+
+/** 裁剪本地库：每条规则最多 LOCAL_MAX_PER_RULE 版、总条数不超过 LOCAL_MAX_TOTAL（保留最新的） */
+function trimLocalRules(list: LocalRuleEntry[]): LocalRuleEntry[] {
+  const byRule = new Map<string, LocalRuleEntry[]>()
+  for (const e of list) {
+    const arr = byRule.get(e.ruleId) ?? []
+    arr.push(e)
+    byRule.set(e.ruleId, arr)
+  }
+  const kept: LocalRuleEntry[] = []
+  for (const arr of byRule.values()) {
+    arr.sort((a, b) => b.savedAt - a.savedAt)
+    kept.push(...arr.slice(0, LOCAL_MAX_PER_RULE))
+  }
+  kept.sort((a, b) => b.savedAt - a.savedAt)
+  return kept.slice(0, LOCAL_MAX_TOTAL).sort((a, b) => a.savedAt - b.savedAt)
+}
+
+/**
+ * 规则数组发生整体替换时（导入/覆盖/删除/用户保存）逐条对比，把"变了的、被删的、新增的"都留档。
+ *
+ * 为什么要对比而不是无脑全量入库：
+ *  ① 每次启动都会重写 rules（内置刷新/修正），无脑入库会让本地库每次启动多出一堆一模一样的条目；
+ *  ② "任何修改都留一份"指的是**内容真的变了**的那些，靠内容哈希去重正好表达这个语义。
+ */
+export function archiveRuleChanges(
+  prev: PlayRule[],
+  next: PlayRule[],
+  reason: LocalRuleReason,
+  nextReason: LocalRuleReason = 'after-change',
+  /**
+   * 可选：按规则决定"新版"的入库原因。
+   * 为什么需要它：一次写入里可能混着两类东西 —— 内置规则（应用托管、最可靠的那一版）
+   * 与用户/仓库规则。用同一个原因会让内置版在本地库里显示成"修改后的版本"，
+   * 用户就看不出"这条是随应用分发的兜底版本"，也就不知道该不该拿它去替换。
+   */
+  nextReasonOf?: (rule: PlayRule) => LocalRuleReason
+): number {
+  let saved = 0
+  const prevByHash = new Map<string, PlayRule>()
+  const prevById = new Map<string, PlayRule>()
+  for (const r of prev) {
+    if (!r?.id) continue
+    prevByHash.set(`${r.id}#${ruleContentHash(r)}`, r)
+    prevById.set(r.id, r)
+  }
+  for (const r of next) {
+    if (!r?.id) continue
+    const same = prevByHash.has(`${r.id}#${ruleContentHash(r)}`)
+    if (same) continue // 内容没变，不入库
+    const before = prevById.get(r.id)
+    // 被改掉的那一版先留档，再存新版（顺序不影响结果，只是日志更好读）
+    if (before) if (archiveRuleSnapshot(before, reason)) saved++
+    if (archiveRuleSnapshot(r, nextReasonOf ? nextReasonOf(r) : nextReason)) saved++
+  }
+  // 被删掉的规则：留档后用户还能找回来
+  const nextIds = new Set(next.map((r) => r?.id).filter(Boolean))
+  for (const r of prev) {
+    if (!r?.id || nextIds.has(r.id)) continue
+    if (archiveRuleSnapshot(r, 'removed')) saved++
+  }
+  return saved
+}
+
+/** 内置规则随应用更新（保留用户自定义规则，仅刷新 default- 前缀的内置规则） */
 export function ensureDefaultRules(): void {
   const rules = store.get<PlayRule[]>('rules', [])
+  /*
+   * 内置规则（default- 前缀）由应用托管：每次启动都按内置定义刷新，保证
+   * ① 用户点名要内置的 AGE / sorani / aafun 一定存在且**启用**；
+   * ② 内置内容随应用升级而更新（用户不用手动"恢复默认"）。
+   * 用户自己加的、以及从仓库导入的规则（repo- / 其它 id）一律原样保留、顺序不动。
+   */
+  const builtin = DEFAULT_RULES.map((r) => ({ ...r, enabled: true }))
   const custom = rules.filter((r) => !r.id.startsWith('default-'))
-  const next = [...custom, ...DEFAULT_RULES]
+  // 内置排最前：列表与搜索结果里这三条先出现（PINNED_RULES 也把它们置顶，两处一致）
+  const next = [...builtin, ...custom]
   if (JSON.stringify(next) !== JSON.stringify(rules)) {
+    // 被覆盖掉的旧内容先留档到本地库，再写新的（"任何修改都留一份"）；
+    // 内置规则标记成 'builtin'：它在本地库里就是"随应用分发、最可靠的那一版"
+    const saved = archiveRuleChanges(rules, next, 'before-change', 'after-change', (r) =>
+      r.id.startsWith('default-') ? 'builtin' : 'after-change'
+    )
     store.set('rules', next)
-    log.append('info', 'rules', `内置播放规则已更新（${DEFAULT_RULES.length} 条）`)
+    log.append(
+      'info',
+      'rules',
+      `内置播放规则已更新（${builtin.length} 条：${builtin.map((r) => r.name).join('、')}）` +
+        (saved > 0 ? `，旧版本已留档 ${saved} 条到本地库` : '')
+    )
   }
+  seedLocalLibraryFromRules()
   repairStoredRules()
+}
+
+/**
+ * 把"当前正在生效"的规则各留一份到本地库（启动时跑一次）。
+ *
+ * 为什么要有这一步：本地库要能在仓库版本跑不通时顶上去，就必须**在出问题之前**已经存有能跑通的版本。
+ * 只靠"改动时才留档"的话，用户从没改过的内置规则在本地库里是空的，
+ * 而它恰恰是最可能被仓库更新覆盖掉的（覆盖后旧版就找不回来了）。
+ */
+function seedLocalLibraryFromRules(): void {
+  for (const r of store.get<PlayRule[]>('rules', [])) {
+    archiveRuleSnapshot(r, r.id.startsWith('default-') ? 'builtin' : 'first-seen')
+  }
 }
 
 /**
@@ -666,6 +870,71 @@ const RULE_FIXES: {
     episodes: {
       linesXPath: '//div[contains(@class,"line_button")]'
     }
+  },
+  {
+    /*
+     * 樱之空（skr.skrcc.cc:666）—— v0.3.9 实测「搜索有结果、线路 7 条，但剧集恒为 0」。
+     *
+     * 根因：站点把剧集容器的类名改掉了，老的
+     *   `(//div[contains(@class,"play_list_box")])[{n}]//div[@id="playlistbox"]/ul/li/a`
+     * 第一段就命中 0 个节点，整条表达式因此恒为空（线路倒是还在，因为 #NumTab 没变）。
+     * 实测新结构：页面里仍有 **7 个 `div#playlistbox`**（每线路一个），
+     * 且顺序与 #NumTab 的标签一一对应 —— 于是直接用「第 n 个 #playlistbox」配对
+     * （{n} 占位由 ruleEpisodesRaw 支持），实测 7 条线路各 14 集。
+     * 用 `ul/li/a` 而不是 `//a`：后者会把「展开/收起」这类非剧集链接也算进来（实测多 1 条）。
+     */
+    match: /skrcc\.cc/i,
+    version: '1.1-fix',
+    episodes: {
+      linesXPath: '//div[@id="NumTab"]/a',
+      lineNameXPath: '@alt',
+      episodesXPath: '(//div[@id="playlistbox"])[{n}]/ul/li/a'
+    }
+  },
+  {
+    /*
+     * MXdm（dcc3.com）—— v0.3.9 实测「搜索 11 条、剧集 0」。
+     *
+     * 根因：详情页把线路容器换成了 `ul.list6`（老的 `//div[@class='playlist']/div[@class='row']/ul`
+     * 命中 0）。实测新结构 `ul.list6` 两段 = 两条线路，每条 14 集，
+     * 剧集链接形如 /play/<id>-<线路>-<集>/ —— 用 `.//li/a`（相对线路）即可。
+     */
+    match: /dcc3\.com/i,
+    version: '2.5-fix',
+    episodes: {
+      linesXPath: '//ul[contains(@class,"list6")]',
+      episodesXPath: './/li/a'
+    }
+  },
+  {
+    /*
+     * 月之祠（moonci.com）—— v0.3.9 实测「搜索 0 条」（aafun 与仓库里的 moonci 是同站同名规则）。
+     *
+     * 根因与 aafun 完全一样：站点 HTML 搜索页走的是它自己的全文索引，
+     * 整串标题经常命中不了（实测「久留美」0 条），而站点的搜索补全接口是 SQL LIKE、能命中。
+     * 所以这条修正把**搜索改到 ajax/suggest**，并用 itemLinkTemplate 由 id 拼详情页地址
+     * （该接口只给 id）；剧集侧顺带改成 aafun 那套已验证可用的单线路写法
+     * （老的 `hl-play-source` 容器在当前页面已为 0）。
+     *
+     * ⚠️ 特意**不写 version**：这条 baseURL 会同时命中内置 aafun（版本 1.3-fix），
+     * 写死一个版本号会把 aafun 的版本压低，反而让启动自动更新判定"仓库版 1.2 更新"
+     * 而把修好的内置版覆盖回去 —— 这正是要避免的。
+     */
+    match: /moonci\.com/i,
+    search: {
+      type: 'api',
+      method: 'GET',
+      url: 'https://www.moonci.com/index.php/ajax/suggest?mid=1&wd=@keyword&limit=20',
+      query: '{}',
+      listJsonPath: '$.list[*]',
+      itemNameJsonPath: '$.name',
+      itemSourceJsonPath: '$.id',
+      itemLinkTemplate: 'https://www.moonci.com/anime/@source.html'
+    },
+    episodes: {
+      linesXPath: '',
+      episodesXPath: '//ul[contains(@class,"hl-plays-list")]/li/a'
+    }
   }
 ]
 
@@ -693,6 +962,8 @@ function repairStoredRules(): void {
     return fixed
   })
   if (changed > 0) {
+    // 修正表改写的也是"规则内容"，同样要留一份到本地库（用户要的是"任何修改都留档"）
+    archiveRuleChanges(rules, next, 'before-change', 'auto-fix')
     store.set('rules', next)
     log.append('info', 'rules', `已应用 ${changed} 条站点改版修正`)
   }
@@ -929,9 +1200,22 @@ export async function rulesRepoImport(names: string[]): Promise<{ imported: numb
       const rule = convertKazumiRule(raw)
       const existing = byName.get(rule.name)
       const finalRule: PlayRule = existing
-        ? { ...rule, id: existing.id, enabled: existing.enabled, createdAt: existing.createdAt }
-        : { ...rule, id: `repo-${rule.name.toLowerCase()}`, createdAt: Date.now() }
+        ? {
+            ...rule,
+            id: existing.id,
+            enabled: existing.enabled,
+            createdAt: existing.createdAt,
+            // 来源如实标成"仓库版"：界面据此显示"当前用的是 git 版还是本地版"（v0.3.9）
+            origin: 'repo'
+          }
+        : { ...rule, id: `repo-${rule.name.toLowerCase()}`, createdAt: Date.now(), origin: 'repo' }
       if (existing) {
+        /*
+         * 覆盖前先把**被覆盖的那一版**留档到本地库（v0.3.9）：
+         * 用户要求"从 git 规则库导入/更新的规则跑不通时，还有本地库可以替换使用"，
+         * 那么被覆盖掉的这一版就必须先存下来 —— 否则覆盖之后原来的能跑版本就永久消失了。
+         */
+        archiveRuleSnapshot(existing, 'repo-import', guessOrigin(existing))
         const idx = rules.findIndex((r) => r.id === existing.id)
         rules[idx] = finalRule
       } else {
@@ -946,6 +1230,11 @@ export async function rulesRepoImport(names: string[]): Promise<{ imported: numb
   }
   store.set('rules', rules)
   log.append('info', 'rules', `规则仓库导入完成：${imported} 条成功，${failed.length} 条失败`)
+  // 导入后的新内容同样进本地库（用户"任何修改都留一份"，且下次被覆盖时它就是"上一版"）
+  for (const name of names) {
+    const r = rules.find((x) => x.name === name)
+    if (r) archiveRuleSnapshot(r, 'repo-import', 'repo')
+  }
   return { imported, failed }
 }
 

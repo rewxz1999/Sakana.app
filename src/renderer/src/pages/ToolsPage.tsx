@@ -1,11 +1,17 @@
 import { useState } from 'react'
 import { motion } from 'framer-motion'
-import { BarChart3, FileDown, FileText, History, LayoutGrid, Play, Puzzle, SquareTerminal, Star, Trash2, Trophy } from 'lucide-react'
+import { BarChart3, BookOpenCheck, FileDown, FileText, History, Info, LayoutGrid, Play, Puzzle, SquareTerminal, Star, Trash2, Trophy } from 'lucide-react'
+import type { ToolMeta } from '@shared/types'
 import { useTools } from '@/stores/tools'
 import { timeAgo } from '@/lib/format'
 import { api } from '@/lib/api'
 import { Button, EmptyState, Modal } from '@/components/ui'
 import { CoverImage } from '@/components/CoverImage'
+import {
+  ToolDetailModal,
+  ToolImportDocsModal,
+  ToolImportReportModal
+} from '@/components/tools/ToolImportDocs'
 import { toast } from '@/stores/app'
 
 /** 内置统计工具（默认自带，无需导入即可从本页启动） */
@@ -81,9 +87,13 @@ const BUILTIN_RECOMMEND_TOOL = {
 }
 
 export function ToolsPage() {
-  const { tools, importTool, removeTool, runTool, exportDocs, runningId, lastResult } = useTools()
+  const { tools, importTool, removeTool, runTool, exportDocs, runningId, lastResult, lastImport, clearImport } = useTools()
   const [docsMenu, setDocsMenu] = useState(false)
   const [resultOpen, setResultOpen] = useState(false)
+  // v0.3.9：导入说明 / 导入结果 / 工具详情三个弹窗（组件见 components/tools/ToolImportDocs.tsx）
+  const [importDocsOpen, setImportDocsOpen] = useState(false)
+  const [importReportOpen, setImportReportOpen] = useState(false)
+  const [detailTool, setDetailTool] = useState<ToolMeta | null>(null)
 
   return (
     <div className="relative h-full overflow-y-auto px-6 py-5">
@@ -91,13 +101,40 @@ export function ToolsPage() {
         <div>
           <h1 className="text-lg font-bold">工具</h1>
           <p className="mt-1 max-w-xl text-xs leading-relaxed text-faint">
-            基于 Python 脚本的扩展工具。导入后可访问应用数据（收藏列表、订阅、观看历史、统计），直接在界面内运行。
+            基于脚本的扩展工具（Python 3 可直接运行；其它语言可导入留档）。导入后可访问应用数据（收藏列表、订阅、观看历史、统计），直接在界面内运行。
+            元数据全是可选的 —— 写法与示例见
+            <button className="ml-1 underline transition-colors hover:text-accent" onClick={() => setImportDocsOpen(true)}>
+              导入说明
+            </button>
+            。
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Button variant="soft" icon={SquareTerminal} onClick={() => void importTool()}>
+          {/* v0.3.9：先给"导入说明"入口 —— 用户要求"工具要求文档够清晰就行"，
+              说明必须能在界面里直接看，而不是只能导出文件后自己找。 */}
+          <Button variant="outline" icon={BookOpenCheck} onClick={() => setImportDocsOpen(true)}>
+            导入说明
+          </Button>
+          <Button
+            variant="soft"
+            icon={SquareTerminal}
+            onClick={() => {
+              /*
+               * 先把上一次的报告清掉再导入：用户取消对话框时 lastImport 会是 null，
+               * 弹窗组件对 null 不渲染 —— 于是"取消"不会误弹出上一次的旧结果。
+               */
+              clearImport()
+              setImportReportOpen(true)
+              void importTool()
+            }}
+          >
             添加工具
           </Button>
+          {lastImport ? (
+            <Button variant="ghost" icon={FileText} onClick={() => setImportReportOpen(true)}>
+              导入结果
+            </Button>
+          ) : null}
           <div className="relative">
             <Button variant="outline" icon={FileDown} onClick={() => setDocsMenu((v) => !v)}>
               保存要求文档
@@ -340,15 +377,33 @@ export function ToolsPage() {
               <div className="flex flex-1 flex-col p-3">
                 <div className="flex items-center justify-between gap-2">
                   <span className="line-clamp-1 text-sm font-semibold">{tool.name}</span>
-                  <button
-                    title="删除工具"
-                    className="text-faint transition-colors hover:text-danger"
-                    onClick={() => {
-                      void removeTool(tool.id)
-                    }}
-                  >
-                    <Trash2 size={14} />
-                  </button>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {/* v0.3.9：种类 + 能否运行，一眼看出"这份脚本是什么语言、能不能点运行" */}
+                    <span
+                      title={tool.runnable === false ? '这种文件没有运行时，只能导入留档' : '可以在这里直接运行'}
+                      className={`rounded-full px-1.5 py-0.5 text-[10px] whitespace-nowrap ${
+                        tool.runnable === false ? 'bg-warn/15 text-warn' : 'bg-ok/15 text-ok'
+                      }`}
+                    >
+                      {tool.kindLabel ?? '脚本'}
+                    </span>
+                    <button
+                      title="工具信息（解析详情）"
+                      className="text-faint transition-colors hover:text-accent"
+                      onClick={() => setDetailTool(tool)}
+                    >
+                      <Info size={13} />
+                    </button>
+                    <button
+                      title="删除工具"
+                      className="text-faint transition-colors hover:text-danger"
+                      onClick={() => {
+                        void removeTool(tool.id)
+                      }}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
                 </div>
                 <p className="mt-1 line-clamp-2 flex-1 text-[11px] leading-relaxed text-dim">
                   {tool.description || '（无描述）'}
@@ -377,7 +432,7 @@ export function ToolsPage() {
           <EmptyState
             icon={Puzzle}
             title="还没有导入外部工具"
-            desc="点击「添加工具」导入 Python 脚本。脚本需接收 --sakana-data 参数或 SAKANA_DATA 环境变量以读取应用数据，详见「保存要求文档」。"
+            desc="点击「添加工具」导入脚本（支持 Python；其它语言也能导入留档，只是不能直接运行）。元数据全部可选，缺字段只会在「导入结果」里给提示 —— 详见「导入说明」。"
           >
             <Button onClick={() => void importTool()}>导入第一个工具</Button>
           </EmptyState>
@@ -426,6 +481,22 @@ export function ToolsPage() {
           </div>
         ) : null}
       </Modal>
+
+      {/* v0.3.9：导入说明（字段表 + 3 个示例 + 常见错误，示例一键复制） */}
+      <ToolImportDocsModal open={importDocsOpen} onClose={() => setImportDocsOpen(false)} />
+
+      {/* v0.3.9：导入结果（成功 N 份 / 其中 M 份带提示 / 逐条"第几行哪个字段"） */}
+      <ToolImportReportModal
+        report={importReportOpen ? lastImport : null}
+        onClose={() => setImportReportOpen(false)}
+        onOpenDocs={() => {
+          setImportReportOpen(false)
+          setImportDocsOpen(true)
+        }}
+      />
+
+      {/* v0.3.9：工具信息（版本/docstring 从哪一行读到的、种类、封面来源） */}
+      <ToolDetailModal tool={detailTool} onClose={() => setDetailTool(null)} />
     </div>
   )
 }

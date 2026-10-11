@@ -1,14 +1,17 @@
 import type { CardExportImageEntry } from '@shared/types'
 import type { ModuleKind, ModuleLayout, ModuleRect, RecommendPage } from '@/stores/recommendTable'
-import { MAX_PHOTOS, MODULE_KINDS, renderModules } from '@/stores/recommendTable'
+import { MAX_PHOTOS, renderModules } from '@/stores/recommendTable'
 import {
   FONT,
+  type ModuleFont,
   type PageFrame,
   RC,
   RL,
   airDateText,
   blendStyle,
   chipStyle,
+  contentBlendStyle,
+  contentGradientStyle,
   coverImageStyle,
   cssText,
   dimTextStyle,
@@ -24,7 +27,9 @@ import {
   infoValueStyle,
   levelParts,
   moduleBoxStyle,
+  moduleFontOf,
   moduleRectsOf,
+  moduleZOf,
   pageBackgroundCss,
   pageNoText,
   pageStyle,
@@ -97,27 +102,27 @@ function styleAttr(rec: Record<string, string>): string {
 }
 
 /** 一行信息：左侧标签固定宽度，右侧内容自适应 */
-function infoRow(label: string, valueHtml: string): string {
+function infoRow(label: string, valueHtml: string, font: ModuleFont): string {
   return `<div${styleAttr(infoRowStyle())}><span${styleAttr(
-    infoLabelStyle()
-  )}>${esc(label)}</span><span${styleAttr(infoValueStyle())}>${valueHtml}</span></div>`
+    infoLabelStyle(font)
+  )}>${esc(label)}</span><span${styleAttr(infoValueStyle(font))}>${valueHtml}</span></div>`
 }
 
 /** 推荐指数：亮星 + 暗星两段（和界面用同一套 levelParts） */
-function starHtml(level: number): string {
+function starHtml(level: number, font: ModuleFont): string {
   const { on, off } = levelParts(level)
   return (
-    `<span${styleAttr(starStyle(true))}>${'★'.repeat(on)}</span>` +
-    `<span${styleAttr(starStyle(false))}>${'☆'.repeat(off)}</span>`
+    `<span${styleAttr(starStyle(true, font))}>${'★'.repeat(on)}</span>` +
+    `<span${styleAttr(starStyle(false, font))}>${'☆'.repeat(off)}</span>`
   )
 }
 
 /** 类型标签：最多 6 个胶囊，多出来的用「+N」 */
-function genresHtml(genres: string[]): string {
-  if (genres.length === 0) return `<span${styleAttr(dimTextStyle())}>暂无标签</span>`
+function genresHtml(genres: string[], font: ModuleFont): string {
+  if (genres.length === 0) return `<span${styleAttr(dimTextStyle(font))}>暂无标签</span>`
   const { list, rest } = genreChips(genres)
-  const chips = list.map((g) => `<span${styleAttr(chipStyle(false))}>${esc(g)}</span>`).join('')
-  return chips + (rest > 0 ? `<span${styleAttr(chipStyle(true))}>+${rest}</span>` : '')
+  const chips = list.map((g) => `<span${styleAttr(chipStyle(false, font))}>${esc(g)}</span>`).join('')
+  return chips + (rest > 0 ? `<span${styleAttr(chipStyle(true, font))}>+${rest}</span>` : '')
 }
 
 /** 模块的内容（导出侧），与 RecommendPageCard 的 renderModule 一一对应 */
@@ -128,6 +133,8 @@ function moduleBody(
   frame: PageFrame,
   ctx: { pageNo: number; pageCount: number; tableName: string; recommender: string; slot: number }
 ): string {
+  // 这一块的字号/字体（用户没设就是基准），与界面那边是同一个取值函数
+  const font = moduleFontOf(page.layout, m.id)
   switch (m.id) {
     case 'cover':
       return `<img${styleAttr(coverImageStyle())} src="${imgTag(`cov${ctx.slot}`)}" alt="封面">`
@@ -135,34 +142,36 @@ function moduleBody(
       const sub = subName(page)
       const rec = ctx.recommender.trim()
       return (
-        `<h1${styleAttr(titleTextStyle())}>${esc(displayName(page))}</h1>` +
-        (sub ? `<div${styleAttr(subTextStyle())}>${esc(sub)}</div>` : '') +
-        (rec ? `<div${styleAttr(recTextStyle())}>推荐人：${esc(rec)}</div>` : '')
+        `<h1${styleAttr(titleTextStyle(font))}>${esc(displayName(page))}</h1>` +
+        (sub ? `<div${styleAttr(subTextStyle(font))}>${esc(sub)}</div>` : '') +
+        (rec ? `<div${styleAttr(recTextStyle(font))}>推荐人：${esc(rec)}</div>` : '')
       )
     }
     case 'ratings':
       return (
         infoRow(
           'bangumi 评分',
-          `<span${styleAttr(scoreTextStyle())}>${esc(scoreText(page.bgmRating))}</span>`
+          `<span${styleAttr(scoreTextStyle())}>${esc(scoreText(page.bgmRating))}</span>`,
+          font
         ) +
         infoRow(
           '推荐人评分',
-          `<span${styleAttr(scoreTextStyle())}>${esc(scoreText(page.myRating, '未评分'))}</span>`
+          `<span${styleAttr(scoreTextStyle())}>${esc(scoreText(page.myRating, '未评分'))}</span>`,
+          font
         )
       )
     case 'level':
-      return infoRow('推荐指数', starHtml(page.recommendLevel))
+      return infoRow('推荐指数', starHtml(page.recommendLevel, font), font)
     case 'meta':
       return (
-        infoRow('播出时间', `<span>${esc(airDateText(page.airDate))}</span>`) +
-        infoRow('类型标签', genresHtml(page.genres))
+        infoRow('播出时间', `<span>${esc(airDateText(page.airDate))}</span>`, font) +
+        infoRow('类型标签', genresHtml(page.genres, font), font)
       )
     case 'reason':
       return (
-        `<div${styleAttr(secTitleStyle())}>推荐理由</div>` +
-        `<p${styleAttr(reasonTextStyle())}>${
-          esc(page.reason) || `<span${styleAttr(emptyHintStyle())}>还没有写推荐理由</span>`
+        `<div${styleAttr(secTitleStyle(font))}>推荐理由</div>` +
+        `<p${styleAttr(reasonTextStyle(font))}>${
+          esc(page.reason) || `<span${styleAttr(emptyHintStyle(font))}>还没有写推荐理由</span>`
         }</p>`
       )
     case 'photos': {
@@ -170,7 +179,7 @@ function moduleBody(
       const cell = photoCellSize(rect, frame)
       const boxes =
         photos.length === 0
-          ? `<span${styleAttr(emptyHintStyle())}>还没有剧照</span>`
+          ? `<span${styleAttr(emptyHintStyle(font))}>还没有剧照</span>`
           : photos
               .map(
                 (_p, i) =>
@@ -179,11 +188,11 @@ function moduleBody(
                   )} src="${imgTag(`ph${ctx.slot}_${i + 1}`)}" alt="剧照"></span>`
               )
               .join('')
-      return `<div${styleAttr(secTitleStyle())}>剧照</div><div${styleAttr(photoRowStyle())}>${boxes}</div>`
+      return `<div${styleAttr(secTitleStyle(font))}>剧照</div><div${styleAttr(photoRowStyle())}>${boxes}</div>`
     }
     case 'foot':
       return (
-        `<div${styleAttr(footRowStyle())}><span>${esc(ctx.tableName)}</span>` +
+        `<div${styleAttr(footRowStyle(font))}><span>${esc(ctx.tableName)}</span>` +
         `<span>${esc(pageNoText(ctx.pageNo, ctx.pageCount))}</span></div>`
       )
     default:
@@ -191,7 +200,11 @@ function moduleBody(
   }
 }
 
-/** 一个模块的完整 HTML：绝对定位到版式算出来的矩形（**没有白板**，文字靠页面级 text-shadow） */
+/**
+ * 一个模块的完整 HTML：绝对定位到算出来的矩形（**没有白板**，文字靠页面级 text-shadow）。
+ *
+ * `order` 是绘制层级：默认 = MODULE_KINDS 的下标，用户在编辑模式里改过层级（`layout.z`）就用他的值。
+ */
 function moduleHtml(
   m: ModuleLayout,
   rect: ModuleRect,
@@ -202,7 +215,8 @@ function moduleHtml(
 ): string {
   // 模块**没有白板**：内容直接落在页面上（可读性靠页面级 text-shadow，见 styles.pageStyle）
   const body = moduleBody(m, rect, page, frame, ctx)
-  return `<div${styleAttr(moduleBoxStyle(rect, order))} data-module="${m.id}">${body}</div>`
+  const font = moduleFontOf(page.layout, m.id)
+  return `<div${styleAttr(moduleBoxStyle(rect, order, font))} data-module="${m.id}">${body}</div>`
 }
 
 /** 导出一页要用的输入 */
@@ -245,7 +259,7 @@ function pageHtml(
   modules: ModuleKind[] | null
 ): string {
   const frame = frameOf(page)
-  const rects = moduleRectsOf(frame)
+  const rects = moduleRectsOf(frame, page.layout)
   /*
    * 要画的模块**一律走 renderModules**（补全 → 丢掉隐藏的 → 再按导出勾选过滤）。
    * 它与界面预览用的是**同一个函数**：以前两边各写一遍，卡片那边漏了 filter(visible)，
@@ -253,10 +267,13 @@ function pageHtml(
    */
   const list = renderModules(page, modules)
   const ctx = { pageNo, pageCount: total, tableName, recommender, slot }
+  /** 页面底色：交融渐变要渐隐到它，两层必须同一个值 */
+  const pageBase = pageBackgroundCss(page.background)
 
   /*
-   * 背景：页面底色（纯色/渐变，或图片背景时的白）→ 图区里的图片层 → 交融渐变 → 模块。
-   * 图区只占页面的一部分（比例见 styles 的 IMAGE_CONTENT_RATIO），图用 cover 裁剪；
+   * 背景：页面底色（纯色/渐变，或图片背景时的白）→ 图区里的图片层 → 交融渐变 →
+   * 内容区渐变（可选）+ 它与页面底色之间的交融条 → 模块。
+   * 图区只占页面的一部分（比例见 page.bandRatio / IMAGE_CONTENT_RATIO），图用 cover 裁剪；
    * 交融渐变贴在图区靠内容区那一侧、渐隐到页面底色，所以两者之间没有硬边。
    */
   const bandWrap = imageBandWrapStyle(frame)
@@ -265,16 +282,22 @@ function pageHtml(
         imageBandImageStyle(frame, page.background, () => `url('${imgTag(`bg${slot}`)}')`)
       )}"></div></div>`
     : ''
-  const blendLayer = frame.pos === 'none' ? '' : `<div${styleAttr(blendStyle(frame))}></div>`
+  const blendLayer =
+    frame.pos === 'none' ? '' : `<div${styleAttr(blendStyle(frame, pageBase))}></div>`
+  const gradStyle = contentGradientStyle(frame, page.contentGradient)
+  const gradLayer = gradStyle
+    ? `<div${styleAttr(gradStyle)}></div>` +
+      (frame.pos === 'none' ? '' : `<div${styleAttr(contentBlendStyle(frame, pageBase))}></div>`)
+    : ''
   const body = list
-    .map((m) => moduleHtml(m, rects[m.id], MODULE_KINDS.indexOf(m.id), page, frame, ctx))
+    .map((m) => moduleHtml(m, rects[m.id], moduleZOf(page.layout, m.id), page, frame, ctx))
     .join('\n')
 
   return `<section${styleAttr({
     ...pageStyle(frame),
-    background: pageBackgroundCss(page.background)
+    background: pageBase
   })}>
-${bandLayer}${blendLayer}
+${bandLayer}${blendLayer}${gradLayer}
 ${body}
 </section>`
 }
@@ -343,13 +366,14 @@ ${body}
 </html>`
 
   /*
-   * 导出宽度 = **页面宽度**（v0.3.8 第四轮起宽高可手填，所以不能再写死 RL.width）。
-   * 长图里各页必须同宽（否则右边缘参差、分页虚线长短不一），所以取各页的最大值 ——
-   * 同一张表里用户通常统一设置，取最大值只是兜底。
-   * 高度 = 各页高之和 + 分页间距 + 上下留白；`renderHtmlToPng` 按这个高度开离屏窗口，
-   * 于是**导出 PNG 的像素尺寸 = 用户填的尺寸 × 清晰度**，与预览完全对得上。
+   * 导出宽度 = **页面宽度**（v0.3.8 第四轮起宽高可手填）。
+   * ⚠️ v0.3.9 修的一处：以前这里写的是 `max(页面宽, RL.width)`，于是用户把页面宽度
+   * **改窄**（例如 800）之后，导出窗口仍然是 1200 宽 —— 成图右侧会多出一条空白条，
+   * 而且"导出 PNG 的像素尺寸 = 页面尺寸 × 清晰度"这条承诺就不成立了。
+   * 现在只取各页实际宽度的最大值（长图里各页必须同宽，否则右边缘参差、分页虚线长短不一），
+   * 页数为 0 时才兜底 RL.width。
    */
-  const width = pages.reduce<number>((m, p) => Math.max(m, frameOf(p).width), RL.width)
+  const width = pages.reduce<number>((m, p) => Math.max(m, frameOf(p).width), 0) || RL.width
   return { html, images, width, height: height + RL.bodyPadV * 2 }
 }
 

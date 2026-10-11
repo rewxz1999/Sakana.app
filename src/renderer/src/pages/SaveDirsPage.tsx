@@ -173,7 +173,7 @@ export function SaveDirsPage() {
       />
       <DirRow
         title="galgame 截图保存位置"
-        desc="galgame 截图助手抓取的游戏窗口画面保存位置"
+        desc="galgame galgame 助手抓取的游戏窗口画面保存位置"
         draft={draft.galDir}
         effective={info.galDir}
         onPick={() => void pick('galDir')}

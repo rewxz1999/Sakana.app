@@ -3,6 +3,7 @@ import { RefreshCw, X } from 'lucide-react'
 import type { StreamInfo } from '@shared/types'
 import { api } from '@/lib/api'
 import { Spinner } from '@/components/ui'
+import { PlayFlowStages, metricsLine, reasonLabel } from '@/components/PlayFlowProgress'
 
 /**
  * 播放状态栏点开后的「流详情」弹窗（v0.2.4）。
@@ -17,12 +18,25 @@ import { Spinner } from '@/components/ui'
 export function StreamInfoModal({
   open,
   onClose,
-  extraLog
+  extraLog,
+  onRetry
 }: {
   open: boolean
   onClose: () => void
   /** 播放页额外提供的状态流水（悬浮窗里为空） */
   extraLog?: string[]
+  /**
+   * 「重跑」：播放失败后重新走一遍「重新解析地址 → 嗅探 → 交给内核」（v0.3.9 补充）。
+   *
+   * 为什么做成回调而不是在这里自己调接口：那条链的入口是**播放页**里的
+   * `startRuleProbe`（它持有播放页地址、探针取消句柄、看门狗等一堆内部状态）。
+   * 在详情面板里另写一套「重新嗅探」必然会跟播放页那一套打架
+   * （两轮探针同时跑、旧的看门狗把新流顶掉）。所以这里只发出「用户要重跑」这一个意图，
+   * 由持有那条链的一方去执行 —— 悬浮窗里则通过 overlay 动作回传给播放页。
+   *
+   * 不传（例如本地播放、或调用方不打算支持重跑）时**不渲染按钮**：不留假按钮。
+   */
+  onRetry?: () => void
 }) {
   const [info, setInfo] = useState<StreamInfo | null>(null)
   const [loading, setLoading] = useState(false)
@@ -35,6 +49,9 @@ export function StreamInfoModal({
     muted: boolean
   } | null>(null)
   const [updatedAt, setUpdatedAt] = useState(0)
+  /** 自检（v0.3.9）：手动跑一次并把「做了什么」显示出来（用户要求不许静默） */
+  const [checking, setChecking] = useState(false)
+  const [checkResult, setCheckResult] = useState('')
   /**
    * 画面子窗口的现场（v0.3.7）。
    *
@@ -83,6 +100,40 @@ export function StreamInfoModal({
     const timer = window.setInterval(() => void load(true), 1000)
     return () => window.clearInterval(timer)
   }, [open, load])
+
+  /**
+   * 是否处于失败态 —— 决定要不要给「重跑」按钮。
+   *
+   * 判据取自过程进度的**真实阶段状态**（有阶段被判 failed/timeout），
+   * 不是另存一个布尔量：否则「失败标记」与「阶段状态」迟早会不一致，
+   * 就会出现「其实没失败却显示重跑」这种假按钮。
+   */
+  const flowFailed =
+    !!info?.flow && info.flow.stages.some((s) => s.status === 'failed' || s.status === 'timeout')
+
+  /**
+   * 手动跑一次自检并重置（v0.3.9）。
+   *
+   * 放在 `load` 之后定义：依赖表里要用到 `load`，
+   * 而 `useCallback` 的依赖数组是在 render 期间求值的 —— 写在前面会撞上暂时性死区。
+   */
+  const selfCheckNow = useCallback(async (): Promise<void> => {
+    setChecking(true)
+    const r = await api.player.selfCheck({ reset: true })
+    setChecking(false)
+    if (!r.ok) {
+      setCheckResult(`自检失败：${r.error}`)
+      return
+    }
+    const bad = r.data.findings.filter((f) => f.level !== 'ok')
+    setCheckResult(
+      bad.length === 0
+        ? '自检通过：嗅探与播放内核状态均正常'
+        : `发现并已重置 ${bad.length} 项：${bad.map((f) => f.title).join('；')}`
+    )
+    // 自检会关掉残留探针窗口 / 销毁错配内核，立刻刷新一次面板，让用户看到新状态
+    void load(true)
+  }, [load])
 
   if (!open) return null
 
@@ -161,6 +212,84 @@ export function StreamInfoModal({
               </span>
             </div>
           </div>
+          {/* 播放过程进度（v0.3.9）：三阶段逐条摊开，含真实耗时与失败原因 */}
+          {info?.flow && (info.flow.running || info.flow.reason !== 'none' || info.flow.stages.some((s) => s.startedAt !== null)) ? (
+            <div className="mb-2 rounded-lg bg-elev2 px-2 py-1.5">
+              <div className="mb-1 flex items-center gap-2 text-[11px] font-medium text-text">
+                <span>播放过程</span>
+                {info.flow.running ? <span className="text-warn">进行中</span> : null}
+                {reasonLabel(info.flow.reason) ? (
+                  <span className="rounded-full bg-warn/15 px-1.5 py-0.5 text-[10px] text-warn">
+                    {reasonLabel(info.flow.reason)}
+                  </span>
+                ) : null}
+                <span className="text-[10px] font-normal text-faint">总耗时 {clock((Date.now() - info.flow.startedAt) / 1000) ?? '—'}</span>
+                {/*
+                  「重跑」（v0.3.9 补充）：只在**真的失败**时出现，且必须有回调才渲染。
+                  点了之后由播放页重走「重新解析地址 → 嗅探 → 交给内核」，
+                  过程进度会从新一轮重新开始（失败原因随之清空）—— 面板每秒轮询，
+                  所以点完 1 秒内就能看到阶段重跑；这里不再自己造一个假的进度条。
+                */}
+                {flowFailed && onRetry ? (
+                  <button
+                    className="ml-auto rounded-md bg-danger/15 px-2 py-0.5 text-[10px] text-danger transition-colors hover:bg-danger/25 whitespace-nowrap"
+                    onClick={onRetry}
+                    title="重新解析地址 → 嗅探 → 交给播放器（会清空本次失败原因）"
+                  >
+                    ↻ 重跑
+                  </button>
+                ) : null}
+              </div>
+              <PlayFlowStages flow={info.flow} />
+              {metricsLine(info.flow) ? (
+                <div className="mt-1 font-mono text-[10px] text-faint">{metricsLine(info.flow)}</div>
+              ) : null}
+              {/* 阶段步骤流水：用户要的「详细显示问题所在」就是这一块 */}
+              <div className="mt-1 max-h-28 overflow-y-auto rounded bg-elev1 p-1.5 font-mono text-[10px] leading-relaxed text-faint">
+                {info.flow.stages.flatMap((s) =>
+                  s.steps.map((x, i) => (
+                    <div key={`${s.key}-${i}`}>
+                      [{s.label}] {new Date(x.at).toLocaleTimeString()} {x.text}
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          ) : null}
+          {/*
+            嗅探 / 内核现场读数（v0.3.9）：用户报的「换源后播放失败」要排查时，
+            这几个布尔值是最直接的证据（残留探针窗口？内核挂载指向死窗口？）
+          */}
+          {info?.selfCheck ? (
+            <div className="mb-2 rounded-lg bg-elev2 px-2 py-1.5 text-[11px]">
+              <div className="mb-1 flex items-center justify-between">
+                <span className="font-medium text-text">嗅探 / 内核自检</span>
+                <button
+                  className="rounded bg-elev1 px-1.5 py-0.5 text-[10px] text-dim hover:text-text"
+                  onClick={() => void selfCheckNow()}
+                  disabled={checking}
+                >
+                  {checking ? '自检中…' : '运行自检并重置'}
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-dim">
+                <span>
+                  嗅探窗口 {info.selfCheck.probeActive ? '工作中' : '空闲'} ·
+                  {info.selfCheck.probeWindowAlive ? ' 有窗口' : ' 无窗口'}
+                  {info.selfCheck.probeListeners ? ' · 监听已挂' : ''}
+                </span>
+                <span>网页嗅探 {info.selfCheck.webviewActive ? '工作中' : '空闲'}{info.selfCheck.webviewAlive ? ' · 有窗口' : ''}</span>
+                <span>
+                  内核 {info.selfCheck.engineReady ? '已就绪' : '未就绪'}
+                  {info.selfCheck.engineAttached ? ' · 已挂载' : ' · 未挂载'}
+                  {info.selfCheck.engineAttachedDestroyed ? '（挂载窗口已销毁！）' : ''}
+                  {info.selfCheck.engineHasPicture ? ' · 有画面' : ''}
+                  {info.selfCheck.engineVideoWidth ? ` · ${info.selfCheck.engineVideoWidth}px` : ''}
+                </span>
+              </div>
+              {checkResult ? <div className="mt-1 text-[10px] text-warn">{checkResult}</div> : null}
+            </div>
+          ) : null}
           {row('媒体地址', info?.url)}
           {row('类型', info?.kind)}
           {row('嗅探来源', info?.channel)}

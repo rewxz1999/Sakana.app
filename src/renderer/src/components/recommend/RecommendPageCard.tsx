@@ -1,15 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
-import type { ModuleKind, ModuleLayout, ModuleRect, RecommendPage } from '@/stores/recommendTable'
+import { useCallback, useMemo, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
+import type { ModuleLayout, ModuleRect, RecommendPage } from '@/stores/recommendTable'
 import { MAX_PHOTOS, MODULE_KINDS, renderModules } from '@/stores/recommendTable'
 import { CoverImage } from '@/components/CoverImage'
 import { localImgUrl } from '@/lib/format'
 import {
   RL,
+  type ModuleFont,
   airDateText,
   asReactStyle,
   blend,
   blendStyle,
   chipStyle,
+  contentBlendStyle,
+  contentGradientStyle,
   dimTextStyle,
   displayName,
   emptyHintStyle,
@@ -23,6 +26,7 @@ import {
   infoValueStyle,
   levelParts,
   moduleBoxStyle,
+  moduleFontOf,
   moduleInnerStyle,
   moduleRectsOf,
   pageBackgroundCss,
@@ -47,18 +51,23 @@ import {
  *
  * 与 `exportHtml.ts` 是同一页的两套渲染器：结构逐层对应，样式与**几何全部来自 `styles.ts`**。
  *
- * ## 位置从哪来（v0.3.8 第三轮：取消了自定义移动）
+ * ## 位置从哪来（v0.3.9：自由摆放又回来了，但仍然只有一份几何）
  *
- * 模块位置**不由数据决定**，而是每次现算：`moduleRectsOf(frameOf(page))`。
- * 界面与导出调的是同一个函数、同一份常量，所以两边不可能不一致 ——
- * 上一版那套"用户拖动坐标 + 两份渲染各自读坐标"已经整条撤掉（拖不动，也就不会错位）。
+ * 模块位置由 `moduleRectsOf(frameOf(page), page.layout)` 现算：
+ * `page.layout` 里带 `x/y/w/h` 的模块用用户坐标（夹进页面），其余按版式默认。
+ * 界面与导出调的是**同一个函数**，所以"所见即所得"是代码结构保证的 ——
+ * 上一版那种"两份渲染各自读坐标"的写法已经整条撤掉。
  *
  * ## 页面结构（从下到上）
  *
  *   1. 页面底色（纯色 / 渐变，或图片背景时的白）；
  *   2. 图区里的图片层（只有设了图片背景）：`cover` 裁剪、可模糊；
  *   3. 交融渐变：贴在图区靠内容区那一侧，渐隐到底色（没有硬边）；
- *   4. 模块：绝对定位，**没有白底**，文字靠页面继承下来的 `TEXT_SHADOW` 白晕保证可读。
+ *   4. 内容区渐变底色（可选，v0.3.9 左菜单 Ⅵ）+ 它与页面底色之间的交融条；
+ *   5. 模块：绝对定位，**没有白底**，文字靠页面继承下来的 `TEXT_SHADOW` 白晕保证可读；
+ *   6. `overlay`：编辑模式下的拖动/选中叠层（由调用方给，不在预览里存在）。
+ *
+ * 层号见 `styles.moduleBoxStyle` 与 `contentGradientStyle`（背景 0 / 交融 1 / 内容渐变 1 / 交融条 2 / 模块 3+）。
  */
 export function RecommendPageCard({
   page,
@@ -66,7 +75,8 @@ export function RecommendPageCard({
   pageCount,
   tableName,
   recommender,
-  onContextMenu
+  onContextMenu,
+  overlay
 }: {
   page: RecommendPage
   pageNo: number
@@ -74,15 +84,22 @@ export function RecommendPageCard({
   tableName: string
   recommender: string
   onContextMenu?: (e: ReactMouseEvent) => void
+  /** 编辑模式的叠层（画在页面坐标系里、模块之上），不传就是纯预览 */
+  overlay?: ReactNode
 }) {
   const frame = useMemo(() => frameOf(page), [page])
-  const rects = useMemo(() => moduleRectsOf(frame), [frame])
+  const rects = useMemo(() => moduleRectsOf(frame, page.layout), [frame, page.layout])
   /** 要画的模块：**一律走 renderModules**（补全 → 丢掉隐藏的），隐藏的完全不进渲染树 */
   const drawn = useMemo(() => renderModules(page), [page])
   const bgResolve = useCallback((p: string) => `url('${localImgUrl(p)}')`, [])
   const bandWrap = imageBandWrapStyle(frame)
+  /** 页面底色（纯色/渐变/白）：交融渐变要渐隐到它，两层必须用同一个值，否则接缝会显形 */
+  const pageBase = pageBackgroundCss(page.background)
+  const contentGrad = contentGradientStyle(frame, page.contentGradient)
 
   const renderModule = (m: ModuleLayout, rect: ModuleRect, order: number): React.ReactNode => {
+    // 这一块的字体/字号（用户没设就是基准），块内所有文字都按它缩放
+    const font: ModuleFont = moduleFontOf(page.layout, m.id)
     const inner = (() => {
       switch (m.id) {
         case 'cover':
@@ -92,46 +109,50 @@ export function RecommendPageCard({
           const rec = recommender.trim()
           return (
             <>
-              <h1 style={asReactStyle(titleTextStyle())}>{displayName(page)}</h1>
-              {sub ? <div style={asReactStyle(subTextStyle())}>{sub}</div> : null}
-              {rec ? <div style={asReactStyle(recTextStyle())}>推荐人：{rec}</div> : null}
+              <h1 style={asReactStyle(titleTextStyle(font))}>{displayName(page)}</h1>
+              {sub ? <div style={asReactStyle(subTextStyle(font))}>{sub}</div> : null}
+              {rec ? <div style={asReactStyle(recTextStyle(font))}>推荐人：{rec}</div> : null}
             </>
           )
         }
         case 'ratings':
           return (
             <>
-              <InfoRow label="bangumi 评分">
+              <InfoRow label="bangumi 评分" font={font}>
                 <span style={asReactStyle(scoreTextStyle())}>{scoreText(page.bgmRating)}</span>
               </InfoRow>
-              <InfoRow label="推荐人评分">
+              <InfoRow label="推荐人评分" font={font}>
                 <span style={asReactStyle(scoreTextStyle())}>{scoreText(page.myRating, '未评分')}</span>
               </InfoRow>
             </>
           )
         case 'level':
           return (
-            <InfoRow label="推荐指数">
-              <Stars level={page.recommendLevel} />
+            <InfoRow label="推荐指数" font={font}>
+              <Stars level={page.recommendLevel} font={font} />
             </InfoRow>
           )
         case 'meta':
           return (
             <>
-              <InfoRow label="播出时间">{airDateText(page.airDate)}</InfoRow>
-              <InfoRow label="类型标签">
-                <Genres genres={page.genres} />
+              <InfoRow label="播出时间" font={font}>
+                {airDateText(page.airDate)}
+              </InfoRow>
+              <InfoRow label="类型标签" font={font}>
+                <Genres genres={page.genres} font={font} />
               </InfoRow>
             </>
           )
         case 'reason':
           return (
             <>
-              <div style={asReactStyle(secTitleStyle())}>推荐理由</div>
+              <div style={asReactStyle(secTitleStyle(font))}>推荐理由</div>
               {page.reason ? (
-                <p style={asReactStyle(reasonTextStyle())}>{page.reason}</p>
+                <p style={asReactStyle(reasonTextStyle(font))}>{page.reason}</p>
               ) : (
-                <p style={asReactStyle(blend(reasonTextStyle(), emptyHintStyle()))}>还没有写推荐理由</p>
+                <p style={asReactStyle(blend(reasonTextStyle(font), emptyHintStyle(font)))}>
+                  还没有写推荐理由
+                </p>
               )}
             </>
           )
@@ -140,10 +161,10 @@ export function RecommendPageCard({
           const cell = photoCellSize(rect, frame)
           return (
             <>
-              <div style={asReactStyle(secTitleStyle())}>剧照</div>
+              <div style={asReactStyle(secTitleStyle(font))}>剧照</div>
               <div style={asReactStyle(photoRowStyle())}>
                 {photos.length === 0 ? (
-                  <span style={asReactStyle(emptyHintStyle())}>还没有剧照</span>
+                  <span style={asReactStyle(emptyHintStyle(font))}>还没有剧照</span>
                 ) : (
                   photos.map((p) => (
                     <span key={p} style={asReactStyle(photoBoxStyle(cell.w, cell.h))}>
@@ -157,7 +178,7 @@ export function RecommendPageCard({
         }
         case 'foot':
           return (
-            <div style={asReactStyle(footRowStyle())}>
+            <div style={asReactStyle(footRowStyle(font))}>
               <span>{tableName}</span>
               <span>{pageNoText(pageNo, pageCount)}</span>
             </div>
@@ -169,7 +190,7 @@ export function RecommendPageCard({
 
     // 模块**没有白板**：内容直接落在页面上（可读性靠页面级的 text-shadow）
     return (
-      <div key={m.id} style={asReactStyle(moduleBoxStyle(rect, order))} data-module={m.id}>
+      <div key={m.id} style={asReactStyle(moduleBoxStyle(rect, order, font))} data-module={m.id}>
         {m.id === 'cover' ? inner : <div style={asReactStyle(moduleInnerStyle(RL.rowGap))}>{inner}</div>}
       </div>
     )
@@ -177,7 +198,7 @@ export function RecommendPageCard({
 
   return (
     <div
-      style={asReactStyle({ ...pageStyle(frame), background: pageBackgroundCss(page.background) })}
+      style={asReactStyle({ ...pageStyle(frame), background: pageBase })}
       onContextMenu={onContextMenu}
     >
       {/* 图区（只有图片背景才有）：外层裁剪，里层图片层可模糊，模糊不会糊出边界 */}
@@ -187,123 +208,69 @@ export function RecommendPageCard({
         </div>
       ) : null}
       {/* 交融渐变：贴着图区靠内容区的那一侧，渐隐到页面底色 */}
-      {frame.pos === 'none' ? null : <div style={asReactStyle(blendStyle(frame))} />}
+      {frame.pos === 'none' ? null : <div style={asReactStyle(blendStyle(frame, pageBase))} />}
+      {/* 内容区渐变底色（可选）+ 它与页面底色之间的交融条 */}
+      {contentGrad ? (
+        <>
+          <div style={asReactStyle(contentGrad)} />
+          {frame.pos === 'none' ? null : (
+            <div style={asReactStyle(contentBlendStyle(frame, pageBase))} />
+          )}
+        </>
+      ) : null}
 
       {/* 模块：按 MODULE_KINDS 的顺序画（顺序即层级，后面的盖前面的） */}
       {drawn.map((m) => renderModule(m, rects[m.id], MODULE_KINDS.indexOf(m.id)))}
+
+      {/* 编辑模式的叠层（拖动 / 选中框），预览时不存在 */}
+      {overlay}
     </div>
   )
 }
 
 /** 一行信息（标签 + 值） */
-function InfoRow({ label, children }: { label: string; children: React.ReactNode }) {
+function InfoRow({
+  label,
+  children,
+  font
+}: {
+  label: string
+  children: React.ReactNode
+  font?: ModuleFont
+}) {
   return (
     <div style={asReactStyle(infoRowStyle())}>
-      <span style={asReactStyle(infoLabelStyle())}>{label}</span>
-      <span style={asReactStyle(infoValueStyle())}>{children}</span>
+      <span style={asReactStyle(infoLabelStyle(font))}>{label}</span>
+      <span style={asReactStyle(infoValueStyle(font))}>{children}</span>
     </div>
   )
 }
 
 /** 推荐指数星星（字符，不依赖图标字体 —— 导出图那边同理） */
-function Stars({ level }: { level: number }) {
+function Stars({ level, font }: { level: number; font?: ModuleFont }) {
   const { on, off } = levelParts(level)
   return (
     <span>
-      <span style={asReactStyle(starStyle(true))}>{'★'.repeat(on)}</span>
-      <span style={asReactStyle(starStyle(false))}>{'☆'.repeat(off)}</span>
+      <span style={asReactStyle(starStyle(true, font))}>{'★'.repeat(on)}</span>
+      <span style={asReactStyle(starStyle(false, font))}>{'☆'.repeat(off)}</span>
     </span>
   )
 }
 
 /** 类型标签胶囊 */
-function Genres({ genres }: { genres: string[] }) {
+function Genres({ genres, font }: { genres: string[]; font?: ModuleFont }) {
   const chips = genreChips(genres)
-  if (chips.list.length === 0) return <span style={asReactStyle(dimTextStyle())}>暂无标签</span>
+  if (chips.list.length === 0) return <span style={asReactStyle(dimTextStyle(font))}>暂无标签</span>
   return (
     <>
       {chips.list.map((g) => (
-        <span key={g} style={asReactStyle(chipStyle(false))}>
+        <span key={g} style={asReactStyle(chipStyle(false, font))}>
           {g}
         </span>
       ))}
-      {chips.rest > 0 ? <span style={asReactStyle(chipStyle(true))}>{`+${chips.rest}`}</span> : null}
+      {chips.rest > 0 ? (
+        <span style={asReactStyle(chipStyle(true, font))}>{`+${chips.rest}`}</span>
+      ) : null}
     </>
-  )
-}
-
-/**
- * 把页面**等比缩放**到容器里（宽高都放得下 → 整页永远完整可见、不出现滚动条）。
- *
- * ⚠️ 量的必须是**容器**（`viewRef`），不能是承载缩放结果的那层：
- * 后者的尺寸是按缩放比写上去的，量它等于拿结果当输入，会自激（越缩越小或根本不缩）。
- *
- * 缩放只影响屏幕呈现：导出用的是同一份版式、由主进程按倍率放大像素，不受这里的 scale 影响。
- * 页面高度会随背景图的位置与比例变（`frameOf`），所以背景一变就再量一次。
- */
-export function FittedRecommendCard({
-  className = '',
-  ...props
-}: {
-  page: RecommendPage
-  pageNo: number
-  pageCount: number
-  tableName: string
-  recommender: string
-  className?: string
-  onContextMenu?: (e: ReactMouseEvent) => void
-}) {
-  const viewRef = useRef<HTMLDivElement | null>(null)
-  const cardRef = useRef<HTMLDivElement | null>(null)
-  const [boxW, setBoxW] = useState(0)
-  const [boxH, setBoxH] = useState(0)
-  const [cardH, setCardH] = useState(0)
-
-  useEffect(() => {
-    const view = viewRef.current
-    const card = cardRef.current
-    if (!view || !card) return
-    const measure = (): void => {
-      setBoxW(view.clientWidth)
-      setBoxH(view.clientHeight)
-      setCardH(card.offsetHeight)
-    }
-    const ro = new ResizeObserver(measure)
-    ro.observe(view)
-    ro.observe(card)
-    measure()
-    return () => ro.disconnect()
-  }, [])
-
-  // 换背景（位置 / 比例）会改页面高度，显式再量一次，别等下一帧
-  useEffect(() => {
-    const card = cardRef.current
-    if (card) setCardH(card.offsetHeight)
-  }, [props.page.background, props.page.layout, props.page.cover, props.page.photos])
-
-  const widthScale = boxW > 0 ? boxW / RL.width : 0
-  const heightScale = boxH > 0 && cardH > 0 ? boxH / cardH : 1
-  const scale = Math.min(1, widthScale, heightScale)
-  const ready = boxW > 0 && cardH > 0
-
-  return (
-    <div
-      ref={viewRef}
-      className={className}
-      style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}
-    >
-      <div
-        style={{
-          width: ready ? RL.width * scale : 0,
-          height: ready ? cardH * scale : 0,
-          flex: '0 0 auto',
-          visibility: ready ? 'visible' : 'hidden'
-        }}
-      >
-        <div ref={cardRef} style={{ width: RL.width, transform: `scale(${scale})`, transformOrigin: 'top left' }}>
-          <RecommendPageCard {...props} />
-        </div>
-      </div>
-    </div>
   )
 }

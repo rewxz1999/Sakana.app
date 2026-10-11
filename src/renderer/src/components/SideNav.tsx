@@ -142,7 +142,7 @@ export function SideNav() {
         <button
           className="mb-1.5 flex w-full items-center gap-1.5 rounded-md px-1 py-1 text-left transition-colors hover:bg-elev2"
           title={castDevice ? `${castDevice.name}（${castDevice.host}:${castDevice.port}）` : '未发现手机投屏应用'}
-          onClick={() => void api.window.openSmall('/player-settings', { width: 700, height: 620, title: '播放器设置' })}
+          onClick={() => void api.window.openSmall('/cast-settings', { width: 700, height: 620, title: '投屏设置' })}
         >
           <span
             className={`h-1.5 w-1.5 shrink-0 rounded-full ${castDevice ? 'bg-ok' : 'bg-faint/60'}`}
