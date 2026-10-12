@@ -1,6 +1,6 @@
 {
   "name": "sakana",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Sakana - 番剧管理及播放桌面客户端",
   "main": "./out/main/index.js",
   "author": "Sakana Team",

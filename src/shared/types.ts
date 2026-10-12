@@ -939,9 +939,46 @@ export interface DanmakuLoadResult extends DanmakuMatch {
    * 播放器状态区据此显示「弹幕来自 巴哈姆特动画疯 · 第 3 集 3001 条」，用户能一眼看出取的是哪一份。
    */
   origin?: DanmakuOrigin
+  /**
+   * v1.1.2：**数据源那一路还在跑**。
+   *
+   * 两段式加载的第一段（本地库/内置，几百毫秒）先返回并让弹幕上屏，
+   * 同时把"已启用的数据源"那一路**立刻**发起；渲染层看到这个标记就再调一次
+   * `load(title, episode, { sourcesOnly: true })`，把源那批合并上来。
+   * 这样"数据源一定会被调用"是结构上的保证，而"快"也不用牺牲。
+   */
+  sourcesPending?: boolean
+  /** v1.1.2：本次返回的**只有数据源那一批**（第二段），渲染层据此走合并而不是替换 */
+  sourcesOnly?: boolean
 }
 
 // ---------------- 弹幕数据源集合器（v1.1） ----------------
+
+/**
+ * 一次「去弹幕数据源要弹幕」的记录（v1.1.2，用户要求：弹幕设置里点开就能看）。
+ *
+ * 为什么需要它：这条链以前是黑的 —— 界面只显示"这批弹幕来自哪里"，
+ * 但"这一集到底有没有去要过、用的哪个关键词、要了多久、为什么没要到"全看不到，
+ * 于是"我在设置里测试能搜到，播放时却没有源弹幕"这种问题只能靠猜。
+ * 落盘在 `<数据根>/data/danmakuFetchLog.json`，只留最近 200 条。
+ */
+export interface DanmakuFetchRecord {
+  /** 记录时刻 */
+  at: number
+  /** 谁发起的：播放器自动加载 / 设置里的测试按钮 */
+  trigger: 'play' | 'test' | 'manual'
+  title: string
+  episode: number
+  sourceId: string
+  sourceName: string
+  /** 实际搜出结果的关键词（巴哈要用日文名/繁体名，这一栏就是证据） */
+  keyword?: string
+  ok: boolean
+  count: number
+  ms: number
+  /** 命中的条目名，或失败原因 */
+  detail: string
+}
 
 /**
  * 数据源类型（用户原话「有可能是 API，有可能是网站，也有可能是数据源链接」）。

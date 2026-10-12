@@ -272,6 +272,9 @@ export const CH = {
   danmakuLibClear: 'danmaku:lib-clear',
   danmakuLibSetDir: 'danmaku:lib-set-dir',
   danmakuLibOpenDir: 'danmaku:lib-open-dir',
+  /** v1.1.2：数据源的「获取记录」（用户要求：在弹幕设置里点开就能看每次去要弹幕的结果） */
+  danmakuFetchLog: 'danmaku:fetch-log',
+  danmakuFetchLogClear: 'danmaku:fetch-log-clear',
 
   // 保存目录（立即生效）
   saveDirsSet: 'save-dirs:set',

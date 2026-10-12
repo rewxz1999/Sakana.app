@@ -353,7 +353,10 @@ const api: SakanaApi = {
     libraryRemove: (ids) => call(CH.danmakuLibRemove, ids),
     libraryClear: () => call(CH.danmakuLibClear),
     librarySetDir: (dir) => call(CH.danmakuLibSetDir, dir),
-    libraryOpenDir: () => call(CH.danmakuLibOpenDir)
+    libraryOpenDir: () => call(CH.danmakuLibOpenDir),
+    // v1.1.2：数据源的「获取记录」（用户要求：设置里点开就能看每次去要弹幕的结果）
+    fetchLog: () => call(CH.danmakuFetchLog),
+    fetchLogClear: () => call(CH.danmakuFetchLogClear)
   },
   cache: {
     info: () => call(CH.cacheInfo),

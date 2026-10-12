@@ -16,6 +16,7 @@ import type {
   DanmakuComment,
   DanmakuLibraryInfo,
   DanmakuLibraryItem,
+  DanmakuFetchRecord,
   DanmakuLoadResult,
   DanmakuMatch,
   DanmakuSettings,
@@ -947,7 +948,7 @@ export interface SakanaApi {
     load(
       title: string,
       episode: number,
-      opts?: { aliases?: string[]; aliasMode?: boolean }
+      opts?: { aliases?: string[]; aliasMode?: boolean; sourcesOnly?: boolean; trigger?: 'play' | 'test' | 'manual' }
     ): Promise<ApiResult<DanmakuLoadResult | null>>
     /** 预取：只预热主进程缓存、不回传弹幕本体（进播放 / 切集时提前加载） */
     prefetch(
@@ -980,6 +981,12 @@ export interface SakanaApi {
     librarySetDir(dir: string): Promise<ApiResult<DanmakuLibraryInfo>>
     /** 本地弹幕库：在系统文件管理器里打开 */
     libraryOpenDir(): Promise<ApiResult<string>>
+    /**
+     * v1.1.2：数据源的「获取记录」——每次去要弹幕的结果（关键词 / 耗时 / 条数 / 失败原因）。
+     * 用户要求「在弹幕设置中加上点击获取弹幕记录」，用来回答"设置里能搜到、播放时却没有源弹幕"。
+     */
+    fetchLog(): Promise<ApiResult<DanmakuFetchRecord[]>>
+    fetchLogClear(): Promise<ApiResult<{ removed: number; records: DanmakuFetchRecord[] }>>
   }
   /**
    * uosc_danmaku（mpv 弹幕插件）集成（v0.2.9）。

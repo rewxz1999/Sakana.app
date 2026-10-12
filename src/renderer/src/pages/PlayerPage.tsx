@@ -53,6 +53,26 @@ import { CoverImage } from '@/components/CoverImage'
 import { StreamInfoModal } from '@/components/StreamInfoModal'
 import { PlayFlowStages } from '@/components/PlayFlowProgress'
 
+/**
+ * 合并两批弹幕并按时间排序（V1.1.2，与主进程 `danmaku.ts` 的 `mergeComments` 同一套规则）。
+ *
+ * 为什么渲染层也要有一份：两段式加载的第二段只把"数据源那一批"送回来，
+ * 要与画面上已有的内置那批合并 —— 让主进程再算一次需要把它手上的量再传回来，不值当。
+ * 去重键 = 「时间（0.1 秒精度）+ 正文」：不同源对同一条弹幕的毫秒位常有差异，
+ * 但同一句话在同一秒出现两次本来就该算重复。
+ */
+function mergeCommentsLocal(a: DanmakuComment[], b: DanmakuComment[]): DanmakuComment[] {
+  const seen = new Set<string>()
+  const out: DanmakuComment[] = []
+  for (const c of [...a, ...b]) {
+    const key = `${Math.round((Number(c.time) || 0) * 10)}|${c.text}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(c)
+  }
+  return out.sort((x, y) => (Number(x.time) || 0) - (Number(y.time) || 0))
+}
+
 interface PlayerState {
   mode: 'local' | 'online' | 'rule'
   title: string
@@ -2383,6 +2403,22 @@ export function PlayerPage() {
           if (/别名|別名|中文名|日文名/.test(row.key)) push(row.value)
         }
       }
+    } else if (state.title) {
+      /*
+       * V1.1.2：没有 subjectId 时**按标题反查一次**，把日文原名/中文名补成别名。
+       *
+       * 为什么必须补：从订阅、历史、搜索结果直接进播放器时拿不到条目 id，
+       * 于是别名是空的，只剩一个中文标题 —— 而巴哈姆特只认**日文名/繁体名**，
+       * 结果是"设置里测试能搜到，播放时却没有源弹幕"（用户报的就是这个）。
+       * 反查失败不影响播放，只是回到原来的行为。
+       */
+      const s = await api.bangumi.search(state.title)
+      const hit = s.ok ? s.data.items?.[0] : null
+      if (hit) {
+        push(hit.name)
+        push(hit.name_cn)
+        console.log(`[player] 按标题反查到条目，用它补别名：${[hit.name, hit.name_cn].filter(Boolean).join(' / ')}`)
+      }
     }
     danmakuAliasRef.current = out.slice(0, 6)
     if (out.length > 0) console.log(`[player] 别名候选（${out.length}）：${out.slice(0, 4).join(' / ')}`)
@@ -2507,6 +2543,34 @@ export function PlayerPage() {
     if (playingRef.current) void api.player.togglePause()
   }
 
+  /**
+   * 两段式加载的第二段：把「已启用的数据源」那批弹幕合并到画面上（V1.1.2）。
+   *
+   * 为什么单独一段：用户既要「数据源必须被调用」，又要「别拖慢」。第一段（内置/本地库）
+   * 几百毫秒上屏，主进程同时已经在跑数据源那一路；这里把它取回来做**去重合并**，
+   * 合并进已有的那批而不是替换 —— 内置那批不能因为源回来了就消失。
+   */
+  const mergeSourceDanmaku = async (key: string, episode: number, aliases: string[]): Promise<void> => {
+    try {
+      const r = await api.danmaku.load(state.title, episode, { aliases, sourcesOnly: true, trigger: 'play' })
+      // 期间换集/换源了 → 这批结果属于上一集，丢掉
+      if (danmakuKeyRef.current !== key) return
+      if (!r.ok || !r.data || r.data.count === 0) {
+        console.log('[player] 数据源没有可用弹幕（获取记录里能看到每次尝试的结果）')
+        return
+      }
+      const add = r.data
+      setDanmaku((prev) => ({
+        comments: mergeCommentsLocal(prev.comments, add.comments),
+        source: `${prev.source} ＋ ${add.origin?.sourceName ?? '数据源'} ${add.count} 条`,
+        loading: false
+      }))
+      console.log(`[player] 数据源弹幕已合并：${add.origin?.sourceName} ${add.count} 条（${add.origin?.detail ?? ''}）`)
+    } catch (err) {
+      console.warn(`[player] 合并数据源弹幕失败：${String((err as Error)?.message ?? err)}`)
+    }
+  }
+
   const loadDanmaku = async (force = false, opts: { aliasMode?: boolean } = {}): Promise<void> => {
     const episode =
       state.mode === 'rule'
@@ -2552,6 +2616,15 @@ export function PlayerPage() {
           `[player] 弹幕已加载：${r.data.episodeTitle} 共 ${r.data.count} 条（缓存=${r.data.fromCache}）${by}` +
             (r.data.origin ? ` 来源=${r.data.origin.sourceName}｜${r.data.origin.detail}` : '')
         )
+        /*
+         * v1.1.2 两段式加载的第二段：数据源那批弹幕。
+         *
+         * 第一段（上面这次调用）拿到的是本地库/内置那批，几百毫秒就上屏了；
+         * 主进程在返回它的同时**已经**把"已启用的数据源"那一路发起（所以"播放前必须调用数据源"
+         * 是结构上的保证，不取决于这里）。这里只是去把已经在跑的结果取回来合并。
+         * 用户报的正是"设置里能搜到、播放时却没有源弹幕"，根因就是以前压根没这一步。
+         */
+        if (r.data.sourcesPending) void mergeSourceDanmaku(key, episode, aliases)
         /*
          * v0.2.9：插件渲染时，确认插件**真的**把这批弹幕挂上了。
          * 判据是插件自己暴露的 `user-data/uosc_danmaku/has-danmaku`（v2.1.0 没有条数属性）。

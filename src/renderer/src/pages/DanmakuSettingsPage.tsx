@@ -8,6 +8,7 @@ import { useSourceCatalog } from '@/components/danmaku/useSourceCatalog'
 import { DanmakuSourcesCard } from '@/components/danmaku/DanmakuSourcesCard'
 import { DanmakuBoxCard } from '@/components/danmaku/DanmakuBoxCard'
 import { DanmakuLibraryCard } from '@/components/danmaku/DanmakuLibraryCard'
+import { DanmakuFetchLogCard } from '@/components/danmaku/DanmakuFetchLogCard'
 import { Button, Input } from '@/components/ui'
 import { Card, SubPage } from '@/components/SettingsShell'
 
@@ -89,6 +90,8 @@ export function DanmakuSettingsPage() {
       <DanmakuSourcesCard catalog={catalog} />
       <DanmakuBoxCard />
       <DanmakuLibraryCard catalog={catalog} />
+      {/* v1.1.2：每次去数据源要弹幕的记录（排障用，默认折叠） */}
+      <DanmakuFetchLogCard />
 
       <Card title="显示" desc="影响画面上的弹幕观感">
         <Toggle label="显示弹幕" desc="关闭后完全不绘制弹幕（数据仍会匹配）" value={d.enabled} onChange={(v) => patch({ enabled: v })} />

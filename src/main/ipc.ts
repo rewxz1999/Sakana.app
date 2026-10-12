@@ -100,6 +100,7 @@ import { fetchDanmaku, loadDanmaku, matchDanmaku, prefetchDanmaku, writeDanmakuX
 // v1.1：数据源集合器（适配器自述/增删改/测试）与本地弹幕库（列表/删除/清空/目录）
 import { DANMAKU_ADAPTERS, danmuboxFetchEpisode, danmuboxSearch, listSources, saveSources, testSource } from './services/danmakuSources'
 import { clearLibrary, ensureLibraryDir, libraryInfo, removeFromLibrary, saveToLibrary } from './services/danmakuLibrary'
+import { clearFetchLog, readFetchLog } from './services/danmakuFetchLog'
 // v0.3.0：Jikan（MAL）作为角色立绘的备用数据源（带 3 次/秒、60 次/分钟节流）
 import { jikanCharactersByTitle } from './services/jikan'
 import { saveDirsInfo, setSaveDirs } from './services/saveDirs'
@@ -1583,6 +1584,14 @@ export function registerIpc(): void {
     await shell.openPath(dir)
     return dir
   })
+  /*
+   * v1.1.2：数据源的「获取记录」。
+   * 用户要求「在弹幕设置中加上点击获取弹幕记录」—— 数据源那条链是黑的，
+   * 只有把"每次去要弹幕的结果（关键词/耗时/条数/失败原因）"记下来，
+   * 才能回答"设置里测试能搜到、播放时却没有源弹幕"这类问题。
+   */
+  ipcMain.handle(CH.danmakuFetchLog, () => readFetchLog())
+  ipcMain.handle(CH.danmakuFetchLogClear, () => ({ removed: clearFetchLog(), records: readFetchLog() }))
 
   // 自动创建未配置的保存目录（baseDir = userData/saves）
   ensureSaveDirs()

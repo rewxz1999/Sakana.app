@@ -660,6 +660,10 @@ export interface SourceHit {
   sourceName: string
   detail: string
   entryName?: string
+  /** 实际搜出结果的那个关键词（V1.1.2：写进「获取记录」，巴哈为什么只有日文名能搜到就靠它看） */
+  keyword?: string
+  /** 这条源这一趟花了多少毫秒 */
+  ms?: number
 }
 
 /**
@@ -709,8 +713,12 @@ export async function loadFromSources(
       continue
     }
     try {
+      const t0 = Date.now()
       const hit = await trySource(source, keywords, title, episode)
-      if (hit) return { hit, errors }
+      if (hit) {
+        hit.ms = Date.now() - t0
+        return { hit, errors }
+      }
       errors.push(`${source.name}：没匹配到「${keywords.slice(0, 3).join(' / ')}」`)
     } catch (err) {
       const msg = String((err as Error)?.message ?? err)
@@ -768,7 +776,8 @@ async function trySource(
         sourceId: source.id,
         sourceName: source.name,
         detail: `《${picked.title}》第 ${target.index} 集（${target.volumeName}，videoSn=${target.videoSn}）`,
-        entryName: picked.title
+        entryName: picked.title,
+        keyword: kw
       }
     }
     return null

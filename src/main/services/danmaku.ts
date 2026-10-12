@@ -7,6 +7,7 @@ import type { DanmakuComment, DanmakuMatch, DanmakuOrigin } from '@shared/types'
 import { log } from '../log'
 import { buildProxyAgents, getSettings } from '../net'
 import { lookupLibrary, readLibraryComments, saveToLibrary } from './danmakuLibrary'
+import { appendFetchRecord } from './danmakuFetchLog'
 import { listSources, loadFromSources } from './danmakuSources'
 
 /**
@@ -490,6 +491,10 @@ export interface DanmakuLoadResult extends DanmakuMatch {
    * 否则 tsc 会在主进程这侧的赋值处报「Object literal may only specify known properties」。
    */
   origin?: DanmakuOrigin
+  /** v1.1.2：数据源那一路还在跑（渲染层拿到后会再调一次 `sourcesOnly` 合并上来） */
+  sourcesPending?: boolean
+  /** v1.1.2：本次返回的只有数据源那一批（第二段） */
+  sourcesOnly?: boolean
 }
 
 export interface DanmakuLoadOptions {
@@ -497,6 +502,18 @@ export interface DanmakuLoadOptions {
   aliases?: string[]
   /** 别名检测模式：额外找弹幕库自己的别名，并放宽到更多候选条目 */
   aliasMode?: boolean
+  /**
+   * 只要数据源那一路（V1.1.2「两段式加载」的第二段）。
+   *
+   * 为什么要有它：用户要求「播放器播放之前必须要调用弹幕数据源获取弹幕」，
+   * 同时又说「拉取弹幕数据源还是不够快」。这两个要求只能靠**分两段**同时满足：
+   *   第一段（快）——本地库/内置库，通常几百毫秒，先让弹幕上屏；
+   *   第二段（慢）——已启用的数据源，回来之后**合并**进画面上那一批（见 PlayerPage 的调用处）。
+   * 传了这个就跳过本地库与内置，只跑数据源。
+   */
+  sourcesOnly?: boolean
+  /** 这次调用是谁发起的（写进「获取记录」，界面上能分清自动加载与手动测试） */
+  trigger?: 'play' | 'test' | 'manual'
 }
 
 /** 别名是否有检索价值：太短/太泛的别名会把无关条目搜出来（实测「再见」命中了一部 2018 电视剧） */
@@ -561,6 +578,50 @@ export async function loadDanmaku(
  */
 const SOURCES_WAIT_MS = 8000
 
+/**
+ * 第二段：只要「已启用的数据源」那一批（V1.1.2 两段式加载）。
+ *
+ * 与第一段的关系见 `loadWithSources` 的说明。这里**不碰本地库、不碰内置**：
+ * 命中本地库那条路会让"数据源一次都没被问到"却看起来像成功（踩过一次，见上面注释）。
+ *
+ * 落盘策略：这一批**不单独覆盖本地库** —— 第一段已经把内置那批存进去了，
+ * 只有源这一批的话存下去反而把完整的那份换成残缺的。用户要的是"源要真的被用上"，
+ * 落盘交给下一次整份加载时命中本地库即可。
+ */
+async function loadSourcesOnly(
+  kw: string,
+  episode: number,
+  opts: DanmakuLoadOptions
+): Promise<DanmakuLoadResult | null> {
+  if (getSettings().danmaku?.autoSources === false) return null
+  const trigger = opts.trigger ?? 'play'
+  const { hit, errors } = await startSources(kw, episode, opts.aliases ?? []).catch(() => ({
+    hit: null,
+    errors: [] as string[]
+  }))
+  recordFetch(kw, episode, hit, errors, trigger, hit?.ms ?? 0)
+  if (!hit) return null
+  return {
+    animeId: 0,
+    episodeId: 0,
+    animeTitle: hit.entryName || kw,
+    episodeTitle: `第${episode}集`,
+    count: hit.comments.length,
+    comments: hit.comments,
+    fromCache: false,
+    matchedBy: hit.keyword || kw,
+    aliasUsed: false,
+    sourcesOnly: true,
+    origin: {
+      sourceId: hit.sourceId,
+      sourceName: hit.sourceName,
+      kind: listSources().find((s) => s.id === hit.sourceId)?.kind ?? 'site',
+      detail: hit.detail,
+      entryName: hit.entryName
+    }
+  }
+}
+
 async function loadWithSources(
   title: string,
   episode: number,
@@ -568,6 +629,15 @@ async function loadWithSources(
 ): Promise<DanmakuLoadResult | null> {
   const kw = String(title ?? '').trim()
   if (!kw) return null
+
+  /*
+   * 第二段（`sourcesOnly`）必须**排在本地库前面**。
+   *
+   * 踩过一次：原来这段写在本地库之后，于是"第二段"直接命中了本地库、把整份缓存又返回了一遍 ——
+   * 表面上条数对得上（看起来像成功了），实际上**数据源一次都没被问到**，
+   * 获取记录里也是空的。用户要的正是"数据源必须真的被调用"，所以这里必须先分流。
+   */
+  if (opts.sourcesOnly) return await loadSourcesOnly(kw, episode, opts)
 
   // 1) 本地弹幕库
   const priority = listSources().map((s) => s.id)
@@ -603,51 +673,43 @@ async function loadWithSources(
   }
 
   /*
-   * 2) 内置弹弹play + 3) 已启用的数据源 —— **并行问，然后合并**（V1.1.1 改）。
+   * ─────────── 2) 内置弹弹play 与 3) 已启用的数据源 ───────────
    *
-   * 用户报的原话：「我添加了弹幕盒子、巴哈姆特弹幕源，但是在使用在线播放的时候进入播放器
-   * 怎么没有直接调用使用，直接从这些弹幕源加载弹幕，并混合弹幕数据载入」。
-   * 查下来是这里的顺序问题：**内置库一旦命中就 return**，用户装的源一次都不会被问到，
-   * 更谈不上混合。现在改成两边都问、按「时间+正文」去重后合并：
-   *   · 热门番的弹幕不会变少（内置那批还在），冷门番/内置没有条目的番由用户自己的源补上；
-   *   · 内置侧重"官方合集"，巴哈/盒子侧重"电视端弹幕"（用词、梗都不一样），合起来更全。
+   * 用户前后提了三件事，只有「分两段」能同时满足：
+   *   · 「装了巴哈/弹幕盒子，播放时却没有看到从数据源拿到的弹幕」→ 数据源必须**每集都真的被调用**；
+   *   · 「拉取弹幕数据源还是不够快」→ 不能让数据源拖慢"弹幕什么时候上屏"；
+   *   · 「播放器播放之前必须要调用弹幕数据源获取弹幕，除非从数据源获取不到」→ 调用要在播放这一刻就发起。
    *
-   * 为什么并行而不是串行：串行会让"进播放器到出弹幕"变成两次网络耗时之和，
-   * 而用户这次的抱怨里就有"加载很久"。`autoSources === false` 是用户在设置里的明确选择，
-   * 那种情况只走内置（保持原行为）。
+   * 于是：
+   *   第一段（本次调用）—— 本地库 / 内置库，通常几百毫秒，**先让弹幕上屏**；
+   *     同时**立刻在后台发起数据源那一路**（`startSources`，不等它），返回时带 `sourcesPending: true`；
+   *   第二段（`sourcesOnly: true` 再调一次）—— 直接取上面那条**已经在跑**的 Promise，
+   *     回来之后按「时间+正文」去重合并进画面上那一批（见 PlayerPage 的调用处）。
+   *
+   * 这样"数据源一定会被调用"是**结构上的保证**（第一段就发起），而"快"也不用牺牲：
+   * 内置那几百毫秒就上屏，源的补充几秒后才叠上去。`autoSources === false` 是用户在设置里的
+   * 明确选择，那种情况完全不碰数据源。
    */
   const autoFromSources = getSettings().danmaku?.autoSources !== false
-  const builtinPromise = loadDanmakuInner(kw, episode, opts)
-  const sourcePromise = autoFromSources
-    ? loadFromSources(kw, episode, opts.aliases ?? [])
-    : Promise.resolve({ hit: null, errors: [] as string[] })
-  /*
-   * 数据源这一路**限时**（V1.1.1）。
-   *
-   * 为什么要限时：用户装的数据源里，弹幕盒子那一条要先把索引整包下下来再解密，
-   * 慢起来是十几秒；而内置库通常几百毫秒就有结果。如果无限等，"合并"就等于
-   * 把弹幕出现时间拖到最慢那个源的速度上 —— 用户这次的抱怨里正好有"加载很久"。
-   * 超时就先用内置的那批（并记一条日志），下一集/下次播放会命中本地库，不会再等。
-   * 输掉的那条 Promise 继续跑完就好，它的结果会在下次入库。
-   */
-  const srcRes = await Promise.race([
-    sourcePromise,
-    new Promise<{ hit: null; errors: string[] }>((resolve) =>
-      setTimeout(
-        () => resolve({ hit: null, errors: [`数据源超过 ${SOURCES_WAIT_MS / 1000} 秒没返回，本次只用内置弹幕`] }),
-        SOURCES_WAIT_MS
-      )
-    )
-  ])
-  const hit = srcRes.hit
-  const errors = srcRes.errors
-  // 内置这一路与数据源同时开始，这里等它（它本来就比数据源快，限时的只有数据源那一路）
-  const builtin = await builtinPromise
 
+  // 第一段：内置 + 后台发起数据源
+  const builtin = await loadDanmakuInner(kw, episode, opts)
+  const sourcePromise = autoFromSources ? startSources(kw, episode, opts.aliases ?? []) : null
+
+  /*
+   * 内置没有、数据源还可能要一会儿 —— 这种情况下**等它**（用户要求"除非从数据源获取不到"）。
+   * 有内置结果的走上面的快速路径，不等。
+   */
+  const hit = builtin || !sourcePromise ? null : (await sourcePromise.catch(() => ({ hit: null, errors: [] }))).hit
   if (!builtin && !hit) {
-    if (errors.length > 0) log.append('info', 'danmaku', `数据源都没取到弹幕：${errors.slice(0, 3).join('；')}`)
+    if (sourcePromise) {
+      const r = await sourcePromise.catch(() => ({ hit: null, errors: [] as string[] }))
+      recordFetch(kw, episode, null, r.errors, opts.trigger ?? 'play', 0)
+    }
+    log.append('info', 'danmaku', '内置与数据源都没有取到弹幕')
     return null
   }
+  if (hit) recordFetch(kw, episode, hit, [], opts.trigger ?? 'play', hit.ms ?? 0)
 
   const parts: string[] = []
   let comments = builtin?.comments ?? []
@@ -690,6 +752,8 @@ async function loadWithSources(
     fromCache: false,
     matchedBy: builtin?.matchedBy || kw,
     aliasUsed: builtin?.aliasUsed ?? false,
+    /** 数据源那一路还在跑 → 渲染层拿到它之后会再调一次 `sourcesOnly` 把结果合并上来 */
+    sourcesPending: Boolean(sourcePromise),
     origin: {
       sourceId: hit?.sourceId ?? 'builtin',
       sourceName: fromText || '内置弹幕库（弹弹play）',
@@ -700,6 +764,63 @@ async function loadWithSources(
       entryName: builtin?.animeTitle || hit?.entryName || kw
     }
   }
+}
+
+/**
+ * 数据源那一路的**在途表**（V1.1.2）。
+ *
+ * 为什么要有它：第一段要为"快"服务，不能在它里面等数据源；但用户同时要求
+ * 「播放器播放之前必须要调用弹幕数据源获取弹幕」—— 所以第一段就**立刻发起**，
+ * 把 Promise 存在这里；第二段（`sourcesOnly`）直接取同一条，不会重复请求，
+ * 也不会因为"渲染层晚了几百毫秒才问"而白白重跑一遍。
+ *
+ * 键里带上关键词，换集/换别名不会串味；结果保留 60 秒（第二段通常几秒内就来取）。
+ */
+const inflightSources = new Map<string, Promise<{ hit: SourceHitLike | null; errors: string[] }>>()
+
+type SourceHitLike = Awaited<ReturnType<typeof loadFromSources>>['hit']
+
+function sourcesKey(kw: string, episode: number, aliases: string[]): string {
+  return `${kw}|${episode}|${aliases.join(',')}`
+}
+
+function startSources(
+  kw: string,
+  episode: number,
+  aliases: string[]
+): Promise<{ hit: SourceHitLike | null; errors: string[] }> {
+  const key = sourcesKey(kw, episode, aliases)
+  const cur = inflightSources.get(key)
+  if (cur) return cur
+  const p = loadFromSources(kw, episode, aliases)
+  inflightSources.set(key, p)
+  // 不论成功失败都留 60 秒再清：第二段可能晚一点才来问
+  setTimeout(() => inflightSources.delete(key), 60000)
+  return p
+}
+
+/** 往「获取记录」里写一条（设置页里能看到"这次到底有没有去要、用的哪个关键词、花了多久"） */
+function recordFetch(
+  title: string,
+  episode: number,
+  hit: SourceHitLike,
+  errors: string[],
+  trigger: 'play' | 'test' | 'manual',
+  ms: number
+): void {
+  appendFetchRecord({
+    at: Date.now(),
+    trigger,
+    title,
+    episode,
+    sourceId: hit?.sourceId ?? '',
+    sourceName: hit?.sourceName ?? '（没有源命中）',
+    keyword: hit?.keyword,
+    ok: Boolean(hit),
+    count: hit?.comments.length ?? 0,
+    ms,
+    detail: hit ? hit.detail : errors.slice(0, 3).join('；') || '数据源都没有返回'
+  })
 }
 
 /**
