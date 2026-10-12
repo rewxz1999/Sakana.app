@@ -876,6 +876,27 @@ export default function PlayerOverlay(): React.ReactElement {
         console.warn('[overlay] data-sakana-draw 容器铺满整窗且没有子元素，已跳过（不把整窗放进形状）')
       }
     }
+    /*
+     * ⑦ V1.1.1：**开着的浮层无条件并进形状**（用户报「所有控制栏按钮唤出的菜单都被播放器内容遮住」）。
+     *
+     * 规则 ②/⑥ 已经在管浮层，但它们各自带前提：②要求 `pointer-events !== none`，
+     * ⑥只认 class 里带 `absolute`/`fixed` 这个词的后代。任何一个前提在某次改 UI 时不成立，
+     * 浮层就会**既不画也不收鼠标**，而露出来的正是下面的原生视频 —— 用户看到的
+     * "菜单被播放器内容遮住"就是它。这条兜底不看 class、不看 pointer-events，
+     * 只问一句"它现在是不是真的可见"（`checkVisibility` 会把祖先的 display/opacity/visibility 一起算进来），
+     * 可见就把它占的那块地方放进形状。**形状只会多不会少**，不会出现"凭空多出一块吃鼠标的区域"
+     * 那种反向问题（不可见的浮层仍然会被排除）。
+     */
+    for (const el of Array.from(document.querySelectorAll<HTMLElement>(`[${POPOVER_ATTR}]`))) {
+      const r = el.getBoundingClientRect()
+      if (r.width < 8 || r.height < 8) continue
+      const visible =
+        typeof el.checkVisibility === 'function'
+          ? el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
+          : getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden'
+      if (!visible) continue
+      addRect(r)
+    }
     return out
   }, [])
 

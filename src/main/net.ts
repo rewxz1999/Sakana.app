@@ -1,10 +1,76 @@
 import axios, { type AxiosRequestConfig } from 'axios'
-import { app } from 'electron'
+import { app, net } from 'electron'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import { SocksProxyAgent } from 'socks-proxy-agent'
 import type { AppSettings, ProxyConfig } from '@shared/types'
 import { DEFAULT_SETTINGS } from '@shared/types'
 import { store } from './store'
+
+/*
+ * ───────── V1.1.1：证书错误兜底（用户报「AGE 突然搜不到番剧」的真因）─────────
+ *
+ * 现象：`[rules] 搜索失败 (AGE): unable to get local issuer certificate`，
+ * 而同一时刻用系统自带的 curl 访问同一个地址是 **HTTP 200**。差异不在站点，在**信任库**：
+ *   · curl / Chromium 用 **Windows 证书库** —— 用户开着带 MITM 的代理/VPN 时，
+ *     站点证书由它的根证书签发，那张根证书已经装进系统库，所以它们照常访问；
+ *   · node（axios 走的就是它）只认自己**内置的 CA 包**，系统库里多出来的根它一个都不认，
+ *     于是同一个请求直接失败。规则引擎全在 node 这一侧，用户看到的就是"规则跑坏了"。
+ *
+ * 处理方式：**不关证书校验**（`rejectUnauthorized: false` 是把安全换成方便，不做），
+ * 而是换一条**本来就信任系统证书的网络栈**（Electron 的 `net.fetch`，即 Chromium）把这次请求重试一次。
+ * 只在这类证书错误上兜底，其它错误原样抛出，行为与以前完全一致。
+ */
+function isCertError(err: unknown): boolean {
+  const code = String((err as { code?: string })?.code ?? '')
+  const msg = String((err as { message?: string })?.message ?? '')
+  return (
+    code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
+    code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+    code === 'DEPTH_ZERO_SELF_SIGNED_CERT' ||
+    code === 'CERT_SIGNATURE_FAILURE' ||
+    /unable to (get|verify) (local issuer|leaf) certificate|self[- ]signed certificate/i.test(msg)
+  )
+}
+
+let certFallbackInstalled = false
+
+/** 注册全局兜底（幂等；在 net.ts 被 import 时装上即可，真正执行要等 app ready） */
+export function installCertFallback(): void {
+  if (certFallbackInstalled) return
+  certFallbackInstalled = true
+  axios.interceptors.response.use(undefined, async (err) => {
+    const cfg = (err as { config?: AxiosRequestConfig & { params?: unknown } })?.config
+    if (!cfg || !isCertError(err)) throw err
+    try {
+      // 把 axios 的 config 还原成一个真实 URL（params 要拼回去，否则搜索关键词会丢）
+      const url = axios.getUri({ ...cfg, params: cfg.params as never })
+      const headers: Record<string, string> = {}
+      for (const [k, v] of Object.entries((cfg.headers ?? {}) as Record<string, unknown>)) {
+        if (v !== undefined && v !== null) headers[k] = String(v)
+      }
+      const method = String(cfg.method ?? 'get').toUpperCase()
+      const body =
+        cfg.data == null
+          ? undefined
+          : typeof cfg.data === 'string'
+            ? cfg.data
+            : JSON.stringify(cfg.data)
+      if (body !== undefined && !Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')) {
+        headers['Content-Type'] = 'application/json'
+      }
+      const r = await net.fetch(url, { method, headers, body })
+      const text = await r.text()
+      // 日志里只留「域名 + 路径」：查询串可能带搜索关键词等信息，没必要落盘
+      console.warn(`[net] 证书不被 node 信任，改用 Chromium 网络栈重试成功：${method} ${url.split('?')[0]} → HTTP ${r.status}`)
+      return { data: text, status: r.status, statusText: r.statusText, headers: {}, config: cfg, request: null }
+    } catch (err2) {
+      console.warn(`[net] 改用 Chromium 网络栈重试也失败：${String((err2 as Error)?.message ?? err2)}`)
+      throw err
+    }
+  })
+}
+
+installCertFallback()
 
 /*
  * UA 里的版本号从 `app.getVersion()` 取（v0.3.9 体检 L5）。

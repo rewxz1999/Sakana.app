@@ -680,11 +680,29 @@ export async function loadFromSources(
   const errors: string[] = []
   for (const source of sources) {
     const keywords: string[] = []
-    if (source.matchMode === 'keyword' && source.keyword?.trim()) keywords.push(source.keyword.trim())
-    if (title.trim()) keywords.push(title.trim())
+    const fixed = source.matchMode === 'keyword' && source.keyword?.trim() ? source.keyword.trim() : ''
+    const titleKw = title.trim()
+    const aliasKw: string[] = []
     for (const a of aliases) {
       const t = String(a ?? '').trim()
-      if (t && !keywords.includes(t)) keywords.push(t)
+      if (t && !aliasKw.includes(t)) aliasKw.push(t)
+    }
+    /*
+     * 关键词顺序按数据源分别排（V1.1.1，用户补充的实测结论）。
+     *
+     * 用户原话：「巴哈姆特弹幕数据只能通过番剧繁体名和日文名搜索」——
+     * 巴哈是台湾站，条目全用繁体标题，拿简体中文名去搜基本是白跑一趟（还要多等一次网络）。
+     * 别名里恰好就有番剧的**日文原名**（由播放页从 bangumi 条目取，见 danmakuAliases），
+     * 所以对巴哈：别名 → 固定关键词 → 番剧名；其它源保持"固定关键词 → 番剧名 → 别名"的习惯顺序。
+     */
+    if (source.adapter === 'bahamut') {
+      keywords.push(...aliasKw)
+      if (fixed) keywords.push(fixed)
+      if (titleKw) keywords.push(titleKw)
+    } else {
+      if (fixed) keywords.push(fixed)
+      if (titleKw) keywords.push(titleKw)
+      keywords.push(...aliasKw)
     }
     if (keywords.length === 0) {
       errors.push(`${source.name}：没有可用的搜索关键词`)

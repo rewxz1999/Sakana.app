@@ -554,6 +554,13 @@ export async function loadDanmaku(
  * 为什么包在外层而不是改进 `loadDanmakuInner`：那里面是 v0.2.8 好不容易调稳的季集判定与
  * 合并逻辑，动它的风险远大于收益；外层包装能做到「内置源行为完全不变」。
  */
+/**
+ * 「数据源那一路最多等多久」——见 loadWithSources 里的说明（V1.1.1）。
+ * 8 秒是权衡：内置库通常几百毫秒就回来了，弹幕盒子那种要下整包索引的源十几秒都有可能，
+ * 不能让最慢的源决定弹幕什么时候出现。
+ */
+const SOURCES_WAIT_MS = 8000
+
 async function loadWithSources(
   title: string,
   episode: number,
@@ -595,60 +602,123 @@ async function loadWithSources(
     }
   }
 
-  // 2) 内置弹弹play（原有逻辑）
-  const builtin = await loadDanmakuInner(kw, episode, opts)
-  if (builtin) {
-    return {
-      ...builtin,
-      origin: {
-        sourceId: 'builtin',
-        sourceName: '内置弹幕库（弹弹play）',
-        kind: 'builtin',
-        detail: `${builtin.animeTitle} · ${builtin.episodeTitle}`,
-        entryName: builtin.animeTitle
-      }
-    }
-  }
+  /*
+   * 2) 内置弹弹play + 3) 已启用的数据源 —— **并行问，然后合并**（V1.1.1 改）。
+   *
+   * 用户报的原话：「我添加了弹幕盒子、巴哈姆特弹幕源，但是在使用在线播放的时候进入播放器
+   * 怎么没有直接调用使用，直接从这些弹幕源加载弹幕，并混合弹幕数据载入」。
+   * 查下来是这里的顺序问题：**内置库一旦命中就 return**，用户装的源一次都不会被问到，
+   * 更谈不上混合。现在改成两边都问、按「时间+正文」去重后合并：
+   *   · 热门番的弹幕不会变少（内置那批还在），冷门番/内置没有条目的番由用户自己的源补上；
+   *   · 内置侧重"官方合集"，巴哈/盒子侧重"电视端弹幕"（用词、梗都不一样），合起来更全。
+   *
+   * 为什么并行而不是串行：串行会让"进播放器到出弹幕"变成两次网络耗时之和，
+   * 而用户这次的抱怨里就有"加载很久"。`autoSources === false` 是用户在设置里的明确选择，
+   * 那种情况只走内置（保持原行为）。
+   */
+  const autoFromSources = getSettings().danmaku?.autoSources !== false
+  const builtinPromise = loadDanmakuInner(kw, episode, opts)
+  const sourcePromise = autoFromSources
+    ? loadFromSources(kw, episode, opts.aliases ?? [])
+    : Promise.resolve({ hit: null, errors: [] as string[] })
+  /*
+   * 数据源这一路**限时**（V1.1.1）。
+   *
+   * 为什么要限时：用户装的数据源里，弹幕盒子那一条要先把索引整包下下来再解密，
+   * 慢起来是十几秒；而内置库通常几百毫秒就有结果。如果无限等，"合并"就等于
+   * 把弹幕出现时间拖到最慢那个源的速度上 —— 用户这次的抱怨里正好有"加载很久"。
+   * 超时就先用内置的那批（并记一条日志），下一集/下次播放会命中本地库，不会再等。
+   * 输掉的那条 Promise 继续跑完就好，它的结果会在下次入库。
+   */
+  const srcRes = await Promise.race([
+    sourcePromise,
+    new Promise<{ hit: null; errors: string[] }>((resolve) =>
+      setTimeout(
+        () => resolve({ hit: null, errors: [`数据源超过 ${SOURCES_WAIT_MS / 1000} 秒没返回，本次只用内置弹幕`] }),
+        SOURCES_WAIT_MS
+      )
+    )
+  ])
+  const hit = srcRes.hit
+  const errors = srcRes.errors
+  // 内置这一路与数据源同时开始，这里等它（它本来就比数据源快，限时的只有数据源那一路）
+  const builtin = await builtinPromise
 
-  // 3) 已启用的数据源（用户可以在设置里关掉自动加载，那时只保留手动搜索下载）
-  if (getSettings().danmaku?.autoSources === false) return null
-  const { hit, errors } = await loadFromSources(kw, episode, opts.aliases ?? [])
-  if (!hit) {
+  if (!builtin && !hit) {
     if (errors.length > 0) log.append('info', 'danmaku', `数据源都没取到弹幕：${errors.slice(0, 3).join('；')}`)
     return null
   }
-  // 存进本地库（下次离线命中）。存失败不影响本次播放，但要记下来。
+
+  const parts: string[] = []
+  let comments = builtin?.comments ?? []
+  if (builtin) parts.push(`内置弹弹play ${builtin.comments.length} 条`)
+  if (hit) {
+    const merged = mergeComments(comments, hit.comments)
+    parts.push(`${hit.sourceName} ${hit.comments.length} 条`)
+    comments = merged
+  }
+  const fromText = parts.join(' + ')
+
+  /*
+   * 合并后的**整份**存进本地库。
+   *
+   * 用户问「弹幕数据为什么没保存到本地？」—— 以前只有"内置没命中、靠数据源兜底"那一条路会存，
+   * 内置命中的那条路一条都不落盘。现在不管谁命中都存：下次（含离线）第 1 步直接命中，
+   * 不再重复下载；想清掉在「设置 → 弹幕 → 本地弹幕库」里手动清空（那条路本来就有）。
+   */
   let saved: ReturnType<typeof saveToLibrary> | null = null
   try {
     saved = saveToLibrary({
-      title: hit.entryName || kw,
+      title: builtin?.animeTitle || hit?.entryName || kw,
       episode,
-      sourceId: hit.sourceId,
-      sourceName: hit.sourceName,
-      origin: hit.detail,
-      comments: hit.comments
+      sourceId: hit?.sourceId ?? 'builtin',
+      sourceName: fromText || '内置弹幕库（弹弹play）',
+      origin: hit ? hit.detail : `${builtin?.animeTitle ?? kw} · ${builtin?.episodeTitle ?? ''}`,
+      comments
     })
   } catch (err) {
-    log.append('warn', 'danmaku', `弹幕下载成功但存入本地库失败：${String((err as Error)?.message ?? err)}`)
+    log.append('warn', 'danmaku', `弹幕取到了但存入本地库失败：${String((err as Error)?.message ?? err)}`)
   }
+
   return {
-    animeId: 0,
-    episodeId: 0,
-    animeTitle: hit.entryName || kw,
-    episodeTitle: `第${episode}集`,
-    count: hit.comments.length,
-    comments: hit.comments,
+    animeId: builtin?.animeId ?? 0,
+    episodeId: builtin?.episodeId ?? 0,
+    animeTitle: builtin?.animeTitle || hit?.entryName || kw,
+    episodeTitle: builtin?.episodeTitle || `第${episode}集`,
+    count: comments.length,
+    comments,
     fromCache: false,
-    matchedBy: kw,
-    aliasUsed: false,
+    matchedBy: builtin?.matchedBy || kw,
+    aliasUsed: builtin?.aliasUsed ?? false,
     origin: {
-      sourceId: hit.sourceId,
-      sourceName: hit.sourceName,
-      kind: listSources().find((s) => s.id === hit.sourceId)?.kind ?? 'site',
-      detail: hit.detail + (saved ? `（已存入本地：${saved.file}）` : ''),
-      entryName: hit.entryName
+      sourceId: hit?.sourceId ?? 'builtin',
+      sourceName: fromText || '内置弹幕库（弹弹play）',
+      kind: hit ? (listSources().find((s) => s.id === hit.sourceId)?.kind ?? 'site') : 'builtin',
+      detail:
+        (hit ? `内置 + ${hit.detail}` : `${builtin?.animeTitle ?? kw} · ${builtin?.episodeTitle ?? ''}`) +
+        (saved ? `（已存入本地：${saved.file}）` : ''),
+      entryName: builtin?.animeTitle || hit?.entryName || kw
     }
   }
+}
+
+/**
+ * 合并两批弹幕并按时间排序（V1.1.1）。
+ *
+ * 去重键 = 「时间（0.1 秒精度）+ 正文」：不同源对同一条弹幕的毫秒位常有差异，
+ * 但同一句话在同一秒出现两次本来就该算重复；精度取细了会留下成对的重复弹幕，
+ * 取粗了（整秒）又会误杀真正的一秒两条。
+ */
+function mergeComments(a: DanmakuComment[], b: DanmakuComment[]): DanmakuComment[] {
+  const seen = new Set<string>()
+  const out: DanmakuComment[] = []
+  for (const c of [...a, ...b]) {
+    const key = `${Math.round((Number(c.time) || 0) * 10)}|${c.text}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(c)
+  }
+  return out.sort((x, y) => (Number(x.time) || 0) - (Number(y.time) || 0))
 }
 
 async function loadDanmakuInner(
