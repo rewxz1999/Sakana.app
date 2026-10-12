@@ -966,6 +966,61 @@ if (!gotLock) {
       }, 2500)
     }
 
+    /*
+     * 「点击播放器按钮没反应」侦测自检（SAKANA_UNRESPONSIVE_TEST=1，V1.1）。
+     *
+     * 这条要证的是**判据本身**：用户要求「只要检测到用户点击播放器按钮无响应就弹出提示按 esc 或 F」，
+     * 而判据是"动作进了主进程，但 1.8 秒内它该改的那个量没变"。所以要两个方向都验：
+     *   ① 正常情况（内核真的动了）→ **不许**弹提示（否则就是误报，用户会被无缘无故打扰）；
+     *   ② 不响应（读到的值纹丝不动）→ **必须**弹，并且要有一条能查的日志。
+     * 这里不依赖真的在播放：把"读 mpv 属性"换成一个我们自己控制的读数源即可
+     * （`setOverlayPropReader` 本来就是给这个用的），播放会话不在也能验。
+     */
+    if (process.env.SAKANA_UNRESPONSIVE_TEST) {
+      setTimeout(() => {
+        void (async () => {
+          const { noteControlAction, setOverlayPropReader, onOverlayClickThrough } = await import(
+            './services/playerOverlay'
+          )
+          let notified = 0
+          onOverlayClickThrough(() => {
+            notified += 1
+          })
+          const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+          // ① 内核确实响应了：读数在 300ms 后翻转 → 期望"不提示"
+          let pause = false
+          setOverlayPropReader((name) => (name === 'pause' ? pause : null))
+          noteControlAction({ type: 'playPause' })
+          await wait(300)
+          pause = true
+          await wait(2200)
+          console.log(`[unresp-test] ① 内核有响应（pause false→true）：提示次数=${notified}（期望 0）`)
+
+          // ② 内核没反应：读数恒定 → 期望"提示一次"
+          setOverlayPropReader((name) => (name === 'pause' ? true : null))
+          const before = notified
+          noteControlAction({ type: 'playPause' })
+          await wait(2600)
+          console.log(`[unresp-test] ② 内核无响应（pause 恒为 true）：新增提示=${notified - before}（期望 1）`)
+
+          // ③ 判据必须"读不到就不判"：没有任何读数源时不许误报
+          setOverlayPropReader(null)
+          const before2 = notified
+          noteControlAction({ type: 'playPause' })
+          await wait(2200)
+          console.log(`[unresp-test] ③ 没有可核实的读数：新增提示=${notified - before2}（期望 0，宁可漏报也不误报）`)
+
+          console.log(
+            `[unresp-test] 结论：${notified === 1 ? '✅ 判据正确（有响应不报、没响应报一次、读不到不报）' : `❌ 期望恰好 1 次提示，实际 ${notified} 次`}`
+          )
+          console.log('[unresp-test] done')
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
+    }
+
     // libmpv 端到端自检（SAKANA_MPV_TEST=视频文件）：嵌入子窗口 → 播放 → 读状态
     if (process.env.SAKANA_MPV_TEST) {
       setTimeout(() => {
@@ -4225,7 +4280,7 @@ if (!gotLock) {
     }
 
     /*
-     * 投屏自检（SAKANA_CAST_TEST=<一个 m3u8 地址>，v0.3.8）。
+     * 投屏自检（SAKANA_CAST_TEST=<一个 m3u8 地址>，v0.3.8；v0.3.9 扩了三段）。
      *
      * 为什么必须自检：投屏这条路里最容易错的是**播放列表改写**（相对地址、子列表、密钥 URI
      * 都要换成经过我们的地址）和**局域网可达性**（服务必须绑 0.0.0.0，电视才连得上）。
@@ -4233,15 +4288,34 @@ if (!gotLock) {
      *   ① 拉播放列表 → 检查里面的分片地址是不是都指回我们；
      *   ② 拉第一个分片 → 检查真的取到了字节。
      * 另外顺带跑一轮 SSDP 发现，把现场能找到的投屏设备打出来。
+     *
+     * ★ v0.3.9 补的三段（全是"缺证据"逼出来的）★
+     *
+     * 老的这一段只证明"本机自己拉得动自己的中转" —— 它**从来没有验证电视有没有取到流**，
+     * 而"连上电视但播不出来"的答案恰恰在那一步。于是补上：
+     *   ③ **播放列表改写回归**（`SAKANA_CAST_SKIP_REWRITE=1` 可关）：现场起一个源站，
+     *      用子列表 / `./x` / `../a/x` / 绝对地址 / 带 query / `#EXT-X-KEY` / `#EXT-X-MAP`
+     *      这一整组用例跑一遍，逐条断言改写结果**是绝对地址且指回我们**，再把每个地址真拉一次；
+     *   ④ **真机投屏**（`SAKANA_CAST_DEVICE=<名字或IP子串>` 指定设备，默认第一台 DLNA）：
+     *      走真实的 `castPlay`（含选封装、SOAP、诊断），然后每秒采一次电视的
+     *      `TransportState` / `RelTime`，最后把中转的**请求流水**（谁、哪个路由、什么状态码、
+     *      多少字节、第几秒）整段打出来 —— "电视到底来没来、来了拿到什么"从此有原始证据。
+     *      `SAKANA_CAST_STRATEGY=auto|relay|direct|transcode` 可指定策略（用完会还原设置）；
+     *      `SAKANA_CAST_KEEP=1` 表示测完不替电视按停止。
      */
     if (process.env.SAKANA_CAST_TEST) {
       setTimeout(() => {
         void (async () => {
           const src = String(process.env.SAKANA_CAST_TEST)
           const mode = (process.env.SAKANA_CAST_MODE as 'hls' | 'mp4' | 'transcode' | undefined) ?? undefined
-          const { startCastRelay, lanIPv4 } = await import('./services/castRelay')
-          const { startCastDiscovery, castDevices } = await import('./services/cast')
+          const { startCastRelay, lanIPv4, castRelayHitLog } = await import('./services/castRelay')
+          const { startCastDiscovery, castDevices, castPlay, castControl, castTransportSnapshot } = await import(
+            './services/cast'
+          )
           const win = getMainWindow() ?? BrowserWindow.getAllWindows()[0]
+          const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+          /** 从交给电视的地址里取出中转会话号（命中流水是按会话记的） */
+          const relayIdOf = (u: string): string => /\/cast\/([A-Za-z0-9_-]+)\//.exec(u)?.[1] ?? ''
           console.log(`[cast-test] 本机局域网 IP: ${lanIPv4()}；中转形态=${mode ?? '自动（m3u8→hls）'}`)
           const relay = await startCastRelay(src, { referer: 'https://example.com/', mode })
           if (!relay) {
@@ -4271,6 +4345,7 @@ if (!gotLock) {
                 console.log(
                   `[cast-test] MP4 流转发 HTTP ${res.status}，读到 ${head.byteLength} 字节；头部 ftyp=${head.includes(Buffer.from('ftyp'))}`
                 )
+                console.log(`[cast-test]   DLNA 响应头 contentFeatures=${res.headers.get('contentFeatures.dlna.org') ?? '(无)'} transferMode=${res.headers.get('transferMode.dlna.org') ?? '(无)'}`)
                 if (!head.includes(Buffer.from('ftyp'))) {
                   console.log(`[cast-test]   ⚠ 头部不像 MP4：${txt.replace(/[^\x20-\x7e]/g, '.')}`)
                 }
@@ -4278,10 +4353,11 @@ if (!gotLock) {
                 const text = await res.text()
                 const refs = text.split(/\r?\n/).filter((l) => l && !l.startsWith('#'))
                 const allOurs = refs.length > 0 && refs.every((l) => l.includes(`/cast/${relay.id}/`))
+                const allAbs = refs.length > 0 && refs.every((l) => /^https?:\/\//i.test(l))
                 console.log(
-                  `[cast-test] 播放列表 HTTP ${res.status}，引用地址 ${refs.length} 条，全部指向本机=${allOurs}`
+                  `[cast-test] 播放列表 HTTP ${res.status}，引用地址 ${refs.length} 条，全部指向本机=${allOurs}，全部是绝对地址=${allAbs}`
                 )
-                console.log(`[cast-test] 第一条引用: ${(refs[0] ?? '').slice(0, 120)}`)
+                console.log(`[cast-test] 第一条引用: ${(refs[0] ?? '').slice(0, 140)}`)
                 if (refs[0]) {
                   const segUrl = refs[0].startsWith('http') ? refs[0] : new URL(refs[0], relay.url).toString()
                   const seg = await fetch(segUrl)
@@ -4293,22 +4369,200 @@ if (!gotLock) {
               console.log(`[cast-test] ❌ 经中转取流失败: ${String((err as Error)?.message ?? err).slice(0, 140)}`)
             }
           }
+          /*
+           * ③ 播放列表改写回归：自造一个源站，跑一整组"子列表 / 相对 / 上级相对 / 绝对 / 带 query /
+           *    密钥 / init 段"的用例。判据只有一条 —— 改写出来的每一条**都是绝对地址、且指向我们的中转**，
+           *    并且真能拉回字节（只断言字符串会被"看着像对"骗过去）。
+           */
+          if (!process.env.SAKANA_CAST_SKIP_REWRITE) {
+            console.log('[cast-test] ── ③ 播放列表改写回归 ──')
+            const http = await import('node:http')
+            const fs = await import('node:fs')
+            const path = await import('node:path')
+            const mediaDir = path.join(process.cwd(), '.e2e', 'hls-test')
+            const segBytes = fs.readFileSync(path.join(mediaDir, 'seg0.ts'))
+            const port = await new Promise<number>((resolve) => {
+              const s = http.createServer((req, res) => {
+                const u = new URL(req.url ?? '/', 'http://127.0.0.1')
+                const origin = `http://127.0.0.1:${(s.address() as { port: number }).port}`
+                const text: Record<string, string> = {
+                  // 主列表 → 子列表：一条相对、一条相对**带 query**
+                  '/hls/master.m3u8':
+                    '#EXTM3U\n#EXT-X-VERSION:3\n' +
+                    '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=1280x720\nsub/variant.m3u8\n' +
+                    '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080\nsub/other.m3u8?token=abc123\n',
+                  // 子列表：相对、./相对、上级相对、绝对、密钥、init 段
+                  '/hls/sub/variant.m3u8':
+                    '#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n' +
+                    '#EXT-X-MAP:URI="init.mp4"\n' +
+                    '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x1234567890abcdef1234567890abcdef\n' +
+                    '#EXTINF:4.000000,\nseg.ts\n' +
+                    '#EXTINF:4.000000,\n./seg.ts\n' +
+                    '#EXTINF:4.000000,\n../a/seg.ts\n' +
+                    `#EXTINF:4.000000,\n${origin}/seg1.ts\n` +
+                    '#EXT-X-ENDLIST\n'
+                }
+                const body = text[u.pathname]
+                if (body !== undefined) {
+                  res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' })
+                  res.end(body)
+                  return
+                }
+                res.writeHead(200, { 'Content-Type': 'video/mp2t' })
+                res.end(segBytes)
+              })
+              s.listen(0, '127.0.0.1', () => resolve((s.address() as { port: number }).port))
+            })
+            const srcUrl = `http://127.0.0.1:${port}/hls/master.m3u8`
+            const rw = await startCastRelay(srcUrl, { mode: 'hls' })
+            if (!rw) {
+              console.log('[cast-test]   ❌ 改写回归用的中转起不来')
+            } else {
+              const b64 = (s: string): string => Buffer.from(s, 'utf-8').toString('base64url')
+              const nonComment = (t: string): string[] => t.split(/\r?\n/).filter((l) => l && !l.startsWith('#'))
+              const master = await (await fetch(rw.url)).text()
+              const masterRefs = nonComment(master)
+              const masterOk =
+                masterRefs.length === 2 &&
+                masterRefs.every((l) => /^https?:\/\//i.test(l) && l.includes(`/cast/${rw.id}/sub?u=`))
+              console.log(`[cast-test]   主列表：${masterRefs.length} 条子列表引用，全部绝对且走 sub 路由=${masterOk}`)
+              masterRefs.forEach((l, i) => {
+                const raw = Buffer.from(new URL(l).searchParams.get('u') ?? '', 'base64url').toString('utf-8')
+                console.log(`[cast-test]     [${i}] 解出源地址=${raw}`)
+              })
+              const subUrl = masterRefs[0]
+              const subText = await (await fetch(subUrl)).text()
+              const declared = subText
+                .split(/\r?\n/)
+                .filter((l) => l.trim().startsWith('#'))
+                .join('\n')
+              const uriAttrs = [...declared.matchAll(/URI="([^"]+)"/g)].map((m) => m[1])
+              const subRefs = nonComment(subText)
+              const expect: [string, string][] = [
+                ['seg.ts', `http://127.0.0.1:${port}/hls/sub/seg.ts`],
+                ['./seg.ts', `http://127.0.0.1:${port}/hls/sub/seg.ts`],
+                ['../a/seg.ts', `http://127.0.0.1:${port}/hls/a/seg.ts`],
+                ['(绝对)', `http://127.0.0.1:${port}/seg1.ts`]
+              ]
+              console.log(`[cast-test]   子列表：${subRefs.length} 条分片引用 + ${uriAttrs.length} 条 URI 属性（密钥/init）`)
+              subRefs.forEach((l, i) => {
+                const raw = Buffer.from(new URL(l).searchParams.get('u') ?? '', 'base64url').toString('utf-8')
+                console.log(
+                  `[cast-test]     [${i}] 期望=${expect[i]?.[0] ?? '?'} 绝对=${/^https?:\/\//i.test(l)} 走 seg 路由=${l.includes(`/cast/${rw.id}/seg?u=`)} 解出=${raw} 一致=${raw === expect[i]?.[1]}`
+                )
+              })
+              uriAttrs.forEach((l) => {
+                const raw = Buffer.from(new URL(l).searchParams.get('u') ?? '', 'base64url').toString('utf-8')
+                console.log(`[cast-test]     URI 属性绝对=${/^https?:\/\//i.test(l)} 指向本机=${l.includes(`/cast/${rw.id}/`)} 解出=${raw}`)
+              })
+              // 真拉一遍：断言字符串之外，还要证明这些地址真能取回字节
+              for (const [i, l] of [...subRefs, ...uriAttrs].entries()) {
+                const r = await fetch(l)
+                const b = await r.arrayBuffer()
+                console.log(`[cast-test]     实拉 #${i} → HTTP ${r.status}，${b.byteLength} 字节`)
+              }
+            }
+          }
           if (win) {
             startCastDiscovery(win)
-            await new Promise((r) => setTimeout(r, 6000))
+            await wait(Number(process.env.SAKANA_CAST_DISCOVER_MS) || 8000)
             const list = castDevices()
             console.log(`[cast-test] SSDP/UDP 发现到 ${list.length} 台设备`)
+            const { castDeviceFormats } = await import('./services/cast')
             for (const d of list) {
               console.log(`[cast-test]   · ${d.kind} ${d.name} @ ${d.host}:${d.port} caps=${d.caps.join(',')}`)
               // 问一下电视认哪些格式（只读，不会开始播放）：HLS 认不认决定要不要重封装成 MP4
-              const { castDeviceFormats } = await import('./services/cast')
               const formats = await castDeviceFormats(d.id)
               if (formats.length > 0) {
-                const hls = formats.some((p) => /mpegurl|mp2t|m3u8/i.test(p))
-                console.log(
-                  `[cast-test]     它能播的格式（前 8 条）：${formats.slice(0, 8).join(' | ')}`.slice(0, 400)
+                /*
+                 * 完整打印：这台电视的 Sink 列表里有 `video/mp2ts`（**不是** mp2t），
+                 * 老判据 `/mpegurl|mp2t|m3u8/` 会把 mp2ts 前缀命中成"支持 HLS" —— 就是这么骗过去的，
+                 * 所以这里必须把"有没有 mpegurl"单独、明确地打出来。
+                 */
+                const hlsMimes = formats.filter((p) => /mpegurl/i.test(p))
+                const mp2t = formats.filter((p) => /mp2t/i.test(p))
+                console.log(`[cast-test]     能力表共 ${formats.length} 条`)
+                console.log(`[cast-test]     含 mpegurl 的条目 ${hlsMimes.length} 条：${hlsMimes.join(' | ') || '(无 → 这台电视不认 HLS)'}`)
+                console.log(`[cast-test]     含 mp2t 的条目（是 TS 分片 mime，不等于支持 HLS）：${mp2t.join(' | ') || '(无)'}`)
+                console.log(`[cast-test]     全部条目：${formats.join(' | ').slice(0, 1200)}`)
+                console.log(`[cast-test]     其中支持 HLS = ${hlsMimes.length > 0}${hlsMimes.length > 0 ? '' : '（投屏时会自动重封装成 MP4）'}`)
+              }
+            }
+            /*
+             * ④ 真机投屏：走真实 castPlay，然后连续采电视的状态 + 中转流水。
+             * 之所以要"采"而不是"看一眼"：电视从收到地址到出画要几秒，
+             * 而 RelTime 推进是**唯一能自动拿到的"它真的在播"的证据**（画面只能靠人眼）。
+             */
+            const want = String(process.env.SAKANA_CAST_DEVICE ?? '').trim()
+            const target = want
+              ? list.find(
+                  (d) =>
+                    d.kind === 'dlna' &&
+                    (d.name.includes(want) || d.host === want || `${d.host}:${d.port}` === want || d.id.includes(want))
                 )
-                console.log(`[cast-test]     其中支持 HLS = ${hls}${hls ? '' : '（投屏时会自动重封装成 MP4）'}`)
+              : list.find((d) => d.kind === 'dlna')
+            if (!target) {
+              console.log(`[cast-test] ④ 跳过真机投屏：没有匹配到 DLNA 设备${want ? `（SAKANA_CAST_DEVICE=${want}）` : ''}`)
+            } else {
+              const strategy = process.env.SAKANA_CAST_USE_RELAY_URL
+                ? 'direct'
+                : (process.env.SAKANA_CAST_STRATEGY ?? 'auto')
+              /*
+               * `SAKANA_CAST_USE_RELAY_URL=1`：把**上面①已经起好的那个中转地址**直接交给电视，
+               * 相当于手工扮演"只用中转（HLS 直通）"这条策略。
+               * 为什么需要这个开关：真机上"电视有没有来我们这儿取流"这件事，只有在
+               * 电视真的拿到我们中转地址时才能验证；而默认策略（auto→重封装）要经过 FFmpeg，
+               * 沙箱里带管道的子进程一律 EPERM，跑不通。这条开关让 HLS 直通这条路能被真机验证。
+               */
+              const mediaUrl = process.env.SAKANA_CAST_USE_RELAY_URL && relay ? relay.url : src
+              const saved = store.get<Record<string, unknown>>('settings', {})
+              console.log(`[cast-test] ── ④ 真机投屏：${target.name} @ ${target.host}:${target.port}，策略=${strategy} ──`)
+              console.log(`[cast-test]   交给电视的地址=${mediaUrl}`)
+              try {
+                store.set('settings', { ...saved, castStrategy: strategy })
+                const r = await castPlay(target.id, { url: mediaUrl, title: 'Sakana 投屏自检', referer: 'https://example.com/' })
+                console.log(`[cast-test]   castPlay ok=${r.ok} usedRelay=${r.usedRelay} url=${r.url ?? '-'}`)
+                console.log(`[cast-test]   给用户的提示=${r.message}`)
+                const seconds = Number(process.env.SAKANA_CAST_SECONDS) || 30
+                const t0 = Date.now()
+                let advanced = false
+                let firstRel = ''
+                for (let i = 0; Date.now() - t0 < seconds * 1000; i += 1) {
+                  await wait(3000)
+                  const snap = await castTransportSnapshot(target.id)
+                  if (!snap) {
+                    console.log('[cast-test]   状态采样失败（电视没回 SOAP）')
+                    continue
+                  }
+                  if (!firstRel && snap.relTime && snap.relTime !== '00:00:00') firstRel = snap.relTime
+                  if (snap.relTime && snap.relTime !== '00:00:00') advanced = true
+                  console.log(
+                    `[cast-test]   +${((Date.now() - t0) / 1000).toFixed(1)}s state=${snap.state || '?'} status=${snap.status || '?'} speed=${snap.speed || '?'} RelTime=${snap.relTime || '-'} duration=${snap.duration || '-'}`
+                  )
+                  console.log(`[cast-test]        TrackURI=${snap.trackUri || '-'}`)
+                  if (snap.state === 'PLAYING' && advanced) break
+                }
+                const logHits = castRelayHitLog(relayIdOf(r.url ?? ''))
+                console.log(`[cast-test]   中转请求流水（共 ${logHits.length} 条；local=本机自检，非 local=电视）：`)
+                for (const h of logHits) {
+                  console.log(
+                    `[cast-test]     ${h.local ? '本机' : '电视'} ${h.remote} ${h.method} ${h.route} → HTTP ${h.status}，${h.bytes} 字节，${h.ms}ms，@+${(h.sinceMs / 1000).toFixed(1)}s${h.range ? `，Range=${h.range}` : ''} UA=${h.ua.slice(0, 40) || '无'}`
+                  )
+                }
+                const remoteHits = logHits.filter((h) => !h.local).length
+                console.log(
+                  `[cast-test]   结论：电视请求中转 ${remoteHits} 次；RelTime 推进=${advanced}${firstRel ? `（首个非零 RelTime=${firstRel}）` : ''}`
+                )
+                console.log(
+                  `[cast-test]   ${advanced ? '✅ 电视确实在播（RelTime 在推进）—— 画面是否真的出现仍需人眼确认' : remoteHits === 0 ? '❌ 电视**从未来取流**（地址不可达：网段/防火墙/选错网卡）' : '❌ 电视来取流了但没进入播放（封装/编码或首字节失败，看上面的流水状态码）'}`
+                )
+                if (!process.env.SAKANA_CAST_KEEP) {
+                  await castControl(target.id, 'stop')
+                  console.log('[cast-test]   已替电视按了停止（SAKANA_CAST_KEEP=1 可跳过）')
+                }
+              } finally {
+                // 设置必须还原：用户自己的投屏策略不能被自检改掉
+                store.set('settings', saved)
               }
             }
           }
@@ -4424,7 +4678,56 @@ if (!gotLock) {
       }, 2500)
     }
 
-    // 媒体扫描自检（SAKANA_MEDIA_TEST=文件夹路径）：递归扫描视频与字幕后退出
+    /*
+     * 投屏契约自检（`SAKANA_CAST_FAKE=<host:port>`，V1.1）。
+     *
+     * 为什么非要有这一段：`/play` 里 V1.1 新增的三个字段（`subjectId` / `sources` / `sourceId`）
+     * 是**跨端契约**（字段表见 android-receiver/README.md §2.5c），手机端的选集、连播、
+     * 换数据源全指着它。而契约写错的代价是**不报错**的 —— 接收端只会当成旧载荷、
+     * 静默退化成"没有条目 id"，用户那边表现为"按钮点不动"，根本查不出原因。
+     *
+     * 所以这里不靠读代码：起一个本地"假接收端"（`.e2e/fake-receiver.mjs`，它把收到的
+     * `/play` 请求体原样落盘），用**真实的** `addCastDevice` + `castPlay` 发一次，
+     * 然后拿假接收端收到的 JSON 逐字段核对。手机不在身边时，这是唯一能证明
+     * "线上到底发了什么"的办法（DLNA 那条路根本不带这些字段，验不到）。
+     */
+    if (process.env.SAKANA_CAST_FAKE) {
+      setTimeout(() => {
+        void (async () => {
+          const addr = String(process.env.SAKANA_CAST_FAKE)
+          const { addCastDevice, castPlay } = await import('./services/cast')
+          const device = await addCastDevice(addr)
+          if (!device) {
+            console.log(`[cast-fake] ❌ 登记失败：${addr} 没有以接收端身份回应 GET /info`)
+            markQuitting()
+            app.quit()
+            return
+          }
+          console.log(`[cast-fake] 已登记设备「${device.name}」kind=${device.kind} id=${device.id}`)
+          const r = await castPlay(device.id, {
+            url: 'https://example.com/selftest/master.m3u8',
+            title: '自检条目 · 第 1 集',
+            referer: 'https://example.com/',
+            index: 0,
+            playlist: [
+              { url: '', title: '第 1 集' },
+              { url: '', title: '第 2 集' }
+            ],
+            subjectId: 12345,
+            sources: [
+              { id: 'selftest-a', name: '自检源A' },
+              { id: 'selftest-b', name: '自检源B' }
+            ],
+            sourceId: 'selftest-b'
+          })
+          console.log(`[cast-fake] castPlay → ok=${String(r.ok)} message=${r.message}`)
+          console.log('[cast-fake] 完成（假接收端收到的请求体在 .e2e/fake-receiver-capture.json）')
+          markQuitting()
+          app.quit()
+        })()
+      }, 2500)
+    }
+
     if (process.env.SAKANA_MEDIA_TEST) {
       setTimeout(() => {
         void (async () => {

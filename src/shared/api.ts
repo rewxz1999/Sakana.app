@@ -12,10 +12,16 @@ import type {
   CastReceiverInfo,
   CharactersResult,
   CharacterItem,
+  DanmakuBoxEntry,
   DanmakuComment,
+  DanmakuLibraryInfo,
+  DanmakuLibraryItem,
   DanmakuLoadResult,
   DanmakuMatch,
   DanmakuSettings,
+  DanmakuSource,
+  DanmakuSourceRegistry,
+  DanmakuSourceTestResult,
   DeleteLocalResult,
   DownloadTask,
   EpisodeProgress,
@@ -26,6 +32,7 @@ import type {
   GalMemRecent,
   GalRecentShot,
   GalBgmSaved,
+  GalUnpackSummary,
   GalSiteSearchResult,
   GalToolsConfig,
   ImageDataUrlResult,
@@ -141,6 +148,14 @@ export interface OverlayState {
     index?: number
     /** 选集列表（接收端/电视上能选集） */
     playlist?: { url: string; title: string }[]
+    /*
+     * V1.1：投屏契约里给接收端补的三项（`CastMediaInput` 的同名可选字段，
+     * 说明见 src/shared/types.ts 与 android-receiver/README.md §2.5c）。
+     * 悬浮窗只负责把它们从播放页搬到主进程，自己不解释。
+     */
+    subjectId?: number
+    sources?: { id: string; name: string }[]
+    sourceId?: string
   } | null
   /**
    * v0.3.9：播放过程进度（三阶段快照）。
@@ -835,6 +850,36 @@ export interface SakanaApi {
     memRecent(gameId: string): Promise<ApiResult<GalMemRecent>>
     /** v0.3.9：把某首 BGM 从游戏档案只读提取并保存到本地（文件名优先真实曲名，其次代号） */
     saveBgm(gameId: string, code: string): Promise<ApiResult<{ ok: boolean; path: string; error: string }>>
+    /** V1.1：引擎检测 + 自动解包 + 解析曲名映射（只读游戏档案，写只写 Sakana 自己的缓存目录） */
+    unpack(gameId: string, exePath: string, gameName: string, force?: boolean): Promise<ApiResult<GalUnpackSummary>>
+    /** V1.1：解包状态（未解包时 reason 说明为什么还不能识别曲名/提取立绘） */
+    unpackStatus(
+      gameId: string,
+      exePath: string
+    ): Promise<ApiResult<{ unpacked: boolean; at: number; files: number; engine: string; evidence: string[]; reason: string }>>
+    /** V1.1：立绘 / CG 提取（立绘 = 按坐标表合成差分立绘，CG 用原名；只写 <保存根目录>/<游戏名>/立绘|cg/） */
+    extractImages(
+      gameId: string,
+      exePath: string,
+      gameName: string,
+      kind: '立绘' | 'cg',
+      limit?: number
+    ): Promise<
+      ApiResult<{
+        ok: boolean
+        count: number
+        candidates: number
+        dir: string
+        files: string[]
+        error: string
+        /** 立绘：按坐标表合成出来的张数（主路径） */
+        composed?: number
+        /** 立绘：回退成「整身底图碎片」的张数（该作没有可读坐标表时） */
+        fallback?: number
+      }>
+    >
+    /** V1.1：手动刷新当前 BGM 识别（跳过 2 秒轮询，立刻重扫） */
+    refreshBgm(gameId: string): Promise<ApiResult<{ ok: boolean; error: string }>>
     /** v0.3.9：最近保存的 BGM（卡片右键菜单「最近保存的 bgm」） */
     savedBgm(gameId: string, gameName?: string): Promise<ApiResult<GalBgmSaved[]>>
     dirsGet(): Promise<ApiResult<{ dir: string }>>
@@ -910,6 +955,31 @@ export interface SakanaApi {
       episode: number,
       opts?: { aliases?: string[]; aliasMode?: boolean }
     ): Promise<ApiResult<{ ok: boolean; count: number; cached: boolean }>>
+
+    // ---------------- v1.1：数据源集合器 ----------------
+    /** 读数据源集合器（含每个适配器的说明与默认基址，设置页据此渲染"新增"表单） */
+    sources(): Promise<ApiResult<DanmakuSourceRegistry>>
+    /** 整表保存（增删改/启停/排序都在渲染层改完提交，主进程再校验一次并写回设置） */
+    sourcesSave(sources: DanmakuSource[]): Promise<ApiResult<DanmakuSource[]>>
+    /** 测试一条数据源：真发请求，逐步回结果 */
+    sourceTest(source: DanmakuSource, keyword?: string): Promise<ApiResult<DanmakuSourceTestResult>>
+    /** 弹幕盒子：按关键字检索它的索引（返回可下载条目） */
+    boxSearch(keyword: string, sourceId?: string): Promise<ApiResult<DanmakuBoxEntry[]>>
+    /** 弹幕盒子：下载条目（尽量取到 episode 那一集）并导入本地弹幕库 */
+    boxDownload(
+      entry: DanmakuBoxEntry,
+      opts?: { title?: string; episode?: number; sourceId?: string }
+    ): Promise<ApiResult<DanmakuLibraryItem>>
+    /** 本地弹幕库：列表（可按番剧名/来源筛选） */
+    library(filter?: { title?: string; sourceId?: string }): Promise<ApiResult<DanmakuLibraryInfo>>
+    /** 本地弹幕库：删除若干条（ids = item.id） */
+    libraryRemove(ids: string[]): Promise<ApiResult<DanmakuLibraryInfo>>
+    /** 本地弹幕库：清空 */
+    libraryClear(): Promise<ApiResult<DanmakuLibraryInfo>>
+    /** 本地弹幕库：改目录（空串 = 回到默认 <缓存目录>/danmaku） */
+    librarySetDir(dir: string): Promise<ApiResult<DanmakuLibraryInfo>>
+    /** 本地弹幕库：在系统文件管理器里打开 */
+    libraryOpenDir(): Promise<ApiResult<string>>
   }
   /**
    * uosc_danmaku（mpv 弹幕插件）集成（v0.2.9）。

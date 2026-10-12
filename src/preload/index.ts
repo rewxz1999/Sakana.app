@@ -297,6 +297,11 @@ const api: SakanaApi = {
     memRecent: (gameId) => call(CH.galMemRecent, gameId),
     saveBgm: (gameId, code) => call(CH.galBgmSave, gameId, code),
     savedBgm: (gameId, gameName) => call(CH.galBgmSaved, gameId, gameName),
+    unpack: (gameId, exePath, gameName, force) => call(CH.galUnpack, gameId, exePath, gameName, !!force),
+    unpackStatus: (gameId, exePath) => call(CH.galUnpackStatus, gameId, exePath),
+    extractImages: (gameId, exePath, gameName, kind, limit) =>
+      call(CH.galExtractImages, gameId, exePath, gameName, kind, limit),
+    refreshBgm: (gameId) => call(CH.galMemRefresh, gameId),
     dirsGet: () => call(CH.galDirsGet),
     dirsSet: (dir) => call(CH.galDirsSet, dir),
     recentShots: () => call(CH.galRecentShots),
@@ -337,7 +342,18 @@ const api: SakanaApi = {
     // v0.2.8：一步到位（播放器 / 本地播放共用）；opts 支持别名检测
     load: (title, episode, opts) => call(CH.danmakuLoad, title, episode, opts),
     // v0.2.8 附加：预取（只预热缓存）
-    prefetch: (title, episode, opts) => call(CH.danmakuPrefetch, title, episode, opts)
+    prefetch: (title, episode, opts) => call(CH.danmakuPrefetch, title, episode, opts),
+    // v1.1：数据源集合器 + 弹幕盒子 + 本地弹幕库
+    sources: () => call(CH.danmakuSourcesGet),
+    sourcesSave: (sources) => call(CH.danmakuSourcesSet, sources),
+    sourceTest: (source, keyword) => call(CH.danmakuSourceTest, source, keyword),
+    boxSearch: (keyword, sourceId) => call(CH.danmakuBoxSearch, keyword, sourceId),
+    boxDownload: (entry, opts) => call(CH.danmakuBoxDownload, entry, opts),
+    library: (filter) => call(CH.danmakuLibList, filter),
+    libraryRemove: (ids) => call(CH.danmakuLibRemove, ids),
+    libraryClear: () => call(CH.danmakuLibClear),
+    librarySetDir: (dir) => call(CH.danmakuLibSetDir, dir),
+    libraryOpenDir: () => call(CH.danmakuLibOpenDir)
   },
   cache: {
     info: () => call(CH.cacheInfo),

@@ -135,4 +135,13 @@
         <item name="android:textColor">@color/player_text_dim</item>
         <item name="android:textSize">12sp</item>
     </style>
+
+    <!-- 业务按钮条里分组之间那条竖线（颜色和底栏分割线一致） -->
+    <style name="PlayerBarDivider">
+        <item name="android:layout_width">1dp</item>
+        <item name="android:layout_height">24dp</item>
+        <item name="android:layout_marginStart">8dp</item>
+        <item name="android:layout_marginEnd">8dp</item>
+        <item name="android:background">@color/player_unplayed</item>
+    </style>
 </resources>

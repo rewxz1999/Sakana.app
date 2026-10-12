@@ -31,14 +31,15 @@
   观看历史会在本机记录并推给电脑。
 - **点收藏直接播**：收藏里点一部 → 电脑自己"选源 → 选集 → 嗅探直链 → 投回本机"。
 - **播放时横屏全屏**：进播放自动转真全屏（edge-to-edge + 隐藏系统栏 + 刘海区域也能用满），
-  控制栏是自己写的（挂在官方 `PlayerView` 的 `controller_layout_id` 上）、几秒自动淡出；
-  支持双击两侧快进快退、左右半边滑音量/亮度、水平拖动定位、长按 2× 速。
+  播放视图与控制栏是 **GSYVideoPlayer**（`StandardGSYVideoPlayer`，内核仍是 Media3 的 exo2）、
+  几秒自动淡出；支持双击两侧快进快退、左右半边滑音量/亮度、水平拖动定位、长按 2× 速。
 - **自己的图标**：白底蓝色投屏符号，和电脑端应用的图标不是同一个。
 - **设置页**：设备名、控制端口、首选网卡、主动连接、屏幕常亮、自动播放、铺满屏幕、开机自启、同步状态、下载说明、关于。
 - **状态可见**：缓冲中 / 播放中 / 已暂停 / 播完 / 播放失败（带错误码、原因和「重试」），以及"已被谁连接"。
 - **全部白底蓝主色**：所有颜色集中在 `colors.xml` / `themes.xml`，布局里不写死颜色。
 
-体积（本机实测）：debug **5.78 MB**，release（R8 + 资源压缩）**1.14 MB**。
+体积（本机实测）：debug **18.9 MB**（换 GSYVideoPlayer 之前是 6.2 MB，代价与原因见 §5b），
+release（R8 + 资源压缩）1.14 MB（**换 GSY 后没有重新量过 release**）。
 
 ---
 
@@ -195,17 +196,25 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
 
 **② 播放层**（有媒体时）
 
-播放器用的是 Media3 官方的 `PlayerView`（`app:use_controller="true"`），但控制栏是**自己写的**
-（`player_control_view.xml`，通过 `app:controller_layout_id` 挂上去，根节点必须是 `<merge>`）。
-这样做的好处是进度条、按钮、配色、状态显示全在自己手里，也不用引第三方播放器库。
+播放视图与控制栏用的是 **GSYVideoPlayer 原生的那一套**（`StandardGSYVideoPlayer`；
+`app.sakana.receiver.SakanaGsyPlayer` 是它的子类，但**没有覆写它的布局**，用的是 GSY 自己的
+`video_layout_normal.xml`）。顶栏的返回键与标题、屏幕中央的播放/暂停键、底栏的进度条 / 时间 /
+全屏键、缓冲转圈、控制栏隐藏后那条细进度线，全是 GSY 原本的图标与配色。
+**内核仍然是 Media3 的 exo2** —— 这次换的是"视图与控制层"，解码引擎没变
+（`gsyvideoplayer-exo2:14.0.0` 里面就是 androidx.media3 1.10.1，本工程用的 1.11.1
+会被对齐上去）。为什么换、代价多少、GSY 给不了什么，见 §5b。
 
 - 画面铺满整个窗口，自动切**横屏全屏**：`WindowCompat.setDecorFitsSystemWindows(window, false)`
   + `WindowInsetsControllerCompat.hide(systemBars())` + `BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`
   （边缘上滑可临时唤出系统栏），主题里 `windowLayoutInDisplayCutoutMode=shortEdges`，
   刘海/挖孔区域也能用满（`FullscreenController.kt`）。
-- **顶栏**：标题（第几集 / 文件名）+「选集」+「设置」+「退出全屏」。
-- **底栏**：进度条（可拖，蓝色已播/缓冲色）+ 当前位置 / 总时长 + 上一集 / 后退 10 秒 /
-  播放暂停 / 前进 10 秒 / 下一集 + 音量− / 音量+ + 倍速 + 锁定方向 / 解锁方向 + 「铺满」/「适应」。
+- **顶栏（GSY 原生）**：返回键（= 退出播放，和返回键第二步同一个方法）+ 标题（第几集 / 文件名）。
+- **底栏（GSY 原生）**：当前位置 / 总时长 / 进度条（可拖）+ 全屏键（= 我们自己的横屏全屏开关）。
+- **业务按钮条（我们叠上去的一条，就在 GSY 底栏正上方、与它同一时刻显隐）**：
+  选集 / 设置 ‖ 上一集 / 后退 10 秒 / 前进 10 秒 / 下一集 ‖ 倍速 / 音量− / 音量+ ‖ 锁定方向 / 铺满-适应。
+  每个按钮的真机位置与逐条验证见 §5b ⑥。
+  （上一集/下一集/±10 秒在换 GSY 之前是 Media3 控制栏的按钮，现在由 `PlayerButtons.kt` 自己接 ——
+  而且接得比原来对：旧实现里播放器一次只放一集，Media3 的上一集/下一集其实是灰的。）
 - **手势**（`PlayerGestures.kt`）：
   - 单击画面：显示 / 隐藏控制栏；
   - 双击左半边 / 右半边：后退 / 前进 10 秒，连点会累加（每次 +10 秒，最多 ±60 秒），
@@ -213,13 +222,22 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
   - 右半边上下滑：音量；左半边上下滑：亮度；
   - 水平拖动：拖动即预览目标时间，松手才 seek（不会边拖边跳）；
   - 长按：2× 倍速，松手恢复。
-- **状态**：缓冲中显示转圈；播完显示重播；**播放失败显示错误码 + 原因 + 「重试」按钮**
-  （重试是重新加载当前这一集并从头开始）。播放中 4 秒无操作控制栏自动淡出，暂停时常显，
-  拖动进度时不消失。
+  - 手势挂在**两层**上：布局里那个透明的 `gesture_layer`（结构从 v0.3.8 起就是这样），
+    以及播放器内部的 `surface_container` —— 后者才是真正会收到触摸的那一层
+    （GSY 把手势监听挂在它身上，它是覆盖整块画面的子视图）。控制栏按钮是它的兄弟视图、
+    z 序更高，ViewGroup 先给子 View 派发，所以"按钮优先、空白处才走手势"不变。
+- **播放/暂停**：屏幕**正中央**那个播放键是 GSY 原生的 —— 它在播放中会自己隐藏（所以
+  "点一下画面唤出控制栏"不受影响），暂停/播完时才出现，点它就是继续播放/重播。
+- **状态**：缓冲中 GSY 自己显示转圈；**播放失败显示错误码 + 原因 + 「重试」按钮**
+  （重试是重新加载当前这一集并从头开始）。播放中 4 秒无操作控制栏自动淡出，暂停/出错/播完常显，
+  拖动进度时不消失（拖 GSY 的进度条会重新计时）。控制栏隐藏后屏幕最底下留一条 2dp 的
+  蓝色进度线 —— 这是 GSY 自带的行为，换 GSY 之前没有。
 - **返回键**：先退出全屏（回到竖屏、恢复系统栏），再按一次才退出播放，**永远不会直接退出 App**。
 - 退出播放（停止、或回到 idle）时恢复 `SCREEN_ORIENTATION_UNSPECIFIED` 和系统栏。
-- 设置页里的「铺满」开关等价于底栏的「铺满」按钮：`resize_mode` 在 `fit`（保持比例留黑边）
-  和 `fill`（裁掉多余部分填满屏幕）之间切，`onResume` 时会重新套用。
+- 设置页里的「铺满」开关等价于底栏的「铺满」按钮：`fit`（保持比例留黑边）与
+  `fill`（拉伸填满、消除黑边）之间切，`onResume` 和每个心跳都会重新套用一次。
+  ⚠️ 这个开关**不能用 GSY 自己的 `GSYVideoType.setShowType()`**（真机实测在本工程的布局下是空操作，
+  原因写在 `VideoFill.kt` 里），现在改成给画面视图设 scale 来实现，见 §5b 的"GSY 给不了什么"。
 
 **配色**：全部白底 + 蓝主色，统一在 `colors.xml` / `themes.xml` 里，布局和 Kotlin 里都不再写死
 颜色（背景 `#FFFFFF`、卡片 `#F5F8FF`、主色 `#2E6BE6`、主文字 `#101828`、次文字 `#667085`、
@@ -262,6 +280,71 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
    「离线 · 缓存于 3 小时前 · 收藏 86 / 历史 14」。
 5. **手动同步**：首页底部或设置页里的「立即同步」。没连过电脑时它会明确告诉你该怎么做，
    而不是假装同步了一下。
+
+### 2.5b 收藏 / 历史分成两个界面
+
+首页顶部是两个 Tab：**收藏 N** / **历史 M**（数字是条数，不用切过去就知道那边有多少）。
+
+- 两个界面各自是**一个独立的 RecyclerView**（收藏两列网格、历史整行卡片），
+  所以**滚动位置天然独立** —— 切回来还在原来那一屏，不用自己记 offset；
+- 两边都有**自己的空态文案**（"还没有从电脑同步收藏…" / "还没有观看记录…"）；
+- 收藏**一条都不截断**（用户报过的"看不到其它收藏"就是数据侧被砍了，这条一直守着）；
+- 历史不再折叠成"前 4 条 + 查看全部" —— 它有了自己的整屏，能一路滚到底。
+
+### 2.5c 数据源、切集、自动连播
+
+**一句话前提：接收端不抓流**（不引规则引擎），所以"换线路 / 换集数"最终都要电脑去解析。
+接收端能做的是**本地能切就本地切**，本地切不了就把选择回传给电脑。
+
+| 动作 | 接收端怎么做 | 电脑端要做什么 |
+| --- | --- | --- |
+| 换集（列表里有地址） | 直接本地 `select`，立刻生效 | 什么都不用做（地址是它给的） |
+| 换集（规则模式只有标题） | 发 `/sync/command` → `play-subject` | 解析这一集并 `/play` 投回来 |
+| 换数据源（线路） | 发 `/sync/command` → `play-subject` + `sourceId` | 换线路解析后 `/play` 投回来 |
+| 自动连播 | 一集 `ended` 后按上面两条规则自动走一次 | 同上（只在本地下不到地址时才需要） |
+
+- 入口在播放层顶栏的「选集」按钮上：弹窗里分**两组**（数据源 / 选集），
+  当前项用主色标出，规则模式下"只有标题、没有地址"的集会标出「规则模式 · 请在电脑上切集」；
+- **自动连播默认开**（设置页可关）：一集播完自动切下一集。
+  · 成功：气泡写"这一集播完了，接着播下一集：第 3 集"；
+  · 要电脑解析：写"正在让电脑准备下一集…"；
+  · **失败绝不静默**：写"已经是最后一集了" / "电脑端没给下一集的地址"，
+    并把电脑返回的原文（比如"这条番剧在已启用的规则里都搜不到"）显示出来；
+  · 有**防重**（同一集的 ended 只处理一次）和**循环保护**（下一集刚开播就结束就不再往下切，
+    提示"可能是地址失效或片长为 0"）—— 不会变成停不下来地跳集。
+
+**电脑端要补的字段（这是唯一的外部依赖，字段名就是契约）—— ✅ V1.1 已实现**
+
+`POST /play`（电脑 → 接收端）新增三个**可选**字段；不给就退化成现在的能力（不报错）：
+
+| 字段 | 类型 | 语义 |
+| --- | --- | --- |
+| `subjectId` | number | 这次投放内容对应的条目 id。**没有它就没有切集/连播**（接收端不知道自己在放哪一部），历史归属也只能靠"猜" |
+| `sources` | array | 这条内容**可选的线路/数据源**，每项 `{ "id": string, "name": string }`；`id` 要稳定（接收端会原样回传）。不给或只有一条时，接收端**不显示**数据源这一组 |
+| `sourceId` | string | 当前正在用的是哪条线路（对应 `sources[].id`），用来标出"当前" |
+
+`POST /sync/command`（接收端 → 电脑）里 `play-subject` 增加**一个可选字段**：
+
+| 字段 | 类型 | 语义 |
+| --- | --- | --- |
+| `sourceId` | string | 用哪条线路解析。不给 = 用电脑的默认线路。原有的 `subjectId`（必填）、`episodeIndex`（可选，从 0 开始）语义不变 |
+
+**电脑端实现位置与约定（V1.1 已落地）**
+
+| 位置 | 做了什么 |
+| --- | --- |
+| `src/shared/types.ts` `CastMediaInput` | 加了这三个可选字段（契约的唯一真源） |
+| `src/renderer/src/pages/PlayerPage.tsx` `castMediaPayload()` | `subjectId` 取当前条目、`sources` 取**已启用的规则**、`sourceId` 取当前规则（只有规则模式有） |
+| `src/main/services/cast.ts` `castPlay()` | 把三项塞进 `POST /play`（都是"有才带"，不给就退化成旧载荷） |
+| `src/main/services/castSync.ts` `playSubjectOnPc()` | 收 `sourceId`；给了就**只试那一条**，不再自动兜底换源 |
+
+- **`sources` 的 `id` 用规则自身的 id**（不是数组下标）：它落盘稳定，而且是电脑**真正能用来重新解析**的东西；
+  接收端换源时原样回传，电脑按这个 id 重新搜索/嗅探/投回来。
+- 电脑**投回去的那一份载荷同样带齐三项**：否则接收端换过一次源就"失忆"（切集/连播全废）。
+- `sources` 里放的**永远是全部已启用规则**，不是"这次用的那条" —— 否则用户换过一次源之后，
+  那份列表就只剩一项、再也换不回去。
+- 指定了 `sourceId` 却搜不到时，电脑**不会**偷偷换一条线路，而是明确回
+  "所选数据源在电脑端不存在或已停用" —— "点了 A 放出来 B"比失败更难理解。
 
 ### 2.6 本地缓存（收藏数据 + 封面图片）
 
@@ -446,7 +529,7 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
 `DefaultHttpDataSource.Factory().setDefaultRequestProperties(map)` 把它们设成**默认请求头**，
 于是 HLS 的**主列表、子列表、以及每一个分片**请求都会自动带上 `Referer` / `Cookie`。
 这样设备是直连 CDN 拉流，电脑不需要做中转代理，画质和速度不受电脑上传带宽限制。
-（实现见 `MediaSources.kt`；对应 `caps` 里承诺的 `headers`。）
+（实现见 `PlayHeaders.kt`；对应 `caps` 里承诺的 `headers`。换 GSY 之后的完整链路见 §5b ②）
 
 透传时会被丢掉的请求头（都是"由连接层自己管、带上会坏事"的）：
 
@@ -527,7 +610,7 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
 
 ## 4. 代码结构
 
-按"一件事一个类 / 一个文件"拆开，**49 个 Kotlin 文件全部 ≤300 行**（最长 300 行）：
+按"一件事一个类 / 一个文件"拆开，**58 个 Kotlin 文件全部 ≤300 行**（最长 300 行）：
 
 **协议与传输**
 
@@ -548,16 +631,29 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `PlayerController.kt` | 300 | ExoPlayer 封装：播放列表、音量、倍速、重试、规则模式的空地址防护 |
-| `PlaybackEvents.kt` | 40 | `Player.Listener` 桥：只把"状态变了/出错了"两件事转出来给界面 |
-| `PlayerGestures.kt` | 192 | 手势：单击/双击累加 seek/长按 2× 速/左右分别调亮度音量/水平拖动 seek |
-| `PlaybackUi.kt` | 295 | 播放层接线：两个形态切换、横屏全屏、控制栏与手势的挂载点、两个出口 |
-| `PlaybackControls.kt` | 156 | 控制栏显隐的**唯一**负责人（一个计时器）+ 关掉 Media3 自带那套 |
-| `ControlsPolicy.kt` | 77 | **纯逻辑**：状态跃迁 -> 该不该动可见性（幂等，同状态一律 NONE）—— 有单测 |
-| `PlayerActions.kt` | 157 | 播放层小动作：提示气泡、亮度、音量、铺满、进度条拖动计时 |
-| `PlaylistNav.kt` | 32 | 播放列表切换目标的计算（跳过空地址、不循环）—— 纯逻辑，有单测 |
-| `PlaybackState.kt` | 28 | 播放状态 -> 协议 `state` 枚举的映射 |
-| `MediaSources.kt` | 82 | URL -> MediaSource：请求头透传、过滤，HLS/直链区分 |
+| `PlayerController.kt` | 300 | 播放控制：GSY 的封装、播放列表、音量、状态、`/control` 的全部动作 |
+| `SakanaGsyPlayer.kt` | 298 | `StandardGSYVideoPlayer` 的子类（不改它的布局）：显隐归我们、原生返回/全屏键换落点、业务按钮条的挂载、手势挂载点、音量/事件桥 |
+| `PlayerSetup.kt` | 63 | `GSYVideoOptionBuilder` 的全部选项（含 `setMapHeadData` 请求头、以及每次都要重申的那些"关掉"开关） |
+| `PlayHeaders.kt` | 93 | `/play` 的 `headers` → GSY 的 map（过滤不该设的头、补 User-Agent、跨协议跳转开关） |
+| `VideoFill.kt` | 62 | 「铺满/适应」的实现：给画面视图设 scale（GSY 的 show type 在本布局下无效，原因见文件注释） |
+| `PlayerModels.kt` | 37 | `PlayerItem` / `PlayerSnapshot` 两个对外数据模型 |
+| `PlayerButtons.kt` | 163 | 业务按钮条的接线与刷新（选集/设置/切集/±10 秒/倍速菜单/音量/锁方向/铺满/重试） |
+| `PlayerGestures.kt` | 191 | 手势：单击/双击累加 seek/长按 2× 速/左右分别调亮度音量/水平拖动 seek |
+| `PlaybackUi.kt` | 299 | 播放层接线：两个形态切换、横屏全屏、业务按钮条与手势的挂载点 |
+| `PlaybackControls.kt` | 128 | 控制栏显隐的**唯一**负责人（一个计时器）+ 关掉 GSY 自带那套 |
+| `ControlsPolicy.kt` | 76 | **纯逻辑**：状态跃迁 -> 该不该动可见性（幂等，同状态一律 NONE）—— 有单测 |
+| `PlayerActions.kt` | 133 | 播放层小动作：提示气泡、亮度、音量、铺满、每心跳校准画面比例 |
+| `PlaylistNav.kt` | 65 | 播放列表切换目标的计算 + `/play` 载荷到列表下标的对齐（跳过空地址、不循环）—— 纯逻辑，有单测 |
+| `PlaybackState.kt` | 41 | GSY 状态 -> 协议 `state` 枚举的映射 |
+| `PlayCatalog.kt` | 71 | 这次投屏的上下文：条目 id / 可选线路 / 当前线路 + 线路解析（纯逻辑，有单测） |
+| `AutoNext.kt` | 63 | **纯逻辑**：一集播完后该本地切、请电脑切、还是就停在这（有单测） |
+| `AutoNextPlayback.kt` | 99 | 连播的执行器：防重、循环保护、失败原因都写成人话（不静默停住） |
+| `PlaySwitcher.kt` | 79 | 剧集/数据源的选择与切换：本地能切就本地切，否则回传给电脑 |
+| `PlayerPickerDialog.kt` | 140 | 播放层的「剧集 / 数据源」弹窗（分两组，当前项上色） |
+
+> `MediaSources.kt`（Media3 的 `MediaSource` 组装）与 `PlaybackEvents.kt`（Media3 的
+> `Player.Listener` 桥）在换 GSY 时**已删除** —— 前者换成 `PlayHeaders.kt`，
+> 后者换成 `SakanaGsyPlayer` 里对 GSY 回调的覆写。**不留两套播放器**是这次改造的硬要求。
 
 **封面缓存（三级：内存 → 磁盘 → 网络）**
 
@@ -591,21 +687,21 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
 | `Receiver.kt` | 176 | 运行期外壳：控制服务 + 发现服务的启停、配置变更重启、连接统计 |
 | `ReceiverApp.kt` | 16 | Application：初始化 Settings / 同步 / 封面缓存（含启动清理） |
 | `MainActivity.kt` | 273 | 主界面接线、两个形态的切换、返回键分级、生命周期、低内存兜底 |
-| `PlaybackUi.kt` | 278 | 播放层：官方 `PlayerView` + 自写控制栏、手势、全屏、提示气泡 |
+| `PlaybackUi.kt` | 299 | 播放层：GSY 原生播放视图 + 业务按钮条接线、手势、全屏、提示气泡 |
 | `FullscreenController.kt` | 74 | 真全屏：edge-to-edge、系统栏隐藏/恢复、屏幕方向与"锁定方向" |
 | `HeaderBinder.kt` | 119 | 顶部状态区（设备名/大字状态/副状态/地址/**同步状态行**） |
 | `StatusText.kt` | 56 | 顶部那两行文字怎么拼（状态与副状态的优先级） |
 | `TimeText.kt` | 55 | **时间文案**：`mm:ss` 与"刚刚 / N 小时前 / 昨天"（播放层、历史卡片、设置页共用） |
-| `HomeBinder.kt` | 65 | 单一 RecyclerView 的接线、滑动位置保护、避免无谓重绘 |
-| `HomeRows.kt` | 86 | 首页要显示哪些行（收藏全部 + 历史折叠）—— 纯逻辑，有单测 |
-| `HomeAdapter.kt` | 185 | 首页多类型适配器（分区标题/空态/收藏格/历史卡/「查看全部」） |
+| `HomeBinder.kt` | 113 | 收藏/历史两个界面 + 顶部 Tab：两个列表各自独立滚动位置 |
+| `HomeRows.kt` | 58 | 两个界面各自的"行模型"（收藏全部 / 历史全部）—— 纯逻辑，有单测 |
+| `HomeAdapter.kt` | 158 | 两个界面共用的适配器（空态 / 收藏格 / 历史卡三种行） |
 | `UiHelpers.kt` | 262 | 同步状态文案（含离线"缓存于"）、选集/详情弹窗、相对时间、字节格式化、剪贴板 |
 | `SettingsUi.kt` | 168 | 设置页里较独立的控件：网卡选择弹窗、最近地址、**图片缓存区块**、字节格式化 |
 | `SettingsActivity.kt` | 278 | 设置页 |
 | `BootReceiver.kt` | 29 | 开机自启（见"已知限制"） |
 
 界面资源：`activity_main.xml`（首页层 + 播放层）、`activity_settings.xml`（表单 + 图片缓存区块）、
-`player_control_view.xml`（自写的 Media3 控制栏，根节点 `<merge>`）、
+`player_overlay.xml`（叠在 GSY 原生控制栏上的业务按钮条 + 重试按钮 + 提示气泡）、`values/ids.xml`（声明 `surface_container`，用来把手势挂到 GSY 自己的画面容器上）、
 `item_favorite.xml`（收藏一格）、`item_history.xml`（历史一张卡）、`item_section.xml`、
 `item_empty.xml`、`item_action.xml`、`item_episode.xml`、`item_recent_host.xml`、
 `res/drawable/ic_*.xml` 共 13 个自己画的矢量图标（含启动图标前景）、
@@ -677,6 +773,22 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
   并给一个「重试」按钮（重新加载**当前这一集**并从 0 开始）。电脑端也可以随时重发 `/play`。
   接收端不擅自重连，是为了不把"地址已过期"变成无限重连。
 - **没有字幕/音轨切换**，也不支持外挂字幕。
+- **播放器已经是 GSYVideoPlayer**（`StandardGSYVideoPlayer`，内核是 exo2 = Media3 1.10.1）。
+  换的原因、代价（debug 包 6.2MB → 18.9MB）、以及 GSY 给不了什么，全部写在 **§5b**。
+  真机验证的证据在 **§6.8**。
+- **控制栏 = GSY 原生的那一条**（用户看过真机后点名要的观感），业务按钮是**叠**在它底栏上方的
+  一小条（不是另拼一条控制栏）。GSY 原生的播放/暂停（屏幕正中，播放中自动隐藏）、进度条/时间、
+  全屏键、返回键都原样可见可用；GSY 没有的业务按钮（选集/设置/上一集/下一集/±10 秒/
+  倍速/音量±/方向锁/铺满）在 `player_overlay.xml` 里补上。这些取舍逐条写在 §5b 的
+  "GSY 给不了什么"与 ⑥。
+- **GSY 的「倍速」只有内核没有入口**：exo2 支持 `setSpeed`，但它的控制栏里没有倍速按钮，
+  所以倍速菜单是我们在按钮条上自己加的（0.5x…2.0x）；长按 2× 速的手势照旧可用。
+- **中央播放键在暂停时会跟"点画面"抢位置**：这是 GSY 原生行为 —— 播放中它是隐藏的，
+  所以只在暂停/播完时点正中会变成"继续播放"（那正是它该做的事）。
+- **切集/连播依赖电脑端补字段**（见 2.5c 的两张表）：**电脑端 V1.1 已经补上了**
+  （`subjectId` / `sources` / `sourceId`，实现在 PlayerPage + cast.ts + castSync.ts）。
+  所以现在只剩"真机验证"这一项没做；如果接的是**旧版电脑端**（V1.0 及以前），
+  接收端仍然只能"本地有地址就切、否则让电脑去搜"，没有条目 id 时连播会明确告诉你"没有条目 id"。
 - **有 9 张封面永远下不下来（电脑端的数据问题，不是缓存的问题）**：真机验证时发现，
   86 条收藏里有 9 条的封面地址是**直连 `http://lain.bgm.tv/...`**，而这台设备所在网络把
   `lain.bgm.tv` 解析成了 `31.13.68.169`（一个 Facebook 的 IP，典型的 DNS 污染），
@@ -753,18 +865,216 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
 
 **验证状态**
 
-- 已经验证：编译通过、打包通过、协议层/网卡选择/播放列表导航/首页行模型/同步客户端与合并逻辑的自测（见下节）。
-- **没有验证**：**未上机**（没有真机，模拟器在本机沙箱里跑不起来，证据见 6.3）；
-  电脑端的投屏通道（`cast.ts`）是**读代码对齐**的，
-  电脑端的**同步服务这一轮还没有代码**（协议是按需求里给的字段实现的），所以两边都没有真正联调过。
-  下面这些都还没有实测：
-  - UI 实际观感、**真全屏与手势**的实际效果（刘海区域、边缘上滑唤出系统栏、返回键顺序）；
-  - 新控制栏在真机上的排版与手感；
+- 已经验证：编译通过、打包通过、协议层/网卡选择/播放列表导航/首页行模型/同步客户端与合并逻辑的自测，
+  以及**播放层换 GSYVideoPlayer 之后的真机验证**（vivo V2302A，证据见 6.8 与 6.2 的 V1.2 那一条）：
+  起播与请求头（含 HLS 的每一个分片）、HLS 时长与拖动、控制栏自动隐藏与点画面唤出、
+  手势拖动 seek、横屏全屏与返回键两段式、选集弹窗、自动连播与防重、铺满/适应。
+- **仍然没有验证**：
+  - 电脑端**界面里点投屏**这条完整链路：本轮是直接 `POST /play` 验的，没从电脑端界面点一遍
+    （历史上报这一条已经验过，见 6.8 i）；
+  - release 包（R8 / 资源压缩）换 GSY 之后的体积与混淆行为；
   - 电视盒子遥控器的焦点行为；
-  - 真实 CDN 的拉流表现、`headers` 是否被接受；
-  - 同步端点的真实行为（端口是不是 52890、字段是否与我们解析的一致、`play-subject` 的返回）。
-  第一次真机联调时请重点看这几点。
+  - 真实第三方 CDN 的拉流表现（本轮验的是自建服务端的"必须带 Referer 才给流"场景，
+    这只证明**头确实发出去了**，不证明某个具体站点一定会接受）；
+  - 刘海区域与边缘上滑唤出系统栏的实际观感（全屏与横屏本身验过了）。
 
+---
+
+## 5b. 最终结论：播放层已换成 GSYVideoPlayer（v1.2），控制栏用 GSY 原生的那一条
+
+用户点名要把内置播放器换成 GSYVideoPlayer；**看过第一版真机效果之后又追加了一条明确要求**：
+「控制栏 UI 不好看，就用 GSYVideoPlayer 内置的播放器控制栏，顺便再增加需要的控制栏按钮」。
+所以最终形态是——**GSY 原生的控制栏原样用**（我们没有改它一个字节，连"为贴合白蓝配色而改它
+样式资源"这件事都撤掉了），业务按钮**叠**在它底栏上方那一小条里。
+下面是全部结论：换成了什么、请求头到底通不通、代价多少、以及 GSY 给不了什么（这几件都得自己补）。
+
+### ① 换成了什么
+
+```groovy
+// settings.gradle → dependencyResolutionManagement.repositories 里加（排在最后）
+maven { url = 'https://jitpack.io' }
+
+// app/build.gradle → dependencies 里加
+implementation 'com.github.CarGuo.GSYVideoPlayer:gsyvideoplayer-java:14.0.0'
+implementation 'com.github.CarGuo.GSYVideoPlayer:gsyvideoplayer-exo2:14.0.0'
+```
+
+- **视图 + 控制栏 = GSY 原生的那一条，我们没有改它一个字节。**
+  `StandardGSYVideoPlayer` 的子类 `SakanaGsyPlayer` 里**没有覆写 `getLayoutId()`**，
+  所以 GSY 用的就是它自己的 `video_layout_normal.xml`：屏幕中央的播放/暂停键、
+  顶栏的返回键与标题、底栏的进度条 / 时间 / 全屏键、缓冲转圈、控制栏隐藏后那条细进度线，
+  全是 GSY 原生的图标与配色。
+  （**上一版曾经覆写 `getLayoutId()` 换成一套白蓝配色 + 自己拼一整条控制栏 —— 用户看过真机
+  之后明确说那条不好看、要 GSY 的原生观感，所以整条撤掉了**，连自绘的 `player_gsy_view.xml`、
+  `player_seek.xml`、`player_seek_thumb.xml`、`player_progress_line.xml` 一起删了。）
+- **业务按钮是"叠"上去的，不是"另起一条控制栏"**：GSY 的控制栏里没有业务按钮
+  （选集、上一集/下一集、±10 秒、倍速、方向锁、画面比例、音量±、设置），
+  所以 `player_overlay.xml` 里那一排按钮由 `SakanaGsyPlayer.installExtraBar()`
+  注入到 GSY 自己的视图树里、**锚在它底栏的正上方**，并跟着底栏一起显隐。
+  具体位置与逐按钮验证见本节 ⑥。
+  为什么不做成"改 GSY 的布局"：那等于把 GSY 的控制栏抄一份进来自己维护，
+  既是用户明确不要的，也会在 GSY 升级时立刻过期。
+- **内核没变**：`gsyvideoplayer-exo2:14.0.0` 里面就是 **androidx.media3 1.10.1**，
+  被本工程原有的 1.11.1 对齐上去 —— 也就是说**换的是视图与控制层，解码引擎还是原来那套 Media3**。
+  所以 **media3 的三个依赖一个都没删**（GSY 的 exo2 直接建在 Media3 的 `MediaSource` /
+  `DataSource` 上，请求头就是靠它带出去的）。
+- **删掉的旧播放层文件**：`MediaSources.kt`（Media3 的 MediaSource 组装 → 变成 `PlayHeaders.kt`）、
+  `PlaybackEvents.kt`（Media3 的 `Player.Listener` 桥 → 变成 `SakanaGsyPlayer` 里对 GSY 回调的覆写）、
+  `player_control_view.xml`（自写的 Media3 控制栏 → 换成 GSY 原生控制栏 + `player_overlay.xml` 按钮条）。
+  **没有两套播放器并存**（这是这次改造的硬要求）。
+- **启动时先选内核**：`ReceiverApp.onCreate` 里
+  `PlayerFactory.setPlayManager(Exo2PlayerManager::class.java)` + `GSYVideoManager.instance()`。
+  GSY 默认的内核是 **ijk**（`PlayerFactory.getPlayManager()` 里写死的兜底值），
+  而 ijk 的原生库（`gsyvideoplayer-arm64` 那一串）我们**故意没引** ——
+  不设这一行，第一次播放就会以"找不到 ijk 原生库"失败。顺手把渲染方式设成
+  `GSYVideoType.SURFACE`（和旧版 `app:surface_type="surface_view"` 对齐）。
+
+### ② 请求头：**通**（这是最关键的结论，先给结论再给证据）
+
+**能带。** 链路逐段核对过（反编译 AAR 字节码，不是猜的）：
+
+```
+GSYVideoOptionBuilder.setMapHeadData(map)
+  → GSYModel.mapHeadData
+  → Exo2PlayerManager.initVideoPlayer()                    (tv.danmaku.ijk.media.exo2)
+       mediaPlayer.setDataSource(context, uri, mapHeadData)
+  → ExoSourceManager.getHttpDataSourceFactory(..., headers)
+       new DefaultHttpDataSource.Factory().setDefaultRequestProperties(headers)
+```
+
+`setDefaultRequestProperties` 正是换 GSY 之前用的那条路：请求头是**默认请求头**，
+HLS 的**主列表、子列表、以及每一个分片**都会自动带上，所以"设备直连 CDN 拉流、
+电脑不做中转"这个前提在 GSY 上依然成立（`caps` 里 `headers` 的承诺没有丢）。
+
+**真机证据（§6.8 有完整命令）**：起了一个"**没有 `Referer: sakana-header-test` 就回 403**"
+的本地 HLS 服务端（`android-receiver/.verify/hdr-server.js`），`/play` 里带上
+`Referer` / `Cookie` / `UserAgent`（同时故意带上 `Range` 和 `Accept-Encoding` 好验证过滤）：
+
+```
+OK   GET /index.m3u8 referer="sakana-header-test" cookie="sakana=1; t=2" ua="SakanaReceiverSelfTest/1.0" range="(无)" accept-encoding="gzip"
+OK   GET /seg00.ts   referer="sakana-header-test" cookie="sakana=1; t=2" ua="SakanaReceiverSelfTest/1.0" range="(无)" accept-encoding="identity"
+...（10 个分片全是 OK）
+```
+
+- 播放成功，`/info` 报 `state=playing`、`durationMs=40000`（HLS 时长解析正常，可拖进度）；
+- **每一个** m3u8/ts 请求都带上了 Referer 与 Cookie —— 这就是"分片也带头"的直接证据；
+- `Range` 是 `(无)`：电脑端带了、接收端**丢掉了**（靠它做分片与 seek，客户端带了会坏）；
+- 与旧实现（Media3 直连）只剩两处差别，都是 GSY 的接口决定的：
+  1. **`User-Agent` 现在当成一个普通请求头放在 map 里**（GSY 没有暴露
+     `DefaultHttpDataSource.Factory.setUserAgent`）。效果一样：`DefaultHttpDataSource`
+     会把 map 里的头原样 `setRequestProperty` 出去。协议里的 `UserAgent` 会被规范成标准头名。
+  2. **跨协议跳转靠 map 里一个特殊键**：GSY 的 `ExoSourceManager` 读
+     `allowCrossProtocolRedirects` 来决定 `setAllowCrossProtocolRedirects(...)`，所以
+     `PlayHeaders` 会主动塞一个 `"true"`。副作用是它同时也会被当成一个 HTTP 头发出去
+     （GSY 自己的写法就是这样），多一个没人认识的头不影响播放；不带它的后果很具体：
+     不少站点是 http 入口 302 到 https 的 CDN，默认不允许跨协议跳转时整条流直接拉不起来。
+
+### ③ 代价（实测，不是估计）
+
+| 项目 | 不加 GSY | 加了 GSY 14.0.0 |
+| --- | --- | --- |
+| debug APK | 6,492,973 字节（6.2 MB） | **19,739,053 字节（18.8 MB）**，约 ×3 |
+
+新增的传递依赖里，下面这些是**本来刻意不引**的（见 app/build.gradle 的注释）：
+
+- `androidx.appcompat:appcompat` + `appcompat-resources`（本工程一直刻意避开 AppCompat）；
+- `com.google.android.gms:play-services-cast-framework` / `play-services-cast` /
+  `play-services-base` / `-basement` / `-tasks` / `-flags`（GSY 的 exo2 模块引了 `media3-cast`，
+  于是把整套 Play Services 拖了进来）；
+- `androidx.media3:media3-cast` / `media3-session` / `media3-datasource-rtmp`；
+- `io.github.carguo:gsyijkjava:1.0.0`（ijkplayer 的 Java 绑定，即使只用 exo2 内核也会带进来）。
+
+**用户已知情并接受**这个体积。顺带一提：上一轮写过的"PowerShell/curl 测出来没网"是**测量错误**
+（沙箱里那两个工具的 TLS 凭据不可用），**Gradle 跑在 JVM 上、TLS 是好的** ——
+`dl.google.com` / `repo1.maven.org` / `jitpack.io` 全部 200，GSY 14.0.0 下载+编译链接都成功。
+
+### ④ GSY 给不了什么（逐条都是"自己补的"或"明确取舍"）
+
+| 事项 | GSY 的做法 | 我们的做法（为什么） |
+| --- | --- | --- |
+| 控制栏几时隐藏 | 状态一变就显示，然后排一个 2.5 秒的隐藏任务 | **把它的计时器覆写成空方法**，显隐仍归 `PlaybackControls` + `ControlsPolicy`（v1.1 跟 Media3 打过一模一样的架，结论是"只能有一个负责人"） |
+| 自带的全屏 / 返回按钮 | `fullscreen` / `back` 走 GSY 自己那套逻辑 | **图标与位置原样保留**，只换落点：返回键 = 退出播放，全屏键 = 我们自己的全屏开关（横屏 + 隐藏系统栏 + 刘海可用）。GSY 原生那套全屏要有外部容器配合，在这个布局里按了不会有任何反应 |
+| 请求头里的 UserAgent | 没有 `setUserAgent` 接口 | 当成普通头 `User-Agent` 放进 map（见 ②） |
+| 音量 / 静音 | 只对外暴露 `setNeedMute(boolean)` | 音量在内核单例上（`GSYVideoManager.instance().player.setVolume`）；"静音 = 音量设 0 + 自己记住原档位"仍然要自己做，ExoPlayer 也没有静音开关 |
+| 状态与错误 | 只给 `what` / `extra` 两个整数 | 协议枚举由 `PlaybackState.kt` 自己映射；错误翻译成人话（"加载失败（地址打不开或需要请求头）"…），**出错仍然如实报 `idle`**，免得电脑端的"缓冲中"永远转下去 |
+| 上一集 / 下一集 / ±10 秒 | GSY 没有这几个按钮 | `PlayerButtons.kt` 自己接。这比旧版**更准**：旧实现里 `PlayerController` 一次只放一集，Media3 的上一集/下一集其实是灰的、点了没反应 |
+| 手势 | GSY 自带亮度/音量/拖动进度 + 点击切换 | 用 `setIsTouchWiget(false)` 全部关掉，换成我们自己的 `PlayerGestures`（语义不一样：双击累加最多 ±60 秒、长按 2×、横滑预览松手才 seek） |
+| 倍速 | 有 `setSpeed`，**控制栏里没有倍速入口** | 按钮条上加一个倍速按钮（按钮上直接显示当前倍速），点开是一个 0.5x/0.75x/1.0x/1.25x/1.5x/2.0x 的菜单，选完走 `setPlaybackSpeed`；长按 2× 速的手势照旧 |
+| 业务按钮（选集/设置/音量/方向锁/画面比例/±10 秒/切集） | GSY 一个都没有 | 叠一条按钮条（见 ⑥），没有去改 GSY 的布局 |
+| 中央播放键的位置 | 屏幕正中央（`R.id.start`） | **原样保留**（用户要求"播放/暂停那套原样可见可用"）。它在**播放中会自己隐藏**，所以"点一下画面唤出控制栏"在播放中不受影响；只有暂停/播完时它才出现，那时点正中就是继续播放 —— 这正是它该有的行为 |
+| 返回键 / 全屏键按下去做什么 | 走 GSY 自己的逻辑 | 图标与位置**完全不动**，只换落点：返回键 = 退出播放（和返回键第二步、旧版顶栏的 ✕ 是同一个方法）；全屏键 = 我们自己的全屏开关。GSY 原来的全屏实现需要外面有一套容器配合（`startWindowFullscreen`），在本工程的布局里按了不会有任何反应 —— 那才是真的"按钮不可用" |
+| 「铺满 / 适应」 | `GSYVideoType.setShowType(...)`，以及 `GSYSurfaceView.setRenderMode(...)` | **两个都试过、都不行**：show type 在本工程的布局下是空操作（`MeasureHelper.doMeasure` 在两个 measureSpec 都是 `EXACTLY` 时只按视频自身宽高比缩放，压根不看它）；而 `setRenderMode` 在 14.0.0 里**是空实现** —— 反汇编它只有一句 `Debuger.printfLog("... not support setRenderMode now")`。最后改成给画面视图设 `scaleX/scaleY`（`VideoFill.kt`），真机实测有效 |
+
+**没有一件是靠"猜"或"差不多"过去的**：上表每一条都在真机上验过（§6.8），
+或者是有明确取舍、在代码注释里写清了为什么。
+
+### ⑤ 为什么这次能换，上一次没换
+
+上一轮的两条理由现在都不成立了：
+
+1. **有真机了**（vivo V2302A，USB 连着）。这次是**每换一层就验一次**：
+   先验起播与请求头，再验控制栏显隐与手势，最后验全屏、返回键两段式、选集弹窗、自动连播、
+   按钮条上的每一个按钮。过程中真机上抓到并修掉了三个只有上机才会暴露的问题：
+   - **启动即崩**：`PlayerActions` / `PlayerButtons` 是**构造时**就按 id 去播放器里找控件的，
+     而按钮条是后装的 → `findViewById(...) must not be null`。现在用一个 `init` 块把
+     `installExtraBar()` 提到它们之前（Kotlin 的 init 块与属性初始化严格按书写顺序执行）。
+   - 「铺满」按钮点得动、设置也存下来了，但**画面一点没变** —— GSY 的 show type 与
+     `setRenderMode` 在本布局下都不起作用（后者是空实现），改成视图变换后才真的铺满。
+   - 我们自己那版"点画面唤出控制栏"被 GSY 中央的播放键抢过位置；改成原生方案后，
+     播放中那个键是隐藏的，两者不再冲突。
+2. **"要重写整个播放层"这件事确实发生了，但比预想的小**：做法是"用 GSY 原生控制栏 +
+   我们只多接管三件事（显隐归属、手势挂载点、画面比例），业务按钮叠一条上去"，
+   而不是"用 ImageButton 自己拼一套控制栏"。上一轮担心的"进度条拖动+时间气泡+缓冲转圈
+   要重新实现一遍"没有发生 —— 那些仍然是 GSY 的。
+
+### ⑥ 业务按钮条：位置与逐按钮验证
+
+一排 11 个按钮，**贴在 GSY 原生底栏的正上方**（底边距在运行时被修正成底栏的真实高度），
+和它同一时刻显隐。真机上 `uiautomator dump` 读到的实际坐标（横屏 2800×1260）：
+
+| 按钮 | 控件 | 真机 bounds（像素） |
+| --- | --- | --- |
+| 选集 | ImageButton `cd_pick_episode` | `[372,952][540,1120]` |
+| 设置 | ImageButton `cd_settings` | `[540,952][708,1120]` |
+| 上一集 | ImageButton `cd_prev` | `[768,952][936,1120]` |
+| 后退 10 秒（文字 `−10s`） | TextView `cd_rew10` | `[936,952][1104,1120]` |
+| 前进 10 秒（文字 `+10s`） | TextView `cd_ffwd10` | `[1104,952][1272,1120]` |
+| 下一集 | ImageButton `cd_next` | `[1272,952][1440,1120]` |
+| 倍速（显示当前倍速） | TextView `cd_playback_speed` | `[1500,952][1696,1120]` |
+| 音量减 | ImageButton `cd_vol_down` | `[1696,952][1864,1120]` |
+| 音量加 | ImageButton `cd_vol_up` | `[1864,952][2032,1120]` |
+| 锁定方向 | ImageButton `cd_lock_orientation` | `[2092,952][2260,1120]` |
+| 铺满 / 按比例 | ImageButton `cd_resize_fill` | `[2260,952][2428,1120]` |
+
+GSY 原生那条控制栏的坐标（同一份 dump）：标题 `[168,50][823,118]`（它左边就是原生返回键）、
+当前时间 `[56,1163][155,1216]`、总时长 `[2555,1163][2655,1216]`、进度条与全屏键在它们之间
+（全屏键在最右 ~`x=2713..2741`）。**两条互不遮挡**：按钮条在 y≈952-1120，原生底栏在 y≈1163-1216。
+
+逐个点过（真机，`/info` 读数就是证据）：
+
+| 按钮 | 点击后的现象 |
+| --- | --- |
+| 选集 | 弹出「剧集 / 数据源」弹窗，两组都在：`数据源（线路）` 下 `自检线路 1（当前）`/`自检线路 2`，`选集（共 2 集）` 下当前集标着「· 当前播放」 |
+| 设置 | 打开 `SettingsActivity`（`topResumedActivity=.../.SettingsActivity`），返回键回到播放层 |
+| 上一集 / 下一集 | `/info` 的 `index` 1→0 / 0→1 |
+| 后退 10 秒 | `positionMs` 30000 → 20000 |
+| 前进 10 秒 | `positionMs` 818 → 10818 |
+| 倍速 | 弹出 `0.5x / 0.75x / 1.0x / 1.25x / 1.5x / 2.0x` 菜单（选中项打了勾） |
+| 音量减 / 音量加 | `/info` 的 `volume` 100→95 / 95→100 |
+| 锁定方向 | 弹提示气泡（`/info` 不变，本来就是对的） |
+| 铺满 / 按比例 | 画面宽度 2240 ⇄ 2800 来回切（像素统计） |
+
+GSY 原生的那几个也一样原样可用（同一次真机验证）：
+
+| 原生控件 | 现象 |
+| --- | --- |
+| 中央播放键（仅暂停/播完时出现） | 暂停态点它 → `state` 变 playing、位置继续走 |
+| 进度条（拖动） | 在 y=1190 横滑 → `positionMs` 23448 → 1816 |
+| 全屏键（底栏最右） | 点一下退出全屏（系统栏出现、画面 2240→2016），再点一下回到全屏 |
+| 返回键（顶栏左上） | `state` playing → idle，回到首页 —— 与返回键第二步、旧版顶栏的 ✕ 完全一致 |
+
+两条控制栏的**显隐是同一个时机**（像素验证）：起播静置 8 秒后，y1010-1060（按钮条）
+与 y1170-1210（原生底栏）两处都测不到白色像素；点一下画面，两处同时回来。
 ---
 
 ## 6. 验证记录（本机实际执行）
@@ -775,8 +1085,57 @@ $env:ANDROID_USER_HOME = "$ws\.android-home"
 cd E:\sakana.app\android-receiver
 $env:JAVA_HOME='E:\environment\jdk-21.0.2'
 $env:ANDROID_HOME='E:\environment\Android SDK'
-.\gradlew.bat clean assembleDebug assembleRelease --console=plain --offline --no-watch-fs
+$env:ANDROID_USER_HOME='E:\sakana.app\android-receiver\.android-home'   # 仓库里那把 debug.keystore 在这里
+$env:GRADLE_USER_HOME='E:\sakana.app\android-receiver\.gradle-home'     # ← 见下面「沙箱里的坑」
+.\gradlew.bat assembleDebug --offline
 ```
+
+## ⚠️ 沙箱里的两个坑（踩过，别重复）
+
+1. **必须设 `GRADLE_USER_HOME` 到工作区里**。默认的 `C:\Users\<用户>\.gradle` 在沙箱里**只读**，
+   而 `gradlew` 启动时要在 `~/.gradle/wrapper/dists/...` 里创建 `.lck` 锁文件 ——
+   创建失败会直接 `FileNotFoundException: ...zip.lck (拒绝访问)`，连 Gradle 都起不来。
+   指向 `.gradle-home`（工作区内、已 gitignore）之后正常。
+2. **`GRADLE_RO_DEP_CACHE` 不足以当依赖缓存**。把只读的 `~/.gradle/caches` 指给它（里面
+   `modules-2` 完整）看起来可行，实际会出现"**元数据解析出来了、构件却不在编译类路径上**"，
+   典型症状就是 Kotlin 编译器报
+   `error: cannot access built-in declaration 'kotlin.String'. Ensure that you have a dependency on the Kotlin standard library.`
+   （`kotlin-stdlib-2.2.21.jar` 明明在只读缓存里）。
+   可靠做法：把 `~/.gradle/caches/modules-2` **整份镜像**到 `.gradle-home/caches/modules-2`
+   （约 1.6 GB / 3965 个文件），之后 `--offline` 就一切正常。
+3. **用户级 init 脚本看不见了**：镜像脚本在 `~/.gradle/init.d/sakana-mirror.gradle`，
+   而 `GRADLE_USER_HOME` 一改，Gradle 就只读 `<GRADLE_USER_HOME>/init.d/`。
+   要镜像生效就得把它**复制一份**到 `.gradle-home/init.d/`（本仓库已经这么做了）。
+4. **Kotlin 编译守护进程起不来**（沙箱不允许命名管道）：日志里会有
+   `Failed to compile with Kotlin daemon ... Could not connect to Kotlin compile daemon`，
+   然后 Gradle 自动退回进程内编译（`Using fallback strategy: Compile without Kotlin daemon`）——
+   **这是噪音，不是失败**，只要最后一行是 `BUILD SUCCESSFUL` 就没问题。
+
+### 6.1b 构建（V1.1 收尾轮复验）
+
+```powershell
+$env:JAVA_HOME='E:\environment\jdk-21.0.2'; $env:ANDROID_HOME='E:\environment\Android SDK'
+$env:ANDROID_USER_HOME='E:\sakana.app\android-receiver\.android-home'
+$env:GRADLE_USER_HOME='E:\sakana.app\android-receiver\.gradle-home'
+.\gradlew.bat assembleDebug --offline
+```
+
+```
+BUILD SUCCESSFUL in 38s
+```
+
+- `app\build\outputs\apk\debug\app-debug.apk` —— **6,492,973 字节**，
+  SHA256 `75DFA4EA82FA2C9FE7D2EF229117A7CECCD97E2F11D71DDA0FC864AFEEDE9A3E`
+- 签名核对（`apksigner verify --print-certs`）：
+
+  ```
+  Signer #1 certificate DN: C=US, O=Android, CN=Android Debug
+  Signer #1 certificate SHA-256 digest: cd9567a9f059b1e0c85ba60c9f0079d3f836b4c167c6a712aa33a47d71523a5f
+  ```
+
+  与线上包**同一把**（`cd9567a9…`），所以真机能原地覆盖安装。
+  这把 key 就在仓库里：`.android-home/debug.keystore`（`ANDROID_USER_HOME` 指到它，AGP 才会用它签名）。
+- 依赖侧另有一次**联网**构建（带 GSY 探针）也是 BUILD SUCCESSFUL，见 §5b。
 
 结果：
 
@@ -846,9 +1205,42 @@ resource 0x7f0a0001 mipmap/ic_launcher_round
 用一个临时 Java 测试类加载上面编译出的 class 后执行：
 
 ```
-==== 121 passed, 0 failed ====    ← 协议 + 同步 + 首页行模型 + 封面缓存 + Activity 接线顺序
+==== 121 passed, 0 failed ====    ← V1.0（协议 + 同步 + 首页 + 封面缓存 + 接线）
+==== 55 passed, 0 failed ====     ← V1.1（两个界面 + 数据源解析 + 切集/连播决策 + 接线）    ← 协议 + 同步 + 首页行模型 + 封面缓存 + Activity 接线顺序
 ==== 71 passed, 0 failed ====     ← 收尾时又对着**最终那一版构建**单独跑了一遍封面缓存与接线部分
+==== 132 passed, 0 failed ====    ← V1.2（换成 GSYVideoPlayer 之后：原有 55 条 + 77 条播放层静态守卫）
 ```
+
+V1.2 那 77 条新断言覆盖的都是"换播放器最容易悄悄弄丢"的东西，命令可复现：
+
+```powershell
+cd E:\sakana.app\android-receiver
+$env:JAVA_HOME='E:\environment\jdk-21.0.2'
+$cp = ".selftest7\out;app\build\tmp\kotlin-classes\debug;" +
+      ".gradle-home\caches\modules-2\files-2.1\org.jetbrains.kotlin\kotlin-stdlib\2.2.21\fa374a986e128314c3db00a20aae55f72a258511\kotlin-stdlib-2.2.21.jar"
+& "$env:JAVA_HOME\bin\javac.exe" -encoding UTF-8 -nowarn -cp $cp -d .selftest7\out .selftest7\V11SelfTest.java
+& "$env:JAVA_HOME\bin\java.exe" '-Dfile.encoding=UTF-8' -cp $cp app.sakana.receiver.V11SelfTest `
+    "app/src/main/java/app/sakana/receiver" "app/src/main/res"
+# => ==== 132 passed, 0 failed ====
+```
+
+具体断言（分十二组）：
+
+| 组 | 钉住的东西 |
+| --- | --- |
+| ① 真的换了、且没留两套 | `activity_main.xml` 用 `SakanaGsyPlayer`、不再有 `PlayerView`；`player_control_view.xml` / `MediaSources.kt` / `PlaybackEvents.kt` 都已删；`MainActivity` 的字段类型与 import |
+| ② **控制栏是 GSY 原生的** | 没有覆写 `getLayoutId`、自绘的白蓝控制栏布局与进度条资源都已删、GSY 的返回/全屏/中央播放键**没有**被钉成 GONE、原生返回键接"退出播放"、原生全屏键接自己的全屏开关 |
+| ③ 业务按钮条 | 叠进播放器视图树、锚在 `mBottomContainer`、显隐镜像它、`ids.xml` 只声明 `surface_container`、装好的时机早于 `PlayerActions`（否则构造即 NPE） |
+| ④ 用户点名要补的 11 个按钮 | 逐个断言 id 存在、`contentDescription` 用的是**已有的** `cd_*`（不新造中文）、倍速菜单与 `setPlaybackSpeed` 接通、退出播放走原生返回键 |
+| ⑤ 内核 | 启动时 `setPlayManager(Exo2PlayerManager)` + 立刻 `GSYVideoManager.instance()`（不设就会退回 ijk，而 ijk 原生库没引）+ `setRenderType(SURFACE)` |
+| ⑥ **请求头** | `setMapHeadData(headData)` 在、`headData` 来自 `PlayHeaders.build`、`Range`/`Accept-Encoding`/连接层的头仍然被丢、`User-Agent` 走 map、`allowCrossProtocolRedirects` 在 |
+| ⑦ 手势 | 同时挂 `gesture_layer` 与 `installGestureTarget`；手势层仍排在播放器**之前**；`PlayerGestures` 的双击/长按逻辑没被动过 |
+| ⑧ 控制栏只有一个负责人 | GSY 的 `startDismissControlViewTimer()` 被覆写成空方法、超时设 0、显隐只由 `ControlsPolicy` 的跃迁驱动、`PlaybackControls` 里不再有 `PlayerView` |
+| ⑨ 全屏与返回键 | 返回键先 `exitFullscreenIfNeeded()` 再判断播放层；进播放层就进全屏；全屏键是来回开关 |
+| ⑩ 铺满 | 全仓库不再调 `GSYVideoType.setShowType`、也不用 GSY 的 `setRenderMode`（14.0.0 里是空实现）、改用画面视图 scale、每心跳校准 |
+| ⑪ 旧行为 | 音量走内核单例、静音靠"音量 0 + 记原档位"、播放失败有人话文案 + 重试按钮、换集前先 `release()` |
+| ⑫ 协议映射 | 出错如实报 `idle`；三种 GSY 状态映射成 `playing`/`paused`/`ended` |
+
 
 > 两次都是**对着 `clean` 之后重新编译出来的 class** 跑的，不是对着上一轮的旧产物。
 > 第二次只覆盖本轮改过的那部分（缓存键/缩放/LRU/离线回退/退避/并发合流/接线扫描 + 首页与字节格式化），
@@ -1192,6 +1584,12 @@ t≈2 秒与 t≈9 秒各截一张图，再用 `.e2e/png-count.mjs` / `png-diff.
 
 **d) 顶栏两个出口**
 
+> ⚠️ **这一小节记的是 v0.3.8 那一轮**（当时控制栏还是自写的 Media3 控制栏）。
+> v1.2 换成 GSY 原生控制栏之后，这两个"图标 + 文字"的出口没有了：
+> 「退出播放」变成 **GSY 原生返回键**（落点仍是同一个 `exitPlayback()`，
+> 见 §5b ⑥ 与 §6.8 f），「退出全屏」变成 **GSY 原生全屏键**（两向开关）。
+> 下面这段保留，是为了说明"返回键第二步 = exitPlayback"这个约定是从什么时候定下来的。
+
 「退出全屏」（`btn_exit_fs`，只在全屏时显示）+「退出播放 ✕」（`btn_exit_play`），
 都是图标 + 文字 + `contentDescription`。✕ 走 `MainActivity.exitPlayback()`，
 **与返回键第二步是同一个方法**（`control("stop")` → 退全屏 → 回首页层，顺带收起控制栏与气泡）。
@@ -1203,6 +1601,237 @@ t≈2 秒与 t≈9 秒各截一张图，再用 `.e2e/png-count.mjs` / `png-diff.
   （同一段 dump 有时有、有时没有，不可靠），拿不到坐标去点。它的逻辑与返回键第二步
   共用同一个方法，静态断言（54 条）已覆盖。
 - 「退出全屏」点击后的竖屏外观、以及返回键「先退全屏再退播放」的两段式，本轮没逐步验证。
+
+---
+
+### 6.8 真机验证：播放层换成 GSYVideoPlayer（v1.2，vivo V2302A / 2800×1260）
+
+设备这次是 USB 连着的（`10AD5P1J4Z000Y5`），所以**下面每一行都是真机跑出来的**，
+不是"读过代码"。测试素材、服务端脚本、截图都留在 `android-receiver/.verify/`（已 gitignore，不进仓库）。
+
+**a. 构建 / 签名 / 覆盖安装**
+
+```powershell
+cd E:\sakana.app\android-receiver
+$env:JAVA_HOME='E:\environment\jdk-21.0.2'
+$env:ANDROID_HOME='E:\environment\Android SDK'
+$env:ANDROID_USER_HOME='E:\sakana.app\android-receiver\.android-home'
+$env:GRADLE_USER_HOME='E:\sakana.app\android-receiver\.gradle-home'
+.\gradlew.bat assembleDebug
+& "$env:ANDROID_HOME\build-tools\36.0.0\apksigner.bat" verify --print-certs app\build\outputs\apk\debug\app-debug.apk
+```
+
+```
+BUILD SUCCESSFUL in 27s
+Signer #1 certificate SHA-256 digest: cd9567a9f059b1e0c85ba60c9f0079d3f836b4c167c6a712aa33a47d71523a5f
+app-debug.apk = 19,739,053 字节（18.8 MB），SHA256 D6E647AA4365D0D17C78405488F0919EDE14A3BC4E019AA0471DBF97E8D5F436
+adb -s 10AD5P1J4Z000Y5 install -r ...  →  Success（原地覆盖，签名与线上包同一把）
+```
+
+58 个 Kotlin 文件全部 ≤300 行（最长 300）。`==== 132 passed, 0 failed ====`（见 6.2 的 V1.2 那一条）。
+
+**b. 把"需要请求头才能播的地址"变成可观察的事实**
+
+自建了一个本地 HLS 服务端，**没有 `Referer: sakana-header-test` 就回 403**
+（`.verify/hdr-server.js`：40 秒纯绿 640×360 HLS，10 个分片；每次请求都把
+referer / cookie / ua / range / accept-encoding 记进日志）：
+
+```powershell
+# 手机 -> 电脑：让设备能访问电脑上的 9099（视频源）
+& $adb -s $d reverse tcp:9099 tcp:9099
+# 电脑 -> 手机：把接收端的控制接口拉到本地
+& $adb -s $d forward tcp:52889 tcp:52889
+node .verify\hdr-server.js 9099          # 后台跑
+node .verify\post.js .verify\play-headers.json   # POST /play（带 Referer/Cookie/UserAgent/Range/Accept-Encoding）
+```
+
+`/play` 载荷里 `headers` 同时给了 `Referer` / `Cookie` / `UserAgent`（要透传的）
+和 `Range` / `Accept-Encoding`（**故意给的**，用来验证过滤）：
+
+```
+OK   GET /index.m3u8 referer="sakana-header-test" cookie="sakana=1; t=2" ua="SakanaReceiverSelfTest/1.0" range="(无)" accept-encoding="gzip"
+OK   GET /seg00.ts   referer="sakana-header-test" cookie="sakana=1; t=2" ua="SakanaReceiverSelfTest/1.0" range="(无)" accept-encoding="identity"
+...（seg01..seg09 同上，全部 OK）
+```
+
+```
+$ curl -s http://127.0.0.1:52889/info
+{"playing":true,"positionMs":9874,"durationMs":40000,...,"state":"playing"}
+```
+
+**结论：请求头通了**，而且是每一个分片都带上了 Referer/Cookie；`Range` 被丢掉（`(无)`）。
+这就是"能不能播线上需要站点鉴权的地址"这条命门的直接证据。详见 §5b ②。
+
+**c. 画面真的在播 + 横屏全屏**
+
+```
+$ adb shell screencap -p /sdcard/t2.png ; adb pull /sdcard/t2.png
+node .verify\bands.mjs t2.png        # 自写的像素统计（这份报告里的"看图"都是它）
+```
+
+```
+图 2800x1260                       ← 横屏全屏（immersive，内容铺满整块屏幕）
+row y=500: 0,193,0×560  0,0,0×140  ← 画面 2240×1260 居中、两侧黑边 280px：16:9 视频在 20:9 屏上"适应"正确
+```
+
+**d. 控制栏自动隐藏 + 点画面唤出（像素级）**
+
+```
+t≈2s（刚起播）: row y=100: 0,57,0×486 0,0,0×99 255,255,255×76   ← 顶栏（半透明深底 + 白字）在
+静置到 t≈8s : row y=100: 0,193,0×560  0,0,0×140                 ← 顶栏没了，只剩画面
+点一下画面后 : row y=100: 0,57,0×486 0,0,0×99 255,255,255×76   ← 又回来了
+```
+
+```
+I SakanaControls: 状态跃迁 playing -> AUTO_HIDE
+I SakanaControls: 安排 4000ms 后隐藏控制栏
+I SakanaControls: 控制栏隐藏（调用前 GSY 侧 visible=true）      ← 4.0 秒后，一次不差
+```
+
+- 点画面**只唤出控制栏、不会暂停**（`playing:true`、`positionMs` 6854 → 9109）——
+  GSY 中央那个播放键**只在暂停/播完时出现**，播放中它是隐藏的，所以两者不冲突。
+- 控制栏隐藏后，屏幕最底下还留着 GSY 那条 2dp 蓝色细进度线（像素上就是 y1253-1259 的蓝色）。
+- **GSY 原生底栏与我们那条业务按钮条是同一时刻显隐**（这是"叠一层"必须成立的条件）：
+  静置 8 秒后，`y1010-1060`（按钮条）与 `y1170-1210`（原生底栏）两处都测不到白色像素；
+  点一下画面，两处同时回来。
+
+**e. 手势（用 `/info` 的位置变化做证据，不靠"看着像"）**
+
+```
+拖 700px（整屏 2800px ≈ 长片时长）：positionMs 5834 -> 18536      ← 水平拖动 seek 生效
+10 分钟测试片：横滑 600px：positionMs 40596 -> 172701（+132s ≈ 600/2800×600s）← 与换算一致
+```
+
+**e2. 业务按钮条：先用 uiautomator 拿到真实坐标，再逐点验**
+
+```powershell
+& $adb -s $d shell uiautomator dump /sdcard/ui_gsy.xml ; adb pull /sdcard/ui_gsy.xml
+# 解析里面的 content-desc，就是每个按钮的真实 bounds（表见 §5b ⑥）
+```
+
+按钮条在 `y=952..1120`，GSY 原生底栏在 `y≈1163..1216`（时间）与最右的全屏键 `x≈2713..2741`：
+**两条互不遮挡**。逐个点过的结果（完整表在 §5b ⑥）：
+
+```
+选集(456,1035)   -> 弹出「剧集 / 数据源」：数据源（线路）2 条 + 选集（共 2 集），当前项标「· 当前播放」
+设置(624,1035)   -> topResumedActivity=.../.SettingsActivity
+下一集(1356)     -> index 0->1        上一集(852) -> index 1->0
+前进10秒(1188)   -> positionMs 818->10818      后退10秒(1020) -> 30000->20000
+音量减(1780)     -> volume 100->95    音量加(1948) -> 95->100
+倍速(1598)       -> 弹出 0.5x/0.75x/1.0x/1.25x/1.5x/2.0x 菜单
+锁定方向(2176)   -> 弹提示气泡
+铺满(2344)       -> 画面宽 2240 <-> 2800（像素统计）
+GSY 原生：中央播放键(暂停态点) -> paused 变 playing；进度条横滑 -> 23448->1816；
+         全屏键 -> 系统栏出现、画面 2240->2016，再点回全屏；
+         返回键(顶栏左上) -> state playing->idle，回首页
+```
+
+**f. 横屏全屏 + 返回键两段式**
+
+```
+（播放中，全屏）顶栏白色元素：[65-601 标题, 1862-1927 选集, 2030-2091 设置, 2186-2222+2254-2428 退出全屏, 2498-2536+2571-2747 退出播放✕]
+返回键第 1 次：仍在播放（state=playing）        ← 只退了全屏，没退播放
+返回键第 2 次：state=idle                     ← 才退出播放、回首页
+```
+
+**g. 选集 / 数据源弹窗**
+
+```
+$ adb shell input tap 1894 105     # 顶栏「选集」
+node .verify\hist.mjs f4.png 400
+row y=400: 255,255,255×359  0,0,0×140  0,77,0×100  46,107,230×31
+```
+
+`46,107,230` 就是主色蓝 `#2E6BE6` —— 弹窗里的"当前项"高亮；大片白色是白底弹窗
+（`uiautomator dump` 在视频播放时读不到浮层节点，所以这里用截图像素判定，这也是 v1.1 记过的方法）。
+
+**h. 自动连播与防重**
+
+用两集（都指向同一条 40 秒 HLS）投屏，观察 `/info`：
+
+```
+t≈40s 第 1 集播完 → index 0 -> 1、state playing              ← 自动连播生效
+再到最后一集播完 →  index 停在 1、state=ended（不再往后跳）   ← 防重与"最后一集"生效
+```
+
+**i. 历史上报（`POST /sync/history`）—— 这条也验了**
+
+`/play` 里带上 `syncUrl` 投一集、播十几秒，再投一次触发下一轮同步：
+
+```
+I SakanaSync: 本地历史已推给电脑：23 条
+I SakanaSync: 同步完成（探测到电脑）：收藏 9 条，历史 23 条
+```
+
+`本地历史已推给电脑` 这一行**只在 `SyncClient.postJson(base, "/sync/history", body)` 返回 ok 时才打印**
+（见 `SyncManager.pushLocalHistory`），所以这就是"播放进度真的推回电脑端了"的证据。
+设备上的本地记录（`shared_prefs/sakana-sync.xml` 的 `history-json`）里能看到这一集的
+`position:11873, duration:40000` —— 这两个数现在来自 GSY，说明换播放器没有把上报链路弄断。
+
+> 附带一个发现：设备当时所在的网络里**真的有一台电脑在跑 Sakana 的同步服务**
+> （`192.168.1.8:52890`），接收端优先用了它而不是自检脚本起的假服务
+> （日志：`探测到电脑同步服务: http://192.168.1.8:52890`）——
+> 也就是说这次推送发给了**真电脑端**，比对着假服务端测更有说服力。
+
+**j. 没能验到的（如实列出来）**
+
+- **release 包**：只构建了 debug，release（R8 + 资源压缩）的体积与混淆行为没重新量过。
+- **真实第三方 CDN 的拉流**：这一轮验的是自建服务端的"必须带 Referer 才给流"场景，
+  它证明**头确实发出去了**，但**不证明某个具体站点一定会接受**（那取决于站点自己的校验规则）。
+- **移动数据下的行为、长时间挂机播放、蓝牙音频**：和播放器实现无关，没测。
+- **电视盒子遥控器的焦点行为**：GSY 的控制栏是普通 View，理论上比自己拼的更容易拿到焦点，
+  但没设备可验。
+- **刘海区域与边缘上滑唤出系统栏的实际观感**：全屏与横屏本身验过了（见 f），
+  刘海那部分只对齐了主题里的 `shortEdges` 设置。
+---
+
+### 6.7 V1.1（两个界面 / 数据源 / 切集 / 连播）：做到了哪一步
+
+**代码做完了，构建与自测复验通过；真机仍然没有，所以"上机实测"这一项还是空的。**
+
+- **构建**：`gradlew assembleDebug --offline` → **BUILD SUCCESSFUL in 38s**（命令与环境见 6.1b）；
+  54 个 Kotlin 文件全部 ≤300 行（最长 300）。
+  APK **6,492,973 字节**，SHA256 `75DFA4EA82FA2C9FE7D2EF229117A7CECCD97E2F11D71DDA0FC864AFEEDE9A3E`；
+  签名用 `apksigner verify --print-certs` 核对为 `cd9567a9f059b1e0c85ba60c9f0079d3f836b4c167c6a712aa33a47d71523a5f`
+  （与线上包同一把 → 可原地覆盖安装）。
+  **没有**把新 APK 拷进 `dist/`（按用户要求，等他验证后自己覆盖并同步电脑端下载地址）。
+- **自测**：**55 条断言 0 失败**，可复现：
+
+  ```powershell
+  cd E:\sakana.app\android-receiver
+  # ⚠️ 注意 gradle 缓存的位置：本仓库的构建环境把 GRADLE_USER_HOME 指到了
+  #    android-receiver\.gradle-home（默认的 ~\.gradle 在受限环境下是只读的），
+  #    所以 kotlin-stdlib 在下面这个路径下；如果你用的是默认 gradle 缓存，
+  #    把它换成 "$env:USERPROFILE\.gradle\caches\modules-2\..." 即可。
+  $cp = ".selftest7\out;app\build\tmp\kotlin-classes\debug;" +
+        ".gradle-home\caches\modules-2\files-2.1\org.jetbrains.kotlin\kotlin-stdlib\2.2.21\fa374a986e128314c3db00a20aae55f72a258511\kotlin-stdlib-2.2.21.jar"
+  & "E:\environment\jdk-21.0.2\bin\java.exe" '-Dfile.encoding=UTF-8' -cp $cp app.sakana.receiver.V11SelfTest "app/src/main/java/app/sakana/receiver"
+  # => ==== 55 passed, 0 failed ====
+  ```
+
+  覆盖：收藏/历史两个界面的行模型、数据源解析、切集与连播决策，以及
+  "两个 Tab 存在""两个列表精确高度""不再有 rv_home""切集先本地后电脑"
+  "自动连播有防重与失败提示"等静态守卫。
+- **未上机（本轮又确认了一次）**：`adb devices` → **列表为空**（USB 上没有任何设备，
+  设备号 `10AD5P1J4Z000Y5` 不出现）；手机也不在网络上（`ping 192.168.1.4` 不通、
+  控制端口 52889 与无线调试 5555 都拒绝连接、UDP 发现端口 52888 无回应）。
+  所以①②③三条**都没有真机证据**，只能等设备回来。
+- **设备回来后按这套跑**（APK 已经在 `app\build\outputs\apk\debug\`，签名与线上一致）：
+
+  ```powershell
+  adb -s 10AD5P1J4Z000Y5 install -r app\build\outputs\apk\debug\app-debug.apk
+  # ① 两个界面：uiautomator dump 里应能看到 tab_favorites / tab_history；
+  #    点「历史」后 rv_history 出现 hist_title，且 rv_favorites 不可见（滚动位置各自独立）
+  # ② 切集/数据源：用一个带 sources + subjectId 的 /play 载荷投流，
+  #    点顶栏「选集」→ 弹窗里两组（数据源 / 选集）都在，当前项高亮
+  # ③ 自动连播：playlist 两项都带地址，第一项用 8 秒短片，
+  #    等它 ended → GET /info 的 index 应从 0 变成 1、state 回到 playing
+  ```
+
+  测试素材与伺服脚本放在 `android-receiver/.verify/`（8 秒 HLS + `serve.js`），验完即删
+  （`.verify/` 与 `.selftest7/` 都已加进 `.gitignore`，不会跟着提交进仓库）。
+  ✅ ②③ 依赖的 `subjectId` / `sources` / `sourceId` **电脑端已经补齐**（见 2.5c 的实现表），
+  所以这两条可以直接按上面的步骤验，不用再走降级路径。
 
 ---
 

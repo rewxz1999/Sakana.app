@@ -225,16 +225,19 @@ export function GalgameToolsPage() {
           {saving ? <div className="mt-2 text-[10px] text-faint">保存中…</div> : null}
         </section>
 
-        {/* 保存位置 */}
+        {/* 保存根目录：截图 / bgm / 立绘 / cg 都挂在它下面，所以这里要说清是"根目录"而不只是截图 */}
         <section className="rounded-xl border border-border bg-elev1 p-4">
           <div className="mb-1 flex items-center gap-2 text-sm font-semibold">
-            <FolderOpen size={15} className="text-accent" /> 截图保存位置
+            <FolderOpen size={15} className="text-accent" /> galgame 保存根目录
           </div>
-          {/* 新版命名规则：按游戏名建子目录 + 文件名带游戏名与时间，这里必须写清楚，否则用户找不到截图 */}
           <p className="mb-3 text-[11px] leading-relaxed text-faint">
-            截图会按游戏名自动建子目录，文件名为「游戏名_日期_时间.png」，例如
-            <span className="text-dim"> CLANNAD\CLANNAD_20260917_143512.png</span>；
-            游戏名里的非法字符会自动替换为下划线。游戏卡片上的「最近截图」只显示这一款游戏自己的截图。
+            截图、BGM、立绘、CG 都按
+            <span className="text-dim"> 根目录\游戏名\种类\文件 </span>
+            存放（种类 = 截图 / bgm / 立绘 / cg）。例如截图是
+            <span className="text-dim"> CLANNAD\截图\CLANNAD_20260917_143512.png</span>，
+            立绘是 <span className="text-dim">CLANNAD\立绘\ひなた_001.png</span>（角色名+序号，差分合成结果）。
+            游戏名里的非法字符会自动替换为下划线；改这里会同时改变截图/BGM/立绘/CG 的落盘位置，
+            旧版直接放在「游戏名」目录下的截图会在下一次截图时自动迁进「截图」子目录（不会并存两套）。
           </p>
           <div className="flex flex-wrap items-center gap-2">
             <Input
@@ -266,7 +269,11 @@ export function GalgameToolsPage() {
         <div className="mt-2">
           <div className="mb-2 text-xs font-semibold text-dim">更多工具正在开发…</div>
           <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-            <GhostCard icon={Users} name="角色立绘提取" desc="提取游戏角色立绘素材" />
+            <GhostCard
+              icon={Users}
+              name="角色立绘提取"
+              desc="已上线：在「galgame 库」里右键游戏卡片 →「解包（引擎检测 / 曲名映射 / 立绘 CG）」，面板里可提取立绘（按坐标合成差分立绘）与 CG"
+            />
             <GhostCard icon={ScanLine} name="文本提取" desc="提取游戏内文本 / 存档" />
             <GhostCard icon={Hammer} name="制作 galgame，也许能做出来？" desc="制作自己的 galgame" />
           </div>

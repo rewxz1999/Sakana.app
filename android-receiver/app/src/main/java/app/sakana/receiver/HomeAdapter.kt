@@ -5,30 +5,31 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
-import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 
 /**
- * 首页的唯一适配器：把 [HomeRows] 摊平出来的行画出来。
+ * 收藏 / 历史两个界面共用的适配器（每种行一个 ViewHolder）。
  *
- * 用 `GridLayoutManager(2)` + span size：收藏一格占 1 列（两列网格），
- * 分区标题 / 空态 / 历史卡片 / 动作行占满 2 列。这样**一个 RecyclerView** 就能同时
- * 装下网格和列表，不需要"ScrollView 里再套 RecyclerView"（那正是滚动失效的根因）。
+ * 为什么一个类给两个列表用：两个界面要画的行**互不重叠** ——
+ * 收藏界面只会出现 `FavoriteRow` / `Empty`，历史界面只会出现 `HistoryRow` / `Empty`。
+ * 所以同一份代码实例化两次即可，不需要维护两个几乎一样的适配器
+ * （那种"复制一份改两行"最终一定会走样）。
+ *
+ * span size 只对收藏界面有意义：`GridLayoutManager(2)` 下收藏格占 1 列、空态占满 2 列；
+ * 历史界面用的是 LinearLayoutManager，这个 lookup 根本不参与。
  */
 internal class HomeAdapter(
     private val onFavorite: (Favorite) -> Unit,
     private val onFavoriteLong: (Favorite) -> Unit,
     private val onHistory: (HistoryItem) -> Unit,
     private val onHistoryLong: (HistoryItem) -> Unit,
-    private val onAction: (HomeText) -> Unit,
 ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
 
     private var rows: List<HomeRow> = emptyList()
 
-    /** 收藏占 1 列，其余整行 —— 交给 GridLayoutManager 用。 */
     val spanSizeLookup: GridLayoutManager.SpanSizeLookup =
         object : GridLayoutManager.SpanSizeLookup() {
             override fun getSpanSize(position: Int): Int =
@@ -44,45 +45,29 @@ internal class HomeAdapter(
     override fun getItemCount(): Int = rows.size
 
     override fun getItemViewType(position: Int): Int = when (rows[position]) {
-        is HomeRow.Section -> TYPE_SECTION
         is HomeRow.Empty -> TYPE_EMPTY
         is HomeRow.FavoriteRow -> TYPE_FAVORITE
         is HomeRow.HistoryRow -> TYPE_HISTORY
-        is HomeRow.Action -> TYPE_ACTION
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
         val inflater = LayoutInflater.from(parent.context)
         return when (viewType) {
-            TYPE_SECTION -> SectionHolder(inflater.inflate(R.layout.item_section, parent, false))
             TYPE_EMPTY -> EmptyHolder(inflater.inflate(R.layout.item_empty, parent, false))
             TYPE_FAVORITE -> FavoriteHolder(inflater.inflate(R.layout.item_favorite, parent, false))
-            TYPE_HISTORY -> HistoryHolder(inflater.inflate(R.layout.item_history, parent, false))
-            else -> ActionHolder(inflater.inflate(R.layout.item_action, parent, false))
+            else -> HistoryHolder(inflater.inflate(R.layout.item_history, parent, false))
         }
     }
 
     override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
         when (val row = rows[position]) {
-            is HomeRow.Section -> (holder as SectionHolder).bind(row)
             is HomeRow.Empty -> (holder as EmptyHolder).bind(row)
             is HomeRow.FavoriteRow -> (holder as FavoriteHolder).bind(row.favorite)
             is HomeRow.HistoryRow -> (holder as HistoryHolder).bind(row)
-            is HomeRow.Action -> (holder as ActionHolder).bind(row)
         }
     }
 
     // ---------------- 各行的 ViewHolder ----------------
-
-    private inner class SectionHolder(view: View) : RecyclerView.ViewHolder(view) {
-        private val title: TextView = view.findViewById(R.id.section_title)
-        private val count: TextView = view.findViewById(R.id.section_count)
-
-        fun bind(row: HomeRow.Section) {
-            title.setText(textOf(itemView.context, row.kind))
-            count.text = if (row.count > 0) row.count.toString() else ""
-        }
-    }
 
     private inner class EmptyHolder(view: View) : RecyclerView.ViewHolder(view) {
         private val label: TextView = view.findViewById(R.id.empty_text)
@@ -90,20 +75,6 @@ internal class HomeAdapter(
         fun bind(row: HomeRow.Empty) {
             label.setText(textOf(itemView.context, row.kind))
             label.setOnClickListener(null)
-        }
-    }
-
-    private inner class ActionHolder(view: View) : RecyclerView.ViewHolder(view) {
-        private val label: TextView = view.findViewById(R.id.action_text)
-
-        fun bind(row: HomeRow.Action) {
-            // 「查看全部 N 条」要把条数填进去；「收起」不用
-            label.text = if (row.kind == HomeText.VIEW_ALL_HISTORY) {
-                itemView.context.getString(R.string.hist_view_all, row.count)
-            } else {
-                textOf(itemView.context, row.kind)
-            }
-            label.setOnClickListener { onAction(row.kind) }
         }
     }
 
@@ -170,22 +141,17 @@ internal class HomeAdapter(
         }
     }
 
-    /** 文案映射集中在这里：纯逻辑层（HomeRows）只给枚举，不依赖 R。 */
-    private fun textOf(context: Context, kind: HomeText): String = when (kind) {
-        HomeText.SECTION_FAVORITES -> context.getString(R.string.section_favorites)
-        HomeText.SECTION_HISTORY -> context.getString(R.string.section_history)
-        HomeText.EMPTY_FAVORITES -> context.getString(R.string.fav_empty)
-        HomeText.EMPTY_HISTORY -> context.getString(R.string.hist_empty)
-        HomeText.COLLAPSE_HISTORY -> context.getString(R.string.hist_collapse)
-        // 带条数的「查看全部 N 条」在 ActionHolder 里单独拼（那里才拿得到 count）
-        HomeText.VIEW_ALL_HISTORY -> context.getString(R.string.hist_view_all_generic)
-    }
-
     private companion object {
-        const val TYPE_SECTION = 0
-        const val TYPE_EMPTY = 1
-        const val TYPE_FAVORITE = 2
-        const val TYPE_HISTORY = 3
-        const val TYPE_ACTION = 4
+        const val TYPE_EMPTY = 0
+        const val TYPE_FAVORITE = 1
+        const val TYPE_HISTORY = 2
+
+        /** 空态文案（纯逻辑层只给类型，映射到字符串在这里做）。 */
+        fun textOf(context: Context, kind: HomeText): String = context.getString(
+            when (kind) {
+                HomeText.EMPTY_FAVORITES -> R.string.fav_empty
+                HomeText.EMPTY_HISTORY -> R.string.hist_empty
+            },
+        )
     }
 }

@@ -44,6 +44,23 @@ docs/项目说明书.md
 docs/更新记录.md
 docs/备用数据源调研.md
 
+# ---- v1.1：安卓端的验证素材与自测产物（与电脑端 .e2e/ 同理，只留本地） ----
+# .verify/ 是投屏真机验证用的 8 秒 HLS 短片与本地伺服脚本，.selftest7/ 是
+# V1.1 自测（55 条断言）的 java 源码与编译产物；两者都是"跑一次就丢"的东西，
+# 且 .class 属于构建产物，不该进仓库。
+android-receiver/.verify/
+android-receiver/.selftest7/
+# 同理：沙箱构建用的 gradle 缓存目录（默认 ~/.gradle 只读，本仓库指向这里）
+android-receiver/.gradle-home/
+# ANDROID_USER_HOME 指到仓库里（默认 ~/.android 在受限环境下写不进去），
+# 但**签名密钥不入库**：dist/ 里发布的 APK 是用这把 debug.keystore 签的
+# （SHA-256 cd9567a9…3a5f），谁拿到它就能签出"能覆盖安装线上包"的 APK，
+# 所以这里整目录忽略，密钥只留在本机。
+# 换机器/重装后想让新构建出来的包还能原地覆盖安装，就把原来那把 keystore
+# 放回 android-receiver/.android-home/debug.keystore；没有它也能构建，
+# 只是签名会变、用户得先卸载再装（数据会丢）。
+android-receiver/.android-home/
+
 # ---- 运行期数据、诊断输出与临时文件 ----
 # v0.2.9 最后更新：数据根目录改到**安装目录**下（开发态就是仓库目录），
 # 因此这几个运行期目录必须忽略，否则开发时跑一次就会把缓存/截图/下载内容带进提交。
@@ -56,6 +73,8 @@ logs/
 *.log
 .cap*.log
 .tmp-*
+# 编辑器/工具在源码目录旁边留下的临时目录（例如 .galSprite.ts.6300.<uuid>.tmpdir/）
+*.tmpdir/
 .testmedia/
 .shots/
 .tstest/
@@ -78,3 +97,7 @@ sakana.local.json
 /logs.json
 /.tmp-*/
 streamBoostLog.json
+
+# ---- 真机验证的临时产物（截图 / uiautomator dump），只留本地 ----
+.verify/
+

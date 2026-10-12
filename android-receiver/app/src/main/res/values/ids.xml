@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  只声明"我们要在自己的代码里按 id 找"的那几个 **GSY 自带布局里的视图**。
+
+  为什么不直接写 `R.id.surface_container`：AGP 8 默认的**非传递 R 类**让 app 模块的 R
+  里没有依赖库（GSY）的资源 id，直接写编译不过。而这里用 `<item type="id">` 声明之后，
+  资源合并会按**名字**把它和 GSY 布局里那个 `@+id/surface_container` 合并成同一个 id ——
+  所以运行时 `findViewById(R.id.surface_container)` 一定能找到 GSY 自己 inflate 出来的那个容器。
+  这也是"自定义第三方播放器"时改它样式的常规做法，区别只在于我们**没有改它的布局文件**。
+
+  只声明确实需要的那一个：
+   · surface_container —— 手势要挂到它身上（GSY 把触摸监听挂在它上面，它是覆盖整块画面的子视图）。
+  GSY 的控制栏与按钮（顶栏/底栏/返回/全屏/中央播放键）都不在这里声明 ——
+  它们在 `SakanaGsyPlayer` 里是通过 GSY 自己的 protected 字段（mBottomContainer /
+  mTopContainer / mBackButton / mFullscreenButton）拿到的，比按 id 找更稳。
+-->
+<resources>
+    <item name="surface_container" type="id" />
+</resources>

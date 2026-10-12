@@ -3,6 +3,7 @@ import { motion } from 'framer-motion'
 import {
   Camera,
   CircleCheck,
+  PackageOpen,
   Download,
   Clock,
   Ellipsis,
@@ -31,6 +32,7 @@ import {
   fmtPlay,
   GalBgmModal,
   GalBgmSavedModal,
+  GalUnpackModal,
   GalContextMenu,
   GalDetailView,
   GalShotsModal,
@@ -68,6 +70,7 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
   const [ymgalGame, setYmgalGame] = useState<GalGame | null>(null)
   const [bgmGame, setBgmGame] = useState<GalGame | null>(null)
   const [bgmSavedGame, setBgmSavedGame] = useState<GalGame | null>(null)
+  const [unpackGame, setUnpackGame] = useState<GalGame | null>(null)
   const [shotsOpen, setShotsOpen] = useState(false)
   const [shotsGame, setShotsGame] = useState<GalGame | null>(null)
   const [bgFailed, setBgFailed] = useState(false)
@@ -299,8 +302,9 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
         label: '从月幕galgame中搜索详情',
         onSelect: () => setYmgalGame(g)
       },
-      { key: 'bgm', icon: Music, label: '查看最近识别的 bgm 名称（可复制）', onSelect: () => setBgmGame(g) },
-      { key: 'bgmSaved', icon: Download, label: '最近保存的 bgm', onSelect: () => setBgmSavedGame(g) },
+      { key: 'bgm', icon: Music, label: '查看最近识别的 bgm 名称（可复制）', group: '常用', onSelect: () => setBgmGame(g) },
+      { key: 'bgmSaved', icon: Download, label: '最近保存的 bgm', group: '常用', onSelect: () => setBgmSavedGame(g) },
+      { key: 'unpack', icon: PackageOpen, label: '解包（引擎检测 / 曲名映射 / 立绘 CG）', group: '工具', onSelect: () => setUnpackGame(g) },
       { key: 'cover', icon: ImageIcon, label: '自定义游戏封面', onSelect: () => void setCustom(g, 'cover') },
       // 沉浸模式保留「自定义背景图」：整屏壁纸就是这张图，卡片库那边的右键菜单才去掉它
       { key: 'banner', icon: ImageIcon, label: '自定义背景图', onSelect: () => void setCustom(g, 'banner') }
@@ -530,6 +534,7 @@ export function GalgameImmersivePage({ onBack }: { onBack: () => void }) {
       {/* 最近识别 BGM 面板（只读内存识别） */}
       <GalBgmModal game={bgmGame} onClose={() => setBgmGame(null)} />
       <GalBgmSavedModal game={bgmSavedGame} onClose={() => setBgmSavedGame(null)} />
+      <GalUnpackModal game={unpackGame} onClose={() => setUnpackGame(null)} />
 
       {/* 最近截图：顶栏按钮看全部，右键菜单里的那一项只看该游戏自己的目录 */}
       <GalShotsModal open={shotsOpen} onClose={() => setShotsOpen(false)} />

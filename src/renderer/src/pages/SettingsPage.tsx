@@ -365,8 +365,9 @@ export function SettingsPage() {
             <OpenRow
               icon={MessagesSquare}
               title="弹幕设置"
-              desc="弹幕开关、覆盖区域、同屏数量、时间轴、字号 / 透明度 / 速度、屏蔽词与 B 站弹幕脚本"
-              onOpen={() => openSmall('/danmaku-settings', 640, 620, '弹幕设置')}
+              desc="显示选项、屏蔽词、弹幕数据源（巴哈姆特 / 弹幕盒子 / 直链）、本地弹幕库管理与 B 站弹幕脚本"
+              // V1.1：加了数据源集合器与弹幕库表格，560 高度塞不下，窗口放大一档
+              onOpen={() => openSmall('/danmaku-settings', 900, 760, '弹幕设置')}
             />
           </div>
         </Section>

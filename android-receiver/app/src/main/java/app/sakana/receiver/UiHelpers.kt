@@ -5,12 +5,6 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.graphics.Typeface
-import android.view.LayoutInflater
-import android.view.View
-import android.view.ViewGroup
-import android.widget.ArrayAdapter
-import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 
@@ -25,68 +19,8 @@ import android.widget.Toast
  */
 
 /**
- * 选集弹窗。
- *
- * 用最朴素的 ListView + ArrayAdapter，不引 RecyclerView，也不单独写 Adapter 类。
- * 每一行除了标题还会标出来：
- *  · 「当前播放」—— 遥控到哪了，最直观的反馈；
- *  · 「规则模式 · 请在电脑上切集」—— 电脑端在规则模式下只能给标题、给不了地址，
- *    这种项点了也播不了，必须说清楚，而不是让用户点了没反应。
+ * 复制文本到剪贴板（首页点地址复制、设置页也有用）；拿不到剪贴板服务时返回 false。
  */
-internal fun showPlaylistDialog(
-    activity: Activity,
-    titles: List<String>,
-    currentIndex: Int,
-    playable: List<Boolean>,
-    onSelect: (Int) -> Unit,
-) {
-    if (titles.isEmpty()) return
-
-    // 先把每行要显示的文字拼好，getView 里就只剩上色，逻辑简单不易错
-    val rows = titles.mapIndexed { i, t ->
-        val marks = ArrayList<String>(2)
-        if (i == currentIndex) marks.add(activity.getString(R.string.playlist_current))
-        if (i !in playable.indices || !playable[i]) marks.add(activity.getString(R.string.playlist_no_url))
-        if (marks.isEmpty()) t else "$t  ·  ${marks.joinToString(" · ")}"
-    }
-
-    val adapter = object : ArrayAdapter<String>(
-        activity,
-        R.layout.item_episode,
-        R.id.episode_title,
-        rows,
-    ) {
-        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-            val view = super.getView(position, convertView, parent)
-            val label = view.findViewById<TextView>(R.id.episode_title)
-            val usable = position !in playable.indices || playable[position]
-            when {
-                position == currentIndex -> {
-                    label.setTextColor(activity.getColor(R.color.accent))
-                    label.setTypeface(null, Typeface.BOLD)
-                }
-                !usable -> {
-                    // 播不了的项用暗色，顺手表明"选它也没用"
-                    label.setTextColor(activity.getColor(R.color.text_muted))
-                    label.setTypeface(null, Typeface.NORMAL)
-                }
-                else -> {
-                    label.setTextColor(activity.getColor(R.color.text_primary))
-                    label.setTypeface(null, Typeface.NORMAL)
-                }
-            }
-            return view
-        }
-    }
-
-    AlertDialog.Builder(activity)
-        .setTitle(activity.getString(R.string.playlist_title, titles.size))
-        .setAdapter(adapter) { _, which -> onSelect(which) }
-        .setNegativeButton(R.string.close, null)
-        .show()
-}
-
-/** 复制文本到剪贴板；返回是否成功（拿不到剪贴板服务时返回 false）。 */
 internal fun copyToClipboard(activity: Activity, label: String, text: String): Boolean {
     val manager = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return false
     manager.setPrimaryClip(ClipData.newPlainText(label, text))

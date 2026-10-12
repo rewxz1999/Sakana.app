@@ -9,7 +9,7 @@ import java.util.concurrent.TimeUnit
 private const val MAIN_THREAD_TIMEOUT_MS = 4000L
 
 /** 界面没打开时 /info 要回的"什么都没在放"。电脑端会一直轮询 /info，不能让它拿到错误对象。 */
-private val IDLE_SNAPSHOT = PlayerController.Snapshot(
+private val IDLE_SNAPSHOT = PlayerSnapshot(
     playing = false,
     positionMs = 0L,
     durationMs = 0L,
@@ -149,10 +149,19 @@ class ControlApi(
             val m = Json.obj(entry) ?: return@mapNotNull null
             // 规则模式下 playlist 里可能只有 title、url 是空串：这种项**保留**
             // （选集列表要显示标题），但不会被真的拿去播放（PlayerController 会拦住）。
-            PlayerController.Item(Json.str(m, "url") ?: "", Json.str(m, "title") ?: "")
+            PlayerItem(Json.str(m, "url") ?: "", Json.str(m, "title") ?: "")
         }
 
-        val result = onMain { player.play(url, title, headers, startMs, index, playlist, autoPlay()) }
+        val result = onMain {
+            // 先记下这次投屏的"上下文"（条目 id / 可选线路 / 当前线路），再交给播放器：
+            // 切集、连播、数据源选择都要用它，而它们的发起时机可能在播放器重建之后。
+            PlayCatalog.update(
+                subjectId = Json.int(root, "subjectId", 0),
+                sources = PlayCatalog.parseSources(root["sources"]),
+                sourceId = Json.str(root, "sourceId"),
+            )
+            player.play(url, title, headers, startMs, index, playlist, autoPlay())
+        }
         // 这里只代表"已经把播放任务下发给播放器了"。真正的起播是异步的，
         // 拉流是否成功要看 /info 的 state 或界面上的错误提示。
         return result.error?.let { Reply.bad("起播失败：$it") } ?: Reply.ok()

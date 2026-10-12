@@ -1,13 +1,15 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import {
   Camera,
   CircleCheck,
   Clock,
   Copy,
+  Cpu,
   Download,
   ExternalLink,
   FolderOpen,
   Gamepad2,
+  PackageOpen,
   Play,
   RefreshCw,
   Search,
@@ -15,7 +17,7 @@ import {
   X,
   type LucideIcon
 } from 'lucide-react'
-import type { GalBgmSaved, GalGame, GalMemRecent, GalRecentShot, YmgalCandidate } from '@shared/types'
+import type { GalBgmSaved, GalGame, GalMemRecent, GalRecentShot, GalUnpackSummary, YmgalCandidate } from '@shared/types'
 import { toast } from '@/stores/app'
 import { api } from '@/lib/api'
 import { imgUrl, localImgUrl, timeAgo } from '@/lib/format'
@@ -293,7 +295,102 @@ export function VndbTab({ game }: { game: GalGame }) {
   )
 }
 
+// ---------------- 引擎检测（卡片 + 详情共用一份缓存） ----------------
+
+export interface EngineInfo {
+  engine: string
+  evidence: string[]
+  reason: string
+}
+
+/**
+ * 引擎检测结果缓存。
+ * 为什么要有缓存：卡片墙上每张卡都要显示引擎，详情面板也要显示 —— 不缓存的话同一款游戏会发两次 IPC，
+ * 卡片一多就是十几次目录扫描。检测依据是游戏目录里的特征文件，一次会话内不会变，缓存到进程结束即可。
+ */
+const engineCache = new Map<string, EngineInfo>()
+
+/** 读某款游戏的引擎（+ 判定依据）。第一次走主进程，之后命中缓存。 */
+export function useGameEngine(game: GalGame | null | undefined): EngineInfo {
+  const key = game ? `${game.id}|${game.exePath ?? ''}` : ''
+  const [info, setInfo] = useState<EngineInfo>(
+    () => (key ? engineCache.get(key) : undefined) ?? { engine: '', evidence: [], reason: '' }
+  )
+  useEffect(() => {
+    if (!key || !game) return
+    const hit = engineCache.get(key)
+    if (hit) {
+      setInfo(hit)
+      return
+    }
+    let alive = true
+    void api.gal.unpackStatus(game.id, game.exePath ?? '').then((r) => {
+      if (!alive || !r.ok) return
+      const v: EngineInfo = {
+        engine: r.data.engine || '未知',
+        evidence: r.data.evidence ?? [],
+        reason: r.data.reason ?? ''
+      }
+      engineCache.set(key, v)
+      setInfo(v)
+    })
+    return () => {
+      alive = false
+    }
+    // game 对象每次 store 推送都会换新，按 key（id+exePath）判定即可
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key])
+  return info
+}
+
+/** 卡片上的小引擎标签（检测不到就什么都不显示，不占位、不编） */
+export function EngineBadge({ game, className = '' }: { game: GalGame; className?: string }) {
+  const info = useGameEngine(game)
+  if (!info.engine || info.engine === '未知') return null
+  return (
+    <span
+      title={`引擎：${info.engine}${info.evidence.length ? `（依据 ${info.evidence.join('、')}）` : ''}`}
+      className={`inline-flex max-w-full items-center gap-0.5 truncate rounded bg-elev2 px-1 py-0.5 text-[10px] text-dim ${className}`}
+    >
+      <Cpu size={9} /> {info.engine}
+    </span>
+  )
+}
+
 // ---------------- 游戏详情（卡片库弹窗 / 沉浸模式抽屉共用） ----------------
+
+/**
+ * 各来源（月幕 / VNDB）**已经展示**了哪些字段。
+ * 详情页据此只补缺口，避免同一个"发售/评分/开发"在上、下两块各显示一遍（用户明确要求去重）。
+ */
+const SOURCE_COVERS: Record<'ymgal' | 'vndb', Set<string>> = {
+  // 月幕标签页展示：标题、简介、发售、开发(brand)、评分、标签、STAFF、角色、官网
+  // —— tags 必须算进去：YmgalTab 本来就渲染 game.tags，不标记就会在下面再显示一遍
+  ymgal: new Set(['description', 'released', 'developers', 'rating', 'tags']),
+  // VNDB 标签页展示：简介、评分、发售、长度、开发、标签、本地路径、VNDB 链接
+  vndb: new Set(['description', 'released', 'developers', 'rating', 'length', 'tags'])
+}
+
+/** 当前来源没覆盖到的本地字段，补成一行；全都被覆盖时什么都不渲染（不占位） */
+function MissingMeta({ game, source }: { game: GalGame; source: 'ymgal' | 'vndb' }): ReactNode | null {
+  const covers = SOURCE_COVERS[source]
+  const rows: ReactNode[] = []
+  if (game.length && !covers.has('length')) rows.push(<span key="len">长度：{game.length}</span>)
+  if (game.tags && game.tags.length > 0 && !covers.has('tags')) {
+    rows.push(
+      <span key="tags" className="flex flex-wrap items-center gap-1">
+        标签：
+        {game.tags.slice(0, 8).map((t) => (
+          <Badge key={t} className="px-2 py-0.5 text-[10px]">
+            {t}
+          </Badge>
+        ))}
+      </span>
+    )
+  }
+  if (!rows.length) return null
+  return <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-dim">{rows}</div>
+}
 
 /**
  * 游戏详情面板：封面、标题、评分、游玩时长、进度、标签、月幕/VNDB 详情、简介、官网、本地路径。
@@ -318,6 +415,11 @@ export function GalDetailView({
 }) {
   const [tab, setTab] = useState<'ymgal' | 'vndb'>(game.ymgal ? 'ymgal' : 'vndb')
   const [updating, setUpdating] = useState(false)
+
+  // 引擎检测：与卡片共用同一份缓存（见 useGameEngine），拿不到就留空、不显示假信息
+  const engineInfo = useGameEngine(game)
+  const engine = engineInfo.engine
+  const engineEvidence = engineInfo.evidence
 
   // 切换游戏（弹窗复用同一实例）时把来源切回有数据的那一侧
   useEffect(() => {
@@ -382,30 +484,7 @@ export function GalDetailView({
         </div>
       </div>
 
-      {/* 评分 / 发售 / 长度 / 开发 / 标签 */}
-      <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-dim">
-        {game.rating ? (
-          <span className="flex items-center gap-0.5 text-warn">
-            <Star size={11} fill="currentColor" /> {game.rating.toFixed(1)}
-          </span>
-        ) : null}
-        {game.released ? <span>发售：{game.released}</span> : null}
-        {game.length ? <span>长度：{game.length}</span> : null}
-      </div>
-      {game.developers && game.developers.length > 0 ? (
-        <div className="mt-1 text-[11px] text-dim">开发：{game.developers.join(' / ')}</div>
-      ) : null}
-      {game.tags && game.tags.length > 0 ? (
-        <div className="mt-2 flex flex-wrap gap-1">
-          {game.tags.slice(0, 8).map((t) => (
-            <Badge key={t} className="px-2 py-0.5 text-[10px]">
-              {t}
-            </Badge>
-          ))}
-        </div>
-      ) : null}
-
-      {/* 来源切换 */}
+      {/* 来源切换（V1.1：本地/导入的元信息已经并进这一块，不再单独重复一遍） */}
       <div className="mt-4 inline-flex items-center gap-1 rounded-lg bg-elev2/70 p-0.5">
         <button className={segCls(tab === 'ymgal')} disabled={!game.ymgal} onClick={() => setTab('ymgal')}>
           月幕
@@ -415,6 +494,20 @@ export function GalDetailView({
         </button>
       </div>
       <div className="mt-3">{tab === 'ymgal' ? <YmgalTab game={game} /> : <VndbTab game={game} />}</div>
+
+      {/*
+        V1.1 去重：本地/导入的字段只在**当前来源没有它**时才补一行。
+        取舍：不做"两套信息的对照表"（同一个发售日显示两遍正是用户要我们去掉的），
+        所以先算出来源已经覆盖了哪些字段（见 SOURCE_COVERS），只渲染缺口。
+      */}
+      <MissingMeta game={game} source={tab} />
+
+      {/* 引擎（只读游戏目录特征文件识别；解包面板里还能看到判定依据） */}
+      <div className="mt-3 flex items-center gap-2 text-[11px] text-dim">
+        <Cpu size={11} />
+        <span>引擎：{engine || '检测中…'}</span>
+        {engineEvidence.length ? <span className="text-faint">（{engineEvidence.join('、')}）</span> : null}
+      </div>
 
       {/* 底部操作 */}
       <div className="mt-4 flex items-center justify-between gap-2 border-t border-border pt-3">
@@ -913,6 +1006,148 @@ export function GalBgmModal({ game, onClose }: { game: GalGame | null; onClose: 
   )
 }
 
+// ---------------- 解包 / 立绘 CG（V1.1） ----------------
+
+/**
+ * 卡片右键「解包」：引擎检测 + 自动解包 + 曲名映射。
+ *
+ * 为什么把它做成一个面板而不是"点一下后台跑"：解包结果里有**做不到的部分**
+ * （Siglus 的 pfs 正文加密、部分 xp3 索引不是 zlib），必须让用户看见"做到哪一步、为什么做不到"，
+ * 而不是静默失败。
+ */
+export function GalUnpackModal({ game, onClose }: { game: GalGame | null; onClose: () => void }) {
+  const [status, setStatus] = useState<{ unpacked: boolean; at: number; files: number; engine: string; evidence: string[]; reason: string } | null>(null)
+  const [summary, setSummary] = useState<GalUnpackSummary | null>(null)
+  const [busy, setBusy] = useState('')
+  const [imgResult, setImgResult] = useState('')
+
+  const loadStatus = useCallback(async (): Promise<void> => {
+    if (!game) return
+    const r = await api.gal.unpackStatus(game.id, game.exePath ?? '')
+    if (r.ok) setStatus(r.data)
+  }, [game])
+
+  useEffect(() => {
+    if (!game) return
+    setSummary(null)
+    setImgResult('')
+    void loadStatus()
+  }, [game, loadStatus])
+
+  const runUnpack = async (force: boolean): Promise<void> => {
+    if (!game) return
+    setBusy('unpack')
+    const r = await api.gal.unpack(game.id, game.exePath ?? '', game.title, force)
+    setBusy('')
+    if (!r.ok) {
+      toast.error(r.error)
+      return
+    }
+    setSummary(r.data)
+    void loadStatus()
+    toast.success(
+      r.data.ok
+        ? `解包完成：${r.data.engine} · ${r.data.files} 个文件 · ${r.data.titles} 条曲名`
+        : `解包未完成：${r.data.error || '没有解出内容'}`
+    )
+  }
+
+  const runExtract = async (kind: '立绘' | 'cg'): Promise<void> => {
+    if (!game) return
+    setBusy(kind)
+    const r = await api.gal.extractImages(game.id, game.exePath ?? '', game.title, kind, 12)
+    setBusy('')
+    if (!r.ok) {
+      toast.error(r.error)
+      return
+    }
+    if (!r.data.ok) {
+      setImgResult(`${kind}：${r.data.error}（候选 ${r.data.candidates}）`)
+      toast.error(r.data.error)
+      return
+    }
+    // 立绘的主路径是"按坐标表合成"；回退路径（整身碎片）也要如实说清楚，不能让用户以为都是合成图
+    const extra =
+      kind === '立绘'
+        ? `（加合成 ${r.data.composed ?? 0} 张${r.data.fallback ? ` · 回退整身碎片 ${r.data.fallback} 张` : ''} · 候选姿势 ${r.data.candidates}）`
+        : `（候选 ${r.data.candidates}）`
+    setImgResult(`${kind}：写出 ${r.data.count} 张${extra} → ${r.data.dir}`)
+    toast.success(`${kind}已提取 ${r.data.count} 张`)
+  }
+
+  return (
+    <Modal open={!!game} onClose={onClose} width={560} title={`解包 · ${game?.title ?? ''}`}>
+      <div className="flex flex-col gap-3">
+        <div className="rounded-lg border border-border bg-elev2/40 px-3 py-2 text-[11px] leading-relaxed">
+          <div>
+            引擎：<span className="font-medium text-text">{status?.engine || '检测中…'}</span>
+            {status?.evidence?.length ? <span className="text-faint">（依据 {status.evidence.join('、')}）</span> : null}
+          </div>
+          <div className="mt-0.5 text-faint">
+            {status?.unpacked
+              ? `已解包：${status.files} 个文本/脚本文件（${new Date(status.at).toLocaleString()}）`
+              : status?.reason || '还没有解包'}
+          </div>
+          <div className="mt-1 text-faint">
+            解包只读游戏档案，产物写在 Sakana 自己的缓存目录；游戏目录不会被改动。
+          </div>
+        </div>
+
+        <div className="flex flex-wrap gap-2">
+          <Button variant="soft" size="sm" loading={busy === 'unpack'} onClick={() => void runUnpack(false)}>
+            {status?.unpacked ? '解析曲名（用已解包内容）' : '开始解包'}
+          </Button>
+          <Button variant="outline" size="sm" loading={busy === 'unpack'} onClick={() => void runUnpack(true)}>
+            清掉缓存重新解包
+          </Button>
+          <Button variant="outline" size="sm" loading={busy === '立绘'} onClick={() => void runExtract('立绘')}>
+            提取立绘
+          </Button>
+          <Button variant="outline" size="sm" loading={busy === 'cg'} onClick={() => void runExtract('cg')}>
+            提取 CG
+          </Button>
+        </div>
+
+        {summary ? (
+          <div className="rounded-lg border border-border bg-elev2/40 px-3 py-2 text-[11px] leading-relaxed">
+            <div>
+              引擎 <span className="font-medium">{summary.engine}</span>
+              {summary.evidence.length ? `（${summary.evidence.join('、')}）` : ''} · 耗时 {summary.elapsedMs}ms
+            </div>
+            <div className="mt-0.5">
+              档案 {summary.archives} 个（索引可读 {summary.readableArchives}）· 解出 {summary.files} 个文件 /{' '}
+              {(summary.bytes / 1024 / 1024).toFixed(1)}MB
+            </div>
+            <div className="mt-0.5">
+              曲名 {summary.titles} 条 · 脚本引用代号 {summary.codes} 个 · 场景脚本 {summary.scripts} 个
+            </div>
+            {summary.sources.length ? <div className="mt-0.5 text-faint">来源：{summary.sources.join('、')}</div> : null}
+            {summary.titles === 0 ? (
+              <div className="mt-1 text-faint">
+                没解析到曲名：内存里的代号会**如实显示为代号**，不会编曲名。
+              </div>
+            ) : null}
+            {summary.error ? <div className="mt-1 text-danger">{summary.error}</div> : null}
+          </div>
+        ) : null}
+
+        {imgResult ? <div className="rounded-lg border border-border bg-elev2/40 px-3 py-2 text-[11px] break-all">{imgResult}</div> : null}
+
+        <div className="text-[11px] leading-relaxed text-faint">
+          保存规则：<code>&lt;自定义根目录&gt;/&lt;游戏名&gt;/&lt;种类&gt;/&lt;文件&gt;</code>，种类分
+          截图 / bgm / 立绘 / cg；立绘文件名用「角色名+序号」（另写 立绘清单.json 记下每张对应的姿势/级别），
+          CG 与截图用原名，BGM 优先用真实曲名。
+          <br />
+          立绘是<b>按坐标表做的差分合成</b>：KiriKiri 系的立绘由「碎片 PNG + 坐标表」组成，
+          Sakana 把坐标表（21 字节头 + zlib + UTF-16 图层表）解出来，按每层的 left/top/不透明度
+          把 visible 的碎片逐层叠成整身立绘，再裁掉四周空白。该作没有可读坐标表时，
+          自动回退成「提取整身底图碎片」，并在上面的结果里写明是哪一种。
+        </div>
+      </div>
+    </Modal>
+  )
+}
+
 // ---------------- 最近保存的 BGM ----------------
 
 /**
@@ -1021,6 +1256,13 @@ export interface GalMenuItem {
   icon: LucideIcon
   label: string
   danger?: boolean
+  /**
+   * 分组（用户反馈"菜单项太多"，所以分两列显示）。
+   * 取舍：**不做折叠/二级菜单**（galgame 卡片是高频操作，多一次点击很难受），
+   * 改成"常用"与"工具"两列并排 —— 常用列是启动/查详情/截图这类天天点的，
+   * 工具列是解包/立绘/CG/自定义封面这类偶尔用的；两列都在一屏内、点一下到底。
+   */
+  group?: '常用' | '工具'
   onSelect: () => void
 }
 
@@ -1061,26 +1303,43 @@ export function useMenuDismiss(open: boolean, close: () => void): void {
 
 export function GalContextMenu({ menu, items }: { menu: GalMenuState | null; items: GalMenuItem[] }) {
   if (!menu) return null
+  // 两列布局：按 group 分组；没标 group 的按原来的单列顺序跟着"常用"走
+  const usual = items.filter((i) => (i.group ?? '常用') === '常用')
+  const tools = items.filter((i) => i.group === '工具')
+  const renderItem = (it: GalMenuItem): ReactNode => {
+    const Icon = it.icon
+    return (
+      <button
+        key={it.key}
+        className={`flex w-full items-center gap-2 px-3.5 py-2 text-left text-xs hover:bg-elev2 ${
+          it.danger ? 'text-danger hover:bg-danger/10' : ''
+        }`}
+        onClick={it.onSelect}
+      >
+        <Icon size={13} /> {it.label}
+      </button>
+    )
+  }
   return (
     <div
       className="fixed z-[70] max-h-[calc(100vh-16px)] overflow-y-auto rounded-xl border border-border bg-elev1 py-1 shadow-2xl"
-      style={{ left: menu.x, top: menu.y, width: 216 }}
+      style={{ left: menu.x, top: menu.y, width: tools.length ? 452 : 216 }}
       onMouseDown={(e) => e.stopPropagation()}
     >
-      {items.map((it) => {
-        const Icon = it.icon
-        return (
-          <button
-            key={it.key}
-            className={`flex w-full items-center gap-2 px-3.5 py-2 text-left text-xs hover:bg-elev2 ${
-              it.danger ? 'text-danger hover:bg-danger/10' : ''
-            }`}
-            onClick={it.onSelect}
-          >
-            <Icon size={13} /> {it.label}
-          </button>
-        )
-      })}
+      {tools.length ? (
+        <div className="flex">
+          <div className="w-[216px] border-r border-border">
+            <div className="px-3.5 pb-1 pt-1.5 text-[10px] font-medium text-faint">常用</div>
+            {usual.map(renderItem)}
+          </div>
+          <div className="w-[236px]">
+            <div className="px-3.5 pb-1 pt-1.5 text-[10px] font-medium text-faint">工具</div>
+            {tools.map(renderItem)}
+          </div>
+        </div>
+      ) : (
+        usual.map(renderItem)
+      )}
     </div>
   )
 }

@@ -137,7 +137,7 @@ export function SaveDirsPage() {
     <SubPage
       icon={FolderOpen}
       title="文件保存配置"
-      desc="番剧下载 / 番剧截图 / galgame 截图保存位置（选择后点「保存」立即生效）"
+      desc="番剧下载 / 番剧截图 / galgame 保存根目录（选择后点「保存」立即生效）"
       maxWidth="max-w-xl"
       actions={
         <Button size="sm" icon={Save} loading={saving} disabled={!dirty} onClick={() => void onSave()}>
@@ -172,8 +172,8 @@ export function SaveDirsPage() {
         onPick={() => void pick('screenshotDir')}
       />
       <DirRow
-        title="galgame 截图保存位置"
-        desc="galgame galgame 助手抓取的游戏窗口画面保存位置"
+        title="galgame 保存根目录"
+        desc="截图 / BGM / 立绘 / CG 的根目录，下面按「游戏名\种类」自动建子目录（截图即 根目录\游戏名\截图\游戏名_时间.png）"
         draft={draft.galDir}
         effective={info.galDir}
         onPick={() => void pick('galDir')}

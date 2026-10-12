@@ -276,6 +276,19 @@
 
         <TextView style="@style/FieldHint" android:text="@string/set_resize_hint" />
 
+        <Switch
+            android:id="@+id/sw_auto_next"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingStart="16dp"
+            android:paddingTop="12dp"
+            android:paddingEnd="16dp"
+            android:text="@string/set_auto_next"
+            android:textColor="@color/text_primary"
+            android:textSize="15sp" />
+
+        <TextView style="@style/FieldHint" android:text="@string/set_auto_next_hint" />
+
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"

@@ -255,6 +255,24 @@ export const CH = {
   /** v0.2.8 附加：只预热缓存、不回传弹幕本体（进播放/切集时预加载用） */
   danmakuPrefetch: 'danmaku:prefetch',
 
+  // 弹幕数据源集合器 + 弹幕盒子 + 本地弹幕库（v1.1）
+  /** 读集合器（顺带把内置源/适配器能力一起回给设置页） */
+  danmakuSourcesGet: 'danmaku:sources-get',
+  /** 整表保存集合器（增删改、启停、排序都在渲染层改完整体提交，主进程再校验一遍） */
+  danmakuSourcesSet: 'danmaku:sources-set',
+  /** 测试一条数据源：真发请求，逐步回结果（不是假按钮） */
+  danmakuSourceTest: 'danmaku:source-test',
+  /** 弹幕盒子：按关键字搜索引 */
+  danmakuBoxSearch: 'danmaku:box-search',
+  /** 弹幕盒子：下载某条并（尽量）取到指定集，落到本地弹幕库 */
+  danmakuBoxDownload: 'danmaku:box-download',
+  /** 本地弹幕库：列表 / 删除 / 清空 / 改目录 / 打开目录 */
+  danmakuLibList: 'danmaku:lib-list',
+  danmakuLibRemove: 'danmaku:lib-remove',
+  danmakuLibClear: 'danmaku:lib-clear',
+  danmakuLibSetDir: 'danmaku:lib-set-dir',
+  danmakuLibOpenDir: 'danmaku:lib-open-dir',
+
   // 保存目录（立即生效）
   saveDirsSet: 'save-dirs:set',
 
@@ -317,6 +335,14 @@ export const CH = {
   galBgmSave: 'gal:bgm-save',
   /** v0.3.9：最近保存的 BGM（卡片右键菜单「最近保存的 bgm」） */
   galBgmSaved: 'gal:bgm-saved',
+  /** V1.1：引擎检测 + 自动解包 + 解析曲名映射（只读游戏档案） */
+  galUnpack: 'gal:unpack',
+  /** V1.1：解包状态（未解包时给出为什么还不能识别曲名/提取立绘） */
+  galUnpackStatus: 'gal:unpack-status',
+  /** V1.1：立绘 / CG 提取（只写自己的保存目录） */
+  galExtractImages: 'gal:extract-images',
+  /** V1.1：手动刷新当前 BGM 识别（跳过轮询） */
+  galMemRefresh: 'gal:mem-refresh',
   galRecentShots: 'gal:recent-shots',
   /** 某款游戏自己的截图（「最近截图」挂在每张游戏卡片上，只看该游戏目录） */
   galListShots: 'gal:list-shots',

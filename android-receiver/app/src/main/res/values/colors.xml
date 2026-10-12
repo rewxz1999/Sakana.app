@@ -47,4 +47,10 @@
     <color name="player_scrubber">#2E6BE6</color>
     <!-- 手势提示气泡（"快进 10 秒"这类） -->
     <color name="player_hint_bg">#CC0B1B33</color>
+    <!--
+      Sakana 那条"业务按钮条"的底色。
+      刻意取成和 GSY 自带底栏一样的 #99000000：按钮条贴在 GSY 底栏的正上方，
+      同色才能看成一整条控制栏，而不是另起一条浮层。
+    -->
+    <color name="player_extra_bar">#99000000</color>
 </resources>

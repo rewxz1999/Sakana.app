@@ -1,13 +1,15 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs'
-import { extname, join } from 'node:path'
+import { dirname, extname, join } from 'node:path'
 import { CH } from '@shared/channels'
 import type {
   AddDownloadInput,
   BatchProbeTarget,
   CardExportImageRequest,
   CastMediaInput,
+  DanmakuBoxEntry,
+  DanmakuSource,
   GalBgmResult,
   GalRecentShot,
   GalToolsConfig,
@@ -95,6 +97,9 @@ import {
   updateInstallState
 } from './services/updater'
 import { fetchDanmaku, loadDanmaku, matchDanmaku, prefetchDanmaku, writeDanmakuXml } from './services/danmaku'
+// v1.1：数据源集合器（适配器自述/增删改/测试）与本地弹幕库（列表/删除/清空/目录）
+import { DANMAKU_ADAPTERS, danmuboxFetchEpisode, danmuboxSearch, listSources, saveSources, testSource } from './services/danmakuSources'
+import { clearLibrary, ensureLibraryDir, libraryInfo, removeFromLibrary, saveToLibrary } from './services/danmakuLibrary'
 // v0.3.0：Jikan（MAL）作为角色立绘的备用数据源（带 3 次/秒、60 次/分钟节流）
 import { jikanCharactersByTitle } from './services/jikan'
 import { saveDirsInfo, setSaveDirs } from './services/saveDirs'
@@ -144,13 +149,22 @@ import {
   galUpdateDetail as galUpdateDetailFn,
   galgameService
 } from './services/galgame'
-import { galMemRecent, galMemSaveBgm, galMemSavedBgm } from './services/galgameMem'
+import {
+  galMemExtractImages,
+  galMemForceRefresh,
+  galMemRecent,
+  galMemSaveBgm,
+  galMemSavedBgm,
+  galMemUnpack,
+  galMemUnpackStatus
+} from './services/galgameMem'
 import {
   galListShots,
   galOverlayResize,
   galPickDir,
   galRecentShots,
   galScreenshotNow,
+  migrateAllGalSaves,
   galToolsCleanup,
   galToolsGet,
   galToolsInit,
@@ -1256,6 +1270,46 @@ export function registerIpc(): void {
   ipcMain.handle(CH.galBgmSaved, (_e, gameId: string, gameName?: string) =>
     galMemSavedBgm(String(gameId ?? ''), gameName ? String(gameName) : undefined)
   )
+  /*
+   * V1.1：引擎检测 + 自动解包 + 解析曲名映射。
+   * 渲染层只传 gameId / exePath / 游戏名，游戏目录由主进程从 exePath 推导（dirname），
+   * 既不用渲染层拼路径，也不会把任意路径交给解包器。全程只读游戏档案。
+   */
+  ipcMain.handle(CH.galUnpack, async (_e, gameId: string, exePath: string, gameName: string, force?: boolean) => {
+    const exe = String(exePath ?? '')
+    if (!exe) {
+      return { ok: false, engine: '', evidence: [], files: 0, bytes: 0, archives: 0, readableArchives: 0, titles: 0, codes: 0, scripts: 0, sources: [], elapsedMs: 0, error: '这款游戏没有记录 exe 路径，无法定位资源档案' }
+    }
+    try {
+      return await galMemUnpack(String(gameId ?? ''), String(gameName ?? ''), dirname(exe), !!force)
+    } catch (err) {
+      return { ok: false, engine: '', evidence: [], files: 0, bytes: 0, archives: 0, readableArchives: 0, titles: 0, codes: 0, scripts: 0, sources: [], elapsedMs: 0, error: `解包失败：${String((err as { message?: string })?.message ?? err)}` }
+    }
+  })
+  ipcMain.handle(CH.galUnpackStatus, (_e, gameId: string, exePath: string) => {
+    const exe = String(exePath ?? '')
+    return galMemUnpackStatus(String(gameId ?? ''), exe ? dirname(exe) : undefined)
+  })
+  ipcMain.handle(
+    CH.galExtractImages,
+    async (_e, gameId: string, exePath: string, gameName: string, kind: '立绘' | 'cg', limit?: number) => {
+      const exe = String(exePath ?? '')
+      const empty = { ok: false, count: 0, candidates: 0, dir: '', files: [] as string[], error: '' }
+      if (!exe) return { ...empty, error: '这款游戏没有记录 exe 路径，无法定位资源档案' }
+      /*
+       * 这里**不要求**开启内存识别：立绘/CG 是从游戏档案里只读取出素材（立绘按坐标表合成），
+       * 与"读进程内存"是两条完全独立的链路。之前把它挂在内存识别开关上，
+       * 没开内存识别的用户点「提取立绘」会被告知"内存识别未开启"——把两件事错绑在一起了。
+       */
+      return galMemExtractImages(String(gameId ?? ''), String(gameName ?? ''), dirname(exe), kind, limit ?? 12)
+    }
+  )
+  // V1.1：悬浮球「手动刷新」——跳过 2 秒轮询，立刻重扫当前场景（等这一轮扫完再返回，避免拿到旧值）
+  ipcMain.handle(CH.galMemRefresh, async (_e, gameId?: string) => {
+    const id = String(gameId ?? '') || galRunningInfo()?.gameId || ''
+    if (!id) return { ok: false, error: '未检测到正在运行的 galgame' }
+    return galMemForceRefresh(id)
+  })
   // 最近截图：截图目录 + 各游戏子目录里最新的 30 张（兼容旧版直接放在根目录的截图）
   ipcMain.handle(CH.galRecentShots, () => galRecentShots(30))
   // 某款游戏自己的截图：只读 <截图目录>/<游戏名>/，供游戏卡片上的「最近截图」使用
@@ -1475,8 +1529,74 @@ export function registerIpc(): void {
       prefetchDanmaku(title, episode, opts)
   )
 
+  /* ─────────────── v1.1：弹幕数据源集合器 + 弹幕盒子 + 本地弹幕库 ─────────────── */
+
+  ipcMain.handle(CH.danmakuSourcesGet, () => ({
+    sources: listSources(),
+    adapters: DANMAKU_ADAPTERS,
+    library: libraryInfo()
+  }))
+  ipcMain.handle(CH.danmakuSourcesSet, (_e, sources: DanmakuSource[]) => saveSources(sources))
+  ipcMain.handle(CH.danmakuSourceTest, (_e, source: DanmakuSource, keyword?: string) =>
+    testSource(source, keyword)
+  )
+  ipcMain.handle(CH.danmakuBoxSearch, async (_e, keyword: string) => {
+    const list = await danmuboxSearch(keyword)
+    log.append('info', 'danmaku', `弹幕盒子搜索「${keyword}」→ ${list.length} 条`)
+    return list
+  })
+  /*
+   * 弹幕盒子下载：下载 → 解压 → 取指定集 → 存进本地库，返回落库条目。
+   * 这里**不**顺手塞给播放器：这条路是用户在设置页点「下载」用的；
+   * 播放时的自动加载走 `loadDanmaku`（它自己会查库、会按优先级用数据源）。
+   */
+  ipcMain.handle(
+    CH.danmakuBoxDownload,
+    async (_e, entry: DanmakuBoxEntry, opts?: { title?: string; episode?: number; sourceId?: string }) => {
+      const title = opts?.title?.trim() || entry.name
+      const episode = Math.max(1, Math.trunc(Number(opts?.episode) || 1))
+      const r = await danmuboxFetchEpisode(entry, episode)
+      if (r.comments.length === 0) throw new Error('这个包里没有可用的弹幕（解压成功但一条都没解析出来）')
+      return saveToLibrary({
+        title,
+        episode,
+        sourceId: opts?.sourceId || 'danmubox',
+        sourceName: '弹幕盒子',
+        origin: `弹幕盒子：${entry.name}（${entry.from}）${r.detail}`,
+        comments: r.comments
+      })
+    }
+  )
+  ipcMain.handle(CH.danmakuLibList, () => libraryInfo())
+  ipcMain.handle(CH.danmakuLibRemove, (_e, ids: string[]) =>
+    removeFromLibrary(Array.isArray(ids) ? ids : [])
+  )
+  ipcMain.handle(CH.danmakuLibClear, () => clearLibrary())
+  ipcMain.handle(CH.danmakuLibSetDir, (_e, dir: string) => {
+    const settings = store.get<Record<string, unknown>>('settings', {})
+    const prev = (settings.danmaku as Record<string, unknown>) ?? {}
+    store.set('settings', { ...settings, danmaku: { ...prev, libraryDir: String(dir ?? '').trim() } })
+    return libraryInfo()
+  })
+  ipcMain.handle(CH.danmakuLibOpenDir, async () => {
+    const dir = ensureLibraryDir()
+    await shell.openPath(dir)
+    return dir
+  })
+
   // 自动创建未配置的保存目录（baseDir = userData/saves）
   ensureSaveDirs()
+  /*
+   * V1.1：把旧版散落在「根目录/游戏名」下的截图挪进「根目录/游戏名/截图」。
+   * 与「截图/BGM/立绘/CG」新布局兼容迁移，避免两套目录并存（用户明确要求）；
+   * 开机扫一次，用户升级后即使不截图也已经归位。
+   */
+  try {
+    const migrated = migrateAllGalSaves()
+    if (migrated > 0) log.append('info', 'gal', `galgame 保存目录已按新布局检查：${migrated} 个游戏目录`)
+  } catch (err) {
+    log.append('warn', 'gal', `保存目录迁移检查失败（不影响使用）: ${String(err)}`)
+  }
   // 启动时恢复galgame 助手（快捷键 + 悬浮窗）
   galToolsInit()
   // 退出前结算游玩时长并回收galgame 助手资源

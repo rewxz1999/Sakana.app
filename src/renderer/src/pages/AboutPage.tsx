@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { CheckCircle2, FolderOpen, Info, XCircle } from 'lucide-react'
 import type { CacheInfo, PlayerAssets, SaveDirsInfo } from '@shared/api'
 import { api } from '@/lib/api'
@@ -59,6 +59,34 @@ function AssetItem({ name, ok }: { name: string; ok: boolean | null }) {
 
 export function AboutPage() {
   const { settings } = useSettings()
+
+  /*
+   * 应用图标的一次性自检（为什么留这一段）。
+   *
+   * 换封面图后出现过"应用图标看起来没显示"的反馈，而它在界面上有两种**长得一模一样**的成因：
+   *   ① 图片根本没加载出来（路径 404 / 解码失败）→ `naturalWidth === 0`；
+   *   ② 图片加载成功了，但源图是**不透明**的、底色接近纯白 → 在浅色主题下"融"进背景。
+   * 只有读 `naturalWidth/naturalHeight` 才能把 ① 和 ② 分开。
+   * 正常路径完全静默（不污染控制台），只在异常时打一条 warn —— 以后再出同类问题，
+   * 打开控制台就能立刻确定是"没加载"还是"加载了但看不见"。
+   */
+  const iconChecked = useRef(false)
+  const onIconLoad = (e: React.SyntheticEvent<HTMLImageElement>): void => {
+    if (iconChecked.current) return
+    iconChecked.current = true
+    const img = e.currentTarget
+    if (img.naturalWidth === 0 || img.naturalHeight === 0) {
+      console.warn('[AboutPage] 应用图标已触发 load 但解码尺寸为 0：', img.currentSrc || img.src)
+    }
+  }
+  const onIconError = (e: React.SyntheticEvent<HTMLImageElement>): void => {
+    const img = e.currentTarget
+    console.warn('[AboutPage] 应用图标加载失败（路径/解码问题）：', {
+      src: img.currentSrc || img.src,
+      naturalWidth: img.naturalWidth
+    })
+  }
+
   const [dataPath, setDataPath] = useState('')
   const [dirs, setDirs] = useState<SaveDirsInfo | null>(null)
   const [cache, setCache] = useState<CacheInfo | null>(null)
@@ -104,13 +132,22 @@ export function AboutPage() {
       {/* 版本 */}
       <div className="flex flex-col items-center gap-1 py-2 text-center">
         {/* 原本这里是一个 🐟 emoji 占位，改用打包内的应用封面图标，保证与任务栏/安装包图标一致 */}
+        {/*
+         * 为什么给图标加底板与描边：源图（resources/icon.png）是**不透明**的 512×512 真彩图，
+         * 没有 alpha 通道，且其主背景色测出来是 rgb(248,248,246)，而本页 sakura 主题背景是
+         * rgb(250,246,248) —— 差 2/255，肉眼完全同色。所以图标那 75% 的浅色底会"融"进页面，
+         * 看起来就像没显示。给一块浅色底板 + 描边后，无论源图有没有透明通道都能看清边界。
+         * 这是**不改图**的修法：一旦以后换成带 alpha 的图标，这段样式依然无害。
+         */}
         <img
           src={appIcon}
           alt="Sakana 应用图标"
           width={80}
           height={80}
           draggable={false}
-          className="h-20 w-20 select-none rounded-2xl object-contain shadow-sm"
+          className="h-20 w-20 select-none rounded-2xl border border-border bg-elev2 object-contain p-1 shadow-sm"
+          onLoad={onIconLoad}
+          onError={onIconError}
         />
         <div className="text-base font-bold">Sakana</div>
         <div className="text-xs text-faint">版本 v{version}</div>

@@ -19,6 +19,9 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // GSYVideoPlayer 只在 JitPack 上发布（com.github.CarGuo.GSYVideoPlayer:...）。
+        // 它排在最后：google()/mavenCentral() 里有同名坐标时不会被它抢走。
+        maven { url = 'https://jitpack.io' }
     }
 }
 

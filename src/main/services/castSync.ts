@@ -258,7 +258,8 @@ export function repairHistoryShape(): number {
  */
 async function playSubjectOnPc(
   subjectId: number,
-  episodeIndex = 0
+  episodeIndex = 0,
+  sourceId = ''
 ): Promise<{ ok: boolean; message: string; episodes?: string[] }> {
   const target = pickTargetDevice()
   if (!target) return { ok: false, message: '电脑端没有找到已连接的手机接收端' }
@@ -274,11 +275,27 @@ async function playSubjectOnPc(
 
   // 规则按「置顶优先」的顺序试；命中就停
   const { sortRulesPinnedFirst } = await import('@shared/types')
-  const rules = sortRulesPinnedFirst(
+  const enabled = sortRulesPinnedFirst(
     store
       .get<import('@shared/types').PlayRule[]>('rules', [])
       .filter((r) => r.enabled)
   )
+  /*
+   * V1.1：接收端换数据源（`sourceId`）时**只试那一条**，不再自动往下兜底。
+   *
+   * 为什么：用户是在手机/电视上明确点了"用这条线路"，如果我们没搜到就自己换一条，
+   * 他看到的会是"点了 A 结果放出来的是 B"——比失败更难理解。所以只有"没指定"时才按
+   * 置顶顺序依次试（那是手机端什么都不知道时的默认行为）。
+   */
+  const rules = sourceId ? enabled.filter((r) => r.id === sourceId) : enabled
+  if (sourceId && rules.length === 0) {
+    return { ok: false, message: '所选数据源在电脑端不存在或已停用，请在电脑上确认规则列表' }
+  }
+  /*
+   * 回给接收端的数据源清单**始终是全部已启用的规则**，不是"这次用的那条"。
+   * 否则它换过一次源之后，那份列表就只剩一项，用户再也换不回去。
+   */
+  const sources = enabled.map((r) => ({ id: r.id, name: r.name }))
   for (const rule of rules) {
     try {
       const s = await ruleSearch(rule.id, name)
@@ -298,7 +315,11 @@ async function playSubjectOnPc(
         referer: stream.referer ?? rule.baseUrl,
         cookies: stream.cookies,
         index: idx,
-        playlist: group.episodes.map((e, i) => ({ url: '', title: e.name || `第 ${i + 1} 集` }))
+        playlist: group.episodes.map((e, i) => ({ url: '', title: e.name || `第 ${i + 1} 集` })),
+        // 这次投回去的同样要带齐契约字段，否则接收端换完源就"失忆"了（切集/连播全废）
+        subjectId,
+        sources,
+        sourceId: rule.id
       }
       const r = await castPlay(target.id, media)
       if (!r.ok) return { ok: false, message: r.message }
@@ -396,7 +417,7 @@ export async function handleCastSync(
     return { ok: true, merged }
   }
   if (pathname === '/sync/command' && method === 'POST') {
-    let parsed: { action?: string; subjectId?: number; episodeIndex?: number } = {}
+    let parsed: { action?: string; subjectId?: number; episodeIndex?: number; sourceId?: string } = {}
     try {
       parsed = JSON.parse(body || '{}') as typeof parsed
     } catch {
@@ -405,7 +426,8 @@ export async function handleCastSync(
     if (parsed.action !== 'play-subject') return { ok: false, error: `不支持的动作：${parsed.action}` }
     const id = Number(parsed.subjectId)
     if (!Number.isFinite(id) || id <= 0) return { ok: false, error: 'subjectId 无效' }
-    const r = await playSubjectOnPc(id, Number(parsed.episodeIndex) || 0)
+    // V1.1：`sourceId` 可选（不给=用电脑自己的默认顺序），语义见 README §2.5c
+    const r = await playSubjectOnPc(id, Number(parsed.episodeIndex) || 0, String(parsed.sourceId ?? ''))
     return { ok: r.ok, message: r.message, episodes: r.episodes ?? [] }
   }
   return { ok: false, error: `未知的同步接口：${pathname}` }

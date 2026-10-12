@@ -5,18 +5,20 @@
  *   注入 / hook 能力；打开文件只用 'r'，不写入、不修改、不删除游戏目录里的任何东西。
  *
  * 支持两种在真机上验证过的格式：
- *   · KiriKiri XP3（`.xp3`）：文件名表在文件尾部、经 zlib 压缩（实测 少女领域 data.xp3：
- *     头部 11 字节 magic + u64 索引偏移；索引 = 17 字节头 + zlib；解压后是一串 File 块，
- *     每个块里有 info（名字 UTF-16）与 segm（段偏移/大小）。**条目数据通常是原样存储的**
- *     —— 所以既能读脚本/CSV 找曲名，也能把 .ogg 原样提取出来。
+ *   · KiriKiri XP3（`.xp3`）：索引经 zlib 压缩，解压后是一串 File 块，每个块里有 info（名字 UTF-16）
+ *     与 segm（段偏移/大小）；条目数据通常**原样存储** —— 所以既能读脚本/CSV 找曲名，也能完整解包。
+ *     ★ 索引位置有三种真实变体（都在真机上遇到过，所以用组合策略去找）：
+ *       ① 头部 11 字节 magic 后的 u64 直接就是索引偏移（实测 少女领域 data.xp3）；
+ *       ② 该 u64 不是偏移（实测 patch.xp3 / fgimage.xp3 是 23），索引其实在**文件尾部**；
+ *       ③ 索引不在尾部 24MB 内（实测 SANA EDITION 的 fgimage.xp3）→ 本版读不了，如实报"不支持"。
  *   · Siglus PFS（`.pfs`）：文件表是**明文**（magic 'pf8' + 重复的
- *     [offset:u32][size:u32][nameLen:u32][name][4 字节]）。但条目内容是加密/压缩的，
- *     实测读不出正文 —— 所以 Siglus 只能列出代号，曲名/提取要如实说"做不到"。
+ *     [offset:u32][size:u32][nameLen:u32][name][4 字节]）。但条目内容是加密的，实测读不出正文
+ *     —— 所以 Siglus 只能列出代号，曲名/提取/立绘都要如实说"做不到"。
  */
 
-import { closeSync, openSync, readSync, readdirSync, statSync, existsSync } from 'node:fs'
+import { closeSync, mkdirSync, openSync, readSync, readdirSync, statSync, existsSync, writeFileSync } from 'node:fs'
 import { inflateSync } from 'node:zlib'
-import { extname, join } from 'node:path'
+import { dirname, extname, join } from 'node:path'
 
 export interface ArchiveEntry {
   /** 档案文件绝对路径 */
@@ -69,42 +71,74 @@ function parseXp3Index(file: string): ArchiveEntry[] | null {
     const head = readAt(fd, 0, 64)
     if (!head.subarray(0, 11).equals(XP3_MAGIC)) return null
 
-    // ① 头部第 11 字节起的 u64 指向索引（实测 少女领域 data.xp3 就是这样）
-    const candidates: number[] = []
+    // ① 头部第 11 字节起的 u64（实测 少女领域 data.xp3 就是索引偏移；patch.xp3 那里是 23，不是偏移）
     const headOff = Number(head.readBigUInt64LE(11))
-    if (headOff > 0 && headOff < total) candidates.push(headOff)
-    // ② 兜底：标准 XP3 的索引偏移记在文件尾部的 magic 之后
-    const tailLen = Math.min(TAIL_SEARCH_BYTES, total)
-    const tail = readAt(fd, total - tailLen, tailLen)
-    for (let at = tail.indexOf(XP3_MAGIC); at >= 0; at = tail.indexOf(XP3_MAGIC, at + 1)) {
-      if (at + 19 <= tail.length) {
-        const o = Number(tail.readBigUInt64LE(at + 11))
-        if (o > 0 && o < total) candidates.push(o)
-      }
-    }
-
-    for (const indexOffset of candidates) {
-      const blob = readAt(fd, indexOffset, Math.min(total - indexOffset, MAX_INDEX_BYTES))
-      // 索引本体：前面若干字节的头 + zlib 流；真机实测是 17 字节
-      let index: Buffer | null = null
-      for (let skip = 0; skip <= 32 && !index; skip++) {
-        if (blob.length < skip + 2 || blob[skip] !== 0x78) continue
-        try {
-          index = inflateSync(blob.subarray(skip))
-        } catch {
-          /* 试下一个偏移 */
-        }
-      }
-      if (!index) continue
-      const entries = walkXp3FileChunks(index)
+    const fromHead = headOff > 0 && headOff < total ? tryInflateIndexAt(fd, headOff, total) : null
+    if (fromHead) {
+      const entries = walkXp3FileChunks(fromHead)
       if (entries.length) return entries.map((e) => ({ ...e, archive: file }))
     }
+
+    // ② 尾部 / 头部扫描：找一个能解压出 "File..." 的 zlib 流
+    for (const [from, to] of [
+      [Math.max(0, total - TAIL_SEARCH_BYTES), total],
+      [0, Math.min(total, TAIL_SEARCH_BYTES)]
+    ]) {
+      const scanned = scanForIndex(fd, from, to)
+      if (scanned) {
+        const entries = walkXp3FileChunks(scanned)
+        if (entries.length) return entries.map((e) => ({ ...e, archive: file }))
+      }
+    }
+    // ③ 都找不到 → 这个档案的索引不是 zlib（实测 SANA EDITION 的 fgimage.xp3 就是），如实返回 null
     return null
   } catch {
     return null
   } finally {
     if (fd >= 0) closeSync(fd)
   }
+}
+
+/** 从某个偏移起尝试把「头 + zlib」解出来；解出来的必须是 XP3 索引（以 "File" 开头） */
+function tryInflateIndexAt(fd: number, offset: number, total: number): Buffer | null {
+  const blob = readAt(fd, offset, Math.min(total - offset, MAX_INDEX_BYTES))
+  for (let skip = 0; skip <= 64; skip++) {
+    if (blob.length < skip + 2) break
+    if (skip > 0 && blob[skip] !== 0x78) continue
+    try {
+      const out = inflateSync(blob.subarray(skip))
+      if (out.length > 64 && out.subarray(0, 4).toString('latin1') === 'File') return out
+    } catch {
+      /* 试下一个偏移 */
+    }
+  }
+  return null
+}
+
+/**
+ * 在 [from,to) 里逐块找 zlib 流（78 9c / 78 da / 78 01 / 78 5e），
+ * 解出来以 "File" 开头就当索引。真机实测 patch.xp3 的索引在尾部，扫描 24MB 约 175ms。
+ */
+function scanForIndex(fd: number, from: number, to: number): Buffer | null {
+  const CHUNK = 8 * 1024 * 1024
+  let pos = from
+  while (pos < to) {
+    const len = Math.min(CHUNK, to - pos)
+    const buf = readAt(fd, pos, len)
+    for (let i = 0; i + 2 < buf.length; i++) {
+      if (buf[i] !== 0x78) continue
+      const b1 = buf[i + 1]
+      if (b1 !== 0x9c && b1 !== 0xda && b1 !== 0x01 && b1 !== 0x5e) continue
+      try {
+        const out = inflateSync(buf.subarray(i))
+        if (out.length > 64 && out.subarray(0, 4).toString('latin1') === 'File') return out
+      } catch {
+        /* 继续扫 */
+      }
+    }
+    pos += len
+  }
+  return null
 }
 
 /** XP3 索引解压后是一串块：每个条目一个 `File` 块，块内是 info / segm 子块 */
@@ -245,7 +279,140 @@ export function listArchiveEntries(gameDir: string): ArchiveEntry[] {
 /** 某个档案能不能读出正文（XP3 可以；Siglus pf8 实测正文是加密的） */
 export function isArchiveReadable(archive: string): boolean {
   const hit = cache.get(archive)
-  return hit ? hit.readable : false
+  if (hit) return hit.readable
+  /*
+   * 缓存里没有 → 现场解析一次再回答（V1.1 复验时补）。
+   *
+   * 为什么不能让"没缓存"直接等于"读不出"：写缓存的是 `listArchiveEntries`，于是答案会被
+   * **调用顺序**决定 —— 先问 `isArchiveReadable(data.xp3)` 得到 false（听起来像"索引被加密"），
+   * 而同一个档案只要先被 listArchiveEntries 列过一次就是 true。独立复验脚本按"先判可读、
+   * 再列条目"这个最自然的顺序写，当场把 3 卷里内容最多的那卷报成"索引读不出来"；
+   * `archiveSummary` 用的是同一个顺序，冷缓存下会固定少算 1 卷。
+   * 所以这里自己把缓存喂上：答案只取决于档案本身，与谁先问无关。
+   */
+  const dir = dirname(archive)
+  if (findArchives(dir).includes(archive)) {
+    listArchiveEntries(dir)
+    const warmed = cache.get(archive)
+    if (warmed) return warmed.readable
+  }
+  return false
+}
+
+// ---------------- 自动解包（只写我们自己的解包目录） ----------------
+
+export interface UnpackOptions {
+  /** 只解包这些扩展名（小写、含点）；不传 = 全部 */
+  exts?: string[]
+  /** 单个条目大小上限（超过就跳过；用于避免一次解出几 GB 音频/视频） */
+  maxEntryBytes?: number
+  /** 解包总量上限（字节） */
+  maxTotalBytes?: number
+  /** 每个档案最多解多少个条目 */
+  maxEntries?: number
+  /** 是否覆盖已存在的文件 */
+  overwrite?: boolean
+}
+
+export interface UnpackResult {
+  ok: boolean
+  /** 解出来的文件数 */
+  files: number
+  /** 跳过的条目数（按大小/类型过滤） */
+  skipped: number
+  /** 解出的总字节 */
+  bytes: number
+  /** 解包目录 */
+  dir: string
+  /** 处理过的档案（含读不了索引的） */
+  archives: { file: string; entries: number; readable: boolean }[]
+  error: string
+}
+
+/** 把档案内名字转成安全的相对路径（防目录穿越；保留子目录结构） */
+function safeRelPath(name: string): string {
+  const parts = name
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter((s) => s && s !== '.' && s !== '..')
+    .map((s) => s.replace(/[<>:"|?*\u0000-\u001f]/g, '_'))
+  return parts.join('/')
+}
+
+/**
+ * 把一个游戏目录里的档案**解包**到 outDir（我们自己的目录，绝不写回游戏目录）。
+ * 默认只解文本类（脚本/表/配置），因为这才是"解析曲目表与立绘坐标"需要的东西；
+ * 传 exts 可以额外解音频或图片（保存 BGM / 提取立绘时用）。
+ *
+ * 是 async 的原因：多档案游戏（实测 SANA EDITION 9 个 xp3）里，找 zlib 索引要扫尾部 16MB，
+ * 一路同步跑会在主进程里卡住十几秒（界面直接假死）。每解完一个档案就让出一轮事件循环，
+ * IPC / 窗口消息还能插进来，界面保持可响应。
+ */
+export async function unpackArchives(gameDir: string, outDir: string, opts: UnpackOptions = {}): Promise<UnpackResult> {
+  const exts = opts.exts ? new Set(opts.exts.map((e) => e.toLowerCase())) : null
+  const maxEntry = opts.maxEntryBytes ?? 16 * 1024 * 1024
+  const maxTotal = opts.maxTotalBytes ?? 512 * 1024 * 1024
+  const maxEntries = opts.maxEntries ?? 20000
+  const result: UnpackResult = { ok: true, files: 0, skipped: 0, bytes: 0, dir: outDir, archives: [], error: '' }
+
+  try {
+    mkdirSync(outDir, { recursive: true })
+  } catch (err) {
+    result.ok = false
+    result.error = `无法创建解包目录：${String((err as { message?: string })?.message ?? err)}`
+    return result
+  }
+
+  for (const archive of findArchives(gameDir)) {
+    const entries = listArchiveEntries(dirname(archive) === gameDir ? gameDir : gameDir).filter((e) => e.archive === archive)
+    const readable = isArchiveReadable(archive)
+    result.archives.push({ file: archive, entries: entries.length, readable })
+    if (!readable) continue
+
+    for (const entry of entries) {
+      if (result.files >= maxEntries || result.bytes >= maxTotal) break
+      const ext = extname(entry.name).toLowerCase()
+      if (exts && !exts.has(ext)) {
+        result.skipped++
+        continue
+      }
+      if (entry.packed > maxEntry) {
+        result.skipped++
+        continue
+      }
+      const rel = safeRelPath(entry.name)
+      if (!rel) {
+        result.skipped++
+        continue
+      }
+      const target = join(outDir, rel)
+      if (!opts.overwrite && existsSync(target)) {
+        result.files++
+        continue
+      }
+      const r = readArchiveEntry(entry, { maxBytes: maxEntry })
+      if (!r.ok || !r.bytes) {
+        result.skipped++
+        continue
+      }
+      try {
+        mkdirSync(dirname(target), { recursive: true })
+        writeFileSync(target, r.bytes)
+        result.files++
+        result.bytes += r.bytes.length
+      } catch {
+        result.skipped++
+      }
+    }
+    // 一个档案处理完就让一轮：找索引要扫尾部 16MB，多档案游戏不能把主进程按住
+    await yieldToLoop()
+  }
+  return result
+}
+
+/** 让出一轮事件循环（Windows/Node 下 setImmediate 最便宜，且不会像 setTimeout 那样有最小延迟） */
+function yieldToLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve))
 }
 
 /** 条目名是否像一个「代号 → 曲名」的文本表（真机实测 KiriKiri 用 main/soundlist.csv） */
@@ -253,6 +420,26 @@ export function looksLikeTitleTable(name: string): boolean {
   const lower = name.toLowerCase()
   if (!/\.(csv|txt|ini|tsv|json|dat)$/.test(lower)) return false
   return /(soundlist|bgmtitle|bgm|music|sound|track|song|ost)/.test(lower)
+}
+
+/**
+ * 只读一个条目**开头的 n 字节**（用于读图片头拿尺寸：PNG 的 IHDR 就在开头）。
+ * 与 readArchiveEntry 不同，这里**不做大小上限判断** —— 一张 3MB 的立绘只需要前几十字节，
+ * 之前用整条读取的上限去卡它，导致大图全被判成"太大读不了"（真机踩过）。
+ */
+export function readEntryHead(entry: ArchiveEntry, n: number): Buffer | null {
+  if (entry.packed !== entry.size) return null // 压缩存储时头字节不是原图开头（图片实测都是原样存）
+  let fd = -1
+  try {
+    fd = openSync(entry.archive, 'r')
+    const want = Math.min(n, entry.packed)
+    const buf = readAt(fd, entry.offset, want)
+    return buf.length ? buf : null
+  } catch {
+    return null
+  } finally {
+    if (fd >= 0) closeSync(fd)
+  }
 }
 
 export interface ReadEntryResult {

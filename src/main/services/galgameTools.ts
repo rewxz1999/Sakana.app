@@ -1,5 +1,5 @@
 import { app, BrowserWindow, desktopCapturer, dialog, globalShortcut, screen } from 'electron'
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { extname, join } from 'node:path'
 import type { GalRecentShot, GalToolsConfig } from '@shared/types'
 import { DEFAULT_GAL_TOOLS } from '@shared/types'
@@ -101,6 +101,8 @@ function overlayHtml(): string {
     <div id="menu">
       <button class="item" id="bgmItem"><span class="ic">🎵</span>读取 BGM</button>
       <div class="divider"></div>
+      <button class="item" id="refreshItem"><span class="ic">🔄</span>手动刷新（立刻重扫）</button>
+      <div class="divider"></div>
       <button class="item" id="shotItem"><span class="ic">📷</span>截图</button>
     </div>
     <div id="result">
@@ -187,6 +189,30 @@ function overlayHtml(): string {
         currentName = ''
         currentCode = ''
         showResult('BGM 识别', (r && r.error) ? r.error : 'BGM 识别失败', '', false, false)
+      }
+    })
+
+    /* 手动刷新：跳过 2 秒轮询，立刻重扫一次内存（切场景后想马上看到结果时用）。
+       refreshBgm 现在会**等这一轮扫描结束**再返回，所以这里不用再"猜一个延迟"——
+       刷新完直接读，拿到的就是新结果，面板上会带「识别于 N 秒前」。 */
+    document.getElementById('refreshItem').addEventListener('click', async function () {
+      showResult('BGM 识别（已刷新）', '正在刷新…', '正在重扫游戏内存', null, false)
+      var rr = null
+      try { rr = await window.sakana.gal.refreshBgm('') } catch (e) { rr = null }
+      if (rr && rr.ok && rr.data && rr.data.ok === false) {
+        showResult('BGM 识别（已刷新）', rr.data.error || '刷新失败', '', false, false)
+        return
+      }
+      var rr2 = null
+      try { rr2 = await window.sakana.gal.readBgm() } catch (e) { rr2 = null }
+      if (rr2 && rr2.ok && rr2.data && rr2.data.name) {
+        currentName = rr2.data.name
+        currentCode = rr2.data.code || rr2.data.name
+        showResult('BGM 识别（已刷新）', rr2.data.name, rr2.data.detail || '', null, true)
+        saveBtn.style.display = 'inline-flex'
+        saveBtn.textContent = '保存这首'
+      } else {
+        showResult('BGM 识别（已刷新）', (rr2 && rr2.data && rr2.data.message) || '未识别到 BGM', '', null, false)
       }
     })
 
@@ -429,11 +455,84 @@ export function galShotRootDir(cfg: GalToolsConfig = getCfg()): string {
   return cfg.dir || join(app.getPath('userData'), 'screenshots', 'galgame')
 }
 
-/** 某款游戏的截图目录：<根目录>/<游戏名>（自动创建） */
+/**
+ * 某款游戏的截图目录：`<可自定义根目录>/<游戏名>/截图/`（自动创建）。
+ *
+ * V1.1 起统一成"根目录 / 游戏名 / 种类 / 文件"（种类 = 截图 / bgm / 立绘 / cg），
+ * 之前截图直接堆在 `<根目录>/<游戏名>/` 下面；老的散文件由 migrateGalSaveLayout 一次性挪进来，
+ * 不保留两套目录（用户明确要求"兼容迁移，不要并存两套"）。
+ */
 export function galGameShotDir(gameName: string): string {
-  const dir = join(galShotRootDir(), sanitizeGalName(gameName))
+  const dir = join(galShotRootDir(), sanitizeGalName(gameName), '截图')
   mkdirSync(dir, { recursive: true })
+  migrateGalSaveLayout(gameName)
   return dir
+}
+
+/** 旧位置（V1.1 之前）：<根目录>/<游戏名>/ 直接放 png */
+export function galGameLegacyShotDir(gameName: string): string {
+  return join(galShotRootDir(), sanitizeGalName(gameName))
+}
+
+/**
+ * 兼容迁移：把旧位置根目录下的图片文件挪进 `截图/`，只做一次、只动图片。
+ * 幂等且保守：任何一步失败都不抛（截图功能不能因为迁移失败而不可用）。
+ */
+export function migrateGalSaveLayout(gameName: string): void {
+  try {
+    const legacy = galGameLegacyShotDir(gameName)
+    const target = join(legacy, '截图')
+    if (!existsSync(legacy)) return
+    // 目标目录已经建好就说明迁移过了（或本来就是新布局）
+    if (existsSync(target) && readdirSync(target).some((n) => /\.(png|jpg|jpeg|webp)$/i.test(n))) return
+    mkdirSync(target, { recursive: true })
+    let moved = 0
+    for (const n of readdirSync(legacy)) {
+      if (!/\.(png|jpg|jpeg|webp)$/i.test(n)) continue
+      const from = join(legacy, n)
+      try {
+        if (!statSync(from).isFile()) continue
+        // 目标同名就不覆盖（rename 在 Windows 上会失败，直接跳过并留原文件）
+        renameSync(from, join(target, n))
+        moved++
+      } catch {
+        /* 单个文件挪不动就留着 */
+      }
+    }
+    if (moved > 0) log.append('info', 'gal', `截图目录迁移完成: ${moved} 个文件 → ${target}`)
+  } catch (err) {
+    log.append('warn', 'gal', `截图目录迁移失败（不影响新截图）: ${String(err)}`)
+  }
+}
+
+/**
+ * 启动时扫一遍保存根目录，把每个游戏目录下散落的旧截图挪进 `截图/`。
+ *
+ * 为什么要开机扫：只在"下次截图"时才迁移的话，用户升级后如果没马上截图，
+ * 老截图会和新目录**并存**一段时间（用户明确要求"不要并存两套"）。
+ * 只处理「根目录/游戏名」下直接躺着的图片，bgm/立绘/cg/截图 这些子目录一律不碰。
+ */
+export function migrateAllGalSaves(): number {
+  const root = galShotRootDir()
+  if (!existsSync(root)) return 0
+  let games = 0
+  let names: string[] = []
+  try {
+    names = readdirSync(root)
+  } catch {
+    return 0
+  }
+  for (const name of names) {
+    const dir = join(root, name)
+    try {
+      if (!statSync(dir).isDirectory()) continue
+    } catch {
+      continue
+    }
+    migrateGalSaveLayout(name)
+    games++
+  }
+  return games
 }
 
 /**
@@ -451,11 +550,14 @@ export async function galScreenshotNow(): Promise<string> {
   try {
     await sleep(200)
     const png = await captureGameWindow()
-    // 命名规则：<游戏名>/<游戏名>_<时间>.png（无游戏信息时退回 sakana/sakana_时间.png）
+    /*
+     * 命名规则（V1.1 统一布局）：`<根目录>/<游戏名>/截图/<游戏名>_<时间>.png`。
+     * 必须走 galGameShotDir（它同时负责把旧版散落在 <游戏名>/ 下的截图迁进 截图/），
+     * 否则新截图又落到根上、和迁移后的 截图/ 并存 —— 正是用户明确不要的"两套目录"。
+     */
     const run = galRunningInfo()
     const name = sanitizeGalName(run?.gameTitle || 'sakana')
-    const gameDir = join(dir, name)
-    mkdirSync(gameDir, { recursive: true })
+    const gameDir = galGameShotDir(name)
     const file = join(gameDir, `${name}_${tsName()}.png`)
     writeFileSync(file, png)
     log.append('info', 'gal', `游戏窗口截图已保存: ${file}`)
@@ -508,11 +610,14 @@ function listImagesIn(dir: string, limit: number): GalRecentShot[] {
 /**
  * 某款游戏自己的截图（gal:list-shots）。
  *
- * 「最近截图」现在挂在每张游戏卡片上，只允许看**这款游戏自己的目录**：
- * 截图保存在 <根目录>/<游戏名>/，所以这里只读该子目录，不混进别的游戏。
+ * 「最近截图」挂在每张游戏卡片上，只允许看**这款游戏自己的目录**。
+ * V1.1 起截图在 `<根目录>/<游戏名>/截图/`；如果这一层还没有文件（迁移没触发或刚装新版），
+ * 就退回读旧位置 `<根目录>/<游戏名>/`，保证老用户不会"截图突然不见了"。
  */
 export function galListShots(gameName: string, limit = 60): GalRecentShot[] {
   const name = sanitizeGalName(gameName || 'sakana')
+  const fresh = listImagesIn(join(galShotRootDir(), name, '截图'), limit)
+  if (fresh.length) return fresh
   return listImagesIn(join(galShotRootDir(), name), limit)
 }
 
@@ -540,6 +645,8 @@ export function galRecentShots(limit = 30): GalRecentShot[] {
       } catch {
         continue
       }
+      // V1.1 布局：<根目录>/<游戏名>/截图/；同时兼容旧位置 <根目录>/<游戏名>/
+      all.push(...listImagesIn(join(sub, '截图'), limit))
       all.push(...listImagesIn(sub, limit))
     }
   }

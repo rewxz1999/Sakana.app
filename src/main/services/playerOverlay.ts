@@ -1789,6 +1789,141 @@ export function pokeOverlay(): void {
   broadcastOverlay(CH.overlayPoke)
 }
 
+/**
+ * 「点击播放器按钮没反应」侦测 + 自救提示（V1.1，用户要求）。
+ *
+ * 用户的原话是：「只要检测到用户点击播放器按钮无响应就弹出提示按 esc 或 F」。
+ * 这里要说清楚**能检测到什么、检测不到什么**，因为这决定了它不是万能的：
+ *
+ * ## 两种"没反应"，只有一种能在主进程里被客观证实
+ *
+ *   ① **动作根本没到**：鼠标事件落在两个窗口之间（悬浮窗的透明区 / 原生视频子窗口），
+ *      React 的 onPointerDown 压根没触发 → 主进程这边**一点痕迹都没有**。
+ *      这种只能靠"鼠标来过但没人点"的间接证据（见上面 noteOverlayMissedClick，
+ *      它在 v0.3.9 改成按区域命中后基本不会再触发）。
+ *   ② **动作到了，但没生效**：动作已经进了主进程（说明点击真的被接住了），
+ *      可它要求改变的那个量**没变** —— 内核卡住/没响应、窗口不配合全屏，都是这一类。
+ *
+ * ②是可以**硬证**的：动作本身带着"应该发生什么"，等一小会儿再读一次那个量就知道有没有发生。
+ * 所以这段只做②，判据全是客观读数（mpv 属性 / 窗口全屏态），不做"猜用户是不是没点动"。
+ * ①留给既有的点击击穿侦测，两者共用同一个自救浮层。
+ *
+ * ## 为什么放在主进程而不是渲染层
+ *
+ * 渲染层对 playPause / 音量 / 静音这些动作是**乐观更新**（先自己把状态改了再去调内核），
+ * 于是"内核没响应"在渲染层看起来一切正常 —— 在那儿做侦测只会得到假阴性。
+ * 而 uosc 控制栏（mpv 自己画的那条）的点击**不经过悬浮窗**，只有主进程同时看得到两条路，
+ * 所以放在这里两边的按钮一起覆盖。
+ */
+const UNRESPONSIVE_MS = 1800
+/** 同一个动作在这么久内只提示一次，避免用户连点几下就被弹一堆浮层 */
+const RESCUE_HINT_COOLDOWN_MS = 15000
+
+/** mpv 属性读取器（由 mpv.ts 注册；playerOverlay 不 import mpv，避免循环依赖） */
+let propReader: ((name: string) => string | number | boolean | null) | null = null
+export function setOverlayPropReader(fn: ((name: string) => string | number | boolean | null) | null): void {
+  propReader = fn
+}
+
+/**
+ * 「这个动作该改哪个量」对照表。
+ *
+ * 只收**客观可读**的：内核的 pause/mute/volume/speed 与窗口的全屏态。
+ * 刻意**不收**这些：
+ *   · 选集/详情/弹幕菜单 —— 效果是渲染层本地状态，主进程看不到；
+ *   · 快进快退/拖动 —— 渲染层会乐观地把进度改掉，读到的永远是"变了"（假阴性）；
+ *   · 退出播放/换集 —— 会换掉整条会话，1.8 秒后读到的是新会话，判不出对错。
+ * 宁可少判几个按钮，也不要把"判不了"写成"没问题"。
+ */
+const EFFECT_PROBES: Record<string, { kind: 'mpv' | 'window'; name: string; label: string }> = {
+  playPause: { kind: 'mpv', name: 'pause', label: '播放/暂停' },
+  toggleMute: { kind: 'mpv', name: 'mute', label: '静音' },
+  volumeUp: { kind: 'mpv', name: 'volume', label: '音量+' },
+  volumeDown: { kind: 'mpv', name: 'volume', label: '音量-' },
+  setVolume: { kind: 'mpv', name: 'volume', label: '音量' },
+  setSpeed: { kind: 'mpv', name: 'speed', label: '倍速' },
+  toggleFullscreen: { kind: 'window', name: 'fullscreen', label: '全屏切换' },
+  exitFullscreen: { kind: 'window', name: 'fullscreen', label: '退出全屏' }
+}
+
+let effectWatchSeq = 0
+let effectWatchTimer: NodeJS.Timeout | null = null
+let lastRescueHintAt = 0
+
+/** 读一个可核实的量；读不到（没会话/没注册/属性不存在）返回 null，调用方据此不判 */
+function readEffectValue(probe: { kind: 'mpv' | 'window'; name: string }): string | number | boolean | null {
+  if (probe.kind === 'window') {
+    if (!ownerWin || ownerWin.isDestroyed()) return null
+    try {
+      return ownerWin.isFullScreen()
+    } catch {
+      return null
+    }
+  }
+  if (!propReader) return null
+  try {
+    const v = propReader(probe.name)
+    return v === undefined ? null : v
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 控制栏动作已经进了主进程 —— 记下来，过一小会儿看它到底有没有生效；没生效就弹自救浮层。
+ *
+ * 两条路都要调它：悬浮窗控制栏（sendOverlayAction）与 uosc 控制栏（mpv.ts 的 250ms 泵）。
+ */
+export function noteControlAction(action: { type?: unknown }): void {
+  const probe = EFFECT_PROBES[String(action?.type ?? '')]
+  if (!probe) return
+  const before = readEffectValue(probe)
+  // 读不到当前值（内核没起来 / 属性不支持）→ 不判，宁可漏报也不误报
+  if (before === null) return
+  const my = ++effectWatchSeq
+  if (effectWatchTimer) clearTimeout(effectWatchTimer)
+  effectWatchTimer = setTimeout(() => {
+    // 之后又点了别的按钮（或同一个按钮）→ 这一轮作废，只判最后一次
+    if (my !== effectWatchSeq) return
+    const after = readEffectValue(probe)
+    if (after === null) return
+    /*
+     * 判定：数值型给一点容差（音量/倍速是浮点），其余要求严格不等。
+     * 反过来说，只要**变过**就算生效 —— 不要求变成"预期的那个值"：
+     * 用户的诉求是"我点了它得有点动静"，不是"它必须按我想的方向动"。
+     */
+    const changed =
+      typeof before === 'number' && typeof after === 'number'
+        ? Math.abs(after - before) > 0.01
+        : after !== before
+    if (changed) {
+      clearOverlayMissedClicks()
+      return
+    }
+    const now = Date.now()
+    if (now - lastRescueHintAt < RESCUE_HINT_COOLDOWN_MS) return
+    lastRescueHintAt = now
+    log.append(
+      'warn',
+      'overlay',
+      `控制栏动作「${probe.label}」在 ${UNRESPONSIVE_MS}ms 内没有改变 ${probe.kind === 'mpv' ? 'mpv 属性 ' : '窗口状态 '}${probe.name}` +
+        `（${String(before)} → ${String(after)}），判定为"点了没反应"，弹出 Esc/F 自救提示`
+    )
+    // 与「疑似点击击穿」共用同一个浮层（文案里已经写了 F / Esc 两条逃生路线）。
+    // 走 `clickThroughCb` 这个**统一出口**（ipc.ts 把它接到 pushOverlayClickThrough），
+    // 而不是自己直接推窗口：否则任何额外订阅者（自检、将来的埋点）都会漏掉这条提示 ——
+    // 自检第一版就是这么漏的（提示回调一次都没触发，看起来像"侦测没生效"）。
+    const payload = { count: 1, at: now }
+    if (clickThroughCb) clickThroughCb(payload)
+    else pushOverlayClickThrough(payload)
+  }, UNRESPONSIVE_MS)
+}
+
+/** 自检用：当前是否有一个"待核实"的动作（null = 没有） */
+export function effectWatchPending(): number {
+  return effectWatchTimer ? effectWatchSeq : 0
+}
+
 /** 悬浮窗 → 播放页：控制栏动作 */
 export function sendOverlayAction(action: Record<string, unknown>): void {
   /*
@@ -1800,6 +1935,8 @@ export function sendOverlayAction(action: Record<string, unknown>): void {
    * 就是数这个计数。平时不开这个环境变量，避免刷日志。
    */
   overlayActionCount++
+  // V1.1：动作进来了就开始盯它有没有真的生效（见 noteControlAction 的说明）
+  noteControlAction(action)
   if (process.env.SAKANA_OVERLAY_HIT_TEST) {
     console.log(
       `[overlay-hit] ACTION #${overlayActionCount} type=${String(action.type)} ` +

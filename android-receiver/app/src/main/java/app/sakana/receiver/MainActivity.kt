@@ -9,7 +9,6 @@ import android.os.Looper
 import android.view.View
 import android.view.WindowManager
 import android.widget.Toast
-import androidx.media3.ui.PlayerView
 
 /** 界面刷新周期：状态/进度/连接/同步提示都在这个节拍里更新，1 秒足够也不费电。 */
 private const val UI_TICK_MS = 1000L
@@ -19,24 +18,30 @@ private const val UI_TICK_MS = 1000L
  *
  * 两个形态（见 activity_main.xml 的两层布局）：
  *  · **首页**：固定状态卡 + 单个 RecyclerView（收藏两列网格 + 观看历史卡片）+ 固定底栏；
- *  · **播放**：官方 PlayerView 铺满窗口 + 横屏全屏 + 浮在画面上的控制栏与手势。
+ *  · **播放**：GSY 的 StandardGSYVideoPlayer 铺满窗口 + 横屏全屏 + 浮在画面上的控制栏与手势。
  *
  * 职责边界（每一块都单独成文件，这里只负责接线、刷新与生命周期）：
- *  · 播放器        PlayerController
+ *  · 播放器        PlayerController（GSY 的封装）
  *  · 投屏协议      ControlApi / ControlServer
  *  · 双端同步      SyncManager / SyncStore / SyncClient / WatchRecorder
- *  · 播放层（控制栏/手势/全屏）PlaybackUi + PlayerGestures + player_control_view.xml
+ *  · 播放层（控制栏/手势/全屏）PlaybackUi + PlayerGestures + player_gsy_view.xml
  *  · 首页列表      HomeRows（纯逻辑）+ HomeAdapter + HomeBinder
  *  · 顶部状态区    HeaderBinder
  *  · 弹窗与文案    UiHelpers
  */
 class MainActivity : Activity() {
 
-    private lateinit var playerView: PlayerView
+    private lateinit var playerView: SakanaGsyPlayer
     private lateinit var header: HeaderBinder
     private lateinit var home: HomeBinder
     private lateinit var playback: PlaybackUi
     private lateinit var player: PlayerController
+
+    /** 自动连播：一集播完自动切下一集（开关在设置页，默认开）。 */
+    private lateinit var autoNext: AutoNextPlayback
+
+    /** 剧集/数据源选择与切换（都在 PlaySwitcher 里，这里只接线）。 */
+    private lateinit var switcher: PlaySwitcher
 
     private val ui = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
@@ -61,7 +66,7 @@ class MainActivity : Activity() {
          * `lateinit property player has not been initialized`（MainActivity.bindViews:121 → onCreate）。
          */
         playerView = findViewById(R.id.player_view)
-        player = PlayerController(this, playerView) { refreshUi() }
+        player = PlayerController(playerView) { refreshUi() }
         bindViews()
 
         // 把播放器交给运行期外壳：HTTP 控制接口从这里拿播放能力；界面销毁时置回 null
@@ -139,6 +144,8 @@ class MainActivity : Activity() {
     private fun bindViews() {
         // playerView 与 player 在 onCreate 里已经建好（见那里的顺序说明），这里只管把各块接起来
         header = HeaderBinder(this, findViewById(R.id.header))
+        // 自动连播的执行器：要拿到 player，所以必须在 player 建好之后（就是这里）
+        autoNext = AutoNextPlayback(this, player) { refreshUi() }
         home = HomeBinder(
             activity = this,
             root = findViewById(R.id.home_view),
@@ -149,7 +156,7 @@ class MainActivity : Activity() {
         )
         playback = PlaybackUi(
             activity = this,
-            playerView = playerView,
+            gsy = playerView,
             controller = player,
             homeView = findViewById(R.id.home_view),
             gestureLayer = findViewById(R.id.gesture_layer),
@@ -160,6 +167,14 @@ class MainActivity : Activity() {
             onExitPlayback = { exitPlayback() },
         )
         playback.bind()
+        // 剧集/数据源切换：playback 已经建好，所以这里才接线（它要往播放层弹气泡提示）
+        switcher = PlaySwitcher(
+            activity = this,
+            player = player,
+            onToast = { toast(it) },
+            onNotice = { playback.showNotice(it) },
+            onChanged = { refreshUi() },
+        )
 
         findViewById<View>(R.id.btn_settings_home).setOnClickListener { openSettings() }
         findViewById<View>(R.id.btn_sync_now).setOnClickListener { syncNowManually() }
@@ -167,19 +182,12 @@ class MainActivity : Activity() {
         findViewById<View>(R.id.row_addr).setOnClickListener { copyAddress() }
     }
 
+    /**
+     * 打开「剧集 / 数据源」选择面板（真正的判断在 PlaySwitcher 里）。
+     * 这里只做接线：把 toast / 气泡提示 / 刷新三个出口交给它。
+     */
     private fun showPlaylist() {
-        val snapshot = player.snapshot()
-        if (snapshot.titles.isEmpty()) {
-            toast(getString(R.string.toast_no_playlist))
-            return
-        }
-        playback.keepControlsAlive()
-        showPlaylistDialog(this, snapshot.titles, snapshot.index, player.playableFlags()) { which ->
-            if (!player.control("select", which.toLong())) {
-                toast(player.notice() ?: getString(R.string.toast_rule_mode, snapshot.titles.getOrNull(which) ?: ""))
-            }
-            refreshUi()
-        }
+        switcher.showPicker { playback.keepControlsAlive() }
     }
 
     /**
@@ -251,11 +259,16 @@ class MainActivity : Activity() {
     private fun refreshUi() {
         val snapshot = player.snapshot()
         val error = player.lastError()
-        val notice = player.notice()
+        // 提示优先显示播放器自己产生的那条（"规则模式下没地址"之类），
+        // 其次是自动连播刚写下的原因（"已经是最后一集"——不能让用户以为它悄悄停了）
+        val notice = player.notice() ?: autoNext.notice
 
         // 有媒体就是"播放态"（含缓冲/暂停/播完）；stop 之后 state 回到 idle 即回首页
         val active = snapshot.state != Proto.STATE_IDLE
         playback.setPlayerMode(active)
+
+        // 自动连播：只有"这一集播完"才动作，且一集只触发一次（内部有防重与循环保护）
+        if (active) autoNext.onTick(snapshot)
 
         if (active) {
             playback.refresh(snapshot, error, notice)

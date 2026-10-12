@@ -27,6 +27,9 @@ object Settings {
     private const val K_RECENT = "recent-peers"
     private const val K_RESIZE_FILL = "resize-fill"
 
+/** 一集播完自动播下一集；默认 true（见 Settings.autoNext 的说明）。 */
+private const val K_AUTO_NEXT = "auto-next"
+
     /** 最近地址最多留几条：留太多设置页会变成一屏历史，反而不好点。 */
     private const val RECENT_MAX = 8
 
@@ -107,6 +110,17 @@ object Settings {
     var resizeFill: Boolean
         get() = prefs.getBoolean(K_RESIZE_FILL, false)
         set(value) = prefs.edit().putBoolean(K_RESIZE_FILL, value).apply()
+
+    /**
+     * 一集播完是否**自动播下一集**（默认开）。
+     *
+     * 为什么默认开：这是"在手机上看连续剧"的基本预期 —— 用户投了一部番，
+     * 不该每集结束都跑回电脑点一下。切不动时会在画面上写明原因（不是静默停住），
+     * 所以打开它不会让用户"莫名其妙地跳集"。
+     */
+    var autoNext: Boolean
+        get() = prefs.getBoolean(K_AUTO_NEXT, true)
+        set(value) = prefs.edit().putBoolean(K_AUTO_NEXT, value).apply()
 
     // ---------------- 主动连接电脑 ----------------
 

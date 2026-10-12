@@ -2,19 +2,21 @@
 <!--
   主界面 = 两层，靠可见性切换（不是两个 Activity —— 换 Activity 会重建播放器、画面会断）：
 
-  ① home_view（空闲态）：**固定状态卡 + 单个 RecyclerView + 固定底栏**
-     为什么是"单个 RecyclerView"而不是"ScrollView 里套两个 RecyclerView"：
-     那正是用户反馈的"收藏翻不动、看不到其它收藏"的根因 —— 嵌套在 ScrollView 里的
-     RecyclerView 用 wrap_content 时，父容器只给 AT_MOST 的高度，LinearLayoutManager
-     只会布局"装得下"的那些项，剩下的条目根本没被创建，于是**滚不到**；
-     而内外两层都能滚又会让手势打架。改成"一个 RecyclerView 装下所有内容
-     （分区标题 + 收藏网格 + 历史卡片，用 span size 区分）"后，
-     只有一层滚动、条目全部参与回收，两个毛病一起消失。
-     固定的状态卡与底栏留在 RecyclerView 之外，所以状态一直可见、底栏一直可点。
+  ① home_view（空闲态）：固定状态卡 + **顶部 Tab（收藏 / 历史）+ 两个各自独立的列表** + 固定底栏。
+     收藏是一个 RecyclerView（两列网格），历史是另一个（整行卡片），同一时刻只显示一个。
+     为什么是两个列表而不是"一个列表换数据源"（V1.1 改）：
+       · 两个 View 各自持有 LayoutManager，**滚动位置天然独立** —— 切回来还在原来那一屏；
+       · 两种界面本来就要不同的布局（网格 vs 整行），塞进一个列表得为每行算 span size。
+     ⚠️ 两个列表都是 0dp + weight=1（父容器给**精确高度**，不是 AT_MOST）：
+     这正是当初"收藏翻不动、看不到其它收藏"的根因 —— 用 wrap_content 时
+     LinearLayoutManager 只会布局"装得下"的那些项，剩下的条目根本没被创建，于是滚不到。
+     **不要再改回 wrap_content**。固定的状态卡与底栏留在列表之外，所以状态一直可见、底栏一直可点。
 
   ② player_layer（播放态）：播放器铺满窗口 + 官方控制栏（见 player_control_view.xml）
      + 一个透明手势层。手势层放在 PlayerView **之前**（z 序更低），
      这样控制栏上的按钮永远先拿到点击，手势只在"画面空白处"生效。
+
+  （更完整的说明见 README §2.5b 与 §4；这份注释只讲"布局为什么长这样"。）
 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
@@ -145,11 +147,41 @@
         </LinearLayout>
 
         <!--
-          唯一的滚动容器：收藏网格 + 观看历史都由 HomeAdapter 用 span size 拼进来。
-          clipToPadding=false + 上下留白，让最后一行卡片不会被底栏顶住、也不会被状态卡切掉。
+          收藏 / 历史分成两个界面（顶部 Tab 切换）。
+          为什么用两个 RecyclerView 而不是一个列表换数据源：
+          两个 View 各自持有自己的 LayoutManager，**滚动位置天然独立** ——
+          切回来时用户还在原来那一屏，不用自己记、也不用手动 restoreState。
+          高度都是 0dp + weight=1，父容器给的是**精确高度**（不是 AT_MOST），
+          所以列表能滚到底（这正是当初"收藏翻不动"的根因，别再改回 wrap_content）。
         -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingStart="10dp"
+            android:paddingTop="6dp"
+            android:paddingEnd="10dp">
+
+            <Button
+                android:id="@+id/tab_favorites"
+                style="@style/AppButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/tab_favorites" />
+
+            <Button
+                android:id="@+id/tab_history"
+                style="@style/AppButtonOutline"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:text="@string/tab_history" />
+        </LinearLayout>
+
         <androidx.recyclerview.widget.RecyclerView
-            android:id="@+id/rv_home"
+            android:id="@+id/rv_favorites"
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
@@ -158,6 +190,18 @@
             android:paddingTop="4dp"
             android:paddingEnd="10dp"
             android:paddingBottom="8dp" />
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/rv_history"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:clipToPadding="false"
+            android:paddingStart="10dp"
+            android:paddingTop="4dp"
+            android:paddingEnd="10dp"
+            android:paddingBottom="8dp"
+            android:visibility="gone" />
 
         <!-- 固定底栏 -->
         <LinearLayout
@@ -197,8 +241,12 @@
 
         <!--
           手势层：透明、盖住整块画面。
-          它是**画面空白处**的触摸目标（控制栏上的按钮在 PlayerView 内部、z 序更高，
-          所以按钮永远优先拿到点击）。双击快进、上下滑音量/亮度都在这里。
+          ⚠️ 它是**故意**排在播放器之前（z 序更低）的，从 v0.3.8 起就是这个顺序，不要挪到后面。
+          真正会收到触摸的是播放器内部的 `surface_container`（GSY 把触摸监听挂在那里），
+          手势同时挂在两处，见 PlaybackUi.bind() 的说明。
+
+          控制栏按钮在播放器视图树里、且 z 序更高，ViewGroup 派发触摸时先给子 View，
+          所以"按钮优先拿到点击、空白处才走手势"这个关系不变。
         -->
         <View
             android:id="@+id/gesture_layer"
@@ -209,20 +257,18 @@
             android:focusable="false" />
 
         <!--
-          Media3 官方播放器视图：画面 + 缓冲转圈 + 错误文案 + 字幕 + 官方控制栏。
-          控制栏布局换成我们自己的 player_control_view.xml（白蓝配色 + 多出来的按钮），
-          但拖动进度、时间、倍速、上一下一这些行为仍然是官方实现。
+          GSY 的播放器视图（`SakanaGsyPlayer` 继承自 StandardGSYVideoPlayer）。
+          它自己 inflate `player_gsy_view.xml` 作为画面 + 控制栏，所以这里没有任何
+          app:xxx 属性 —— 上一个版本那一堆 `app:controller_layout_id` / `app:resize_mode`
+          是 Media3 PlayerView 的东西，换成 GSY 之后全部由 GSYVideoOptionBuilder 设置。
+
+          为什么还要包一层 FrameLayout：`PlaybackUi.setPlayerMode` 是按"父容器的可见性"
+          来切两个形态的（首页层 / 播放层），GSY 的视图自己不负责这件事。
         -->
-        <androidx.media3.ui.PlayerView
+        <app.sakana.receiver.SakanaGsyPlayer
             android:id="@+id/player_view"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:background="@android:color/black"
-            app:controller_layout_id="@layout/player_control_view"
-            app:resize_mode="fit"
-            app:show_buffering="always"
-            app:show_timeout="4000"
-            app:surface_type="surface_view"
-            app:use_controller="true" />
+            android:background="@android:color/black" />
     </FrameLayout>
 </FrameLayout>

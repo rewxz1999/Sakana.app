@@ -201,7 +201,12 @@ object SyncManager {
      * 电脑完成"选源 → 选集 → 嗅探直链 → 投屏到本机"，随后 `/play` 会自己送上门。
      * 所以这里只负责显示进度与结果，成功后界面会在收到 `/play` 时自动进入播放。
      */
-    fun playSubject(subjectId: Int, episodeIndex: Int?, onDone: (Boolean, String) -> Unit) {
+    fun playSubject(
+        subjectId: Int,
+        episodeIndex: Int?,
+        sourceId: String? = null,
+        onDone: (Boolean, String) -> Unit,
+    ) {
         val base = SyncStore.syncUrl
         if (base == null) {
             onDone(false, "还没有连上电脑的同步服务，无法点播")
@@ -225,6 +230,8 @@ object SyncManager {
             )
             // episodeIndex 可省略：不给就是"从第 1 集/续播位置开始"，由电脑端决定
             if (episodeIndex != null && episodeIndex >= 0) payload["episodeIndex"] = episodeIndex
+            // sourceId 是"用哪条线路"（电脑端在 /play 里给过 id）。不给就让电脑端用默认线路
+            if (!sourceId.isNullOrBlank()) payload["sourceId"] = sourceId
 
             val result = SyncClient.command(base, Json.stringify(payload))
             val obj = Json.obj(result.json())
@@ -258,7 +265,7 @@ object SyncManager {
      * 把当前播放状态记进本地历史（由主界面每秒调一次）。
      * 真正的记录逻辑与"等 /play 认领 subjectId"的窗口都在 WatchRecorder.kt。
      */
-    fun notePlayback(snapshot: PlayerController.Snapshot) {
+    fun notePlayback(snapshot: PlayerSnapshot) {
         WatchRecorder.notePlayback(snapshot)
     }
 }

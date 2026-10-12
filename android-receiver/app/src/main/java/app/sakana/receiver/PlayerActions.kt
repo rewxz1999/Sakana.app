@@ -4,19 +4,14 @@ import android.app.Activity
 import android.os.Handler
 import android.os.Looper
 import android.view.View
-import android.view.ViewGroup
 import android.widget.ImageButton
 import android.widget.TextView
-import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.DefaultTimeBar
-import androidx.media3.ui.PlayerView
-import androidx.media3.ui.TimeBar
 
 /** 手势提示气泡的显示时长。 */
 private const val HINT_MS = 900L
 
 /**
- * 播放层里那些"具体动作"：提示气泡、亮度、音量、进度、画面比例。
+ * 播放层里那些"具体动作"：提示气泡、亮度、音量、画面比例。
  *
  * 为什么从 `PlaybackUi` 拆出来（而不是继续堆在一个类里）：
  * `PlaybackUi` 真正不可替代的职责只有三件 —— 两个形态的切换、横屏全屏、以及
@@ -24,21 +19,19 @@ private const val HINT_MS = 900L
  * 的小动作，混在一起会把那个文件顶过 300 行，也让人看不清主干。
  *
  * 提示气泡放在这里而不是单独一个类：它只有 [show]/[hide] 两个动作，
- * 而且每一个动作（调音量、调亮度、锁方向、切铺满）都要弹一句，
- * 分开反而要来回跳两个文件。
+ * 而且每一个动作（调音量、调亮度、锁方向、切铺满）都要弹一句，分开反而要来回跳两个文件。
  */
 internal class PlayerActions(
     private val activity: Activity,
-    private val playerView: PlayerView,
+    private val gsy: SakanaGsyPlayer,
     private val controller: PlayerController,
 ) {
 
     private val handler = Handler(Looper.getMainLooper())
-    private val hintView: TextView = playerView.findViewById(R.id.player_hint)
-    private val resizeButton: ImageButton = playerView.findViewById(R.id.btn_resize)
+    private val hintView: TextView = gsy.findViewById(R.id.player_hint)
+    private val resizeButton: ImageButton = gsy.findViewById(R.id.btn_resize)
     private val dismissHint = Runnable { hintView.visibility = View.GONE }
 
-    /** 播放层里所有"点一下弹个说法"的动作都走这里。 */
     /**
      * 由 `PlaybackUi` 注入：任何一次操作之后都要"重新计时"（免得用户正在动的时候控制栏淡出）。
      * 用可变字段而不是构造参数，是为了避免构造顺序上的循环依赖。
@@ -102,7 +95,9 @@ internal class PlayerActions(
         return if (value < 0f) 100 else (value * 100).toInt().coerceIn(5, 100)
     }
 
-    /** 铺满：fit = 按比例（可能留黑边），fill = 拉伸填满（消除黑边）。 */
+    // ---------------- 画面比例（适应 / 铺满） ----------------
+
+    /** 铺满：fit = 按比例（可能留黑边），fill = 撑满屏幕（消除黑边）。 */
     fun toggleResize() {
         Settings.resizeFill = !Settings.resizeFill
         applyResizeMode()
@@ -114,43 +109,25 @@ internal class PlayerActions(
 
     fun applyResizeMode() {
         val fill = Settings.resizeFill
-        playerView.resizeMode =
-            if (fill) AspectRatioFrameLayout.RESIZE_MODE_FILL else AspectRatioFrameLayout.RESIZE_MODE_FIT
+        syncFill()
         resizeButton.setImageResource(if (fill) R.drawable.ic_fullscreen_exit else R.drawable.ic_fullscreen)
         resizeButton.contentDescription = activity.getString(
             if (fill) R.string.cd_resize_fit else R.string.cd_resize_fill,
         )
     }
 
-    /** 错误/提示文案挂在画面上的那个「重试」按钮。 */
-    fun setRetryVisible(visible: Boolean) {
-        playerView.findViewById<View>(R.id.btn_retry).visibility = if (visible) View.VISIBLE else View.GONE
-    }
-
     /**
-     * 拖进度条的时候要不停"重新计时"，否则拖到一半控制栏就自己淡出了。
-     *
-     * 为什么不用 `findViewById(R.id.exo_progress)`：AGP 8 默认开启**非传递 R 类**，
-     * 我们的 R 里没有 media3-ui 的 id（`R.id.exo_progress` 编译不过）；
-     * 而 XML 里又必须写 `@id/exo_progress`，否则 Media3 的 PlayerControlView 找不到它
-     * （它会优先用这个 id，见 player_control_view.xml 的文件头说明）。
-     * 折中办法：按类型找视图树里第一个 DefaultTimeBar —— 我们只有一个。
+     * 把当前比例套到画面上。**每个心跳都会调一次**（成本只有两次比较）：
+     * 起播那一瞬间画面视图还没有尺寸、横竖屏切换会重新测量、换一集可能换宽高比 ——
+     * 这三件事都会让上一次算出来的比例过期，而它们都没有"算完了"的回调可挂。
+     * 具体怎么拉伸（以及为什么不用 GSY 自己的 show type）见 `SakanaGsyPlayer.applyFill`。
      */
-    fun bindScrubKeepAlive(onScrub: () -> Unit) {
-        findTimeBar(playerView)?.addListener(
-            object : TimeBar.OnScrubListener {
-                override fun onScrubStart(timeBar: TimeBar, position: Long) = onScrub()
-                override fun onScrubMove(timeBar: TimeBar, position: Long) = onScrub()
-                override fun onScrubStop(timeBar: TimeBar, position: Long, canceled: Boolean) = onScrub()
-            },
-        )
+    fun syncFill() {
+        gsy.applyFill(Settings.resizeFill)
     }
 
-    private fun findTimeBar(view: View): DefaultTimeBar? {
-        if (view is DefaultTimeBar) return view
-        if (view is ViewGroup) {
-            for (i in 0 until view.childCount) findTimeBar(view.getChildAt(i))?.let { return it }
-        }
-        return null
+    /** 视图尺寸变了（横竖屏切换、进出播放层）时会被调用一次。 */
+    fun onPlayerSizeChanged() {
+        syncFill()
     }
 }

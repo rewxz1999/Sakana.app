@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Camera,
   CircleCheck,
+  PackageOpen,
   Download,
   Clock,
   ExternalLink,
@@ -25,9 +26,11 @@ import { api } from '@/lib/api'
 import { Button, ConfirmModal, EmptyState, IconButton, Input, Modal, Spinner } from '@/components/ui'
 import {
   Cover,
+  EngineBadge,
   fmtPlay,
   GalBgmModal,
   GalBgmSavedModal,
+  GalUnpackModal,
   GalContextMenu,
   GalDetailView,
   GalShotsModal,
@@ -62,6 +65,7 @@ export function GalgameLibraryPage() {
   const [ymgalGame, setYmgalGame] = useState<GalGame | null>(null)
   const [bgmGame, setBgmGame] = useState<GalGame | null>(null)
   const [bgmSavedGame, setBgmSavedGame] = useState<GalGame | null>(null)
+  const [unpackGame, setUnpackGame] = useState<GalGame | null>(null)
   const [removing, setRemoving] = useState<GalGame | null>(null)
 
   // 站点搜索统计
@@ -192,17 +196,18 @@ export function GalgameLibraryPage() {
     const g = menu?.game
     if (!g) return []
     const items: GalMenuItem[] = [
-      { key: 'launch', icon: Play, label: running[g.id] ? '游戏中' : '启动游戏', onSelect: () => void onLaunch(g) },
-      { key: 'ymgal', icon: Search, label: '从月幕galgame中搜索详情', onSelect: () => setYmgalGame(g) },
-      { key: 'bgm', icon: Music, label: '查看最近识别的 bgm 名称（可复制）', onSelect: () => setBgmGame(g) },
-      { key: 'bgmSaved', icon: Download, label: '最近保存的 bgm', onSelect: () => setBgmSavedGame(g) },
-      { key: 'sites', icon: ExternalLink, label: '在资源站搜索该游戏', onSelect: () => searchForGame(g) },
-      { key: 'cover', icon: ImageIcon, label: '设置自定义封面', onSelect: () => void setCustomCover(g) },
-      { key: 'folder', icon: FolderOpen, label: '打开游戏目录', onSelect: () => void openFolder(g) },
-      { key: 'shots', icon: Camera, label: '最近截图', onSelect: () => setShotsGame(g) }
+      { key: 'launch', icon: Play, label: running[g.id] ? '游戏中' : '启动游戏', group: '常用', onSelect: () => void onLaunch(g) },
+      { key: 'ymgal', icon: Search, label: '从月幕galgame中搜索详情', group: '常用', onSelect: () => setYmgalGame(g) },
+      { key: 'bgm', icon: Music, label: '查看最近识别的 bgm 名称（可复制）', group: '常用', onSelect: () => setBgmGame(g) },
+      { key: 'bgmSaved', icon: Download, label: '最近保存的 bgm', group: '常用', onSelect: () => setBgmSavedGame(g) },
+      { key: 'sites', icon: ExternalLink, label: '在资源站搜索该游戏', group: '常用', onSelect: () => searchForGame(g) },
+      { key: 'unpack', icon: PackageOpen, label: '解包（引擎检测 / 曲名映射 / 立绘 CG）', group: '工具', onSelect: () => setUnpackGame(g) },
+      { key: 'cover', icon: ImageIcon, label: '设置自定义封面', group: '工具', onSelect: () => void setCustomCover(g) },
+      { key: 'folder', icon: FolderOpen, label: '打开游戏目录', group: '工具', onSelect: () => void openFolder(g) },
+      { key: 'shots', icon: Camera, label: '最近截图', group: '常用', onSelect: () => setShotsGame(g) }
     ]
     if (g.customCover || g.customBanner) {
-      items.push({ key: 'clear', icon: RotateCcw, label: '恢复数据源图片', onSelect: () => void clearCustom(g) })
+      items.push({ key: 'clear', icon: RotateCcw, label: '恢复数据源图片', group: '工具', onSelect: () => void clearCustom(g) })
     }
     items.push(
       {
@@ -211,7 +216,7 @@ export function GalgameLibraryPage() {
         label: g.finished ? '取消标记玩完' : '标记玩完',
         onSelect: () => void toggleFinished(g.id)
       },
-      { key: 'remove', icon: Trash2, label: '从库中移除', danger: true, onSelect: () => setRemoving(g) }
+      { key: 'remove', icon: Trash2, label: '从库中移除', danger: true, group: '工具', onSelect: () => setRemoving(g) }
     )
     return items
   }
@@ -458,10 +463,14 @@ export function GalgameLibraryPage() {
                       ) : (
                         <span>未游玩</span>
                       )}
-                      {game.titleCn && game.titleCn !== game.title ? (
-                        <span className="min-w-0 flex-1 truncate text-right">{game.title}</span>
-                      ) : null}
+                      {/* 引擎标签（只读游戏目录特征文件识别；检测不到就不显示） */}
+                      <EngineBadge game={game} className="ml-auto" />
                     </div>
+                    {game.titleCn && game.titleCn !== game.title ? (
+                      <div className="truncate text-[10px] text-faint" title={game.title}>
+                        {game.title}
+                      </div>
+                    ) : null}
                   </div>
                 </div>
               )
@@ -496,6 +505,7 @@ export function GalgameLibraryPage() {
       {/* 最近识别 BGM 面板（只读内存识别） */}
       <GalBgmModal game={bgmGame} onClose={() => setBgmGame(null)} />
       <GalBgmSavedModal game={bgmSavedGame} onClose={() => setBgmSavedGame(null)} />
+      <GalUnpackModal game={unpackGame} onClose={() => setUnpackGame(null)} />
 
       {/* 移除确认 */}
       <ConfirmModal

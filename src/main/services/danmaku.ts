@@ -3,9 +3,11 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from '
 import { join } from 'node:path'
 import { app } from 'electron'
 import axios from 'axios'
-import type { DanmakuComment, DanmakuMatch } from '@shared/types'
+import type { DanmakuComment, DanmakuMatch, DanmakuOrigin } from '@shared/types'
 import { log } from '../log'
 import { buildProxyAgents, getSettings } from '../net'
+import { lookupLibrary, readLibraryComments, saveToLibrary } from './danmakuLibrary'
+import { listSources, loadFromSources } from './danmakuSources'
 
 /**
  * 弹幕接口（v0.2.8 正式接入）：对接弹弹play 的 v2 接口。
@@ -480,6 +482,14 @@ export interface DanmakuLoadResult extends DanmakuMatch {
   matchedBy?: string
   /** 是否用到了别名（别名检测） */
   aliasUsed?: boolean
+  /**
+   * v1.1：这批弹幕是哪来的（内置弹弹play / 本地弹幕库 / 某个数据源）。
+   *
+   * 注意这里与 `@shared/types` 的同名接口是**两份声明**（主进程这份是历史遗留，字段一直
+   * 与 shared 保持同步）；渲染层看到的始终是 shared 那份，所以新增字段两边都要加，
+   * 否则 tsc 会在主进程这侧的赋值处报「Object literal may only specify known properties」。
+   */
+  origin?: DanmakuOrigin
 }
 
 export interface DanmakuLoadOptions {
@@ -525,11 +535,120 @@ export async function loadDanmaku(
   const flightKey = `${title}|${episode}|${opts.aliasMode ? 'alias' : 'plain'}`
   const running = inflightLoad.get(flightKey)
   if (running) return await running
-  const task = loadDanmakuInner(title, episode, opts).finally(() => {
+  const task = loadWithSources(title, episode, opts).finally(() => {
     inflightLoad.delete(flightKey)
   })
   inflightLoad.set(flightKey, task)
   return await task
+}
+
+/**
+ * v1.1：在「内置弹弹play」之外，接上**本地弹幕库**与**数据源集合器**。
+ *
+ * 顺序（用户要求「已有源仍作为默认源，启用的数据源按优先级依次尝试」）：
+ *   1. **本地弹幕库**：以前从数据源下载下来的弹幕，离线立刻命中，不发任何请求；
+ *   2. **内置弹弹play**：原有的整条链（严格季集闸门 + 多来源合并 + 缓存）**一行没改**；
+ *   3. **已启用的数据源**（按 priority）：巴哈姆特 / 弹幕盒子 / 直链，
+ *      拿到之后**顺手存进本地弹幕库**，下次播放直接命中第 1 步。
+ *
+ * 为什么包在外层而不是改进 `loadDanmakuInner`：那里面是 v0.2.8 好不容易调稳的季集判定与
+ * 合并逻辑，动它的风险远大于收益；外层包装能做到「内置源行为完全不变」。
+ */
+async function loadWithSources(
+  title: string,
+  episode: number,
+  opts: DanmakuLoadOptions = {}
+): Promise<DanmakuLoadResult | null> {
+  const kw = String(title ?? '').trim()
+  if (!kw) return null
+
+  // 1) 本地弹幕库
+  const priority = listSources().map((s) => s.id)
+  const lib = lookupLibrary(kw, episode, priority)
+  if (lib) {
+    try {
+      const comments = readLibraryComments(lib)
+      if (comments.length > 0) {
+        log.append('info', 'danmaku', `本地弹幕库命中：${lib.title} 第${lib.episode}集（${lib.sourceName}，${comments.length} 条）`)
+        return {
+          animeId: 0,
+          episodeId: 0,
+          animeTitle: lib.title,
+          episodeTitle: `第${lib.episode}集`,
+          count: comments.length,
+          comments,
+          fromCache: true,
+          matchedBy: kw,
+          aliasUsed: false,
+          origin: {
+            sourceId: lib.sourceId,
+            sourceName: lib.sourceName,
+            kind: 'library',
+            detail: `本地弹幕库：${lib.origin}`,
+            entryName: lib.title
+          }
+        }
+      }
+    } catch (err) {
+      // 库里的文件坏了不该让整条链失败：记一条日志，继续走后面的源
+      log.append('warn', 'danmaku', `读取本地弹幕库失败（${lib.file}）：${String((err as Error)?.message ?? err)}`)
+    }
+  }
+
+  // 2) 内置弹弹play（原有逻辑）
+  const builtin = await loadDanmakuInner(kw, episode, opts)
+  if (builtin) {
+    return {
+      ...builtin,
+      origin: {
+        sourceId: 'builtin',
+        sourceName: '内置弹幕库（弹弹play）',
+        kind: 'builtin',
+        detail: `${builtin.animeTitle} · ${builtin.episodeTitle}`,
+        entryName: builtin.animeTitle
+      }
+    }
+  }
+
+  // 3) 已启用的数据源（用户可以在设置里关掉自动加载，那时只保留手动搜索下载）
+  if (getSettings().danmaku?.autoSources === false) return null
+  const { hit, errors } = await loadFromSources(kw, episode, opts.aliases ?? [])
+  if (!hit) {
+    if (errors.length > 0) log.append('info', 'danmaku', `数据源都没取到弹幕：${errors.slice(0, 3).join('；')}`)
+    return null
+  }
+  // 存进本地库（下次离线命中）。存失败不影响本次播放，但要记下来。
+  let saved: ReturnType<typeof saveToLibrary> | null = null
+  try {
+    saved = saveToLibrary({
+      title: hit.entryName || kw,
+      episode,
+      sourceId: hit.sourceId,
+      sourceName: hit.sourceName,
+      origin: hit.detail,
+      comments: hit.comments
+    })
+  } catch (err) {
+    log.append('warn', 'danmaku', `弹幕下载成功但存入本地库失败：${String((err as Error)?.message ?? err)}`)
+  }
+  return {
+    animeId: 0,
+    episodeId: 0,
+    animeTitle: hit.entryName || kw,
+    episodeTitle: `第${episode}集`,
+    count: hit.comments.length,
+    comments: hit.comments,
+    fromCache: false,
+    matchedBy: kw,
+    aliasUsed: false,
+    origin: {
+      sourceId: hit.sourceId,
+      sourceName: hit.sourceName,
+      kind: listSources().find((s) => s.id === hit.sourceId)?.kind ?? 'site',
+      detail: hit.detail + (saved ? `（已存入本地：${saved.file}）` : ''),
+      entryName: hit.entryName
+    }
+  }
 }
 
 async function loadDanmakuInner(

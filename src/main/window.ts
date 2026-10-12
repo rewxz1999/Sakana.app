@@ -159,20 +159,59 @@ function reloadSmallWindow(hash: string, win: BrowserWindow): Promise<void> {
   return loadSmallWindow(hash, win)
 }
 
+/*
+ * 图标候选路径（按优先级）。
+ *
+ * 为什么 Windows 上把 `.ico` 排在 `.png` 前面：Windows 给窗口 / 任务栏 / 托盘取图标时
+ * 会自己缩放到 16/20/24/32/48px。如果只给一张 512×512 的 PNG，就是**一步缩 32 倍**
+ * （`tray.ts` 还额外硬 `resize` 到 16×16），小尺寸必然糊；`.ico` 允许**每个尺寸各带一张
+ * 预先缩好的位图**（`resources/icon.ico` 内含 16/24/32/48/64/128/256），系统直接取用、不缩放。
+ * `.png` 保留为兜底，保证没有 `.ico` 时行为与以前完全一致。
+ *
+ * 路径为什么是这两个根：开发态 `app.getAppPath()` 就是仓库根，图标在 `<repo>/resources/`；
+ * 打包态 `app.getAppPath()` 是 `<安装目录>/resources/app.asar`（asar 里没有 resources/**），
+ * 真正的图标由 package.json 的 `extraResources` 拷到 `process.resourcesPath`（= `<安装目录>/resources`）。
+ */
+function iconCandidates(): string[] {
+  const names = process.platform === 'win32' ? ['icon.ico', 'icon.png'] : ['icon.png']
+  const roots = [join(app.getAppPath(), 'resources'), process.resourcesPath ?? '']
+  const out: string[] = []
+  for (const name of names) {
+    for (const root of roots) {
+      // 空字符串会被 join 成相对路径，反而可能撞到 cwd 下的同名文件，直接跳过
+      if (root) out.push(join(root, name))
+    }
+  }
+  return out
+}
+
 export function iconPath(): string | null {
-  const candidates = [
-    join(app.getAppPath(), 'resources', 'icon.png'),
-    join(process.resourcesPath ?? '', 'icon.png')
-  ]
-  for (const p of candidates) {
+  for (const p of iconCandidates()) {
     if (existsSync(p)) return p
   }
   return null
 }
 
 export function applyIcon(win: BrowserWindow): void {
-  const p = iconPath()
-  if (p) win.setIcon(nativeImage.createFromPath(p))
+  /*
+   * 逐个候选试解码，而不是只信 `existsSync`。
+   *
+   * 为什么：`nativeImage` 解码失败时返回的是**空图**，而 Electron 对空图调用 `setIcon`
+   * 是**静默忽略**的 —— 以前这里没有守卫，于是"图标不显示"这件事在日志里一点线索都没有，
+   * 只能靠猜（这次就被猜成了"原图太大"）。现在每个候选都会实际解码一次，失败写 warn 并
+   * 继续试下一个，全部失败也有明确记录。
+   */
+  for (const p of iconCandidates()) {
+    if (!existsSync(p)) continue
+    const img = nativeImage.createFromPath(p)
+    if (img.isEmpty()) {
+      log.append('warn', 'window', `图标解码为空，改用下一个候选: ${p}`)
+      continue
+    }
+    win.setIcon(img)
+    return
+  }
+  log.append('warn', 'window', '未找到可用的应用图标，窗口将使用 Electron 默认图标')
 }
 
 export function createMainWindow(): BrowserWindow {

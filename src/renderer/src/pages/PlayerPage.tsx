@@ -34,6 +34,7 @@ import type {
   MediaInspectResult,
   PlayStatus,
   PlayFlowSnapshot,
+  PlayRule,
   RuleEpisodeGroup,
   RuleSearchEntry,
   SubjectDetail
@@ -2021,7 +2022,8 @@ export function PlayerPage() {
           if (uoscActiveRef.current && a.key === 'offsetMs') void api.uosc.delay(Number(a.value) || 0)
           break
         case 'openDanmakuSettings':
-          void api.window.openSmall('/danmaku-settings', { width: 620, height: 560, title: '弹幕设置' })
+          // V1.1：数据源集合器 + 弹幕盒子检索 + 本地弹幕库都在这一页，窗口要比以前宽
+          void api.window.openSmall('/danmaku-settings', { width: 900, height: 760, title: '弹幕设置' })
           break
         case 'openQualitySettings':
           // v0.3.3：uosc 的「画质」菜单里点了「完整画质设置…」→ 打开播放器设置页（Anime4K 卡片在最前面）
@@ -2419,12 +2421,32 @@ export function PlayerPage() {
    * 本地播放没有可投的在线地址（`url` 为空），界面据此提示改用接收端自己打开文件。
    */
   const castMediaCacheRef = useRef<{ key: string; payload: OverlayState['castMedia'] } | null>(null)
+  /*
+   * V1.1：电脑上的「数据源」清单（= 已启用的规则），随投屏一起交给接收端，
+   * 手机/电视上才有得选、切回来的事才有得做（契约见 android-receiver/README.md §2.5c）。
+   *
+   * 为什么缓存在 ref 而不是每次现取：`castMediaPayload()` 在渲染期被**同步**调用
+   * （悬浮窗状态每 800ms 整体推一次），那里不能 await。这份清单只在改规则时变，
+   * 真正要投屏前（`startCastTo`）再刷一次就足够新。
+   */
+  const castSourcesRef = useRef<{ id: string; name: string }[]>([])
+  const refreshCastSources = async (): Promise<void> => {
+    const r = await api.store.get('rules')
+    if (!r.ok || !Array.isArray(r.data)) return
+    const next = (r.data as PlayRule[]).filter((x) => x.enabled).map((x) => ({ id: x.id, name: x.name }))
+    const prev = castSourcesRef.current
+    // 只有清单真的变了才让投屏缓存失效：否则每次投屏都会白重建一遍播放列表
+    if (prev.length === next.length && prev.every((s, i) => s.id === next[i].id && s.name === next[i].name)) return
+    castSourcesRef.current = next
+    castMediaCacheRef.current = null
+  }
   const castMediaPayload = (): OverlayState['castMedia'] => {
     const url =
       state.mode === 'rule' ? (ruleStreamRef.current ?? '') : state.mode === 'online' ? (state.url ?? '') : ''
     const line = ruleCurrent?.line ?? 0
     const ep = ruleCurrent?.ep ?? currentIndex
-    const key = `${state.mode}|${state.title}|${url}|${line}|${ep}|${files.length}`
+    // 缓存键要带上"哪一部 + 哪条数据源"：换源/换条目后直链可能一样，但契约字段必须跟着变
+    const key = `${state.mode}|${state.title}|${url}|${line}|${ep}|${files.length}|${state.subjectId ?? ''}|${state.ruleId ?? ''}`
     if (castMediaCacheRef.current?.key === key) return castMediaCacheRef.current.payload
     const groups = state.groups ?? []
     const playlist =
@@ -2437,6 +2459,14 @@ export function PlayerPage() {
           title: `${state.title}${ep >= 0 ? ` · 第 ${ep + 1} 集` : ''}`,
           referer: state.referer,
           index: ep,
+          /*
+           * V1.1 投屏契约三项：给接收端"这是哪一部 / 还有哪些数据源 / 现在用哪条"。
+           * 缺了它们，接收端上的选集、连播、换数据源都只能是摆设（它只有一个直链，
+           * 既不知道条目 id 也没有别的线路可解析）。本地播放没有在线地址，走不到这里。
+           */
+          subjectId: state.subjectId,
+          sources: castSourcesRef.current,
+          sourceId: state.mode === 'rule' ? state.ruleId : undefined,
           /*
            * 播放列表只带**标题**、不带地址：规则模式下每集的直链都要重新"解析播放页 + 嗅探"才能拿到，
            * 现在没有现成的地址可给。所以接收端/电视上的"选集"列表是只读的展示，
@@ -2456,6 +2486,8 @@ export function PlayerPage() {
    * 而用户真正在看的是电视 —— 把带宽让给它，这也是「投屏要流畅」的一部分。
    */
   const startCastTo = async (deviceId: string): Promise<void> => {
+    // 先把数据源清单刷成最新的，再构造载荷（顺序不能反，见 refreshCastSources 的注释）
+    await refreshCastSources().catch(() => undefined)
     const media = castMediaPayload()
     if (!media) {
       toast.warn('本地文件没有可投的在线地址：请在接收端直接打开这个文件')
@@ -2505,12 +2537,21 @@ export function PlayerPage() {
       if (danmakuKeyRef.current !== key) return // 期间又换集了
       if (r.ok && r.data) {
         const by = r.data.aliasUsed ? `（别名「${r.data.matchedBy}」命中）` : ''
+        /*
+         * v1.1：把「这条弹幕从哪来」写进来源串 —— 用户装了多个数据源之后，
+         * 最需要一眼看出的就是"这份弹幕是内置库还是巴哈/弹幕盒子给的"，
+         * 否则数量对不上时无从判断。来源串显示在播放器状态区与悬浮窗的来源行。
+         */
+        const from = r.data.origin ? `〔来自 ${r.data.origin.sourceName}〕` : ''
         setDanmaku({
           comments: r.data.comments,
-          source: `${r.data.animeTitle} · ${r.data.episodeTitle}${by}`,
+          source: `${r.data.animeTitle} · ${r.data.episodeTitle}${by}${from}`,
           loading: false
         })
-        console.log(`[player] 弹幕已加载：${r.data.episodeTitle} 共 ${r.data.count} 条（缓存=${r.data.fromCache}）${by}`)
+        console.log(
+          `[player] 弹幕已加载：${r.data.episodeTitle} 共 ${r.data.count} 条（缓存=${r.data.fromCache}）${by}` +
+            (r.data.origin ? ` 来源=${r.data.origin.sourceName}｜${r.data.origin.detail}` : '')
+        )
         /*
          * v0.2.9：插件渲染时，确认插件**真的**把这批弹幕挂上了。
          * 判据是插件自己暴露的 `user-data/uosc_danmaku/has-danmaku`（v2.1.0 没有条数属性）。

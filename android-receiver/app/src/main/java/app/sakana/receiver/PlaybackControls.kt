@@ -3,7 +3,6 @@ package app.sakana.receiver
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import androidx.media3.ui.PlayerView
 
 private const val TAG = "SakanaControls"
 
@@ -13,39 +12,38 @@ internal const val HIDE_TIMEOUT_MS = 4_000L
 /**
  * 控制栏显隐的**唯一**负责人。
  *
- * ## 为什么必须独占
+ * ## 这个类的来历（换播放器时踩过两次，别再踩第三次）
  *
- * Media3 的 `PlayerView` / `PlayerControlView` 自己也有一套自动显隐，两边一起管必然打架。
- * 实测（反编译 media3-ui 1.11.1 字节码）它们的联动是这样的：
+ * v0.3.8 那会儿控制栏"永远不隐藏"，反编译 media3-ui 的字节码才定位到两条互相独立的坑
+ * （每秒给 `controllerShowTimeoutMs` 赋值 = 每秒重置倒计时；淡入动画被打断后 `uxState` 卡在 1，
+ * `hide()` 只隐藏进度条）。当时的结论是：**显隐只能有一个负责人**，
+ * 于是把播放器自带那套整个关掉，只留这里的计时器 + [controlsAction] 的状态跃迁。
  *
- * ```
- * PlayerView.setControllerShowTimeoutMs(t)
- *   → this.controllerShowTimeoutMs = t
- *   → if (controller.isFullyVisible()) showController()
- *        → PlayerControlView.setShowTimeoutMs(t)
- *             → if (isFullyVisible()) resetHideCallbacks()   // 取消并**重新开始**隐藏倒计时
- * ```
+ * 换成 GSY 之后同样的问题又摆了一遍，只是换了个名字：GSY 的
+ * `GSYVideoControlView.startDismissControlViewTimer()` 会在状态变化、点击空白处等
+ * 好几个地方排一个 2.5 秒的隐藏任务。所以我们做的是同一件事 ——
+ * 在 `SakanaGsyPlayer` 里把那个计时器覆写成空方法，显隐完全归这里管。
  *
- * 也就是说：**给 `controllerShowTimeoutMs` 赋一次值，就等于把"4 秒后隐藏"重新数一遍**。
- * 上一版在 `MainActivity` 每秒刷新时都写一次这个字段，于是倒计时永远到不了 4 秒 ——
- * 这正是"全屏播放时控制栏不隐藏"的真因（缓冲时更彻底：`playing == false` 会把超时设成 0，
- * 相当于"永不隐藏"，而且 `refresh()` 里还有一句每秒 `showController()`）。
- *
- * 所以现在把 Media3 那套**全部关掉**（`controllerAutoShow=false`、`controllerHideOnTouch=false`、
- * `controllerShowTimeoutMs=0` 且**只在 bind 时设一次**），显隐完全由这里的
- * [Handler] 计时器 + [controlsAction] 的状态跃迁决定：
+ * 规矩没变：
  *  · 显示/隐藏只由"跃迁"和用户操作触发；
  *  · "4 秒后隐藏"只有一个计时器（[hideAction]），谁要延后都走 [keepAlive]；
  *  · 暂停/出错/播完 → [pin]（常显，连计时器都不排）。
  */
-internal class PlaybackControls(private val playerView: PlayerView) {
+internal class PlaybackControls(private val gsy: SakanaGsyPlayer) {
 
     private val handler = Handler(Looper.getMainLooper())
     private val hideAction = Runnable { hide() }
 
-    /** 我们自己记的可见性：`PlayerView` 只暴露 `isControllerFullyVisible()`（带动画语义），不适用。 */
-    var visible = true
-        private set
+    /**
+     * 控制栏现在是不是可见的。
+     *
+     * **故意做成"读 GSY 的真实状态"而不是自己记一个标志位**：GSY 的状态机也会动控制栏的
+     * 可见性（`changeUiToXxxShow()`），自己记的那份一定会不同步 ——
+     * 一旦不同步，[arm] 就会在"其实看得见"的时候跳过计时（控制栏再也不自动隐藏），
+     * 或者反过来在隐藏状态下排一个空的隐藏任务。读真实值则永远自洽：
+     * 显示着 → 排计时；已经隐藏 → 不排。
+     */
+    val visible: Boolean get() = gsy.widgetsVisible()
 
     /** 常显（暂停/出错/播完）。常显期间 [keepAlive] 不会排计时器。 */
     private var pinned = false
@@ -54,49 +52,25 @@ internal class PlaybackControls(private val playerView: PlayerView) {
     private var lastKey: String? = null
 
     /**
-     * 把 Media3 自带的自动行为关掉，并且**只在这里**设一次超时。
-     * 这三行是"两边不要打架"的全部开关，改动前请先读完类注释。
+     * GSY 那边的自动行为已经在 `SakanaGsyPlayer` 的覆写里关掉了，
+     * 这里只把超时时间也设成 0（双保险：任何漏网的 `startDismissControlViewTimer` 调用
+     * 即使真的排了任务，也是"0 毫秒后隐藏"，不会在我们显示之后又把控制栏拉回去）。
      */
     fun bind() {
-        playerView.controllerAutoShow = false
-        playerView.controllerHideOnTouch = false
-        // 0 = 永不自动隐藏：Media3 那边彻底不管，隐藏时机由我们的计时器决定
-        playerView.controllerShowTimeoutMs = 0
-        /*
-         * **关掉控制栏的淡入淡出动画**。这条不是审美问题，是真机上"控制栏不隐藏"的第二个原因：
-         *
-         * 反编译 PlayerControlViewLayoutManager 可以看到它有一套 uxState 状态机，
-         * `isFullyVisible()` 只有在 uxState == 0（完全显示）时才为真；`show()` 会先把
-         * uxState 置 1 并启动淡入动画，**等动画结束的回调**再置回 0。
-         * 而真机上进播放层时会立刻切横屏（SENSOR_LANDSCAPE），窗口重建会把这段淡入动画打断，
-         * "动画结束"的回调就不再执行 —— uxState 永远停在 1。
-         * 于是 `hide()` 里这一段：
-         *     if (uxState == 3 || uxState == 2) return;          // 不适用
-         *     if (!animationEnabled) hideController();            // 立即隐藏
-         *     else if (uxState == 1) hideProgressBar();           // ← 只隐藏进度条！
-         *     else hideAllBars();
-         * 走的就是 `hideProgressBar()`：**顶栏底栏还在原地**，看起来就是"控制栏永远不隐藏"。
-         *
-         * 关掉动画之后 show()/hide() 都是立即置可见性，没有动画回调可以被打断，也就没有这个死角。
-         * 代价只是没有淡入淡出效果 —— 对这种"几秒不看就消失"的控制栏来说完全可以接受。
-         */
-        playerView.setControllerAnimationEnabled(false)
+        gsy.setDismissControlTime(0)
     }
 
     /** 用户主动显示（点画面、点了按钮、刚进播放层）。会重新开始计时。 */
     fun show() {
-        visible = true
-        playerView.showController()
+        gsy.showWidgets()
         arm()
     }
 
     fun hide() {
-        visible = false
         handler.removeCallbacks(hideAction)
-        // 打一行日志：Media3 的 hide() 在"动画进行中/没完全可见"时是**空操作**，
-        // 真机上"控制栏不隐藏"这类问题只能靠这一行分清是"我们没调"还是"调了没用"
-        Log.i(TAG, "控制栏隐藏（hideController 前 isFullyVisible=${playerView.isControllerFullyVisible()}）")
-        playerView.hideController()
+        // 打一行日志：真机上"控制栏不隐藏"这类问题只能靠这一行分清是"我们没调"还是"调了没用"
+        Log.i(TAG, "控制栏隐藏（调用前 GSY 侧 visible=${gsy.widgetsVisible()}）")
+        gsy.hideWidgets()
     }
 
     /** 用户操作之后"重新计时"（拖进度、调音量、点按钮）。 */
@@ -111,7 +85,7 @@ internal class PlaybackControls(private val playerView: PlayerView) {
 
     /**
      * 每个心跳调一次，但**只有状态跃迁时才会动手**（见 `ControlsPolicy.kt`）。
-     * 状态没变的那一秒什么都不做 —— 这正是修掉"永不隐藏"的关键。
+     * 状态没变的那一秒什么都不做 —— 这正是当初修掉"永不隐藏"的关键。
      */
     fun applyState(hasError: Boolean, state: String) {
         val key = controlsStateKey(hasError, state)
@@ -137,14 +111,13 @@ internal class PlaybackControls(private val playerView: PlayerView) {
     /** 显示并常显：暂停 / 出错 / 播完 —— 用户这时候正在找按钮，不能藏。 */
     private fun pin() {
         pinned = true
-        visible = true
         handler.removeCallbacks(hideAction)
-        playerView.showController()
+        gsy.showWidgets()
     }
 
     /**
      * 排"4 秒后隐藏"。常显中、或者当前已经隐藏时什么都不做 ——
-     * 后者是必要的：缓冲时若已经隐藏，延长计时也不该把回调排上去（虽然排了也没视觉效果）。
+     * 后者是必要的：缓冲时若已经隐藏，延长计时也不该把回调排上去。
      */
     private fun arm() {
         handler.removeCallbacks(hideAction)

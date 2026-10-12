@@ -50,7 +50,7 @@ internal object WatchRecorder {
     }
 
     /** 把当前播放状态记进本地历史（限流，见类注释）。 */
-    fun notePlayback(snapshot: PlayerController.Snapshot) {
+    fun notePlayback(snapshot: PlayerSnapshot) {
         if (!SyncStore.isReady) return
         val state = snapshot.state
         val active = state == Proto.STATE_PLAYING || state == Proto.STATE_BUFFERING ||

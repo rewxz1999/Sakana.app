@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ============================================================================
+  Sakana 自己的一层"业务按钮条"（叠在 **GSY 原生控制栏** 上方，不是替代它）
+  ============================================================================
+
+  这一版的规矩（用户明确要求，见 README §5b）：
+   · **播放视图与控制栏用 GSY 原生的那套**（`video_layout_normal.xml`，我们没有改它一个字节），
+     播放/暂停（屏幕中央那个）、进度条、时间、全屏键、返回键、缓冲转圈、底部细进度线
+     全部原样可见可用；
+   · GSY 那条控制栏上**没有**业务按钮（选集、上一集/下一集、±10 秒、倍速、方向锁、画面比例、
+     音量±、设置），所以在这里补一条按钮条叠到它**正上方**；
+   · 显隐时机与 GSY 的控制栏**完全同步**：`SakanaGsyPlayer.setViewShowState` 里
+     只要 GSY 动了它的底栏，这条就跟着动（一个计时器都不需要多，也不会出现"控制栏淡出了、
+     按钮条还挂在那"）。
+
+  为什么不做成"改 GSY 的布局"：那样等于把 GSY 的控制栏抄一份进来自己维护 ——
+  既是用户明确不要的（他要的就是 GSY 的原生观感），也会在 GSY 升级时立刻过期。
+
+  样式：背景用和 GSY 底栏一样的 #99000000、图标沿用本工程一直用的白色矢量图，
+  所以看上去是"同一条控制栏多了一排按钮"，而不是另起一条飘在别处的浮层。
+
+  位置：贴 FS 底栏正上方（`layout_marginBottom` 在运行时会被修正成 GSY 底栏的真实高度，
+  这里的 40dp 只是它在那份布局里的默认高度，用来避免第一帧错位）。
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <!--
+      按钮条本身：不拦截整块画面（FrameLayout 不可点击，触摸会继续传给下层的 GSY 控制栏
+      与 surface_container），只有它自己那几个按钮会消费点击。
+    -->
+    <LinearLayout
+        android:id="@+id/extra_bar"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="40dp"
+        android:background="@color/player_extra_bar"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp">
+
+        <!-- ============ 内容：选集 / 设置 ============ -->
+        <ImageButton
+            android:id="@+id/btn_pick_episode"
+            style="@style/PlayerIconButton"
+            android:contentDescription="@string/cd_pick_episode"
+            android:src="@drawable/ic_playlist" />
+
+        <ImageButton
+            android:id="@+id/btn_settings_player"
+            style="@style/PlayerIconButton"
+            android:contentDescription="@string/cd_settings"
+            android:src="@drawable/ic_settings" />
+
+        <View style="@style/PlayerBarDivider" />
+
+        <!-- ============ 一集之内：上一集 / 后退 10 秒 / 前进 10 秒 / 下一集 ============ -->
+        <ImageButton
+            android:id="@+id/btn_prev"
+            style="@style/PlayerIconButton"
+            android:contentDescription="@string/cd_prev"
+            android:src="@drawable/ic_prev" />
+
+        <!--
+          ±10 秒用文字而不是图标：图标表达不出"10 秒"这个数量，而自己画一个带数字的矢量图
+          要多两个文件、还容易和上一集/下一集的图标撞脸。这两个标签不是中文（"−10s"/"+10s"），
+          所以没有新造一套中文文案。
+        -->
+        <TextView
+            android:id="@+id/btn_rew10"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/cd_rew10"
+            android:gravity="center"
+            android:text="@string/player_rew10"
+            android:textColor="@color/player_icon"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/btn_ffwd10"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/cd_ffwd10"
+            android:gravity="center"
+            android:text="@string/player_ffwd10"
+            android:textColor="@color/player_icon"
+            android:textSize="13sp" />
+
+        <ImageButton
+            android:id="@+id/btn_next"
+            style="@style/PlayerIconButton"
+            android:contentDescription="@string/cd_next"
+            android:src="@drawable/ic_next" />
+
+        <View style="@style/PlayerBarDivider" />
+
+        <!--
+          倍速：按钮上直接显示当前倍速（"1.0x"），点一下弹出可选倍速。
+          GSY 自己没有倍速按钮（它的 exo2 内核有 setSpeed，但控制栏里没有入口），
+          所以这一条是"顺便增加"里必须自己接的一个。
+        -->
+        <TextView
+            android:id="@+id/btn_speed"
+            android:layout_width="56dp"
+            android:layout_height="48dp"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/cd_playback_speed"
+            android:gravity="center"
+            android:text="@string/player_speed_1x"
+            android:textColor="@color/player_icon"
+            android:textSize="13sp"
+            tools:ignore="HardcodedText" />
+
+        <ImageButton
+            android:id="@+id/btn_volume_down"
+            style="@style/PlayerIconButton"
+            android:contentDescription="@string/cd_vol_down"
+            android:src="@drawable/ic_vol_down" />
+
+        <ImageButton
+            android:id="@+id/btn_volume_up"
+            style="@style/PlayerIconButton"
+            android:contentDescription="@string/cd_vol_up"
+            android:src="@drawable/ic_vol_up" />
+
+        <View style="@style/PlayerBarDivider" />
+
+        <!-- ============ 画面：方向锁 / 铺满-按比例 ============ -->
+        <ImageButton
+            android:id="@+id/btn_lock_orientation"
+            style="@style/PlayerIconButton"
+            android:contentDescription="@string/cd_lock_orientation"
+            android:src="@drawable/ic_lock_orientation" />
+
+        <ImageButton
+            android:id="@+id/btn_resize"
+            style="@style/PlayerIconButton"
+            android:contentDescription="@string/cd_resize_fill"
+            android:src="@drawable/ic_fullscreen" />
+    </LinearLayout>
+
+    <!--
+      出错时的「重试」：GSY 出错时只是把中央播放键换成一个错误图标，
+      **没有任何文字**（"播放失败不能变成黑屏没提示"是硬要求），所以这里自己摆一个。
+      只在出错时可见（PlayerButtons.refresh 控制）。
+    -->
+    <Button
+        android:id="@+id/btn_retry"
+        style="@style/AppButtonOutline"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="120dp"
+        android:text="@string/cd_retry"
+        android:visibility="gone" />
+
+    <!-- 手势/操作提示气泡（双击快进、调音量、锁方向、切铺满都往这里写） -->
+    <TextView
+        android:id="@+id/player_hint"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="@color/player_hint_bg"
+        android:paddingStart="18dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="18dp"
+        android:paddingBottom="10dp"
+        android:textColor="@color/player_text"
+        android:textSize="15sp"
+        android:visibility="gone" />
+</FrameLayout>

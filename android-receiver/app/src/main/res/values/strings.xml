@@ -113,8 +113,11 @@
 
     <!-- ================= 首页：收藏 / 历史 / 同步 ================= -->
 
-    <string name="section_favorites">收藏</string>
-    <string name="section_history">观看历史</string>
+    <!--
+      收藏 / 历史各自有顶部 Tab（tab_favorites / tab_history 见文件后半段），
+      所以原来那两条"分区标题"（section_favorites / section_history）已经删掉：
+      同一个东西有两个名字会让下一轮不知道该信哪个。
+    -->
     <string name="settings">设置</string>
     <string name="sync_now">立即同步</string>
 
@@ -174,12 +177,45 @@
     <string name="player_unknown_title">未命名</string>
     <string name="player_time_separator">/</string>
     <string name="cd_playback_speed">倍速</string>
+    <!-- ±10 秒：换 GSY 之后这两个动作是我们自己接的按钮（上一版是 Media3 的 ±秒 按钮） -->
+    <string name="cd_rew10">后退 10 秒</string>
+    <string name="cd_ffwd10">前进 10 秒</string>
+    <string name="player_rew10">−10s</string>
+    <string name="player_ffwd10">+10s</string>
+    <!-- 倍速按钮上显示的当前倍速（纯数字+单位，不是中文文案）；可选倍速见 speed_options -->
+    <string name="player_speed_1x">1.0x</string>
     <string name="cd_pick_episode">选集</string>
     <string name="cd_lock_orientation">锁定方向</string>
     <string name="cd_unlock_orientation">解锁方向</string>
     <string name="cd_resize_fit">按比例显示（可能留黑边）</string>
     <string name="cd_resize_fill">铺满屏幕（消除黑边）</string>
     <string name="cd_retry">重试</string>
+
+    <!-- 首页顶部 Tab：收藏 / 历史分成两个界面 -->
+    <string name="tab_favorites">收藏</string>
+    <string name="tab_history">历史</string>
+    <string name="tab_favorites_count">收藏 %1$d</string>
+    <string name="tab_history_count">历史 %1$d</string>
+
+    <!-- 播放层：剧集 / 数据源 选择 -->
+    <string name="picker_title">剧集 / 数据源</string>
+    <string name="picker_sources">数据源（线路）</string>
+    <string name="picker_source_current">%1$s（当前）</string>
+    <string name="picker_episodes">选集（共 %1$d 集）</string>
+    <string name="picker_no_episodes">电脑端没有给出集列表</string>
+    <string name="picker_source_switching">正在让电脑切到「%1$s」…</string>
+    <string name="picker_episode_switching">正在让电脑切到这一集…</string>
+    <string name="picker_episode_local">已在手机上切到「%1$s」</string>
+    <string name="picker_no_episode_id">这一集没有可播地址、也没有条目 id，只能在电脑上切</string>
+
+    <!-- 自动连播 -->
+    <string name="auto_next_done">这一集播完了，接着播下一集：%1$s</string>
+    <string name="auto_next_asking_pc">这一集播完了，正在让电脑准备下一集…</string>
+    <string name="auto_next_last">已经是最后一集了，没有自动连播</string>
+    <string name="auto_next_no_address">这一集播完了，但电脑端没给下一集的地址（请在电脑上切集）</string>
+    <string name="auto_next_loop_guard">下一集刚开播就结束了，已停止自动连播（可能是地址失效或片长为 0）</string>
+    <string name="set_auto_next">自动播放下一集</string>
+    <string name="set_auto_next_hint">一集播完自动切下一集：手机上能直接切就本地切（最快）；只有电脑端知道地址时，会让电脑解析后投回来。切不动时会在画面上写清原因，不会静默停住。</string>
 
     <!-- 顶栏的两个"出路"：图标旁边配文字，横屏全屏下才猜不出也找得到 -->
     <string name="player_exit_fullscreen">退出全屏</string>
@@ -197,11 +233,27 @@
     <string name="toast_resize_fill">已铺满画面</string>
     <string name="toast_resize_fit">已按原始比例显示</string>
 
+    <!--
+      倍速菜单的选项。
+      ⚠️ 刻意**不做成中文文案**（不写"1.5 倍速"）：这几项就是倍速值本身，
+      换语言也不用翻；用户也交代了不要新造一套中文文案。
+      条目顺序 = 菜单里从上到下的顺序，倍速按钮上的文字也会用同一份（带 "x" 后缀）。
+    -->
+    <string-array name="speed_options">
+        <item>0.5x</item>
+        <item>0.75x</item>
+        <item>1.0x</item>
+        <item>1.25x</item>
+        <item>1.5x</item>
+        <item>2.0x</item>
+    </string-array>
+
     <!-- ================= 观看历史（卡片式） ================= -->
     <string name="hist_episode_badge">第 %1$d 集</string>
-    <string name="hist_view_all">查看全部 %1$d 条</string>
-    <string name="hist_view_all_generic">查看全部</string>
-    <string name="hist_collapse">收起</string>
+    <!--
+      历史不再折叠（原来有"查看全部 N 条 / 收起"，现在它有自己的整屏），所以
+      hist_view_all / hist_view_all_generic / hist_collapse 三条一并删除。
+    -->
     <string name="hist_delete">删除这条记录</string>
     <string name="hist_detail_title">观看详情</string>
     <string name="hist_detail_title_line">标题：%1$s</string>

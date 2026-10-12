@@ -16,14 +16,14 @@ interface PlayerGateway {
         headers: Map<String, String>,
         startMs: Long,
         index: Int,
-        playlist: List<PlayerController.Item>,
+        playlist: List<PlayerItem>,
         autoPlay: Boolean,
     )
 
     /** @return false 表示动作不认识或参数不合法（调用方据此回 400） */
     fun control(action: String, value: Long): Boolean
 
-    fun snapshot(): PlayerController.Snapshot
+    fun snapshot(): PlayerSnapshot
 
     /** 最近一次播放错误原因；没有错误时为 null。 */
     fun lastError(): String?

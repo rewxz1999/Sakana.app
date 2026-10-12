@@ -934,6 +934,151 @@ export interface DanmakuLoadResult extends DanmakuMatch {
   matchedBy?: string
   /** 是否用到了别名 */
   aliasUsed?: boolean
+  /**
+   * v1.1：这批弹幕最终是哪来的（内置弹幕库 / 本地弹幕库 / 某个已启用的数据源）。
+   * 播放器状态区据此显示「弹幕来自 巴哈姆特动画疯 · 第 3 集 3001 条」，用户能一眼看出取的是哪一份。
+   */
+  origin?: DanmakuOrigin
+}
+
+// ---------------- 弹幕数据源集合器（v1.1） ----------------
+
+/**
+ * 数据源类型（用户原话「有可能是 API，有可能是网站，也有可能是数据源链接」）。
+ *
+ * - `api`：有结构化接口的数据源（巴哈姆特动画疯走 api.gamer.com.tw；弹幕盒子走它的静态索引）；
+ * - `site`：站点型（页面/索引需要按站点自己的结构去抓，弹幕盒子就是这一类）；
+ * - `link`：**直链/模板**型 —— 用户自己贴一个地址（或填带 {title}/{episode} 的模板），
+ *   应用只负责下载与格式转换，不猜站点结构。这是"站点检索不了"时唯一能保证可用的路子。
+ */
+export type DanmakuSourceKind = 'api' | 'site' | 'link'
+
+/**
+ * 一条弹幕数据源配置。
+ *
+ * 为什么把「适配器 id」和「数据源 id」分开：id 是用户视角的稳定标识（增删改排序都按它来），
+ * adapter 决定用哪段代码去抓（danmubox / bahamut / link）。一个适配器可以被配置成多条数据源
+ * （例如两个不同基址的巴哈反代），互不干扰。
+ */
+export interface DanmakuSource {
+  id: string
+  /** 展示名（设置页里显示，用户可改） */
+  name: string
+  kind: DanmakuSourceKind
+  /** 适配器 id：'danmubox' | 'bahamut' | 'link'（未知适配器会被跳过并如实报错） */
+  adapter: string
+  /** 启用开关：只有启用的源才会在播放时参与自动加载 */
+  enabled: boolean
+  /** 优先级（越小越先尝试）；集合器列表按它排序 */
+  priority: number
+  /**
+   * 匹配方式：
+   * - `title`：用「番剧名 + 别名（番剧库给的日文名/其它译名）」去搜（默认）；
+   * - `keyword`：固定关键词（番剧名与站点标题对不上时的兜底，例如巴哈用繁体/日文标题）。
+   */
+  matchMode: 'title' | 'keyword'
+  /** matchMode='keyword' 时的固定关键词 */
+  keyword?: string
+  /** 接口/站点基址（可指向自建反代；留空用适配器的默认值） */
+  base?: string
+  /** 凭据（Cookie / Token），需要时才用；界面上打码显示 */
+  credential?: string
+  /** link 源的直链模板，支持 {title} {episode} {episode2}（两位补零） */
+  urlTemplate?: string
+  /** 备注（用户自己写） */
+  note?: string
+  createdAt: number
+  updatedAt?: number
+}
+
+/** 数据源「测试」按钮的结果：每一步都真发请求，失败了也要说清是哪一步 */
+export interface DanmakuSourceTestResult {
+  ok: boolean
+  /** 结论（中文，直接显示） */
+  message: string
+  /** 逐步骤记录：查了什么、回了几条、耗时多少 */
+  steps: { name: string; ok: boolean; detail: string; ms: number }[]
+  /** 实测拿到的样本条目（便于用户判断是不是自己要的那部） */
+  samples?: { title: string; episode?: number; count?: number; extra?: string }[]
+}
+
+/** 本地弹幕库里的一条记录（一个番剧的一集弹幕 = 一个文件） */
+export interface DanmakuLibraryItem {
+  id: string
+  /** 番剧名（下载时用的匹配名） */
+  title: string
+  /** 集数（1 起；0 = 整季/合集包，无法拆到某一集） */
+  episode: number
+  /** 数据源 id / 名称（'builtin' = 内置弹幕库缓存） */
+  sourceId: string
+  sourceName: string
+  /** 库内相对路径（相对库根目录） */
+  file: string
+  bytes: number
+  /** 弹幕条数（导入时解析出来的条数） */
+  count: number
+  /** 文件格式：bili-xml / ddp-json / simple-json */
+  format: DanmakuFormat
+  /** 原始来源描述（如「弹幕盒子：妄想学生会SYD - 第一季」） */
+  origin: string
+  at: number
+}
+
+/** 弹幕文件格式（导入解析时按内容判定，不看扩展名） */
+export type DanmakuFormat = 'bili-xml' | 'ddp-json' | 'simple-json'
+
+/** 本地弹幕库总览 */
+export interface DanmakuLibraryInfo {
+  dir: string
+  bytes: number
+  items: DanmakuLibraryItem[]
+}
+
+/** 一个可用适配器的自述（设置页「新增数据源」的表单与说明都由它生成） */
+export interface DanmakuAdapterInfo {
+  id: string
+  name: string
+  kind: DanmakuSourceKind
+  /** 默认基址（空串 = 这个适配器不需要基址） */
+  defaultBase: string
+  /** 中文说明：这个源怎么工作、实测能不能用 */
+  desc: string
+  /** 是否需要用户填直链模板（link 源） */
+  needTemplate: boolean
+}
+
+/** 集合器总览（设置页一屏要的东西：现有配置 + 可用适配器 + 本地库） */
+export interface DanmakuSourceRegistry {
+  sources: DanmakuSource[]
+  adapters: DanmakuAdapterInfo[]
+  library: DanmakuLibraryInfo
+}
+
+/** 弹幕盒子（站点型数据源）搜到的条目 */
+export interface DanmakuBoxEntry {
+  /** 名称（下载后的文件名 = 这个 + .7z） */
+  name: string
+  /** 来源站（bilibili / AcFun / 优酷 / 动画疯 …） */
+  from: string
+  bytes: number
+  /** 所在的仓库（dmrepository/repo001…），下载地址由它与 fileName 拼出 */
+  repo: string
+  /** 仓库内路径（如 01/xxxx.7z） */
+  fileName: string
+  /** 下载地址（已按镜像拼好，界面上"复制链接"用） */
+  url: string
+}
+
+/** 这条弹幕最终是哪来的（播放器状态区显示「弹幕来自 …」） */
+export interface DanmakuOrigin {
+  sourceId: string
+  sourceName: string
+  /** 'builtin' = 内置弹弹play 弹幕库；'library' = 本地弹幕库命中 */
+  kind: 'builtin' | 'library' | DanmakuSourceKind
+  /** 一句话说明：命中的条目 / 本地文件 / 直链 */
+  detail: string
+  /** 数据源的原始条目名（下载的包名），便于用户核对 */
+  entryName?: string
 }
 
 /** v0.2.8：弹幕显示设置（播放器悬浮窗 + 设置页共用；未设置项用默认值） */
@@ -976,6 +1121,18 @@ export interface DanmakuSettings {
    * 两种方式用的是**同一份**弹幕数据（应用侧统一做季集判定与多来源合并）。
    */
   renderer?: 'canvas' | 'uosc'
+  /**
+   * v1.1：数据源集合器。只有 `enabled` 的源会在播放时自动参与加载（按 priority 依次尝试）。
+   * 内置弹弹play 弹幕库始终作为默认源，`sources` 是它之外的补充，不会互相顶掉。
+   */
+  sources?: DanmakuSource[]
+  /** v1.1：本地弹幕库目录（留空 = `<缓存目录>/danmaku`） */
+  libraryDir?: string
+  /**
+   * v1.1：进播放器时是否自动尝试已启用的数据源。
+   * 关掉后集合器只用于「手动搜索下载」，不会在播放时发网络请求（流量敏感场景）。
+   */
+  autoSources?: boolean
 }
 
 export const DEFAULT_DANMAKU_SETTINGS: DanmakuSettings = {
@@ -992,7 +1149,11 @@ export const DEFAULT_DANMAKU_SETTINGS: DanmakuSettings = {
   bold: true,
   outline: true,
   shadow: false,
-  blockWords: ''
+  blockWords: '',
+  // v1.1：默认**开启**自动加载（用户要求「进播放器时启用的数据源自动开始找弹幕」），
+  // 集合器一开始是空的，所以开着也不会产生任何请求 —— 用户加了源才生效。
+  autoSources: true,
+  sources: []
 }
 
 /** 把设置里的零散字段补成完整弹幕设置（兼容未设置/半设置的历史数据） */
@@ -1015,7 +1176,13 @@ export function resolveDanmakuSettings(raw: Partial<DanmakuSettings> | undefined
     bold: raw.bold !== false,
     outline: raw.outline !== false,
     shadow: raw.shadow === true,
-    blockWords: typeof raw.blockWords === 'string' ? raw.blockWords : d.blockWords
+    blockWords: typeof raw.blockWords === 'string' ? raw.blockWords : d.blockWords,
+    autoSources: raw.autoSources !== false,
+    // 集合器：只保留结构像样的条目（id/adapter 必须有，否则适配器无法执行）
+    sources: (Array.isArray(raw.sources) ? raw.sources : []).filter(
+      (s): s is DanmakuSource => !!s && typeof s.id === 'string' && typeof s.adapter === 'string'
+    ),
+    libraryDir: typeof raw.libraryDir === 'string' ? raw.libraryDir : ''
   }
 }
 
@@ -2193,6 +2360,35 @@ export interface GalBgmSaved {
   size: number
 }
 
+/**
+ * 解包结果摘要（gal:unpack）。
+ * 只读游戏档案；解包产物写在 Sakana 自己的缓存目录里，游戏目录一个字节都不动。
+ */
+export interface GalUnpackSummary {
+  ok: boolean
+  /** 识别到的引擎（KiriKiri / Ren'Py / BGI / SiglusEngine / 未知） */
+  engine: string
+  /** 判定依据（例如 `*.xp3 x3`），界面上要说清"凭什么这么认" */
+  evidence: string[]
+  /** 解出来的文本/脚本文件数 */
+  files: number
+  bytes: number
+  /** 游戏目录里的档案总数 / 其中索引能读出来的数量 */
+  archives: number
+  readableArchives: number
+  /** 解析出的曲名条数 */
+  titles: number
+  /** 脚本里引用的代号个数 */
+  codes: number
+  /** 扫到的场景脚本文档数 */
+  scripts: number
+  /** 曲名/代号来源文件（界面显示） */
+  sources: string[]
+  elapsedMs: number
+  /** 非空 = 做不到的部分（例如档案加密读不出），必须如实显示 */
+  error: string
+}
+
 /** galgame galgame 助手 / 工具配置（electron-store key: galgameTools） */
 export interface GalToolsConfig {
   screenshotEnabled: boolean // 启动galgame 助手
@@ -2543,6 +2739,24 @@ export interface CastMediaInput {
   index?: number
   /** 播放列表（接收端能在电视上选集） */
   playlist?: { url: string; title: string }[]
+  /*
+   * ↓↓↓ V1.1：给接收端补的三个字段（字段名就是契约，见 android-receiver/README.md §2.5c）。
+   *
+   * 为什么必须由电脑给：接收端只拿到一个直链，它**不知道自己在放哪一部、还有哪些线路**——
+   * 于是"选集/连播/换数据源"这三件事在接收端都做不了（历史上它的选集列表只能是只读展示）。
+   * 三个字段都是**可选**：老版本接收端会忽略它们，新接收端拿不到时退化成旧行为，不会报错。
+   */
+  /** 这次投放的内容对应哪个条目（接收端据此向电脑请求换集/连播） */
+  subjectId?: number
+  /**
+   * 这条内容可选的**数据源**（电脑上叫"规则"，一条规则=一个站点）。
+   *
+   * `id` 用规则自身的 id：它稳定、落盘不变，而且是电脑**真正能用来重新解析**的东西
+   * （接收端换源时原样回传 → 电脑按这个 id 重新搜索/嗅探/投回来）。
+   */
+  sources?: { id: string; name: string }[]
+  /** 当前这一集的直链是从哪条数据源解析出来的（对应 `sources[].id`） */
+  sourceId?: string
 }
 
 /** 接收端当前状态（Sakana 接收端有完整状态；DLNA 电视没有查询接口，返回 null） */

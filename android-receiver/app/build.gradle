@@ -20,8 +20,16 @@ android {
         // edge-to-edge（内容铺到状态栏/导航栏底下），而本工程刻意不引 AppCompat/insets 那套，
         // 定 34 可以让全屏视频界面在绝大多数设备上保持"内容区自动避开系统栏"，少一堆适配工作。
         targetSdk = 34
-        versionCode = 1
-        versionName = '1.0.0'
+        /*
+         * V1.1：versionCode 必须跟着涨。
+         *
+         * 这一版换了播放器（GSYVideoPlayer）、加了两个界面/数据源/连播，
+         * 而用户是拿新 APK **原地覆盖安装**上一版的 —— 有些 ROM（真机这台 vivo 就是）
+         * 在 versionCode 没有变大时会直接拒绝安装（"应用未安装"，且不给原因），
+         * 表现成"新包装不上"，很难查。涨到 2 之后实测 `adb install -r` 一次成功。
+         */
+        versionCode = 2
+        versionName = '1.1.0'
     }
 
     // 用 JDK 21 跑 Gradle，但字节码目标锁在 17：
@@ -72,7 +80,19 @@ dependencies {
     //  · OkHttp / NanoHTTPD / Gson 等 —— HTTP 服务与 JSON 都是手写的（见 Http.kt / Json.kt）
     implementation 'androidx.media3:media3-exoplayer:1.11.1'
     implementation 'androidx.media3:media3-exoplayer-hls:1.11.1'
+    // media3-ui 仍然必须留着：GSY 的 exo2 内核要用 Media3 的 MediaSource / DataSource 那一层
+    // （请求头就是靠 DefaultHttpDataSource.Factory 带上去的，见 PlayHeaders.kt）。
     implementation 'androidx.media3:media3-ui:1.11.1'
+
+    // ---- GSYVideoPlayer（用户点名的播放器）----
+    //  · gsyvideoplayer-java —— 播放器视图与控制栏（StandardGSYVideoPlayer 等）
+    //  · gsyvideoplayer-exo2 —— exo2 内核，里面的播放引擎就是 androidx.media3 1.10.1
+    //    （与本工程原来用的 Media3 是同一套引擎，所以"换 GSY"换的是**视图层**，不是解码器）
+    //  · 没有 gsyvideoplayer-android 这个模块名，别再猜（§5b 记过一次）。
+    // 代价（本机实测）：debug APK 6.2MB -> 18.9MB，并带进 appcompat /
+    // play-services-cast 那一串本来就是刻意不引的东西。用户已知情并接受。
+    implementation 'com.github.CarGuo.GSYVideoPlayer:gsyvideoplayer-java:14.0.0'
+    implementation 'com.github.CarGuo.GSYVideoPlayer:gsyvideoplayer-exo2:14.0.0'
 
     // 收藏网格需要 RecyclerView（media3-ui 本来就把它作为运行时依赖带进来了，
     // 所以这里显式声明**不会增加任何体积**，只是把它从"仅运行时"提到编译期，

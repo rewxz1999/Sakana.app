@@ -84,6 +84,15 @@ interface GithubRelease {
   name?: string
   body?: string
   html_url?: string
+  /**
+   * 草稿 / 预发布标记（V1.1 补）。
+   *
+   * 拉列表挑版本时必须能区分它们：草稿不该给任何人看，预发布（测试版）也不该推给
+   * 普通用户 —— 上一次事故正是"最新那个 release 勾了预发布，于是 /releases/latest
+   * 跳过它、客户端永远看不到新版"（详见 fetchLatestRelease 注释）。
+   */
+  draft?: boolean
+  prerelease?: boolean
   assets?: {
     id: number
     name: string
@@ -93,18 +102,59 @@ interface GithubRelease {
   }[]
 }
 
-/** 取最新 release（走 api.github.com：本机与用户的网络实测这条最稳） */
+/**
+ * 取最新 release（走 api.github.com：本机与用户的网络实测这条最稳）。
+ *
+ * ## 为什么不能只信 `/releases/latest`（V1.1 真事故）
+ *
+ * 用户报「旧版本检查更新检查不到新版本」。查下来是**发布侧**的问题，但客户端也有责任：
+ *   · v1.0.0 那次发布勾了"预发布"（prerelease），而 GitHub 的 `/releases/latest`
+ *     **会跳过所有预发布** —— 它当时返回的是更早的 v0.3.7，客户端一比对就得出
+ *     "已经是最新版本"，1.0.0 永远看不到；
+ *   · 后来把 prerelease 改成 false 也**没立刻恢复**：仓库那个"Latest"指针（`make_latest`）
+ *     是在发布时定下的，预发布不会去动它，必须显式 `make_latest=true` 才会挪过去。
+ * 这两条都发生在服务端，而**已经装出去的旧客户端改不了** —— 所以这里补一道客户端兜底：
+ * 再拉一次 release 列表，如果列表里有**比 `/releases/latest` 更新的正式版**就用它。
+ * 列表拿不到（网络/限流）时照旧用 `/releases/latest` 的结果，不影响原来的行为。
+ */
 async function fetchLatestRelease(): Promise<GithubRelease | null> {
+  let primary: GithubRelease | null = null
   try {
     const text = await httpGetText(`${API_BASE}/releases/latest`, 12000, {
       headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Sakana-Updater' }
     })
     const json = JSON.parse(text) as GithubRelease
-    return json?.tag_name ? json : null
+    primary = json?.tag_name ? json : null
   } catch (err) {
     log.append('warn', 'update', `GitHub Releases 查询失败: ${String((err as Error)?.message ?? err)}`)
-    return null
   }
+
+  try {
+    const text = await httpGetText(`${API_BASE}/releases?per_page=15`, 12000, {
+      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Sakana-Updater' }
+    })
+    const list = JSON.parse(text) as GithubRelease[]
+    if (Array.isArray(list)) {
+      // 只认正式版（草稿与预发布都不该推给普通用户），在其中挑版本号最大的那个
+      const stable = list.filter((r) => r && r.tag_name && !r.draft && !r.prerelease)
+      let best: GithubRelease | null = primary
+      // 复用本文件已有的语义化版本比较（`isNewer` 忽略 v 前缀与 -beta 后缀）
+      for (const r of stable) {
+        if (!best || isNewer(String(r.tag_name), String(best.tag_name))) best = r
+      }
+      if (primary && best && best.tag_name !== primary.tag_name) {
+        log.append(
+          'info',
+          'update',
+          `Releases 列表里的最新正式版是 ${best.tag_name}，而 /releases/latest 给的是 ${primary.tag_name} —— 按列表走（见 fetchLatestRelease 注释）`
+        )
+      }
+      if (best) return best
+    }
+  } catch (err) {
+    log.append('warn', 'update', `Release 列表查询失败（继续用 /releases/latest 的结果）: ${String((err as Error)?.message ?? err)}`)
+  }
+  return primary
 }
 
 /** 从 release 里挑出 Windows 安装包（没有就退而取任意 .exe 资产） */

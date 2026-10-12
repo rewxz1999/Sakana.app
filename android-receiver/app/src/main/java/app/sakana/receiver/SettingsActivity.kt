@@ -32,6 +32,7 @@ class SettingsActivity : Activity() {
     private lateinit var swAutoplay: Switch
     private lateinit var swBoot: Switch
     private lateinit var swResize: Switch
+    private lateinit var swAutoNext: Switch
     private lateinit var tvAboutVersion: TextView
     private lateinit var tvAboutPort: TextView
     private lateinit var tvAboutFace: TextView
@@ -72,6 +73,7 @@ class SettingsActivity : Activity() {
         swAutoplay = findViewById(R.id.sw_autoplay)
         swBoot = findViewById(R.id.sw_boot)
         swResize = findViewById(R.id.sw_resize)
+        swAutoNext = findViewById(R.id.sw_auto_next)
         tvAboutVersion = findViewById(R.id.tv_about_version)
         tvAboutPort = findViewById(R.id.tv_about_port)
         tvAboutFace = findViewById(R.id.tv_about_face)
@@ -94,6 +96,7 @@ class SettingsActivity : Activity() {
         swAutoplay.isChecked = Settings.autoPlay
         swBoot.isChecked = Settings.autoOpenOnBoot
         swResize.isChecked = Settings.resizeFill
+        swAutoNext.isChecked = Settings.autoNext
         tvFace.text = faceLabel()
         bindRecentHosts(layoutRecent, Settings.recentPeers) { etPeer.setText(it) }
     }
@@ -131,6 +134,11 @@ class SettingsActivity : Activity() {
         swResize.setOnCheckedChangeListener { _, checked ->
             Settings.resizeFill = checked
             toast(getString(if (checked) R.string.toast_resize_fill else R.string.toast_resize_fit))
+        }
+        // 自动连播：只存设置，播放层每次判断时现读（改完立刻生效，不用重启）
+        swAutoNext.setOnCheckedChangeListener { _, checked ->
+            Settings.autoNext = checked
+            toast(getString(R.string.toast_saved))
         }
     }
 

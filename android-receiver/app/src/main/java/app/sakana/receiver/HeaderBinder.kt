@@ -41,7 +41,7 @@ internal class HeaderBinder(private val activity: Activity, header: View) {
         return "${face()?.ip ?: Lan.localIpv4(null)}:$port"
     }
 
-    fun refresh(snapshot: PlayerController.Snapshot, error: String?, notice: String?) {
+    fun refresh(snapshot: PlayerSnapshot, error: String?, notice: String?) {
         tvName.text = Settings.deviceName
         refreshAddress()
         refreshSyncStatus()

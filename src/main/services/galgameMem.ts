@@ -3,12 +3,14 @@ import { existsSync, readdirSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { CH } from '@shared/channels'
 import { DEFAULT_GAL_TOOLS } from '@shared/types'
-import type { GalBgmSaved, GalMemEntry, GalMemRecent } from '@shared/types'
+import type { GalBgmSaved, GalMemEntry, GalMemRecent, GalUnpackSummary } from '@shared/types'
 import { log } from '../log'
 import { getSettings } from '../net'
 import { store } from '../store'
 import { listModules, scanProcessMemory, winMemStatus } from './winMem'
+import { detectGalEngine, readBgmMap, readUnpackManifest, runUnpack } from './galUnpack'
 import {
+  buildBgmMapFromUnpacked,
   hasCode,
   listSavedBgm,
   loadBgmCatalog,
@@ -18,6 +20,7 @@ import {
   titleForCode,
   type BgmCatalog
 } from './galBgmCatalog'
+import { extractImages } from './galSprite'
 
 /**
  * galgame「BGM / 章节」只读内存识别服务。
@@ -433,7 +436,7 @@ export function galMemStart(opts: {
    * 放在这里做一次（带缓存），面板一打开就能显示真实曲名；读不出来就如实显示代号。
    * 整段包在 try 里：曲名解析失败绝不能影响内存识别本身。
    */
-  let catalog: BgmCatalog = { titles: new Map(), source: '', codes: new Set() }
+  let catalog: BgmCatalog = { titles: new Map(), files: new Map(), source: '', codes: new Set() }
   try {
     const t0 = Date.now()
     catalog = loadBgmCatalog(dirname(opts.exePath))
@@ -608,4 +611,178 @@ export function galMemHasCode(gameId: string, code: string): boolean {
   const sess = sessions.get(gameId)
   if (!sess) return false
   return hasCode(sess.catalog, code)
+}
+
+// ---------------- 解包 / 立绘 / 手动刷新（V1.1） ----------------
+
+/**
+ * 手动刷新（悬浮球「galgame 助手」的刷新按钮）：**跳过 2 秒轮询**，立刻重扫一次内存。
+ *
+ * 为什么做成 async 并 await tick：tick 里要扫 256MB 上限的可读内存（winMem 自己限 1.2 秒），
+ * 上一版直接 `void tick()` 就返回，悬浮窗只能靠"等 800ms 再读"这种碰运气的方式拿结果 ——
+ * 用户点了刷新却看到旧值，等于没刷新。现在等这一轮扫完再返回，调用方拿到的一定是新结果。
+ */
+export async function galMemForceRefresh(gameId: string): Promise<{ ok: boolean; error: string }> {
+  const sess = sessions.get(gameId)
+  if (!sess) return { ok: false, error: '这款游戏当前没有在运行，无法刷新识别' }
+  if (sess.timer) {
+    clearTimeout(sess.timer)
+    sess.timer = null
+  }
+  // tick 结束时会自己排下一轮，所以这里 await 不会打断正常节奏
+  try {
+    await tick(sess)
+  } catch (err) {
+    return { ok: false, error: String((err as { message?: string })?.message ?? err) }
+  }
+  return { ok: true, error: '' }
+}
+
+/** 引擎信息（卡片/详情显示"识别到的引擎 + 判定依据"） */
+export function galMemEngineInfo(gameId: string, gameDir?: string): { engine: string; evidence: string[] } {
+  const sess = sessions.get(gameId)
+  const dir = gameDir || (sess ? dirname(sess.exePath) : '')
+  if (!dir) return { engine: sess?.engine ?? '', evidence: [] }
+  try {
+    const info = detectGalEngine(dir)
+    if (info.engine === '未知' && sess?.engine) return { engine: sess.engine, evidence: ['运行时识别'] }
+    return { engine: info.engine, evidence: info.evidence }
+  } catch {
+    return { engine: sess?.engine ?? '', evidence: [] }
+  }
+}
+
+/**
+ * 解包 + 解析（卡片右键「解包」）：
+ *   ① 检测引擎 → ② 把文本/脚本解到 Sakana 缓存目录 → ③ 解析「代号 → 曲名/真实文件名」并落盘缓存。
+ * 只读游戏文件；产物写在缓存目录里，游戏目录一个字节都不动。
+ */
+export async function galMemUnpack(
+  gameId: string,
+  gameName: string,
+  gameDir: string,
+  force = false
+): Promise<GalUnpackSummary> {
+  void gameName
+  const t0 = Date.now()
+  const engine = detectGalEngine(gameDir)
+  const manifest = await runUnpack(gameId, gameDir, { force })
+  /*
+   * 映射按游戏 id 落盘缓存（用户要求）：不强制重建时直接用缓存，
+   * 否则每次点「解包」都要把几百个脚本重扫一遍（实测 少女领域 803 个文件 ≈ 1.8 秒）。
+   * 「清掉缓存重新解包」（force=true）才会真正重扫，与按钮文案一致。
+   */
+  const cached = readBgmMap(gameId)
+  const map = !force && cached ? cached : await buildBgmMapFromUnpacked(gameId, gameDir)
+  // 解包/映射变了 → 运行中的会话重新读一次曲名表（否则面板还是旧数据）
+  const sess = sessions.get(gameId)
+  if (sess) sess.catalog = loadBgmCatalog(gameDir)
+  const readable = manifest.archives.filter((a) => a.readable).length
+  /*
+   * 「解不出来」有两种完全不同的原因，文案必须分开说（V1.1 复验时改）。
+   *
+   * 起因：用户库里的《灵感满溢的甜蜜创想》（SiglusEngine）解包 0 文件，界面却说
+   * "档案索引读不出来"。实际拿字节验过（`.e2e/gal-pfs-probe.ts`）：
+   *   · 5 个 .pfs 的文件表**全都读得出来**，29224 个真实文件名（`sound\bgm\bgm01_a.ogg`
+   *     这种）都能列；代号 → 真实文件名这条链是通的（`fileForCode('bgm01_a')` 命中）；
+   *   · 但正文一字节都取不到：1MB 窗口里 `OggS`/`PNG` 命中 **0 次**、熵 7.73~7.75 bit/字节，
+   *     把偏移前后平移 ±64KB 重扫也一样 —— 所以不是"偏移算错"，是真加密。
+   * 把这两件事说成一件，用户会以为"连文件表都没有、这游戏没救了"，
+   * 而事实上他至少能拿到"这首曲子对应档案里哪个文件"。
+   */
+  const entriesTotal = manifest.archives.reduce((n, a) => n + a.entries, 0)
+  const failReason = manifest.error
+    ? manifest.error
+    : readable === 0
+      ? entriesTotal > 0
+        ? `档案里的文件名列得出来（${entriesTotal} 个），但正文是加密的：音频/图片/脚本都取不到字节，本版导不出内容（代号 → 真实文件名仍然可用）`
+        : '档案索引读不出来（该作使用了自定义压缩，本版无法解包）'
+      : ''
+  return {
+    ok: manifest.files > 0,
+    engine: engine.engine,
+    evidence: engine.evidence,
+    files: manifest.files,
+    bytes: manifest.bytes,
+    archives: manifest.archives.length,
+    readableArchives: readable,
+    titles: map ? Object.keys(map.titles).length : 0,
+    codes: map ? (map.usedCodes?.length ?? 0) + Object.keys(map.files).length : 0,
+    scripts: map ? Object.keys(map.scenes ?? {}).length : 0,
+    sources: map?.sources ?? [],
+    elapsedMs: Date.now() - t0,
+    error: failReason
+  }
+}
+
+/** 解包状态（没解过时给出"曲名映射/立绘提取都需要先解包"的原因） */
+export function galMemUnpackStatus(
+  gameId: string,
+  gameDir?: string
+): { unpacked: boolean; at: number; files: number; engine: string; evidence: string[]; reason: string } {
+  const manifest = readUnpackManifest(gameId)
+  const info = gameDir ? detectGalEngine(gameDir) : { engine: '', evidence: [] as string[] }
+  if (!manifest) {
+    return {
+      unpacked: false,
+      at: 0,
+      files: 0,
+      engine: info.engine,
+      evidence: info.evidence,
+      reason: '还没有解包：曲名映射与立绘/CG 提取都需要先解包（只读游戏档案，不会改动游戏目录）'
+    }
+  }
+  return { unpacked: true, at: manifest.at, files: manifest.files, engine: manifest.engine, evidence: manifest.evidence, reason: '' }
+}
+
+/** 立绘 / CG 提取（只写 `<保存根目录>/<游戏名>/立绘|cg/`） */
+export async function galMemExtractImages(
+  gameId: string,
+  gameName: string,
+  gameDir: string,
+  kind: '立绘' | 'cg',
+  limit = 12
+): Promise<{
+  ok: boolean
+  count: number
+  candidates: number
+  dir: string
+  files: string[]
+  error: string
+  /** 立绘：按坐标表合成出来的张数（主路径） */
+  composed?: number
+  /** 立绘：回退成"整身底图碎片"的张数（没有坐标表时） */
+  fallback?: number
+}> {
+  const sess = sessions.get(gameId)
+  const root = sess ? sess.rootDir : galRootDir()
+  try {
+    const r = await extractImages({ gameDir, rootDir: root, gameName, kind, limit })
+    if (r.ok) {
+      log.append(
+        'info',
+        'galmem',
+        `${kind}提取: 候选 ${r.candidates}，写出 ${r.count} 张（合成 ${r.composed ?? 0} / 回退 ${r.fallback ?? 0}）→ ${r.dir}`
+      )
+    }
+    return {
+      ok: r.ok,
+      count: r.count,
+      candidates: r.candidates,
+      dir: r.dir,
+      files: r.files,
+      composed: r.composed,
+      fallback: r.fallback,
+      error: r.error
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      count: 0,
+      candidates: 0,
+      dir: '',
+      files: [],
+      error: String((err as { message?: string })?.message ?? err)
+    }
+  }
 }

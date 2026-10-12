@@ -1,6 +1,6 @@
 {
   "name": "sakana",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Sakana - 鐣墽绠＄悊鍙婃挱鏀炬闈㈠鎴风",
   "main": "./out/main/index.js",
   "author": "Sakana Team",
@@ -65,6 +65,10 @@
         "to": "icon.png"
       },
       {
+        "from": "resources/icon.ico",
+        "to": "icon.ico"
+      },
+      {
         "from": "resources/mpv-scripts",
         "to": "mpv-scripts"
       },
@@ -86,7 +90,7 @@
           ]
         }
       ],
-      "icon": "resources/icon.png",
+      "icon": "resources/icon.ico",
       "artifactName": "Sakana-${version}-setup.${ext}"
     },
     "nsis": {

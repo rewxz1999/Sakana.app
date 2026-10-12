@@ -4,6 +4,10 @@ import type { DanmakuSettings } from '@shared/types'
 import { DEFAULT_DANMAKU_SETTINGS, resolveDanmakuSettings } from '@shared/types'
 import { api } from '@/lib/api'
 import { useSettings, toast } from '@/stores/app'
+import { useSourceCatalog } from '@/components/danmaku/useSourceCatalog'
+import { DanmakuSourcesCard } from '@/components/danmaku/DanmakuSourcesCard'
+import { DanmakuBoxCard } from '@/components/danmaku/DanmakuBoxCard'
+import { DanmakuLibraryCard } from '@/components/danmaku/DanmakuLibraryCard'
 import { Button, Input } from '@/components/ui'
 import { Card, SubPage } from '@/components/SettingsShell'
 
@@ -17,10 +21,16 @@ import { Card, SubPage } from '@/components/SettingsShell'
  * v0.3.9：用户要求「B 站弹幕板块放在弹幕设置中」，于是原「播放器设置」里的
  * 「B 站弹幕（mpv 脚本）」整块搬到这里 —— 它本来就是弹幕来源相关（yt-dlp + biliass 管线），
  * 放在播放器设置里既难找、也和画质/音频那几块混在一起。设置字段仍是 `settings.biliDanmaku`。
+ *
+ * V1.1（本次）：新增「弹幕数据源」集合器 + 「弹幕盒子」检索下载 + 「本地弹幕库」管理三块。
+ * 集合器状态由本页统一持有（`useSourceCatalog`）再传给三个卡片 —— 三处共用一份，
+ * 不会各拉一次接口、也不会改完互相不同步。
  */
 export function DanmakuSettingsPage() {
   const { settings, save } = useSettings()
   const [d, setD] = useState<DanmakuSettings>(() => resolveDanmakuSettings(settings?.danmaku))
+  // 数据源集合器（含本地弹幕库）：三个卡片共用这一份状态
+  const catalog = useSourceCatalog()
 
   // 设置从主进程加载完成后再同步一次（首帧可能拿到默认值）
   useEffect(() => {
@@ -37,8 +47,8 @@ export function DanmakuSettingsPage() {
     <SubPage
       icon={MessageSquare}
       title="弹幕设置"
-      desc="弹幕来自弹弹play 弹幕库，按番剧名与集数自动匹配；本地播放同样可用。下方还有 B 站弹幕（yt-dlp + biliass）配置"
-      maxWidth="max-w-xl"
+      desc="弹幕按「番剧名 + 集数」自动匹配：先查本地弹幕库，再走内置弹弹play 弹幕库，最后按优先级尝试下面的数据源；本地播放同样可用"
+      maxWidth="max-w-2xl"
       actions={
         <Button
           size="sm"
@@ -74,6 +84,11 @@ export function DanmakuSettingsPage() {
           插件取不到弹幕时会自动回落到内置画布，不会出现「两边都没有」。
         </div>
       </Card>
+
+      {/* ---------------- V1.1：数据源集合器 / 弹幕盒子 / 本地弹幕库 ---------------- */}
+      <DanmakuSourcesCard catalog={catalog} />
+      <DanmakuBoxCard />
+      <DanmakuLibraryCard catalog={catalog} />
 
       <Card title="显示" desc="影响画面上的弹幕观感">
         <Toggle label="显示弹幕" desc="关闭后完全不绘制弹幕（数据仍会匹配）" value={d.enabled} onChange={(v) => patch({ enabled: v })} />
@@ -242,6 +257,13 @@ export function DanmakuSettingsPage() {
           弹幕按「番剧名 + 集数」自动匹配弹幕库，找不到对应条目时播放器会显示「未找到弹幕」，不影响播放。
           同一集只会请求一次，之后走本地缓存；播放器悬浮窗里的「重新检测弹幕」可以强制重新拉取，
           「别名检测弹幕」则会连别名一起搜（番剧名与弹幕库标题对不上时用它）。
+          <div className="mt-1.5">
+            进播放器时的尝试顺序：<b className="text-dim">本地弹幕库</b>（命中则不发请求）→{' '}
+            <b className="text-dim">内置弹弹play</b> → <b className="text-dim">上面启用的数据源</b>
+            （按优先级 1、2、3…）。拿到第一条有内容的就停止，播放器状态区会写明
+            <b className="text-dim">这条弹幕来自哪个源</b>；全部失败时会列出每个源各自的原因
+            （未匹配 / 下载失败 / 格式不支持）。
+          </div>
         </div>
       </Card>
     </SubPage>

@@ -596,11 +596,39 @@ export function PlayerSourcePage({
         animate={{ opacity: 1, y: 0 }}
         exit={{ opacity: 0, y: 8 }}
         transition={{ duration: 0.18 }}
-        /* z-[65]：必须在验证弹窗（z-[70]）之下，见文件头说明 */
-        className="fixed inset-0 z-[65] flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm"
+        /*
+         * z-[65]：必须在验证弹窗（z-[70]）之下，见文件头说明。
+         *
+         * ⚠️ V1.1 改：不再用 `inset-0`，改成**从上沿留出一条**（`top-[104px]`）。
+         *
+         * 起因是用户报的「番剧详情页返回按钮不灵敏，需要点好几次才响应」。真机实测
+         * （`.e2e/v11-back-sources.mjs`，真实命中测试的点击）：面板打开时，
+         * 在详情页「返回」按钮中心取 `elementFromPoint` 拿到的是**这块浮层**，
+         * 连点 3 次导航次数都是 0 —— 点击全被它吃掉了；按 Esc 关掉面板后同一个坐标
+         * 点一次就立刻返回。而详情页有一条自动逻辑：**从播放页退出回来会把这块面板弹出来**
+         * （`location.state.openSources`），于是"看完一集 → 回详情 → 想点返回"这条最常见的
+         * 路径每次都会踩中它。
+         *
+         * 留出的 104px 正好是「标题栏 + 详情页返回按钮那一行」（实测按钮占 y=60~94），
+         * 于是返回按钮在面板打开时**依然看得见、点得着**，不用先关面板再点第二次。
+         * 面板本体跟着改成 `h-full`（父容器已经扣掉了这 104px），不会溢出屏幕。
+         */
+        className="fixed inset-x-0 bottom-0 top-[104px] z-[65] flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm"
         data-ps-stage={stage}
+        /*
+         * 点浮层空白处 = 关闭（V1.1 补）。
+         *
+         * 以前点空白处**什么都不发生**：用户想点的是被它盖住的页面元素，反馈却是"死了一样"。
+         * 用 `e.target === e.currentTarget` 判定"点在空白处而不是面板本体上"，
+         * 避免误关正在操作的区域。
+         */
+        onMouseDown={(e) => {
+          if (e.target === e.currentTarget) onClose()
+        }}
       >
-        <div className="flex h-[88vh] w-full max-w-[1220px] flex-col overflow-hidden rounded-2xl border border-border bg-elev1 shadow-2xl">
+        {/* `h-full` 而不是 `h-[88vh]`：浮层自己已经从上面留掉了 104px（见上面的说明），
+            再按视口高度算一次就会顶出屏幕底部（实测 642px 视口下会超出）。 */}
+        <div className="flex h-full w-full max-w-[1220px] flex-col overflow-hidden rounded-2xl border border-border bg-elev1 shadow-2xl">
           {/* ---------------- 头部：面包屑（当前走到第几级一目了然） ---------------- */}
           <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border px-4 py-2.5">
             <div className="flex min-w-0 items-center gap-2">

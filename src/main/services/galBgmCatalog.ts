@@ -6,24 +6,49 @@
  *   游戏目录里的东西一个字节都不会被改动。
  *
  * 解析顺序（用户指定）：
- *   ① 游戏目录里的明文数据（BGM 目录、csv/ini/json/txt 曲目表）；
- *   ② 档案里的曲目表（KiriKiri XP3 实测 main/soundlist.csv 就是 `bgm01,Graceful lady`）；
- *   ③ 都没有 → 如实返回「只有代号」，绝不编曲名。
+ *   ① **解包产物**：从 .ks/.tjs/.rpy/.csv 里解析 `bgm "xxx.ogg"` 之类调用 + 曲目表，
+ *      按游戏 id 落盘缓存（重新解包才更新，见 galUnpack）；
+ *   ② 游戏目录里的明文数据（BGM 目录、csv/ini/json/txt 曲目表）；
+ *   ③ 档案里的曲目表（KiriKiri XP3 实测 main/soundlist.csv 就是 `bgm01,Graceful lady`）；
+ *   ④ 都没有 → 如实返回「只有代号」，绝不编曲名。
  */
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, extname, join } from 'node:path'
+import { basename, dirname, extname, join } from 'node:path'
 import type { GalBgmSaved } from '@shared/types'
 import { listArchiveEntries, looksLikeTitleTable, readArchiveEntry, type ArchiveEntry } from './galArchive'
+import { listUnpackedFiles, readBgmMap, readUnpackManifest, unpackRootDir, writeBgmMap, type GameBgmMap } from './galUnpack'
 
 /** 曲名解析结果（缓存） */
 export interface BgmCatalog {
   /** 代号（小写、去扩展名）→ 曲名 */
   titles: Map<string, string>
+  /** 代号 → 档案里的真实文件名（含子目录，例如 `bgm/bgm01.ogg`）——内存联动时显示"真实文件名" */
+  files: Map<string, string>
   /** 曲名来源（给界面/日志看，例如「档案 main/soundlist.csv」） */
   source: string
   /** 已知的 BGM 代号（小写、去扩展名）——没有曲名时用来如实说明"只有代号" */
   codes: Set<string>
+}
+
+/**
+ * 按游戏目录找到「之前解包/解析过」的曲名映射（解包缓存是按游戏 id 落的盘，
+ * 这里用 manifest 里的 gameDir 反查；只有重新解包才会更新，符合"重新解包才更新"的要求）。
+ */
+function readGameBgmMapByDir(gameDir: string): GameBgmMap | null {
+  let ids: string[]
+  try {
+    ids = readdirSync(unpackRootDir())
+  } catch {
+    return null
+  }
+  for (const id of ids) {
+    const manifest = readUnpackManifest(id)
+    if (!manifest || manifest.gameDir !== gameDir) continue
+    const map = readBgmMap(id)
+    if (map) return map
+  }
+  return null
 }
 
 const catalogCache = new Map<string, { key: string; catalog: BgmCatalog }>()
@@ -32,6 +57,182 @@ const catalogCache = new Map<string, { key: string; catalog: BgmCatalog }>()
 export function normalizeCode(raw: string): string {
   const base = raw.split(/[\\/]/).pop() ?? raw
   return base.replace(/\.[a-z0-9]+$/i, '').toLowerCase()
+}
+
+// ---------------- 从解包产物解析「代号 → 真实文件名/曲名」 ----------------
+
+/**
+ * 从脚本里抽出 BGM 调用（用户指定的步骤③）。
+ * 覆盖真机上常见的几种写法：
+ *   · KiriKiri/KAG：`[playbgm storage="bgm01"]`、`[bgm storage="bgm/bgm01.ogg" loop=true]`
+ *   · KiriKiri/TJS：`SoundLibrary.playBGM("bgm01")`、`playBGM("sound/bgm/bgm01.ogg")`
+ *   · Ren'Py：`play music "audio/bgm01.ogg"`、`queue music "bgm/op.ogg" fadeout 1.0`
+ * 只做字符串匹配，不执行任何脚本内容。
+ */
+const BGM_CALL_RES: RegExp[] = [
+  /\[\s*(?:playbgm|bgm|fadebgm|stopbgm)\b[^\]]*?(?:storage|file)\s*=\s*["']([^"']+)["']/gi,
+  /\bplayBGM\s*\(\s*["']([^"']+)["']/gi,
+  /\bplaySE\s*\(\s*["']([^"']+)["']/gi, // 少数游戏把 BGM 也走 playSE
+  /\bplay\s+music\s+["']([^"']+)["']/gi,
+  /\bqueue\s+music\s+["']([^"']+)["']/gi,
+  /\bbgm\s+["']([^"']+)["']/gi
+]
+
+/** 脚本里出现的音频文件名（含扩展名才算） */
+function extractBgmCalls(text: string, into: Map<string, Set<string>>): number {
+  let n = 0
+  for (const re of BGM_CALL_RES) {
+    re.lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = re.exec(text)) !== null) {
+      const raw = m[1].trim()
+      if (!/\.(ogg|mp3|wav|opus|m4a|flac|aac|adx|hca)$/i.test(raw)) continue
+      const code = normalizeCode(raw)
+      if (!code) continue
+      const set = into.get(code) ?? new Set<string>()
+      set.add(raw)
+      into.set(code, set)
+      n++
+    }
+  }
+  return n
+}
+
+/**
+ * 抽出**不带扩展名的代号**。
+ *
+ * 为什么必须做这一步：真机实测 少女领域 的场景脚本（`CN/scn/ky01_1.txt.scn`）里
+ * BGM 是用**纯代号**引用的（字符串表里就是 `bgm` `bgm01` `bgm06` … `bgm_BGM01`），不带 `.ogg`。
+ * 只认"带扩展名的调用"会一条都解析不到 —— 本版第一遍就踩了这个坑：
+ * 解包出 40 个 .ks / 349 个 .scn，结果"脚本调用 0 个代号"。KAG 脚本里 `bgm01`
+ * 这种 token 只出现在 BGM 相关位置，误报率很低。
+ */
+const BARE_CODE_RE = /\b((?:bgm|music|bkm|ost)[_-]?[a-z0-9_]{1,16})\b/gi
+
+/** `bgm_BGM01` → `bgm01`（去掉重复的 bgm 前缀），其余原样小写 */
+function normalizeBareToken(token: string): string {
+  const t = token.toLowerCase()
+  const stripped = t.replace(/^(?:bgm|music|bkm|ost)[_-]/, '')
+  return /^(?:bgm|music|bkm|ost)/.test(stripped) ? stripped : t
+}
+
+export interface ScriptScanResult {
+  /** 代号 → 该脚本里出现的**带扩展名**的真实文件名 */
+  files: Map<string, Set<string>>
+  /** 脚本里出现过的纯代号（不带扩展名）——只当"用到了"的证据 */
+  used: Set<string>
+  /** 场景脚本文件 → 它用到的代号（"这个场景大概会放哪几首"） */
+  sceneCodes: Map<string, string[]>
+}
+
+/**
+ * 纯代号只认「bgm/music/bkm/ost + 可选分隔符 + 数字开头」这种形状。
+ * 为什么要卡这么死：KAG 脚本里还有一堆同前缀的**系统命令** token
+ * （真机实测扫出 `bgmindiabsolute`/`bgmindiuistorage`/`bgmtitle`/`bgmindimoveleft` 这些），
+ * 不卡形状就会把它们当成曲目代号写进映射表。
+ */
+function isTrackShaped(token: string): boolean {
+  const t = normalizeBareToken(token)
+  return /^(?:bgm|music|bkm|ost)[_-]?\d[a-z0-9_]{0,14}$/.test(t)
+}
+
+/** 扫一段脚本文本，抽出 BGM 代号（带扩展名的调用 + 纯代号 token） */
+export function scanScriptForBgm(text: string, fileName: string, out: ScriptScanResult): number {
+  const before = out.used.size
+  extractBgmCalls(text, out.files)
+  BARE_CODE_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  const sceneSet = new Set<string>()
+  while ((m = BARE_CODE_RE.exec(text)) !== null) {
+    if (!isTrackShaped(m[1])) continue
+    const code = normalizeBareToken(m[1])
+    out.used.add(code)
+    sceneSet.add(code)
+  }
+  if (sceneSet.size && /\.(ks|scn|tjs|rpy)$/i.test(fileName)) {
+    out.sceneCodes.set(fileName, [...sceneSet].slice(0, 40))
+  }
+  return out.used.size - before
+}
+
+/**
+ * 解析解包产物，产出「代号 → 曲名 / 真实文件名」映射并按游戏 id 落盘缓存。
+ * 前提：先跑过 runUnpack（没有解包清单时直接返回 null，界面会提示"先解包"）。
+ *
+ * async：一次要读几百上千个脚本文件（实测 少女领域 803 个），同步读完会把主进程按住好几秒；
+ * 每 50 个文件让出一轮事件循环，界面保持可响应。
+ */
+export async function buildBgmMapFromUnpacked(gameId: string, gameDir: string): Promise<GameBgmMap | null> {
+  const manifest = readUnpackManifest(gameId)
+  if (!manifest) return null
+
+  const titles = new Map<string, string>()
+  const sources: string[] = []
+  const scan: ScriptScanResult = { files: new Map(), used: new Set(), sceneCodes: new Map() }
+
+  // 注意：必须带上 .scn —— 真机实测这个引擎的 BGM 引用全在场景文件 .scn 里
+  //（少写一个扩展名就只剩 5 个文件被扫到，330 多个场景全漏掉）
+  const textFiles = listUnpackedFiles(gameId, [
+    '.ks',
+    '.scn',
+    '.tjs',
+    '.csv',
+    '.txt',
+    '.ini',
+    '.tsv',
+    '.rpy',
+    '.rpyc',
+    '.dat',
+    '.stand',
+    '.lua',
+    '.ksd'
+  ])
+  let scriptCalls = 0
+  let sinceYield = 0
+  for (const f of textFiles) {
+    let buf: Buffer
+    try {
+      buf = readFileSync(f)
+    } catch {
+      continue
+    }
+    const name = basename(f)
+    /*
+     * 一份文件按多种编码各扫一遍再取并集。
+     * 为什么不能只挑一种：真机实测 .scn 场景文件是 **PSB 二进制容器**
+     * （头 `PSB\0`），里面既有 UTF-8 字符串表也有 UTF-16 段；用"偶数位是否大量 0"
+     * 这种启发式挑编码会挑错（实测挑成 UTF-16 → 一条代号都认不出，只剩 4 处）。
+     * 正则扫描本身很便宜，两种都扫最稳。
+     */
+    const texts = new Set<string>([buf.toString('utf8'), buf.toString('utf16le'), decodeLocal(buf)])
+    let matchedTitleTable = false
+    for (const text of texts) {
+      if (!matchedTitleTable && looksLikeTitleTable(name) && parseTitleTable(text, titles) > 0) {
+        sources.push(name)
+        matchedTitleTable = true
+      }
+      scriptCalls += scanScriptForBgm(text, name, scan)
+    }
+    // 每 50 个文件让出一轮事件循环（见函数注释：几百个脚本同步读完会卡住界面）
+    if (++sinceYield >= 50) {
+      sinceYield = 0
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+  }
+
+  const map: GameBgmMap = {
+    gameId,
+    at: Date.now(),
+    titles: Object.fromEntries(titles),
+    files: Object.fromEntries([...scan.files].map(([k, v]) => [k, [...v]])),
+    usedCodes: [...scan.used],
+    scenes: Object.fromEntries(scan.sceneCodes),
+    sources: [...new Set(sources)].slice(0, 12),
+    filesUnpacked: manifest.files,
+    scriptCalls
+  }
+  writeBgmMap(map)
+  return map
 }
 
 /** 曲名表的行解析：找出「代号列 + 曲名列」。真机实测格式 `bgm01,Graceful lady`、`bgm01,01`、制表符/等号也兼容 */
@@ -124,16 +325,34 @@ export function loadBgmCatalog(gameDir: string): BgmCatalog {
   if (hit && hit.key === key) return hit.catalog
 
   const titles = new Map<string, string>()
+  const files = new Map<string, string>()
   const codes = new Set<string>()
   const sources: string[] = []
 
-  // ① 明文文件
+  // ① 解包产物（最优先：脚本里的 BGM 调用 + 解包出的曲目表；按游戏 id 落盘缓存）
+  const unpackedMap = readGameBgmMapByDir(gameDir)
+  if (unpackedMap) {
+    for (const [code, title] of Object.entries(unpackedMap.titles)) titles.set(code, title)
+    // 只用"带扩展名的真实文件名"；纯代号只算"脚本用到过"，不能当成文件名
+    for (const [code, list] of Object.entries(unpackedMap.files)) {
+      codes.add(code)
+      if (list[0]) files.set(code, list[0])
+    }
+    for (const code of unpackedMap.usedCodes ?? []) codes.add(code)
+    if (unpackedMap.sources.length) sources.push(`解包脚本 ${unpackedMap.sources.slice(0, 3).join('/')}`)
+  }
+
+  // ② 明文文件
   sources.push(...scanDiskTables(gameDir, titles))
 
-  // ② 档案里的曲目表 + 代号清单
+  // ③ 档案里的曲目表 + 代号清单（档案里的名字就是"真实文件名"）
   const entries: ArchiveEntry[] = listArchiveEntries(gameDir)
   for (const e of entries) {
-    if (/\.(ogg|wav|mp3|opus|flac|m4a|aac)$/i.test(e.name)) codes.add(normalizeCode(e.name))
+    if (/\.(ogg|wav|mp3|opus|flac|m4a|aac)$/i.test(e.name)) {
+      const code = normalizeCode(e.name)
+      codes.add(code)
+      if (!files.has(code)) files.set(code, e.name.replace(/\\/g, '/'))
+    }
   }
   const tables = entries.filter((e) => looksLikeTitleTable(e.name) && e.size <= 1024 * 1024)
   for (const t of tables) {
@@ -144,6 +363,7 @@ export function loadBgmCatalog(gameDir: string): BgmCatalog {
 
   const catalog: BgmCatalog = {
     titles,
+    files,
     source: sources.length ? sources.slice(0, 3).join('、') : '',
     codes
   }
@@ -158,9 +378,16 @@ export function loadBgmCatalog(gameDir: string): BgmCatalog {
 /**
  * 代号 → 曲名。`bgm01_a` / `bgm01_b` 这类「同一首曲子的 A/B 段」会回退到 `bgm01`，
  * 这正是游戏自己 `bgmtitlemap.csv` 的对应关系（实测：bgm01→01、bgm10_full→10）。
+ *
+ * 另外还会先去掉**重复前缀**：真机实测 少女领域 的字符串表里出现过 `bgm_BGM01` 这种写法，
+ * 不去重就永远匹配不上（它其实是 bgm01）。
  */
+function stripDupPrefix(code: string): string {
+  return code.replace(/^(?:bgm|music|bkm|ost)[_-]+(?=(?:bgm|music|bkm|ost)[_-]?\d)/i, '')
+}
+
 export function titleForCode(catalog: BgmCatalog, rawCode: string): string {
-  let code = normalizeCode(rawCode)
+  let code = stripDupPrefix(normalizeCode(rawCode))
   for (let i = 0; i < 4 && code; i++) {
     const hit = catalog.titles.get(code)
     if (hit) return hit
@@ -173,7 +400,7 @@ export function titleForCode(catalog: BgmCatalog, rawCode: string): string {
 
 /** 代号是否已知（用于"只有代号"的如实说明） */
 export function hasCode(catalog: BgmCatalog, rawCode: string): boolean {
-  let code = normalizeCode(rawCode)
+  let code = stripDupPrefix(normalizeCode(rawCode))
   for (let i = 0; i < 4 && code; i++) {
     if (catalog.codes.has(code) || catalog.titles.has(code)) return true
     const next = code.replace(/[_\-][a-z0-9]{1,4}$/, '')
@@ -183,17 +410,44 @@ export function hasCode(catalog: BgmCatalog, rawCode: string): boolean {
   return false
 }
 
-// ---------------- 保存（提取档案里的音频） ----------------
+/**
+ * 代号 → **真实文件名**（档案/脚本里的原始写法，例如 `bgm/bgm01.ogg`）。
+ * 与曲名一样支持 A/B 段与重复前缀回退（`bgm01_a` / `bgm_BGM01` → `bgm01`）。
+ * 取不到返回空串，界面显示代号即可。
+ */
+export function fileForCode(catalog: BgmCatalog, rawCode: string): string {
+  let code = stripDupPrefix(normalizeCode(rawCode))
+  for (let i = 0; i < 4 && code; i++) {
+    const hit = catalog.files.get(code)
+    if (hit) return hit
+    const next = code.replace(/[_\-][a-z0-9]{1,4}$/, '')
+    if (next === code) break
+    code = next
+  }
+  return ''
+}
+
+// ---------------- 保存规则（用户明确要求的目录约定） ----------------
 
 /**
- * BGM 保存根目录：沿用截图那套约定 —— `<galgame 截图根目录>/<游戏名>/bgm/`。
- * 这里直接读 galgameTools 的配置键（而不是 import galgameTools），
- * 因为 galgameTools → galgame → galgameMem 已经有一条依赖链，反向 import 会成环。
+ * galgame 保存目录的**种类**（用户要求：`自定义根目录 / galgame 名称 / 种类 / 文件`）：
+ *   bgm 用真实名字、截图维持原样、立绘用「角色名+序号」、CG 用原名。
  */
-export function bgmSaveDir(rootDir: string, gameName: string): string {
-  const dir = join(rootDir, sanitizeName(gameName), 'bgm')
+export type GalSaveKind = 'bgm' | '截图' | '立绘' | 'cg'
+
+/**
+ * 某款游戏某个种类的保存目录：`<可自定义根目录>/<游戏名>/<种类>/`。
+ * 根目录来自「galgame 助手」配置里的 dir（设置页可改），默认 userData/screenshots/galgame。
+ */
+export function galKindDir(rootDir: string, gameName: string, kind: GalSaveKind): string {
+  const dir = join(rootDir, sanitizeName(gameName), kind)
   mkdirSync(dir, { recursive: true })
   return dir
+}
+
+/** BGM 保存目录（= 种类 bgm） */
+export function bgmSaveDir(rootDir: string, gameName: string): string {
+  return galKindDir(rootDir, gameName, 'bgm')
 }
 
 /** 与 galgameTools.sanitizeGalName 同规则（同理避免成环，保持行为一致） */

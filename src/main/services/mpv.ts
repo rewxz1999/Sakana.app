@@ -8,6 +8,7 @@ import { anime4kChain } from '@shared/anime4k'
 import { BROWSER_UA, getSettings } from '../net'
 import { danmakuApiBase } from './danmaku'
 import { beginStage, failStage, endFlow, flowDetail, flowRunning, pushStep, succeedStage } from './playFlow'
+import { noteControlAction, setOverlayPropReader } from './playerOverlay'
 import { log } from '../log'
 import { store } from '../store'
 
@@ -242,6 +243,19 @@ function loadNative(): MpvNative | null {
     }
     native = mod
     ready = true
+    /*
+     * V1.1：把「读一个 mpv 属性」的能力交给 playerOverlay 的"点了没反应"侦测用。
+     *
+     * 为什么要这么绕（而不是让 playerOverlay 直接 import 本文件）：两个模块都要被 ipc.ts 用，
+     * 而 playerOverlay 在悬浮窗生命周期里到处被调用，反过来依赖"内核是否已加载"会把
+     * 那条链变得很脆。这里注册一个函数即可：内核没加载时它压根不会被注册，
+     * 侦测那边读不到值就不做判断（宁可漏报也不误报）。
+     */
+    setOverlayPropReader((name) => {
+      // 只回传标量：mpv 的节点类属性（track-list 之类）转成对象后没法用于"变没变"的比较
+      const v = native?.getProperty(name)
+      return typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' ? v : null
+    })
     log.append('info', 'mpv', `libmpv 已加载: ${String(mod.getProperty('mpv-version') ?? '未知版本')}`)
     return mod
   } catch (err) {
@@ -1146,6 +1160,12 @@ function pollUoscCtrl(win: BrowserWindow): void {
   }
   lastDispatchedAction = raw
   dispatchedCount += 1
+  /*
+   * V1.1：uosc 控制栏（mpv 自己画的那条）的点击**不经过悬浮窗**，只有这里看得到。
+   * 用户要的是"点播放器按钮没反应就提示 Esc/F"，而很多用户用的正是 uosc 这条，
+   * 所以这条路上的动作也要交给同一套侦测（判据与悬浮窗那条完全相同：客观读数）。
+   */
+  noteControlAction(action)
   try {
     if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
       win.webContents.send(CH.overlayAction, action)
