@@ -692,24 +692,32 @@ export async function loadFromSources(
       if (t && !aliasKw.includes(t)) aliasKw.push(t)
     }
     /*
-     * 关键词顺序按数据源分别排（V1.1.1，用户补充的实测结论）。
+     * 巴哈姆特：**只用日文名与繁体名搜**（用户两次强调的实测结论）。
      *
-     * 用户原话：「巴哈姆特弹幕数据只能通过番剧繁体名和日文名搜索」——
-     * 巴哈是台湾站，条目全用繁体标题，拿简体中文名去搜基本是白跑一趟（还要多等一次网络）。
-     * 别名里恰好就有番剧的**日文原名**（由播放页从 bangumi 条目取，见 danmakuAliases），
-     * 所以对巴哈：别名 → 固定关键词 → 番剧名；其它源保持"固定关键词 → 番剧名 → 别名"的习惯顺序。
+     * 用户原话：「使用巴哈姆特数据源时只能使用番剧的日文名和繁体名（日文名一般番剧详情里就有）」。
+     * 所以这里不再把番剧名本身（一般是简体中文）当候选：
+     *   · 日文名 —— 别名里带**假名**（平假名/片假名）的那些，番剧详情里本来就有，是最可靠的一条；
+     *   · 繁体名 —— 别名里与标题**不同**的那些（详情页的「别名/中文名」栏常填繁体译名）；
+     *   · 简体标题与简体固定关键词**一个都不发**：巴哈搜不到，只会白等一次网络往返，
+     *     还可能按标题相似度匹配到无关条目（`pickBahamutAnime` 就是按相似度挑的）。
+     * 其它数据源（弹幕盒子/直链）保持原来的顺序：固定关键词 → 番剧名 → 别名。
      */
+    const isJapanese = (t: string): boolean => /[\u3040-\u30ff]/.test(t)
     if (source.adapter === 'bahamut') {
-      keywords.push(...aliasKw)
-      if (fixed) keywords.push(fixed)
-      if (titleKw) keywords.push(titleKw)
+      keywords.push(...aliasKw.filter(isJapanese))
+      keywords.push(...aliasKw.filter((t) => !isJapanese(t) && t !== titleKw))
+      if (fixed && fixed !== titleKw) keywords.push(fixed)
     } else {
       if (fixed) keywords.push(fixed)
       if (titleKw) keywords.push(titleKw)
       keywords.push(...aliasKw)
     }
     if (keywords.length === 0) {
-      errors.push(`${source.name}：没有可用的搜索关键词`)
+      errors.push(
+        source.adapter === 'bahamut'
+          ? `${source.name}：没有可用的搜索关键词（巴哈只认日文名/繁体名，这一集的别名里没有）`
+          : `${source.name}：没有可用的搜索关键词`
+      )
       continue
     }
     try {
@@ -756,8 +764,9 @@ async function trySource(
     const base = source.base?.trim() || BAHAMUT_BASE
     for (const kw of keywords) {
       const animes = await bahamutSearch(kw, base)
-      // 标题对得上才继续：搜"败犬"也可能回一堆无关条目
-      const picked = pickBahamutAnime(animes, keywords, title)
+      // 标题对得上才继续：搜"败犬"也可能回一堆无关条目。
+      // ⚠️ 日文名那一支例外，见 pickBahamutAnime 里 usedKeyword 的说明。
+      const picked = pickBahamutAnime(animes, keywords, title, kw)
       if (!picked) continue
       const eps = await bahamutEpisodes(picked.animeSn, base)
       if (eps.length === 0) continue
@@ -826,7 +835,8 @@ async function trySource(
 function pickBahamutAnime(
   list: BahamutAnime[],
   keywords: string[],
-  title: string
+  title: string,
+  usedKeyword = ''
 ): BahamutAnime | null {
   if (list.length === 0) return null
   const norm = (s: string): string =>
@@ -836,6 +846,19 @@ function pickBahamutAnime(
       .replace(/[!！?？~～·・:：,，.。'"“”\-—_/\\|]/g, '')
       .replace(/\s+/g, '')
       .toLowerCase()
+  /*
+   * 用**日文名**搜出来的结果，标题一定是繁体/日文 —— 与简体番剧名本来就对不上，
+   * 继续按相似度筛会把正确答案全部筛掉。
+   *
+   * 这是真机实测出来的（用户点名的两条就是要靠日文名搜）：
+   *   拿《葬送のフリーレン》能搜到，但返回的条目叫《葬送的芙莉蓮》，
+   *   相似度判定为 0 → 整条被丢弃 → 用户看到的就是"设置里能搜到、播放时没有源弹幕"。
+   * 所以日文名这一路改用「巴哈自己的相关性排序 + 正片特征」来挑，不再要求标题能对上。
+   */
+  if (/[\u3040-\u30ff]/.test(usedKeyword)) {
+    const main = list.filter((a) => /共\s*\d+\s*集/.test(a.info))
+    return (main[0] ?? list[0]) || null
+  }
   const want = norm(title)
   const cands = keywords.map((k) => norm(k)).filter(Boolean)
   const wantSeason = seasonOfTitle(title)
