@@ -64,7 +64,7 @@ import {
 // v0.3.7：播放源列表的批量预嗅探（每条规则命中多少资源）
 import { startBatchProbe, stopBatchProbe } from './services/ruleProbeBatch'
 // v0.3.7：人机验证窗口
-import { closeVerifyWindow, openVerifyWindow, setVerifyBounds } from './services/ruleVerify'
+import { closeVerifyWindow, openVerifyWindow, reloadVerifyWindow, setVerifyBounds } from './services/ruleVerify'
 // v0.3.8：投屏（发现设备 + DLNA/Sakana 控制）
 import {
   addCastDevice,
@@ -77,7 +77,7 @@ import {
   type CastAction
 } from './services/cast'
 import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
-import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested, mpvApplyVideoEnhance, anime4kAvailable, anime4kShaderFiles, mpvRevealUoscUi } from './services/mpv'
+import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested, mpvApplyVideoEnhance, anime4kAvailable, anime4kShaderFiles, mpvRevealUoscUi, uoscBridgeStats, mpvSendScriptMessage } from './services/mpv'
 // v0.3.7：画面子窗口诊断（查「正在播放但没有画面」）
 import { mpvDiagnosticBounds, mpvDumpWindows, mpvHitTest, mpvRaiseStats, mpvSurfaceInfo } from './services/mpv'
 import { buildStreamInfo } from './services/playerInfo'
@@ -97,6 +97,9 @@ import {
   updateInstallState
 } from './services/updater'
 import { fetchDanmaku, loadDanmaku, matchDanmaku, prefetchDanmaku, writeDanmakuXml } from './services/danmaku'
+import { cacheStats, danmakuCacheRoot } from './services/danmakuCache'
+import { progressReset, progressSnapshot } from './services/danmakuProgress'
+import { resetSourceRunnerStats, sourceRunnerStats } from './services/danmakuSourceRunner'
 // v1.1：数据源集合器（适配器自述/增删改/测试）与本地弹幕库（列表/删除/清空/目录）
 import { DANMAKU_ADAPTERS, danmuboxFetchEpisode, danmuboxSearch, listSources, saveSources, testSource } from './services/danmakuSources'
 import { clearLibrary, ensureLibraryDir, libraryInfo, removeFromLibrary, saveToLibrary } from './services/danmakuLibrary'
@@ -410,14 +413,21 @@ export function registerIpc(): void {
 
   // ---------- bangumi 数据源 ----------
   ipcMain.handle(CH.bgmCalendar, (_e, force?: boolean) => bangumi.calendar(!!force))
-  ipcMain.handle(CH.bgmSubject, (_e, id: number) => bangumi.subject(id))
+  ipcMain.handle(CH.bgmSubject, (_e, id: number, priority?: string) =>
+    bangumi.subject(Number(id), priority === 'A' || priority === 'B' ? priority : 'S')
+  )
+  // v1.1.4：详情页首屏的「纯缓存快照」与独立的评分板块（都不阻塞正文）
+  ipcMain.handle(CH.bgmSubjectCached, (_e, id: number) => bangumi.subjectCached(Number(id)))
+  ipcMain.handle(CH.bgmRating, (_e, id: number, refresh?: boolean) => bangumi.rating(Number(id), !!refresh))
   ipcMain.handle(CH.bgmSearch, (_e, keyword: string) => bangumi.search(keyword))
   ipcMain.handle(CH.bgmRatings, (_e, ids: number[], force?: boolean) => bangumi.ratings(ids, !!force))
-  ipcMain.handle(CH.bgmSeason, (_e, year: number, month: number, force?: boolean) =>
-    bangumi.season(Number(year), Number(month), !!force)
+  ipcMain.handle(CH.bgmSeason, (_e, year: number, month: number, force?: boolean, priority?: string) =>
+    bangumi.season(Number(year), Number(month), !!force, priority === 'A' || priority === 'B' ? priority : 'S')
   )
   /** 「更新到第几集」（v0.3.7）：取不到返回 null，界面据此隐藏这一行而不是显示 0 */
-  ipcMain.handle(CH.bgmEpisodeProgress, (_e, id: number) => bangumi.episodeProgress(Number(id)))
+  ipcMain.handle(CH.bgmEpisodeProgress, (_e, id: number, priority?: string) =>
+    bangumi.episodeProgress(Number(id), priority === 'A' || priority === 'B' ? priority : 'S')
+  )
   ipcMain.handle(CH.bgmTestMirrors, () => bangumi.testMirrors())
   // 「最XX的角色 9宫格」：角色列表（v0 优先 + 老接口兜底）与导出用的图片 data URL
   ipcMain.handle(CH.bgmCharacters, (_e, id: number) => bangumi.characters(Number(id)))
@@ -604,7 +614,10 @@ export function registerIpc(): void {
   )
 
   // ---------- 播放规则引擎 ----------
-  ipcMain.handle(CH.rulesSearch, (_e, ruleId: string, keyword: string) => ruleSearch(ruleId, keyword))
+  // subjectId 只给库驱动规则（巴哈姆特）用来把中文名换成日文原名，XPath 规则忽略它
+  ipcMain.handle(CH.rulesSearch, (_e, ruleId: string, keyword: string, subjectId?: number) =>
+    ruleSearch(ruleId, keyword, subjectId)
+  )
   ipcMain.handle(CH.rulesEpisodes, (_e, ruleId: string, entry) => ruleEpisodes(ruleId, entry))
   ipcMain.handle(
     CH.rulesPlay,
@@ -659,13 +672,14 @@ export function registerIpc(): void {
    */
   ipcMain.handle(
     CH.rulesBatchProbe,
-    (e, req: { keyword: string; rules: BatchProbeTarget[]; force?: boolean }) => {
+    (e, req: { keyword: string; rules: BatchProbeTarget[]; force?: boolean; subjectId?: number }) => {
       const w = BrowserWindow.fromWebContents(e.sender) ?? focused()
       if (!w) return { jobId: '', total: 0, cached: false }
       return startBatchProbe(w, {
         keyword: String(req?.keyword ?? ''),
         rules: req?.rules ?? [],
-        force: req?.force === true
+        force: req?.force === true,
+        subjectId: typeof req?.subjectId === 'number' ? req.subjectId : undefined
       })
     }
   )
@@ -719,6 +733,8 @@ export function registerIpc(): void {
     closeVerifyWindow()
     return true
   })
+  // v1.1：外框上的「重新加载」（站点 5xx / 网络抖动时就地重试，不丢已过一半的验证）
+  ipcMain.handle(CH.rulesVerifyReload, () => reloadVerifyWindow())
   // Kazumi 式在线播放：可见网页视图嗅探
   ipcMain.handle(
     CH.ruleWebviewOpen,
@@ -952,8 +968,14 @@ export function registerIpc(): void {
     loaded: mpvUoscDanmakuLoaded(),
     // 有弹幕在排队等 mpv 载入文件：渲染层此时应当「再等等」而不是回落到画布
     pending: mpvPluginDanmakuPending(),
-    // v0.2.18：uosc 本体（控制栏）是否挂上了 —— 渲染层据此决定要不要回落到旧控制栏
-    bar: uoscControlBarRequested() && uoscControlBarActive()
+    // v0.2.18：uosc 本体（控制栏）是否挂上了
+    bar: uoscControlBarRequested() && uoscControlBarActive(),
+    /*
+     * v1.1.4：桥接脚本侧的硬证据 —— uosc 版本、实际下发的按钮名、set-button 次数。
+     * 自检用：uosc 的按钮画在 mpv 的 ASS 图层里，Electron 侧看不到 DOM，
+     * 「控制栏到底有没有按钮」只能问脚本自己（属性由 sakana-uosc-ctrl.lua 写入）。
+     */
+    bridge: uoscBridgeStats()
   }))
   ipcMain.handle(CH.playerUoscMenu, (_e, which: 'search' | 'total' | 'style' | 'delay' | 'add') =>
     mpvOpenDanmakuMenu(which)
@@ -975,6 +997,19 @@ export function registerIpc(): void {
    * 在主进程里直接派发成 OverlayAction（见 mpv.ts 的 pollUoscCtrl），不经过本文件。
    */
   ipcMain.handle(CH.playerUoscBar, (_e, payload: unknown) => mpvPushUoscBar(payload))
+  /*
+   * v1.1.4：**自检/排障专用**的 uosc 按钮旁路。
+   *
+   * uosc 的按钮画在原生 mpv 子窗口里，CDP 往视频区域派发 DOM 点击是打不中的
+   * （点击落在 mpv 的 HWND 上，不经过 Chromium）。所以自检走「按钮点击的**同一条**命令路径」：
+   *   这里 → `script-message sakana-ctrl <动作>` → 桥接脚本写 user-data → 250ms 泵派发。
+   * 它不新增任何业务逻辑，只是把 input.conf 里已有的那条 script-message 暴露给自检，
+   * 因此"这条通了"等价于"按钮的命令通了"（差别只在 uosc 有没有收到鼠标，由 uosc 自己负责）。
+   */
+  ipcMain.handle(CH.playerUoscCtrl, (_e, action: string) => {
+    if (typeof action !== 'string' || action.trim() === '') return false
+    return mpvSendScriptMessage(['sakana-ctrl', action])
+  })
   // v0.3.3：播放页/悬浮窗看到鼠标移动时调它 → uosc 立刻把控制栏显示出来（flash-ui，节流在 mpv.ts 里）
   ipcMain.handle(CH.playerUoscReveal, () => mpvRevealUoscUi())
   // ---------- 全屏控制栏悬浮窗 ----------
@@ -1365,7 +1400,11 @@ export function registerIpc(): void {
     return shell.openPath(target)
   })
   ipcMain.handle(CH.cacheInfo, () => getCacheBytes())
-  ipcMain.handle(CH.cacheClear, () => clearCache())
+  ipcMain.handle(CH.cacheClear, () => {
+    // v1.1.4：清磁盘缓存的同时清掉主进程内存里的 L1（否则同一会话仍会读到已删除的旧数据）
+    bangumi.clearMemoryCache()
+    return clearCache()
+  })
   ipcMain.handle(CH.junkClear, () => clearJunk())
   // 自定义缓存目录：保存并 mkdir -p（'' = 恢复默认 userData/cache）
   ipcMain.handle(CH.cacheSetDir, (_e, dir: string) => setCacheDir(dir))
@@ -1514,7 +1553,20 @@ export function registerIpc(): void {
    */
   ipcMain.handle(
     CH.danmakuLoad,
-    async (_e, title: string, episode: number, opts?: { aliases?: string[]; aliasMode?: boolean }) => {
+    async (
+      _e,
+      title: string,
+      episode: number,
+      opts?: {
+        aliases?: string[]
+        aliasMode?: boolean
+        sourcesOnly?: boolean
+        keyword?: string
+        subjectId?: number
+        force?: boolean
+        trigger?: 'play' | 'test' | 'manual'
+      }
+    ) => {
       const r = await loadDanmaku(title, episode, opts)
       if (r && r.comments.length > 0 && uoscDanmakuRequested()) {
         const file = writeDanmakuXml(r.comments, `${r.episodeId}:${r.episodeTitle}`)
@@ -1526,9 +1578,27 @@ export function registerIpc(): void {
   // v0.2.8 附加：预取（只预热缓存，不回传弹幕本体），用于「进播放/切集时提前加载」
   ipcMain.handle(
     CH.danmakuPrefetch,
-    (_e, title: string, episode: number, opts?: { aliases?: string[]; aliasMode?: boolean }) =>
-      prefetchDanmaku(title, episode, opts)
+    (
+      _e,
+      title: string,
+      episode: number,
+      opts?: { aliases?: string[]; aliasMode?: boolean; keyword?: string; subjectId?: number; force?: boolean }
+    ) => prefetchDanmaku(title, episode, opts)
   )
+  // V1.2：获取进度（流详情面板按秒轮询；数据来自主进程真实步骤）
+  ipcMain.handle(CH.danmakuProgress, () => progressSnapshot())
+  // V1.2：运行期统计（自检断言"第二次进同一集网络请求为 0"）
+  ipcMain.handle(CH.danmakuStats, () => ({
+    cacheRoot: danmakuCacheRoot(),
+    runner: sourceRunnerStats(),
+    cache: cacheStats(),
+    progress: progressSnapshot()
+  }))
+  ipcMain.handle(CH.danmakuStatsReset, () => {
+    resetSourceRunnerStats()
+    progressReset()
+    return true
+  })
 
   /* ─────────────── v1.1：弹幕数据源集合器 + 弹幕盒子 + 本地弹幕库 ─────────────── */
 

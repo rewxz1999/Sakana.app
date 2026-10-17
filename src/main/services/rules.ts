@@ -18,9 +18,11 @@ import type {
   RulesRepoMeta
 } from '@shared/types'
 import { DEFAULT_RULES, emptyRule } from '@shared/types'
+import { BAHAMUT_RULE_ID, bahamutRule } from '@shared/bahamutRule'
 import { log } from '../log'
 import { BROWSER_UA, buildProxyAgents, getSettings } from '../net'
 import { store } from '../store'
+import { bahamutEpisodes, bahamutPlay, bahamutSearch } from './bahamut'
 import { normalizeEpisodeGroups } from './episodeNormalize'
 import { episodesViaWebview, searchViaWebview } from './ruleSearchWebview'
 
@@ -260,6 +262,64 @@ function extractName(doc: XDocWrapper, xpathStr: string, node: HNode): string {
 
 // ---------------- HTTP ----------------
 
+/**
+ * AGE 这类站点的 301 会指回 **http://**（同域），而站点只开 https。
+ *
+ * 现象（v1.1 实测）：`https://www.agedm.io/search?...` 大约每三四次里有两次返回 301 →
+ * `http://www.agedm.io/...`，node 直连 :80 是 **ETIMEDOUT**（浏览器没事，因为 Chrome
+ * 自己会把同域 http 升级成 https 并缓存跳转）。
+ * 以前搜索/选集全靠 axios 直连，于是表现为「AGE 时好时坏」。
+ * 这里在 axios 的跳转钩子上做**范围极窄**的升级：只有「原地址 https + 目标同 host + http」
+ * 才换成 https；指向别的 http 域名的跳转一律原样跟随（有些站的真源确实在 http 上）。
+ */
+function upgradeRedirectProtocol(
+  options: { protocol?: string; hostname?: string; port?: number | string; href?: string },
+  original: { protocol: string; host: string }
+): void {
+  if (original.protocol !== 'https:') return
+  const proto = String(options.protocol ?? '')
+  if (proto !== 'http:') return
+  const host = String(options.hostname ?? '')
+  if (!host || !sameSite(host, original.host)) return
+  options.protocol = 'https:'
+  options.port = 443
+  // node 的 http 客户端会用 href 覆盖其它字段，所以这里必须一起改
+  if (typeof options.href === 'string') {
+    options.href = options.href.replace(/^http:\/\//i, 'https://')
+  }
+}
+
+/**
+ * 同站判定：忽略开头的 `www.`。
+ *
+ * 为什么不能只比全等：AGE 的 301 目标就是 **`agedm.io`**（不带 www），
+ * 而原地址是 `www.agedm.io` —— 全等比较会让升级失效，请求照样打到 http:80 然后超时。
+ */
+function sameSite(a: string, b: string): boolean {
+  const norm = (h: string): string => h.toLowerCase().replace(/^www\./, '')
+  return norm(a) === norm(b)
+}
+
+/**
+ * 统一的「跟随跳转时升级 http→https」钩子（见 upgradeRedirectProtocol 的说明）。
+ * 抽出来是因为搜索、选集、预嗅探三处都走 axios，口径必须一致。
+ */
+function beforeRedirectFor(url: string): (options: Record<string, unknown>) => void {
+  let original = { protocol: 'https:', host: '' }
+  try {
+    const u = new URL(url)
+    original = { protocol: u.protocol, host: u.hostname }
+  } catch {
+    /* URL 不合法就不做升级 */
+  }
+  return (options: Record<string, unknown>) => {
+    upgradeRedirectProtocol(
+      options as { protocol?: string; hostname?: string; port?: number | string; href?: string },
+      original
+    )
+  }
+}
+
 async function httpRequest(
   url: string,
   method: 'GET' | 'POST',
@@ -273,6 +333,8 @@ async function httpRequest(
     timeout: 30000,
     responseType: 'text' as const,
     headers: { 'User-Agent': BROWSER_UA, ...headers },
+    // AGE 偶发的 301→http:80 会 ETIMEDOUT（见 upgradeRedirectProtocol）
+    beforeRedirect: beforeRedirectFor(url),
     ...buildProxyAgents(getSettings().proxy)
   }
   if (method === 'POST') {
@@ -319,6 +381,11 @@ async function httpRequest(
 export function ruleSearchUrl(ruleId: string, keyword: string): string | null {
   const rule = getRule(ruleId)
   if (!rule) return null
+  /*
+   * 库驱动规则（巴哈姆特）没有"搜索结果页"这种东西：它的 search.url 是 JSON 接口，
+   * 把接口地址塞给验证窗口只会给用户看一坨 JSON。给它站点首页即可。
+   */
+  if (rule.engine === 'bahamut') return rule.baseUrl
   try {
     return fillTemplate(rule.search.url, { keyword })
   } catch {
@@ -352,9 +419,30 @@ export function looksLikeVerificationWall(text: string): boolean {
 export const VERIFY_WALL_MESSAGE = '需要人机验证：站点要求先通过验证（在播放源列表里点这条线路即可弹窗验证）'
 
 
-export async function ruleSearch(ruleId: string, keyword: string): Promise<RuleSearchResult> {
+export async function ruleSearch(
+  ruleId: string,
+  keyword: string,
+  /**
+   * 可选：番剧条目 id（v1.1）。
+   *
+   * 为什么搜索需要它：巴哈姆特只认繁体/日文名，而界面传下来的是**中文名**。
+   * 我们的 bangumi 数据源里 `subject(id).name` 就是日文原名，所以库驱动规则
+   * 需要拿到条目 id 才能换一个能搜到的词（见 services/bahamut.ts 的 bahamutSearchTerm）。
+   * XPath/API 规则完全忽略这个参数，行为一行没变。
+   */
+  subjectId?: number
+): Promise<RuleSearchResult> {
   const rule = getRule(ruleId)
   if (!rule) return { items: [], error: '规则不存在' }
+  /*
+   * ★ 库驱动分支（v1.1）★
+   * 巴哈姆特不是 XPath 能描述的东西（见 shared/bahamutRule.ts），
+   * 所以在这里**提前返回**，下面那套 XPath/JSONPath 引擎一行都不碰。
+   */
+  if (rule.engine === 'bahamut') {
+    const r = await bahamutSearch(keyword, subjectId)
+    return { items: r.items, error: r.error }
+  }
   const def = rule.search
   try {
     const url = fillTemplate(def.url, { keyword })
@@ -483,6 +571,8 @@ async function ruleEpisodesRaw(
 ): Promise<RuleEpisodesResult> {
   const rule = getRule(ruleId)
   if (!rule) return { groups: [], vars: {}, error: '规则不存在' }
+  // 库驱动分支：巴哈姆特按「日语版/剧场版/OVA/中配」四个卷分组（见 services/bahamut.ts）
+  if (rule.engine === 'bahamut') return await bahamutEpisodes(entry)
   const def = rule.episodes
   try {
     const groups: RuleEpisodeGroup[] = []
@@ -613,6 +703,8 @@ export async function rulePlay(
 ): Promise<RulePlayResult> {
   const rule = getRule(ruleId)
   if (!rule) throw new Error('规则不存在')
+  // 库驱动分支：巴哈姆特返回**官方观看页**（直链由站点播放器持有，见 bahamut.ts 的说明）
+  if (rule.engine === 'bahamut') return bahamutPlay(episodeLink)
   const def = rule.episodes
   if (def.type === 'xpath') {
     const url = resolveUrl(rule.baseUrl, episodeLink || entry.link || entry.source)
@@ -802,8 +894,21 @@ export function ensureDefaultRules(): void {
    */
   const builtin = DEFAULT_RULES.map((r) => ({ ...r, enabled: true }))
   const custom = rules.filter((r) => !r.id.startsWith('default-'))
-  // 内置排最前：列表与搜索结果里这三条先出现（PINNED_RULES 也把它们置顶，两处一致）
-  const next = [...builtin, ...custom]
+  /*
+   * 巴哈姆特（v1.1）：**只播种一次**的普通规则。
+   *
+   * 为什么不放进 DEFAULT_RULES：那张表的语义是「应用托管、每次启动强制启用并整体覆盖」，
+   * 而用户要求巴哈姆特**能被启用/停用** —— 放进内置表的话用户关掉它、下次启动又会被打开。
+   * 所以它用一个普通 id（`local-bahamut`），首次启动时播种，之后启用状态归用户。
+   * `bahamutRuleSeeded` 是"已经播过种"的标记：用户主动删掉它之后不该每次启动又冒出来。
+   */
+  const seeded = store.get<boolean>('bahamutRuleSeeded', false)
+  const hasBahamut = rules.some((r) => r.id === BAHAMUT_RULE_ID)
+  const bahamutSeed = !hasBahamut && !seeded ? [bahamutRule()] : []
+  if (bahamutSeed.length > 0) store.set('bahamutRuleSeeded', true)
+  // 内置排最前：列表与搜索结果里这三条先出现（PINNED_RULES 也把它们置顶，两处一致）；
+  // 巴哈姆特排在内置之后、用户规则之前（它是"应用带来的可选线路"，但不是托管规则）
+  const next = [...builtin, ...bahamutSeed, ...custom]
   if (JSON.stringify(next) !== JSON.stringify(rules)) {
     // 被覆盖掉的旧内容先留档到本地库，再写新的（"任何修改都留一份"）；
     // 内置规则标记成 'builtin'：它在本地库里就是"随应用分发、最可靠的那一版"

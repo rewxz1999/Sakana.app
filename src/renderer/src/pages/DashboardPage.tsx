@@ -93,7 +93,13 @@ const favProgressInflight = new Map<number, Promise<Awaited<ReturnType<typeof ap
 function fetchFavProgress(id: number): Promise<Awaited<ReturnType<typeof api.bangumi.episodeProgress>>> {
   const running = favProgressInflight.get(id)
   if (running) return running
-  const p = api.bangumi.episodeProgress(id)
+  /*
+   * v1.1.4：显式标 B 级。
+   * 仪表盘进来就对本季收藏逐部查分集进度，是一次**后台批量补齐**：
+   * 以前它以 4 路并发和番剧表/详情抢同一条带宽，用户看到的就是「番剧表一直加载不完」。
+   * 现在它排在 B 级（同时在飞最多 1 个），番剧表与详情（S 级）永远先走。
+   */
+  const p = api.bangumi.episodeProgress(id, 'B')
   favProgressInflight.set(id, p)
   void p.finally(() => {
     if (favProgressInflight.get(id) === p) favProgressInflight.delete(id)
@@ -103,10 +109,12 @@ function fetchFavProgress(id: number): Promise<Awaited<ReturnType<typeof api.ban
 
 /**
  * 分集进度请求的并发上限。
- * 一部番一次请求（实测约 300ms），4 路并发能在十几秒内跑完一份几百部的收藏，
- * 又不至于把 Bangumi 反代打成限流（同类批量取数在主进程里也是小并发）。
+ *
+ * v1.1.4：从 4 降到 2。主进程的 B 级队列本身只允许 1 个在飞，这里再压一档是为了
+ * 不让渲染层一次排十几个 IPC 在队列里等（排队超时会变成「检测失败」）；
+ * 2 个交替足够把一个会话的收藏补齐，失败/超时也会在界面上如实标出。
  */
-const FAV_PROGRESS_CONCURRENCY = 4
+const FAV_PROGRESS_CONCURRENCY = 2
 
 /**
  * 「继续观看」归一化条目。

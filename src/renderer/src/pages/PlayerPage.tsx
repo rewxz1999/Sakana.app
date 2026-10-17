@@ -40,6 +40,7 @@ import type {
   SubjectDetail
 } from '@shared/types'
 import { resolveDanmakuSettings } from '@shared/types'
+import { mergeDanmakuBatches } from '@shared/danmakuTimeline'
 import { ENGINE_ATTACH_TIMEOUT_MS, ONLINE_PLAY_TIMEOUT_MS, RELAY_READY_TIMEOUT_MS } from '@shared/onlinePlay'
 import { api } from '@/lib/api'
 import { fmtDuration, localSubUrl, localVideoUrl } from '@/lib/format'
@@ -61,16 +62,14 @@ import { PlayFlowStages } from '@/components/PlayFlowProgress'
  * 去重键 = 「时间（0.1 秒精度）+ 正文」：不同源对同一条弹幕的毫秒位常有差异，
  * 但同一句话在同一秒出现两次本来就该算重复。
  */
-function mergeCommentsLocal(a: DanmakuComment[], b: DanmakuComment[]): DanmakuComment[] {
-  const seen = new Set<string>()
-  const out: DanmakuComment[] = []
-  for (const c of [...a, ...b]) {
-    const key = `${Math.round((Number(c.time) || 0) * 10)}|${c.text}`
-    if (seen.has(key)) continue
-    seen.add(key)
-    out.push(c)
-  }
-  return out.sort((x, y) => (Number(x.time) || 0) - (Number(y.time) || 0))
+/**
+ * 合并两批弹幕（V1.2：调共享实现，不再在渲染层写第三份去重逻辑）。
+ *
+ * 去重键/容差与主进程集成器完全一致（`@shared/danmakuTimeline`），
+ * 容差来自设置里的「弹幕误差」，所以用户在设置里改 100→200ms 时两端同时生效。
+ */
+function mergeCommentsLocal(a: DanmakuComment[], b: DanmakuComment[], toleranceMs = 100): DanmakuComment[] {
+  return mergeDanmakuBatches([a, b], { toleranceMs })
 }
 
 interface PlayerState {
@@ -1830,24 +1829,27 @@ export function PlayerPage() {
    */
   const overlayActive = engineState !== 'fallback'
   /**
-   * v0.2.18：控制栏是否由 uosc（mpv 侧绘制）接管。
+   * v1.1.4：控制栏是否由 uosc（mpv 侧绘制）接管 —— **现在恒为"是"**。
    *
-   * 三重条件：
-   *   ① 设置里显式勾选了「改用 mpv 的 uosc 控制栏」（`uoscControlBar === true`，**默认不勾**）；
-   *   ② 内核确实是 libmpv（HTML5 回退路径里没有 mpv，也就没有 uosc）；
-   *   ③ uosc 本体没有明确报告「没挂上」（`uoscBarReady === false` 时回落到自建控制栏）。
-   * 为 true 时悬浮窗只画弹幕与「uosc 给不了的浮层」，不再画控件。
+   * 为什么不再看 `settings.uoscControlBar`：
+   *   v1.1.4 把旧的自绘控制栏整体剥离到 `playerLegacy/PlayerOverlayBar.tsx` 并且不再渲染
+   *   （PlayerOverlayPage 里只剩一句说明）。如果这里还允许 false，结果就是
+   *   「uosc 不画 + 旧栏不画」= 完全没有控制栏 —— 老用户设置里残留 false 时会直接踩中。
+   *   设置项保留只是为了兼容旧 settings.json（见 shared/types.ts 的字段注释）。
+   *
+   * 仍然保留的两条判据：
+   *   ① 内核必须是 libmpv（HTML5 回退路径里没有 mpv，也就没有 uosc）；
+   *   ② uosc 本体没有明确报告「没挂上」（`uoscBarReady === false`）。
+   *      这一条现在只用于日志/排障：旧栏不会再作为回退出现，
+   *      所以 uosc 挂不上时应当在日志里看到 `uosc 加载失败`，而不是悄悄少一条控制栏。
    */
   const [uoscBarReady, setUoscBarReady] = useState<boolean | null>(null)
   /*
-   * v0.3.3：默认改成「用应用自己的控制栏」，所以这里的判定从 `!== false` 变成 `=== true`。
-   *
-   * ⚠️ 两处默认值必须一致：主进程 `uoscControlBarRequested()`（mpv.ts）决定 uosc 到底画不画控制栏，
-   * 这里决定悬浮窗里的自建控制栏画不画。以前主进程是 `!== false`、渲染层也是 `!== false`，
-   * 只要改一边就会出现「两边都不画」——用户看到的就是**根本没有控制栏**。
+   * v1.1.4：**不再用 `uoscBarReady` 决定画不画状态**。
+   * 旧栏已删，uosc 是唯一控制栏；即使状态查询偶尔晚一拍，也要把按钮状态推过去，
+   * 否则 uosc 的按钮会停在占位态（没有图标/菜单内容）。`uoscBarReady` 只留给日志与排障。
    */
-  const uoscBarMode =
-    appSettings?.uoscControlBar === true && engineState === 'active' && uoscBarReady !== false
+  const uoscBarMode = engineState === 'active'
   /** 最近一次 show 拿到的悬浮窗代号（hide 时带回去，防止迟到的 hide 关掉新窗口） */
   const overlayGenRef = useRef<number | null>(null)
   useEffect(() => {
@@ -1989,6 +1991,15 @@ export function PlayerPage() {
           if (!detail) void loadDetail()
           poke()
           break
+        /*
+         * v1.1.5：uosc 右上角角标「播放流详情」。
+         * 只切已有的 showStreamInfo 状态 —— 面板、数据源、每秒轮询都在 StreamInfoModal 里，
+         * 这里不另造 UI，保证和「状态药丸」打开的是同一个面板。
+         */
+        case 'toggleStreamInfo':
+          setShowStreamInfo((v) => !v)
+          poke()
+          break
         /**
          * 选集浮层里点了某一集（v0.2.6：与规则页选集走同一套「重新挂载」逻辑）
          * v0.2.7 附加：本地播放时选集也走悬浮窗（见下面 setEpisodes 的分支），这里分流到本地切集。
@@ -2054,11 +2065,55 @@ export function PlayerPage() {
           void api.uosc.menu(String(a.key) as 'search' | 'total' | 'style' | 'delay' | 'add')
           break
         case 'reloadDanmaku':
-          void loadDanmaku(true)
+          // V1.2：重新检测 = 绕过本地缓存真去各源要一遍（否则"重新检测"永远命中缓存，等于没点）
+          void loadDanmaku(true, { force: true })
+          break
+        case 'danmakuReload':
+          // uosc 菜单那一侧的动作名（与旧 reloadDanmaku 同一个行为）
+          void loadDanmaku(true, { force: true })
           break
         case 'detectDanmakuAlias':
-          void loadDanmaku(true, { aliasMode: true })
+          void loadDanmaku(true, { aliasMode: true, force: true })
           break
+        /*
+         * V1.2：播放器内的弹幕动作（uosc 菜单通过 `script-message sakana-ctrl …` 发过来）。
+         *
+         * 为什么做成"动作"而不是继续放在旧控制栏的 popover 里：用户这轮要求控制栏完全交给
+         * uosc、旧底栏默认不渲染；旧栏里的弹幕 popover 因此不可见。这里把动作语义固定下来，
+         * uosc 那条线只要在菜单里挂入口即可，不需要再复制一套弹幕设置逻辑。
+         *   · danmakuArea / danmakuFontSize / danmakuOffset：改显示参数（立即生效、持久化）；
+         *   · danmakuReload：绕过缓存重新取；
+         *   · danmakuAliasSearch：用用户输入的关键词当别名再搜一遍。
+         */
+        case 'danmakuArea': {
+          const value = Math.min(1, Math.max(0.15, Number(a.value) || 1))
+          void updateDanmaku({ area: value })
+          break
+        }
+        case 'danmakuFontSize': {
+          const value = Math.min(40, Math.max(12, Math.round(Number(a.value) || 22)))
+          void updateDanmaku({ fontSize: value })
+          break
+        }
+        case 'danmakuOffset': {
+          const cur = danmakuSettingsRef.current.offsetMs
+          const next = Math.min(10000, Math.max(-10000, cur + (Number(a.deltaMs) || 0)))
+          void updateDanmaku({ offsetMs: next })
+          // 时间轴微调对两种渲染方式都生效：同步告诉 mpv 插件（它按「秒」处理延迟）
+          if (uoscActiveRef.current) void api.uosc.delay(next)
+          toast.info(`弹幕时序 ${next / 1000 >= 0 ? '+' : ''}${(next / 1000).toFixed(1)}s`)
+          break
+        }
+        case 'danmakuAliasSearch': {
+          const kw = String(a.keyword ?? '').trim()
+          if (!kw) {
+            toast.warn('请输入别名/关键词后再搜索')
+            break
+          }
+          toast.info(`正在用「${kw}」到各源搜索弹幕…`)
+          void loadDanmaku(true, { keyword: kw, force: true })
+          break
+        }
         case 'exitPlayer':
           exitPlayer()
           break
@@ -2087,6 +2142,7 @@ export function PlayerPage() {
           if (castDeviceRef.current) {
             const id = castDeviceRef.current
             castDeviceRef.current = null
+            setCastDeviceId(null)
             void api.cast.stop(id)
             toast.info('已停止投屏')
             // 投屏时本机是暂停的（把带宽让给电视），停止后恢复本机播放
@@ -2426,6 +2482,32 @@ export function PlayerPage() {
   }
 
   /**
+   * V1.2：**进播放器就预加载弹幕**（不等内核起来）。
+   *
+   * 为什么提前：用户要求「进播放器就预加载」，而内核挂载/首帧通常要 1~3 秒；
+   * 等 `engineState === 'active'` 再发请求，等于把弹幕链路的起点推迟到视频已经播起来之后。
+   * 这里在标题/集数一确定就发起预取（与正式加载共用同一套单飞与缓存，不会重复请求），
+   * 正式加载时通常已经命中缓存或正在跑。
+   */
+  useEffect(() => {
+    if (!state.title) return
+    const ep =
+      state.mode === 'rule' ? (ruleCurrent?.ep ?? -1) + 1 : (currentFile?.episode ?? currentIndex + 1)
+    if (!ep || ep < 1) return
+    let alive = true
+    void (async () => {
+      const aliases = await danmakuAliases()
+      if (!alive) return
+      const r = await api.danmaku.prefetch(state.title, ep, { aliases, subjectId: state.subjectId })
+      if (r.ok) console.log(`[player] 弹幕预取完成：${r.data.count} 条（缓存=${r.data.cached}）`)
+    })()
+    return () => {
+      alive = false
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.title, state.mode, state.subjectId, ruleCurrent?.ep, currentIndex])
+
+  /**
    * 拉取当前这一集的弹幕。
    *
    * - 规则播放：番剧名用 `state.title`，集数用当前线路里的集序号（从 1 开始）；
@@ -2447,6 +2529,15 @@ export function PlayerPage() {
 
   /** 正在投屏的设备 id；为空表示没在投屏 */
   const castDeviceRef = useRef<string | null>(null)
+  /**
+   * 同一个设备 id 的**响应式**副本（v1.1.4）。
+   *
+   * 为什么不能只留 ref：`sakana-status`（播放状态菜单）要显示"投屏状态"，
+   * 而状态下行只在 React 重新渲染时才会推。ref 改了不会触发渲染 ——
+   * 菜单就会一直显示"未投屏"，直到下一集。所以 ref 仍用于动作回调里的同步判断，
+   * 这个 state 专门用于把投屏状态带进 uosc 状态载荷。
+   */
+  const [castDeviceId, setCastDeviceId] = useState<string | null>(null)
 
   /**
    * 投屏要用的这一段媒体（按「模式 + 番剧 + 流地址 + 线路 + 集」缓存）。
@@ -2539,6 +2630,7 @@ export function PlayerPage() {
       return
     }
     castDeviceRef.current = deviceId
+    setCastDeviceId(deviceId)
     toast.success(r.data.message)
     if (playingRef.current) void api.player.togglePause()
   }
@@ -2550,9 +2642,21 @@ export function PlayerPage() {
    * 几百毫秒上屏，主进程同时已经在跑数据源那一路；这里把它取回来做**去重合并**，
    * 合并进已有的那批而不是替换 —— 内置那批不能因为源回来了就消失。
    */
-  const mergeSourceDanmaku = async (key: string, episode: number, aliases: string[]): Promise<void> => {
+  const mergeSourceDanmaku = async (
+    key: string,
+    episode: number,
+    aliases: string[],
+    extra: { keyword?: string; force?: boolean } = {}
+  ): Promise<void> => {
     try {
-      const r = await api.danmaku.load(state.title, episode, { aliases, sourcesOnly: true, trigger: 'play' })
+      const r = await api.danmaku.load(state.title, episode, {
+        aliases,
+        sourcesOnly: true,
+        trigger: 'play',
+        keyword: extra.keyword,
+        subjectId: state.subjectId,
+        force: extra.force
+      })
       // 期间换集/换源了 → 这批结果属于上一集，丢掉
       if (danmakuKeyRef.current !== key) return
       if (!r.ok || !r.data || r.data.count === 0) {
@@ -2560,25 +2664,36 @@ export function PlayerPage() {
         return
       }
       const add = r.data
+      const who = add.sources?.length
+        ? add.sources.map((s) => `${s.sourceName} ${s.count}${s.fromCache ? '·缓存' : ''}`).join(' ＋ ')
+        : `${add.origin?.sourceName ?? '数据源'} ${add.count} 条`
       setDanmaku((prev) => ({
-        comments: mergeCommentsLocal(prev.comments, add.comments),
-        source: `${prev.source} ＋ ${add.origin?.sourceName ?? '数据源'} ${add.count} 条`,
+        comments: mergeCommentsLocal(
+          prev.comments,
+          add.comments,
+          danmakuSettingsRef.current.errorToleranceMs ?? 100
+        ),
+        source: `${prev.source} ＋ ${who}`,
         loading: false
       }))
-      console.log(`[player] 数据源弹幕已合并：${add.origin?.sourceName} ${add.count} 条（${add.origin?.detail ?? ''}）`)
+      console.log(`[player] 数据源弹幕已合并：${who}（新增 ${add.count} 条，去重后并入画面）`)
     } catch (err) {
       console.warn(`[player] 合并数据源弹幕失败：${String((err as Error)?.message ?? err)}`)
     }
   }
 
-  const loadDanmaku = async (force = false, opts: { aliasMode?: boolean } = {}): Promise<void> => {
+  const loadDanmaku = async (
+    force = false,
+    opts: { aliasMode?: boolean; keyword?: string; force?: boolean } = {}
+  ): Promise<void> => {
     const episode =
       state.mode === 'rule'
         ? (ruleCurrent?.ep ?? 0) + 1
         : (currentFile?.episode ?? currentIndex + 1)
+    const hard = force || opts.force === true
     const baseKey = `${state.mode}:${state.title}:${episode}`
-    const key = `${baseKey}:${opts.aliasMode ? 'alias' : 'plain'}`
-    if (!force && danmakuKeyRef.current === key) return
+    const key = `${baseKey}:${opts.aliasMode ? 'alias' : 'plain'}:${opts.keyword ?? ''}`
+    if (!hard && danmakuKeyRef.current === key) return
     /** 同一集内的「重新检测 / 别名检测」：保留现有弹幕，别让画面上的弹幕先消失 */
     const sameEpisode = danmakuBaseKeyRef.current === baseKey
     danmakuKeyRef.current = key
@@ -2596,7 +2711,10 @@ export function PlayerPage() {
     try {
       const r = await api.danmaku.load(state.title, episode, {
         aliases,
-        aliasMode: opts.aliasMode
+        aliasMode: opts.aliasMode,
+        keyword: opts.keyword,
+        subjectId: state.subjectId,
+        force: hard
       })
       if (danmakuKeyRef.current !== key) return // 期间又换集了
       if (r.ok && r.data) {
@@ -2605,8 +2723,13 @@ export function PlayerPage() {
          * v1.1：把「这条弹幕从哪来」写进来源串 —— 用户装了多个数据源之后，
          * 最需要一眼看出的就是"这份弹幕是内置库还是巴哈/弹幕盒子给的"，
          * 否则数量对不上时无从判断。来源串显示在播放器状态区与悬浮窗的来源行。
+         * V1.2：多源合并后单个 origin 会丢掉"另一半从哪来"，所以把每个源的条数也带上。
          */
-        const from = r.data.origin ? `〔来自 ${r.data.origin.sourceName}〕` : ''
+        const from = r.data.sources?.length
+          ? `〔${r.data.sources.map((s) => `${s.sourceName} ${s.count}${s.fromCache ? '·缓存' : ''}`).join(' ＋ ')}〕`
+          : r.data.origin
+            ? `〔来自 ${r.data.origin.sourceName}〕`
+            : ''
         setDanmaku({
           comments: r.data.comments,
           source: `${r.data.animeTitle} · ${r.data.episodeTitle}${by}${from}`,
@@ -2614,7 +2737,9 @@ export function PlayerPage() {
         })
         console.log(
           `[player] 弹幕已加载：${r.data.episodeTitle} 共 ${r.data.count} 条（缓存=${r.data.fromCache}）${by}` +
-            (r.data.origin ? ` 来源=${r.data.origin.sourceName}｜${r.data.origin.detail}` : '')
+            (r.data.sources?.length
+              ? ` 来源=${r.data.sources.map((s) => `${s.sourceName}:${s.count}${s.fromCache ? '(缓存)' : ''}`).join(' + ')}`
+              : '')
         )
         /*
          * v1.1.2 两段式加载的第二段：数据源那批弹幕。
@@ -2624,7 +2749,8 @@ export function PlayerPage() {
          * 是结构上的保证，不取决于这里）。这里只是去把已经在跑的结果取回来合并。
          * 用户报的正是"设置里能搜到、播放时却没有源弹幕"，根因就是以前压根没这一步。
          */
-        if (r.data.sourcesPending) void mergeSourceDanmaku(key, episode, aliases)
+        if (r.data.sourcesPending)
+          void mergeSourceDanmaku(key, episode, aliases, { keyword: opts.keyword, force: hard })
         /*
          * v0.2.9：插件渲染时，确认插件**真的**把这批弹幕挂上了。
          * 判据是插件自己暴露的 `user-data/uosc_danmaku/has-danmaku`（v2.1.0 没有条数属性）。
@@ -2755,6 +2881,7 @@ export function PlayerPage() {
         count: danmaku.comments.length,
         area: danmakuSettings.area,
         maxCount: danmakuSettings.maxCount,
+        fontSize: danmakuSettings.fontSize,
         offsetMs: danmakuSettings.offsetMs,
         showScroll: danmakuSettings.showScroll,
         showTop: danmakuSettings.showTop,
@@ -2762,7 +2889,13 @@ export function PlayerPage() {
         pluginActive: uoscActive,
         source: danmaku.source
       },
-      status: playStatus
+      status: playStatus,
+      /*
+       * v1.1.4：投屏状态（`sakana-status` 菜单要显示它）。
+       * 只有设备 id：渲染层在投屏面板里才知道设备名，而"是否在投"只看 id 就够了；
+       * 菜单里显示「投屏中（设备 xxxxxxxx…）」——显示 id 前缀，不编造名字。
+       */
+      cast: { active: castDeviceId !== null, deviceId: castDeviceId ?? undefined }
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
@@ -2789,7 +2922,8 @@ export function PlayerPage() {
     danmakuSettings.showTop,
     danmakuSettings.showBottom,
     uoscActive,
-    playStatus
+    playStatus,
+    castDeviceId
   ])
 
   /** 换集（或首次进入）时自动拉弹幕：规则模式按当前集数，本地模式按文件集数 */

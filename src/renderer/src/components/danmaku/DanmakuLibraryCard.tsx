@@ -38,6 +38,9 @@ export function DanmakuLibraryCard({ catalog }: { catalog: SourceCatalogState })
   const [titleFilter, setTitleFilter] = useState('')
   const [sourceFilter, setSourceFilter] = useState('')
   const [clearOpen, setClearOpen] = useState(false)
+  /** V1.2：用户要求「选择本地弹幕删除」——支持多选后一次删掉 */
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [confirmSelected, setConfirmSelected] = useState(false)
   const [busy, setBusy] = useState(false)
 
   const items = lib?.items ?? []
@@ -78,6 +81,32 @@ export function DanmakuLibraryCard({ catalog }: { catalog: SourceCatalogState })
     toast.success(`已删除「${it.title} 第${it.episode}集」`)
   }
 
+  const toggleSelect = (id: string): void => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  /** 多选删除：只提交当前勾选、且仍在列表里的 id（筛选后隐藏的不会被误删） */
+  async function removeSelected(): Promise<void> {
+    const ids = [...selected].filter((id) => items.some((it) => it.id === id))
+    if (ids.length === 0) return
+    setBusy(true)
+    const r = await api.danmaku.libraryRemove(ids)
+    setBusy(false)
+    setConfirmSelected(false)
+    setSelected(new Set())
+    if (!r.ok) {
+      toast.error(`删除失败：${r.error}`)
+      return
+    }
+    await reload()
+    toast.success(`已删除所选 ${ids.length} 个弹幕文件`)
+  }
+
   async function pickDir(): Promise<void> {
     const r = await api.dialog.pickDir(lib?.dir)
     if (!r.ok) {
@@ -99,8 +128,8 @@ export function DanmakuLibraryCard({ catalog }: { catalog: SourceCatalogState })
 
   return (
     <Card
-      title="本地弹幕库"
-      desc="从各数据源下载回来的弹幕都存在这里（每个「番剧 + 集 + 来源」一个文件）。进播放器时优先命中本地库，不发任何请求"
+      title="本地弹幕缓存"
+      desc="按 <缓存根>/弹幕/<番剧名>/第01集-<源名>.xml 存放（文件名带来源名，不同源互不覆盖）。进播放器时优先命中，不发任何请求；可在这里查看/多选删除/改缓存文件夹"
     >
       <div className="mb-2.5 flex flex-wrap items-center gap-2 text-[11px] text-faint">
         <HardDrive size={12} className="shrink-0" />
@@ -139,6 +168,15 @@ export function DanmakuLibraryCard({ catalog }: { catalog: SourceCatalogState })
         <span className="flex-1" />
         <Button size="sm" variant="ghost" icon={RefreshCw} onClick={() => void refresh()} loading={busy}>
           刷新
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          icon={Trash2}
+          disabled={selected.size === 0 || busy}
+          onClick={() => setConfirmSelected(true)}
+        >
+          删除所选{selected.size > 0 ? `（${selected.size}）` : ''}
         </Button>
         <Button
           size="sm"
@@ -183,10 +221,10 @@ export function DanmakuLibraryCard({ catalog }: { catalog: SourceCatalogState })
 
       {items.length === 0 ? (
         <div className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-[11px] leading-relaxed text-faint">
-          弹幕库还是空的。
+          本地缓存还是空的。
           <br />
-          用上面的「弹幕盒子」搜索下载，或加一条「巴哈姆特动画疯」数据源后进播放器自动下载，
-          也可以自己把 B 站 XML 丢进上面那个目录（文件名不管，点「刷新」会重建索引）。
+          进播放器播放一次就会按源自动缓存（文件名带来源名）；也可以自己把 B 站 XML 丢进上面那个目录，
+          文件名按「第NN集-来源名.xml」，点「刷新」会重建索引。
         </div>
       ) : filtered.length === 0 ? (
         <div className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-[11px] text-faint">
@@ -197,6 +235,24 @@ export function DanmakuLibraryCard({ catalog }: { catalog: SourceCatalogState })
           <table className="w-full text-left text-[11px]">
             <thead className="sticky top-0 bg-elev2 text-faint">
               <tr>
+                <th className="w-6 px-2 py-1 font-medium">
+                  <input
+                    type="checkbox"
+                    className="h-3 w-3 accent-accent"
+                    checked={filtered.length > 0 && filtered.every((it) => selected.has(it.id))}
+                    onChange={(e) => {
+                      setSelected((prev) => {
+                        const next = new Set(prev)
+                        for (const it of filtered) {
+                          if (e.target.checked) next.add(it.id)
+                          else next.delete(it.id)
+                        }
+                        return next
+                      })
+                    }}
+                    title="全选当前筛选结果"
+                  />
+                </th>
                 <th className="px-2 py-1 font-medium">番剧</th>
                 <th className="px-2 py-1 font-medium whitespace-nowrap">集</th>
                 <th className="px-2 py-1 font-medium whitespace-nowrap">来源</th>
@@ -209,6 +265,15 @@ export function DanmakuLibraryCard({ catalog }: { catalog: SourceCatalogState })
             <tbody>
               {filtered.map((it) => (
                 <tr key={it.id} className="border-t border-border">
+                  <td className="px-2 py-1.5">
+                    <input
+                      type="checkbox"
+                      className="h-3 w-3 accent-accent"
+                      checked={selected.has(it.id)}
+                      onChange={() => toggleSelect(it.id)}
+                      title="选中后可批量删除"
+                    />
+                  </td>
                   <td className="px-2 py-1.5">
                     <div className="max-w-[200px] truncate text-text" title={`${it.origin} · ${it.file}`}>
                       {it.title}
@@ -241,6 +306,22 @@ export function DanmakuLibraryCard({ catalog }: { catalog: SourceCatalogState })
           </div>
         </div>
       )}
+
+      <ConfirmModal
+        open={confirmSelected}
+        title="删除所选的本地弹幕"
+        message={
+          <>
+            确定删除选中的 {selected.size} 个弹幕文件？
+            <br />
+            只删缓存文件，不影响收藏、播放进度；下次播放会重新从源获取。此操作不可撤销。
+          </>
+        }
+        confirmText="删除所选"
+        danger
+        onConfirm={() => void removeSelected()}
+        onClose={() => setConfirmSelected(false)}
+      />
 
       <ConfirmModal
         open={clearOpen}

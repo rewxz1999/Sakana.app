@@ -3,12 +3,20 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from '
 import { join } from 'node:path'
 import { app } from 'electron'
 import axios from 'axios'
-import type { DanmakuComment, DanmakuMatch, DanmakuOrigin } from '@shared/types'
+import type {
+  DanmakuComment,
+  DanmakuMatch,
+  DanmakuOrigin,
+  DanmakuSourceRunInfo
+} from '@shared/types'
+import { resolveDanmakuSettings } from '@shared/types'
 import { log } from '../log'
 import { buildProxyAgents, getSettings } from '../net'
-import { lookupLibrary, readLibraryComments, saveToLibrary } from './danmakuLibrary'
-import { appendFetchRecord } from './danmakuFetchLog'
-import { listSources, loadFromSources } from './danmakuSources'
+import { readCachedSource, writeCachedSource } from './danmakuCache'
+import { integrateDanmaku, type DanmakuBatch } from './danmakuIntegrator'
+import { progressBegin, progressDone, progressFail, progressStep } from './danmakuProgress'
+import { enabledFetchers } from './danmaku/index'
+import { noteNetworkFetch, readCachedBatches, runEnabledSources } from './danmakuSourceRunner'
 
 /**
  * 弹幕接口（v0.2.8 正式接入）：对接弹弹play 的 v2 接口。
@@ -345,14 +353,16 @@ function scoreAnime(title: string, anime: SearchAnime, wantEp = 1): number {
  */
 const CACHE_V = 'v2'
 
-async function searchEpisodes(title: string): Promise<SearchAnime[]> {
+async function searchEpisodes(title: string, useCache = true): Promise<SearchAnime[]> {
   const cacheKey = `search:${CACHE_V}:${title}`
-  const cached = readCache<SearchAnime[]>(cacheKey, TTL_SEARCH)
-  if (cached) return cached
+  if (useCache) {
+    const cached = readCache<SearchAnime[]>(cacheKey, TTL_SEARCH)
+    if (cached) return cached
+  }
   const path = `/api/v2/search/episodes?anime=${encodeURIComponent(title)}`
   const data = await get<{ success?: boolean; animes?: SearchAnime[] }>(path)
   const list = Array.isArray(data?.animes) ? data.animes : []
-  if (list.length > 0) writeCache(cacheKey, list)
+  if (useCache && list.length > 0) writeCache(cacheKey, list)
   return list
 }
 
@@ -495,6 +505,8 @@ export interface DanmakuLoadResult extends DanmakuMatch {
   sourcesPending?: boolean
   /** v1.1.2：本次返回的只有数据源那一批（第二段） */
   sourcesOnly?: boolean
+  /** V1.2：这一批由哪些源组成（每个源的原始条数/是否缓存） */
+  sources?: DanmakuSourceRunInfo[]
 }
 
 export interface DanmakuLoadOptions {
@@ -502,6 +514,15 @@ export interface DanmakuLoadOptions {
   aliases?: string[]
   /** 别名检测模式：额外找弹幕库自己的别名，并放宽到更多候选条目 */
   aliasMode?: boolean
+  /**
+   * V1.2：用户手动输入的别名搜索词（播放器「输入别名搜索弹幕」）。
+   * 有它时各源优先用它搜索，但缓存仍按原番剧名落盘（同一部番不该缓存成两份）。
+   */
+  keyword?: string
+  /** V1.2：番剧库条目 id（巴哈取日文原名用；没有就按标题反查一次） */
+  subjectId?: number
+  /** V1.2：绕过本地缓存重新请求（「重新检测弹幕」） */
+  force?: boolean
   /**
    * 只要数据源那一路（V1.1.2「两段式加载」的第二段）。
    *
@@ -549,7 +570,15 @@ export async function loadDanmaku(
    * 实测播放页挂载 + 预取会几乎同时发起两次相同请求（日志里能看到两条一样的「拉取弹幕 N 条」），
    * 既浪费接口配额也拖慢出弹幕。
    */
-  const flightKey = `${title}|${episode}|${opts.aliasMode ? 'alias' : 'plain'}`
+  const flightKey = [
+    title,
+    episode,
+    opts.aliasMode ? 'alias' : 'plain',
+    opts.sourcesOnly ? 'sources' : 'full',
+    opts.force ? 'force' : 'cache',
+    opts.keyword ?? '',
+    opts.subjectId ?? ''
+  ].join('|')
   const running = inflightLoad.get(flightKey)
   if (running) return await running
   const task = loadWithSources(title, episode, opts).finally(() => {
@@ -579,14 +608,42 @@ export async function loadDanmaku(
 const SOURCES_WAIT_MS = 8000
 
 /**
- * 第二段：只要「已启用的数据源」那一批（V1.1.2 两段式加载）。
+ * V1.2：内置弹弹play 在缓存里的来源名。
+ * 它也是"第三层缓存"的一员：命中它就不再请求内置接口（第二次进同一集网络请求为 0 的关键）。
+ */
+const BUILTIN_SOURCE_NAME = '内置弹弹play'
+
+/** 把集成结果包装成渲染层用的 DanmakuLoadResult（多个入口共用，字段口径只在这里定义） */
+function resultOfIntegration(
+  integ: ReturnType<typeof integrateDanmaku>,
+  input: { title: string; episode: number; matchedBy?: string; aliasUsed?: boolean },
+  extra: Partial<DanmakuLoadResult> = {}
+): DanmakuLoadResult | null {
+  if (integ.comments.length === 0) return null
+  return {
+    animeId: 0,
+    episodeId: 0,
+    animeTitle: input.title,
+    episodeTitle: `第${input.episode}集`,
+    count: integ.count,
+    comments: integ.comments,
+    fromCache: integ.fromCache,
+    matchedBy: input.matchedBy ?? input.title,
+    aliasUsed: input.aliasUsed === true,
+    origin: integ.primary ?? undefined,
+    sources: integ.sources,
+    ...extra
+  }
+}
+
+/**
+ * 第二段：等待「补全任务」（内置 + 已启用的数据源）。
  *
- * 与第一段的关系见 `loadWithSources` 的说明。这里**不碰本地库、不碰内置**：
- * 命中本地库那条路会让"数据源一次都没被问到"却看起来像成功（踩过一次，见上面注释）。
+ * V1.2 起第二段**不再自己起一条链**：第一段已经用 `startSupplement` 把任务发起了，
+ * 这里直接 await 同一个 Promise（键相同 → 不会重复请求）。这样"数据源一定会被调用"
+ * 是结构上的保证，而不是靠渲染层是否记得再调一次。
  *
- * 落盘策略：这一批**不单独覆盖本地库** —— 第一段已经把内置那批存进去了，
- * 只有源这一批的话存下去反而把完整的那份换成残缺的。用户要的是"源要真的被用上"，
- * 落盘交给下一次整份加载时命中本地库即可。
+ * 返回值只用于**合并**：渲染层拿到后与原弹幕按「时间+正文」去重，不会替换。
  */
 async function loadSourcesOnly(
   kw: string,
@@ -595,32 +652,19 @@ async function loadSourcesOnly(
 ): Promise<DanmakuLoadResult | null> {
   if (getSettings().danmaku?.autoSources === false) return null
   const trigger = opts.trigger ?? 'play'
-  const { hit, errors } = await startSources(kw, episode, opts.aliases ?? []).catch(() => ({
-    hit: null,
-    errors: [] as string[]
-  }))
-  recordFetch(kw, episode, hit, errors, trigger, hit?.ms ?? 0)
-  if (!hit) return null
-  return {
-    animeId: 0,
-    episodeId: 0,
-    animeTitle: hit.entryName || kw,
-    episodeTitle: `第${episode}集`,
-    count: hit.comments.length,
-    comments: hit.comments,
-    fromCache: false,
-    matchedBy: hit.keyword || kw,
-    aliasUsed: false,
-    sourcesOnly: true,
-    origin: {
-      sourceId: hit.sourceId,
-      sourceName: hit.sourceName,
-      kind: listSources().find((s) => s.id === hit.sourceId)?.kind ?? 'site',
-      detail: hit.detail,
-      entryName: hit.entryName
-    }
-  }
+  const job = startSupplement(kw, episode, opts, true)
+  if (!job) return null
+  const r = await job.catch(() => null)
+  if (!r || r.batches.length === 0) return null
+  const integ = integrateDanmaku(r.batches, { toleranceMs: toleranceMsOfSettings() })
+  return resultOfIntegration(integ, { title: kw, episode, matchedBy: opts.keyword || kw }, { sourcesOnly: true })
 }
+
+/** 当前设置里的去重容差（「弹幕误差」） */
+function toleranceMsOfSettings(): number {
+  return resolveDanmakuSettings(getSettings().danmaku).errorToleranceMs ?? 100
+}
+
 
 async function loadWithSources(
   title: string,
@@ -631,7 +675,7 @@ async function loadWithSources(
   if (!kw) return null
 
   /*
-   * 第二段（`sourcesOnly`）必须**排在本地库前面**。
+   * 第二段（`sourcesOnly`）必须**排在缓存前面**。
    *
    * 踩过一次：原来这段写在本地库之后，于是"第二段"直接命中了本地库、把整份缓存又返回了一遍 ——
    * 表面上条数对得上（看起来像成功了），实际上**数据源一次都没被问到**，
@@ -639,207 +683,289 @@ async function loadWithSources(
    */
   if (opts.sourcesOnly) return await loadSourcesOnly(kw, episode, opts)
 
-  // 1) 本地弹幕库
-  const priority = listSources().map((s) => s.id)
-  const lib = lookupLibrary(kw, episode, priority)
-  if (lib) {
-    try {
-      const comments = readLibraryComments(lib)
-      if (comments.length > 0) {
-        log.append('info', 'danmaku', `本地弹幕库命中：${lib.title} 第${lib.episode}集（${lib.sourceName}，${comments.length} 条）`)
-        return {
-          animeId: 0,
-          episodeId: 0,
-          animeTitle: lib.title,
-          episodeTitle: `第${lib.episode}集`,
-          count: comments.length,
-          comments,
-          fromCache: true,
-          matchedBy: kw,
-          aliasUsed: false,
-          origin: {
-            sourceId: lib.sourceId,
-            sourceName: lib.sourceName,
-            kind: 'library',
-            detail: `本地弹幕库：${lib.origin}`,
-            entryName: lib.title
-          }
-        }
-      }
-    } catch (err) {
-      // 库里的文件坏了不该让整条链失败：记一条日志，继续走后面的源
-      log.append('warn', 'danmaku', `读取本地弹幕库失败（${lib.file}）：${String((err as Error)?.message ?? err)}`)
-    }
+  progressBegin(kw, episode)
+  const settings = resolveDanmakuSettings(getSettings().danmaku)
+  const autoSources = settings.autoSources !== false
+  const toleranceMs = settings.errorToleranceMs ?? 100
+  const force = opts.force === true
+  // 关掉自动源时，缓存/补全都只针对内置库（用户明确不想发源请求）
+  const bindings = autoSources ? enabledFetchers() : []
+
+  // 1) 本地缓存：每个启用的源各查各的（文件名带源名，互不混淆）+ 内置那一份
+  const cachedExternal = force
+    ? { batches: [] as DanmakuBatch[], missing: bindings }
+    : readCachedBatches(kw, episode, bindings)
+  const builtinCached = force ? null : readCachedSource(kw, episode, BUILTIN_SOURCE_NAME)
+  const cachedBatches: DanmakuBatch[] = [...cachedExternal.batches]
+  if (builtinCached) {
+    progressDone('builtin', BUILTIN_SOURCE_NAME, 1, 1, `本地缓存命中（${builtinCached.comments.length} 条，未发网络请求）`)
+    cachedBatches.push({
+      sourceId: 'builtin',
+      sourceName: BUILTIN_SOURCE_NAME,
+      comments: builtinCached.comments,
+      fromCache: true,
+      detail: `本地缓存 ${builtinCached.relPath}（未发网络请求）`,
+      entryName: builtinCached.item.title,
+      kind: 'builtin'
+    })
+  }
+  const allCached = cachedExternal.missing.length === 0 && Boolean(builtinCached)
+
+  /*
+   * 2) 有缓存 → 立刻返回（用户要求「当前集有本地缓存就直接用，不重新加载」）。
+   *
+   * 后台任务只补**缺的那部分**：缓存已经齐全时连任务都不发，第二次进同一集网络请求为 0。
+   * 还有缺失时发一条 `sourcesPending`，渲染层按两段式去取第二段（外部行为保持不变）。
+   */
+  if (cachedBatches.length > 0) {
+    const missingNames = cachedExternal.missing.map((b) => b.name)
+    /*
+     * 已经有任意缓存时**不再为了内置库发网络请求**：
+     * 用户要的是"当前集有本地缓存就直接用，不重新加载"。内置库上一轮没取到就让它留在缺省，
+     * 不能因为"内置还没缓存"就让第二次进同一集又发一次请求（那正好违背用户点名的证据）。
+     * 只有"一点缓存都没有"的首轮才同时跑内置与数据源。
+     */
+    const needBuiltin = !builtinCached && cachedExternal.batches.length === 0
+    const job =
+      allCached || (missingNames.length === 0 && !needBuiltin)
+        ? null
+        : startSupplement(kw, episode, opts, autoSources, missingNames, needBuiltin)
+    const integ = integrateDanmaku(cachedBatches, { toleranceMs })
+    return resultOfIntegration(
+      integ,
+      {
+        title: kw,
+        episode,
+        matchedBy: opts.keyword || kw,
+        aliasUsed: Boolean(opts.keyword && normalizeTitle(opts.keyword) !== normalizeTitle(kw))
+      },
+      // fromCache 说的是"这一批是不是全来自缓存"，不是"所有源都缓存了没"：
+      // 有源缺缓存时这批仍是缓存（同时 sourcesPending=true，第二段会补）
+      { sourcesPending: Boolean(job), fromCache: integ.fromCache }
+    )
   }
 
   /*
-   * ─────────── 2) 内置弹弹play 与 3) 已启用的数据源 ───────────
-   *
-   * 用户前后提了三件事，只有「分两段」能同时满足：
-   *   · 「装了巴哈/弹幕盒子，播放时却没有看到从数据源拿到的弹幕」→ 数据源必须**每集都真的被调用**；
-   *   · 「拉取弹幕数据源还是不够快」→ 不能让数据源拖慢"弹幕什么时候上屏"；
-   *   · 「播放器播放之前必须要调用弹幕数据源获取弹幕，除非从数据源获取不到」→ 调用要在播放这一刻就发起。
-   *
-   * 于是：
-   *   第一段（本次调用）—— 本地库 / 内置库，通常几百毫秒，**先让弹幕上屏**；
-   *     同时**立刻在后台发起数据源那一路**（`startSources`，不等它），返回时带 `sourcesPending: true`；
-   *   第二段（`sourcesOnly: true` 再调一次）—— 直接取上面那条**已经在跑**的 Promise，
-   *     回来之后按「时间+正文」去重合并进画面上那一批（见 PlayerPage 的调用处）。
-   *
-   * 这样"数据源一定会被调用"是**结构上的保证**（第一段就发起），而"快"也不用牺牲：
-   * 内置那几百毫秒就上屏，源的补充几秒后才叠上去。`autoSources === false` 是用户在设置里的
-   * 明确选择，那种情况完全不碰数据源。
+   * 3) 一点缓存都没有：必须等（用户要求「除非从数据源获取不到」）。
+   *    内置与数据源是并行的，谁先回来都算数；全部失败才返回 null。
    */
-  const autoFromSources = getSettings().danmaku?.autoSources !== false
-
-  // 第一段：内置 + 后台发起数据源
-  const builtin = await loadDanmakuInner(kw, episode, opts)
-  const sourcePromise = autoFromSources ? startSources(kw, episode, opts.aliases ?? []) : null
-
-  /*
-   * 内置没有、数据源还可能要一会儿 —— 这种情况下**等它**（用户要求"除非从数据源获取不到"）。
-   * 有内置结果的走上面的快速路径，不等。
-   */
-  const hit = builtin || !sourcePromise ? null : (await sourcePromise.catch(() => ({ hit: null, errors: [] }))).hit
-  if (!builtin && !hit) {
-    if (sourcePromise) {
-      const r = await sourcePromise.catch(() => ({ hit: null, errors: [] as string[] }))
-      recordFetch(kw, episode, null, r.errors, opts.trigger ?? 'play', 0)
-    }
-    log.append('info', 'danmaku', '内置与数据源都没有取到弹幕')
+  const job = startSupplement(
+    kw,
+    episode,
+    opts,
+    autoSources,
+    cachedExternal.missing.map((b) => b.name),
+    true
+  )
+  if (!job) {
+    log.append('info', 'danmaku', '没有启用的数据源，也没有内置缓存')
     return null
   }
-  if (hit) recordFetch(kw, episode, hit, [], opts.trigger ?? 'play', hit.ms ?? 0)
-
-  const parts: string[] = []
-  let comments = builtin?.comments ?? []
-  if (builtin) parts.push(`内置弹弹play ${builtin.comments.length} 条`)
-  if (hit) {
-    const merged = mergeComments(comments, hit.comments)
-    parts.push(`${hit.sourceName} ${hit.comments.length} 条`)
-    comments = merged
+  const r = await job.catch(() => null)
+  if (!r || r.batches.length === 0) {
+    log.append('info', 'danmaku', `内置与数据源都没有取到弹幕${r?.errors?.length ? `（${r.errors.slice(0, 3).join('；')}）` : ''}`)
+    return null
   }
-  const fromText = parts.join(' + ')
-
-  /*
-   * 合并后的**整份**存进本地库。
-   *
-   * 用户问「弹幕数据为什么没保存到本地？」—— 以前只有"内置没命中、靠数据源兜底"那一条路会存，
-   * 内置命中的那条路一条都不落盘。现在不管谁命中都存：下次（含离线）第 1 步直接命中，
-   * 不再重复下载；想清掉在「设置 → 弹幕 → 本地弹幕库」里手动清空（那条路本来就有）。
-   */
-  let saved: ReturnType<typeof saveToLibrary> | null = null
-  try {
-    saved = saveToLibrary({
-      title: builtin?.animeTitle || hit?.entryName || kw,
+  const integ = integrateDanmaku(r.batches, { toleranceMs })
+  return resultOfIntegration(
+    integ,
+    {
+      title: kw,
       episode,
-      sourceId: hit?.sourceId ?? 'builtin',
-      sourceName: fromText || '内置弹幕库（弹弹play）',
-      origin: hit ? hit.detail : `${builtin?.animeTitle ?? kw} · ${builtin?.episodeTitle ?? ''}`,
-      comments
-    })
-  } catch (err) {
-    log.append('warn', 'danmaku', `弹幕取到了但存入本地库失败：${String((err as Error)?.message ?? err)}`)
-  }
-
-  return {
-    animeId: builtin?.animeId ?? 0,
-    episodeId: builtin?.episodeId ?? 0,
-    animeTitle: builtin?.animeTitle || hit?.entryName || kw,
-    episodeTitle: builtin?.episodeTitle || `第${episode}集`,
-    count: comments.length,
-    comments,
-    fromCache: false,
-    matchedBy: builtin?.matchedBy || kw,
-    aliasUsed: builtin?.aliasUsed ?? false,
-    /** 数据源那一路还在跑 → 渲染层拿到它之后会再调一次 `sourcesOnly` 把结果合并上来 */
-    sourcesPending: Boolean(sourcePromise),
-    origin: {
-      sourceId: hit?.sourceId ?? 'builtin',
-      sourceName: fromText || '内置弹幕库（弹弹play）',
-      kind: hit ? (listSources().find((s) => s.id === hit.sourceId)?.kind ?? 'site') : 'builtin',
-      detail:
-        (hit ? `内置 + ${hit.detail}` : `${builtin?.animeTitle ?? kw} · ${builtin?.episodeTitle ?? ''}`) +
-        (saved ? `（已存入本地：${saved.file}）` : ''),
-      entryName: builtin?.animeTitle || hit?.entryName || kw
-    }
-  }
+      matchedBy: opts.keyword || kw,
+      aliasUsed: Boolean(opts.keyword && normalizeTitle(opts.keyword) !== normalizeTitle(kw))
+    },
+    { sourcesPending: false }
+  )
 }
 
 /**
- * 数据源那一路的**在途表**（V1.1.2）。
+ * 「补全任务」：并行跑内置弹弹play 与已启用的获取器。
  *
- * 为什么要有它：第一段要为"快"服务，不能在它里面等数据源；但用户同时要求
- * 「播放器播放之前必须要调用弹幕数据源获取弹幕」—— 所以第一段就**立刻发起**，
- * 把 Promise 存在这里；第二段（`sourcesOnly`）直接取同一条，不会重复请求，
- * 也不会因为"渲染层晚了几百毫秒才问"而白白重跑一遍。
+ * V1.2 把"内置"也收进任务里，是为了让**任何**缺失都能在第二段补上：
+ *   · 只有外部源缓存、内置没缓存时，第二段仍会把内置那份补进来；
+ *   · 只有内置缓存、外部源没缓存时，第二段补外部源；
+ *   · 两边都有缓存时第一段直接返回，任务根本不会创建（网络请求为 0）。
  *
- * 键里带上关键词，换集/换别名不会串味；结果保留 60 秒（第二段通常几秒内就来取）。
+ * 第一段与第二段共用同一个 Promise（键 = 标题+集+别名+关键词+是否强制），
+ * 所以"数据源一定会被调用"不依赖渲染层是否记得再问一次。
  */
-const inflightSources = new Map<string, Promise<{ hit: SourceHitLike | null; errors: string[] }>>()
-
-type SourceHitLike = Awaited<ReturnType<typeof loadFromSources>>['hit']
-
-function sourcesKey(kw: string, episode: number, aliases: string[]): string {
-  return `${kw}|${episode}|${aliases.join(',')}`
+interface SupplementResult {
+  batches: DanmakuBatch[]
+  errors: string[]
 }
 
-function startSources(
+const inflightSupplement = new Map<string, Promise<SupplementResult>>()
+
+function supplementKey(kw: string, episode: number, opts: DanmakuLoadOptions, includeSources: boolean): string {
+  return [
+    kw,
+    episode,
+    opts.aliases?.join(',') ?? '',
+    opts.keyword ?? '',
+    opts.subjectId ?? '',
+    opts.force ? 'force' : 'cache',
+    includeSources ? 'sources' : 'builtin-only'
+  ].join('|')
+}
+
+function startSupplement(
   kw: string,
   episode: number,
-  aliases: string[]
-): Promise<{ hit: SourceHitLike | null; errors: string[] }> {
-  const key = sourcesKey(kw, episode, aliases)
-  const cur = inflightSources.get(key)
+  opts: DanmakuLoadOptions,
+  includeSources: boolean,
+  missingNames: string[] = [],
+  includeBuiltin = true
+): Promise<SupplementResult> | null {
+  const key = supplementKey(kw, episode, opts, includeSources)
+  const cur = inflightSupplement.get(key)
   if (cur) return cur
-  const p = loadFromSources(kw, episode, aliases)
-  inflightSources.set(key, p)
-  // 不论成功失败都留 60 秒再清：第二段可能晚一点才来问
-  setTimeout(() => inflightSources.delete(key), 60000)
+  const p = runSupplement(kw, episode, opts, includeSources, missingNames, includeBuiltin).finally(() => {
+    // 结果保留 60 秒：第二段通常几秒内就来取，过期后重跑也不会拿到旧数据
+    setTimeout(() => inflightSupplement.delete(key), 60000)
+  })
+  inflightSupplement.set(key, p)
   return p
 }
 
-/** 往「获取记录」里写一条（设置页里能看到"这次到底有没有去要、用的哪个关键词、花了多久"） */
-function recordFetch(
-  title: string,
+/**
+ * 内置库最多等多久（毫秒）。
+ *
+ * 为什么不让它拖住数据源：内置弹弹play 在反代不可用时单次搜索能超时 12~24 秒，
+ * 而巴哈 2~3 秒就能回。如果第二段必须等内置跑完，用户看到的"数据源弹幕"会被拖到几十秒后。
+ * 超时后内置继续在后台跑（跑完仍会写缓存，下次播放直接命中），本次结果先用已到的源。
+ */
+const BUILTIN_WAIT_MS = 6000
+
+/**
+ * 数据源那一路最多等多久（毫秒）。
+ *
+ * 用户的原话是「拉取弹幕数据源还是不够快」。实测（真机日志）第一段冷启动要 17.7 秒，
+ * 根因就是下面 `await externalP` **完全没有上限** —— 内置那一路有 `BUILTIN_WAIT_MS` 兜着，
+ * 数据源这一路却要等所有源**全跑完**才返回（弹幕盒子要整包下索引，慢起来十几秒）。
+ *
+ * 所以这里也给一个上限：到点先用已经拿到的批次返回，没跑完的源继续在后台跑，
+ * 跑完照旧写缓存，下次进同一集直接命中 —— 与内置那一路的处理保持一致。
+ * 这不违背"播放前必须调用数据源"：请求在任务开始时就发出了，这里限制的只是**等它多久**。
+ */
+const EXTERNAL_WAIT_MS = 8000
+
+async function runSupplement(
+  kw: string,
   episode: number,
-  hit: SourceHitLike,
-  errors: string[],
-  trigger: 'play' | 'test' | 'manual',
-  ms: number
-): void {
-  appendFetchRecord({
-    at: Date.now(),
-    trigger,
-    title,
-    episode,
-    sourceId: hit?.sourceId ?? '',
-    sourceName: hit?.sourceName ?? '（没有源命中）',
-    keyword: hit?.keyword,
-    ok: Boolean(hit),
-    count: hit?.comments.length ?? 0,
-    ms,
-    detail: hit ? hit.detail : errors.slice(0, 3).join('；') || '数据源都没有返回'
+  opts: DanmakuLoadOptions,
+  includeSources: boolean,
+  missingNames: string[],
+  includeBuiltin: boolean
+): Promise<SupplementResult> {
+  const errors: string[] = []
+  const builtinP = includeBuiltin
+    ? loadBuiltinBatch(kw, episode, opts).catch((err): null => {
+        errors.push(`内置弹弹play：${String((err as Error)?.message ?? err)}`)
+        return null
+      })
+    : Promise.resolve(null)
+  const externalP = (
+    includeSources
+      ? runEnabledSources({
+          title: kw,
+          episode,
+          aliases: opts.aliases ?? [],
+          keyword: opts.keyword,
+          subjectId: opts.subjectId,
+          force: opts.force,
+          missingSourceNames: missingNames,
+          trigger: opts.trigger ?? 'play'
+        })
+      : Promise.resolve({ batches: [] as DanmakuBatch[], errors: [] as string[], cacheHits: 0 })
+  ).catch((err) => {
+    errors.push(`数据源：${String((err as Error)?.message ?? err)}`)
+    return { batches: [] as DanmakuBatch[], errors: [] as string[], cacheHits: 0 }
   })
+
+  const external = await Promise.race([
+    externalP,
+    new Promise<{ batches: DanmakuBatch[]; errors: string[]; cacheHits: number }>((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            batches: [] as DanmakuBatch[],
+            errors: [`数据源超过 ${EXTERNAL_WAIT_MS / 1000} 秒还没全回，本次先用已到的（后台继续跑并写缓存）`],
+            cacheHits: 0
+          }),
+        EXTERNAL_WAIT_MS
+      )
+    )
+  ])
+  // 内置最多等 BUILTIN_WAIT_MS；超时后它继续在后台跑（结果仍会落缓存）
+  const builtin = await Promise.race([
+    builtinP,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), BUILTIN_WAIT_MS))
+  ])
+  const batches: DanmakuBatch[] = []
+  if (builtin) batches.push(builtin)
+  batches.push(...external.batches)
+  errors.push(...external.errors)
+  return { batches, errors }
 }
 
 /**
- * 合并两批弹幕并按时间排序（V1.1.1）。
- *
- * 去重键 = 「时间（0.1 秒精度）+ 正文」：不同源对同一条弹幕的毫秒位常有差异，
- * 但同一句话在同一秒出现两次本来就该算重复；精度取细了会留下成对的重复弹幕，
- * 取粗了（整秒）又会误杀真正的一秒两条。
+ * 内置弹弹play 这一批：先查缓存，没有再走原来的完整匹配链（季集闸门 + 同集多来源合并）。
+ * 命中缓存时也发一条「已完成」进度，详情面板能看到"第 1/1 步：本地缓存"。
  */
-function mergeComments(a: DanmakuComment[], b: DanmakuComment[]): DanmakuComment[] {
-  const seen = new Set<string>()
-  const out: DanmakuComment[] = []
-  for (const c of [...a, ...b]) {
-    const key = `${Math.round((Number(c.time) || 0) * 10)}|${c.text}`
-    if (seen.has(key)) continue
-    seen.add(key)
-    out.push(c)
+async function loadBuiltinBatch(
+  kw: string,
+  episode: number,
+  opts: DanmakuLoadOptions
+): Promise<DanmakuBatch | null> {
+  if (opts.force !== true) {
+    const hit = readCachedSource(kw, episode, BUILTIN_SOURCE_NAME)
+    if (hit) {
+      progressDone('builtin', BUILTIN_SOURCE_NAME, 1, 1, `内置弹弹play 命中本地缓存（${hit.comments.length} 条）`)
+      return {
+        sourceId: 'builtin',
+        sourceName: BUILTIN_SOURCE_NAME,
+        comments: hit.comments,
+        fromCache: true,
+        detail: `本地缓存 ${hit.relPath}（未发网络请求）`,
+        entryName: hit.item.title,
+        kind: 'builtin'
+      }
+    }
   }
-  return out.sort((x, y) => (Number(x.time) || 0) - (Number(y.time) || 0))
+  progressStep('builtin', BUILTIN_SOURCE_NAME, 1, 2, '正在匹配内置弹弹play 弹幕库…')
+  noteNetworkFetch()
+  let r: DanmakuLoadResult | null
+  try {
+    r = await loadDanmakuInner(kw, episode, opts)
+  } catch (err) {
+    const msg = String((err as Error)?.message ?? err)
+    progressFail('builtin', BUILTIN_SOURCE_NAME, 1, 2, '内置弹弹play 取弹幕失败', msg)
+    throw err
+  }
+  if (!r || r.comments.length === 0) {
+    progressFail('builtin', BUILTIN_SOURCE_NAME, 2, 2, '内置弹弹play 没有匹配到弹幕', '该番剧/集在弹弹play 弹幕库里没有条目')
+    return null
+  }
+  progressStep('builtin', BUILTIN_SOURCE_NAME, 2, 2, `正在写入内置弹幕缓存（${r.comments.length} 条）…`)
+  const saved = writeCachedSource({
+    title: kw,
+    episode,
+    sourceId: 'builtin',
+    sourceName: BUILTIN_SOURCE_NAME,
+    origin: `${r.animeTitle} · ${r.episodeTitle}`,
+    comments: r.comments
+  })
+  progressDone('builtin', BUILTIN_SOURCE_NAME, 2, 2, `内置弹弹play 取到 ${r.comments.length} 条`)
+  return {
+    sourceId: 'builtin',
+    sourceName: BUILTIN_SOURCE_NAME,
+    comments: r.comments,
+    fromCache: false,
+    detail: `${r.animeTitle} · ${r.episodeTitle}${saved ? ` → ${saved.file.replace(/\\/g, '/')}` : ''}`,
+    entryName: r.animeTitle,
+    kind: 'builtin'
+  }
 }
 
 async function loadDanmakuInner(
@@ -864,7 +990,7 @@ async function loadDanmakuInner(
     const results = await Promise.all(
       queries.map(async (q) => {
         try {
-          return { q, list: await searchEpisodes(q) }
+          return { q, list: await searchEpisodes(q, opts.force !== true) }
         } catch (err) {
           log.append('warn', 'danmaku', `弹幕搜索失败（${q}）: ${String((err as Error)?.message ?? err)}`)
           return { q, list: [] as SearchAnime[] }
@@ -955,8 +1081,8 @@ async function loadDanmakuInner(
     }
     if (targets.length === 0) return null
 
-    // 第一个来源是否为缓存命中（用于 fromCache 展示）
-    const primaryCached = Boolean(
+    // 第一个来源是否为缓存命中（用于 fromCache 展示；force 时不看缓存）
+    const primaryCached = opts.force !== true && Boolean(
       readCache<DanmakuComment[]>(`comments:${CACHE_V}:${targets[0].ep.episodeId}`, TTL_COMMENTS)
     )
 
@@ -969,7 +1095,7 @@ async function loadDanmakuInner(
          * 合并就会把首次出弹幕的时间拖到十几秒。
          */
         return await Promise.race([
-          fetchDanmaku(t.ep.episodeId),
+          fetchDanmaku(t.ep.episodeId, opts.force !== true),
           new Promise<DanmakuComment[]>((resolve) => setTimeout(() => resolve([]), MERGE_DEADLINE_MS))
         ])
       })
@@ -989,15 +1115,22 @@ async function loadDanmakuInner(
     })
     if (parts.length === 0) return null
 
-    // 合并去重
-    const merged = new Map<string, DanmakuComment>()
-    for (const p of parts) {
-      for (const c of p.comments) {
-        const key = `${Math.round(c.time * 10)}|${c.text}`
-        if (!merged.has(key)) merged.set(key, c)
-      }
-    }
-    const comments = [...merged.values()].sort((a, b) => a.time - b.time).slice(0, MAX_COMMENTS)
+    /*
+     * 合并去重（V1.2：改走唯一的集成器入口）。
+     * 同一集在弹幕库里常有 youku/bilibili/tencent 多份，条数差很多；这里仍按
+     * 「时间 + 正文」去重后按时间排序 —— 与播放器看到的最终时间轴是同一套算法。
+     */
+    const integrated = integrateDanmaku(
+      parts.map((p) => ({
+        sourceId: 'builtin',
+        sourceName: '内置弹弹play',
+        comments: p.comments,
+        detail: p.title,
+        kind: 'builtin' as const
+      })),
+      { maxComments: MAX_COMMENTS, toleranceMs: toleranceMsOfSettings() }
+    )
+    const comments = integrated.comments
     const primary = targets[0]
     const aliasUsed = normalizeTitle(primary.by) !== normalizeTitle(kw)
     if (aliasUsed) log.append('info', 'danmaku', `别名命中：用「${primary.by}」匹配到 ${primary.a.animeTitle}`)

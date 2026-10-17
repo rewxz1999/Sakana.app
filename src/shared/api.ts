@@ -2,6 +2,7 @@ import type {
   AddDownloadInput,
   AppSettings,
   AspectMode,
+  CachedSubjectResult,
   CalendarResult,
   CardExportImageRequest,
   CardExportImageResult,
@@ -19,6 +20,8 @@ import type {
   DanmakuFetchRecord,
   DanmakuLoadResult,
   DanmakuMatch,
+  DanmakuProgressSnapshot,
+  DanmakuRuntimeStats,
   DanmakuSettings,
   DanmakuSource,
   DanmakuSourceRegistry,
@@ -41,6 +44,8 @@ import type {
   LocalDirInfo,
   LocalTargetInput,
   LocalVideoFile,
+  NetPriority,
+  RatingResult,
   LogEntry,
   MediaInspectResult,
   MikanSearchResult,
@@ -212,6 +217,8 @@ export interface UoscBarState {
     count: number
     area: number
     maxCount: number
+    /** 弹幕字号（CSS px；uosc「弹幕」菜单的高亮档位用它；旧调用方不传时按 22 处理） */
+    fontSize?: number
     offsetMs: number
     showScroll: boolean
     showTop: boolean
@@ -221,6 +228,14 @@ export interface UoscBarState {
     source: string
   }
   status: { kind: PlayStatus; text: string }
+  /**
+   * 投屏状态（v1.1.4）。
+   *
+   * 为什么要随控制栏状态一起推：`sakana-status` 菜单（播放状态）要显示「投屏状态」，
+   * 而投屏的"当前设备"只有渲染层知道（主进程的 cast 服务只记会话，不记谁在用）。
+   * 不放在这里的话，菜单只能永远显示"未投屏"——那是编的，不是读的。
+   */
+  cast?: { active: boolean; deviceId?: string; deviceName?: string }
 }
 
 /** 选集数据（低频变化，单独走一个通道；避免把大数组塞进每秒多次的状态推送） */
@@ -272,6 +287,12 @@ export type OverlayAction =
   | { type: 'setSubtitle'; id: number }
   | { type: 'toggleEpisodes' }
   | { type: 'toggleInfo' }
+  /**
+   * v1.1.5：uosc 右上角角标「播放流详情」→ 打开/关闭流详情面板
+   * （StreamInfoModal：嗅探地址 / 带宽 / 线路读数 / 播放流程）。
+   * 复用 PlayerPage 已有的 `showStreamInfo` 状态，不新造一套 UI。
+   */
+  | { type: 'toggleStreamInfo' }
   | { type: 'snapshot' }
   | { type: 'setAspect'; aspect: AspectMode }
   | { type: 'toggleFullscreen' }
@@ -294,6 +315,18 @@ export type OverlayAction =
   | { type: 'uoscMenu'; key: 'search' | 'total' | 'style' | 'delay' | 'add' }
   | { type: 'reloadDanmaku' }
   | { type: 'detectDanmakuAlias' }
+  /** V1.2：播放器里输入别名搜索弹幕（关键词由用户在悬浮窗里输入） */
+  | { type: 'searchDanmakuAlias'; keyword: string }
+  /**
+   * V1.2：uosc 菜单用的弹幕动作（旧底栏已停用，popover 不再渲染）。
+   * 这些名字就是 `script-message sakana-ctrl <动作> [参数]` 里的动作名，主进程 `mpv.ts`
+   * 只做透传；真正的行为在 PlayerPage 的 overlay 动作 switch 里。
+   */
+  | { type: 'danmakuArea'; value: number }
+  | { type: 'danmakuFontSize'; value: number }
+  | { type: 'danmakuOffset'; deltaMs: number }
+  | { type: 'danmakuReload' }
+  | { type: 'danmakuAliasSearch'; keyword: string }
   /** 断点续播提示上的两个按钮 */
   | { type: 'undoResume' }
   | { type: 'dismissResume' }
@@ -342,7 +375,28 @@ export interface SakanaApi {
   }
   bangumi: {
     calendar(force?: boolean): Promise<ApiResult<CalendarResult>>
-    subject(id: number): Promise<ApiResult<SubjectResult>>
+    /**
+     * 番剧表在后台刷新完成时推送（v1.1.4）。
+     *
+     * 为什么需要：现在首屏**直接用磁盘缓存**立刻渲染，联网刷新在后台做；
+     * 没有这个事件的话，用户要等到下次进页面才能看到新数据（或者永远看旧的）。
+     * 返回取消订阅函数。
+     */
+    onCalendar(cb: (r: CalendarResult) => void): () => void
+    /**
+     * `priority` 缺省 S（用户正打开详情页）；番剧表标签补齐那种后台动作传 B。
+     */
+    subject(id: number, priority?: NetPriority): Promise<ApiResult<SubjectResult>>
+    /**
+     * 只读缓存、绝不联网的详情快照（v1.1.4，详情页首屏用）。
+     * 命中磁盘/内存缓存时 1ms 级返回，页面先把标题/封面/简介/评分画出来。
+     */
+    subjectCached(id: number): Promise<ApiResult<CachedSubjectResult>>
+    /**
+     * 评分板块（v1.1.4）：`refresh=false` 先给 6 小时缓存，`refresh=true` 再联网重取。
+     * 与详情正文解耦，慢网络下不阻塞首屏。
+     */
+    rating(id: number, refresh?: boolean): Promise<ApiResult<RatingResult>>
     search(keyword: string): Promise<ApiResult<SearchResult>>
     /**
      * 补全 / 刷新番剧评分与评分人数。
@@ -357,13 +411,17 @@ export interface SakanaApi {
     /**
      * 某个季度的番剧列表（番剧表「预览 20xx年春」弹窗）。
      * month 可传该季度内的任意一个月，主进程会规范化到季度并按季度缓存。
+     *
+     * v1.1.4：`priority` 让「随机推荐」这类后台取样走 B 级（不挤占番剧表/详情）。
      */
-    season(year: number, month: number, force?: boolean): Promise<ApiResult<SeasonResult>>
+    season(year: number, month: number, force?: boolean, priority?: NetPriority): Promise<ApiResult<SeasonResult>>
     /**
      * 「更新到第几集」（v0.3.7）：按分集接口每集的 airdate 数出**已放送集数**。
      * 取不到（离线 / 兜底数据源的负数 id / 条目没有分集）时 data 为 null，界面隐藏这一行。
+     *
+     * v1.1.4：`priority` 缺省 S（用户正看着详情页）；仪表盘那种批量后台补齐传 B。
      */
-    episodeProgress(id: number): Promise<ApiResult<EpisodeProgress | null>>
+    episodeProgress(id: number, priority?: NetPriority): Promise<ApiResult<EpisodeProgress | null>>
     testMirrors(): Promise<ApiResult<MirrorTestResult[]>>
     /**
      * 角色列表（「最XX的角色 9宫格」工具）。
@@ -460,7 +518,11 @@ export interface SakanaApi {
     onChanged(cb: (tasks: DownloadTask[]) => void): () => void
   }
   rules: {
-    search(ruleId: string, keyword: string): Promise<ApiResult<RuleSearchResult>>
+    /**
+     * `subjectId`（v1.1）：库驱动规则（巴哈姆特）要用它把中文名换成 bangumi 的**日文原名**，
+     * 因为该站只认繁体/日文名。XPath/JSONPath 规则完全忽略它。
+     */
+    search(ruleId: string, keyword: string, subjectId?: number): Promise<ApiResult<RuleSearchResult>>
     episodes(ruleId: string, entry: RuleSearchEntry): Promise<ApiResult<RuleEpisodesResult>>
     play(
       ruleId: string,
@@ -757,6 +819,8 @@ export interface SakanaApi {
       keyword: string
       rules: BatchProbeTarget[]
       force?: boolean
+      /** 库驱动规则（巴哈姆特）用它换日文原名搜索；其它规则忽略 */
+      subjectId?: number
     }): Promise<ApiResult<{ jobId: string; total: number; cached: boolean; probedAt?: number }>>
     /** 停止当前批次（离开播放源列表时调用，别让它在后台空跑） */
     stop(): Promise<ApiResult<boolean>>
@@ -780,6 +844,22 @@ export interface SakanaApi {
     /** 蒙层尺寸变化时重新摆放窗口 */
     setBounds(bounds: { x: number; y: number; width: number; height: number }): Promise<ApiResult<boolean>>
     close(): Promise<ApiResult<boolean>>
+    /**
+     * v1.1：验证页的真实加载状态（加载中 / 已加载 / 失败原因）。
+     *
+     * 外框（应用自己的弹窗）用它显示进度与失败信息，而不是写死一句
+     * 「验证窗口正在这里打开…」—— 页面已经 404 了那句话还在，正是用户说的割裂感。
+     */
+    onState(
+      cb: (st: {
+        status: 'loading' | 'loaded' | 'failed' | 'closed'
+        progress: number
+        error?: string
+        host?: string
+      }) => void
+    ): () => void
+    /** 就地重新加载验证页（站点偶发 5xx 时不必关掉弹窗重来） */
+    reload(): Promise<ApiResult<boolean>>
   }
   /**
    * 投屏（v0.3.8）。
@@ -948,13 +1028,21 @@ export interface SakanaApi {
     load(
       title: string,
       episode: number,
-      opts?: { aliases?: string[]; aliasMode?: boolean; sourcesOnly?: boolean; trigger?: 'play' | 'test' | 'manual' }
+      opts?: {
+        aliases?: string[]
+        aliasMode?: boolean
+        sourcesOnly?: boolean
+        keyword?: string
+        subjectId?: number
+        force?: boolean
+        trigger?: 'play' | 'test' | 'manual'
+      }
     ): Promise<ApiResult<DanmakuLoadResult | null>>
     /** 预取：只预热主进程缓存、不回传弹幕本体（进播放 / 切集时提前加载） */
     prefetch(
       title: string,
       episode: number,
-      opts?: { aliases?: string[]; aliasMode?: boolean }
+      opts?: { aliases?: string[]; aliasMode?: boolean; keyword?: string; subjectId?: number; force?: boolean }
     ): Promise<ApiResult<{ ok: boolean; count: number; cached: boolean }>>
 
     // ---------------- v1.1：数据源集合器 ----------------
@@ -987,6 +1075,12 @@ export interface SakanaApi {
      */
     fetchLog(): Promise<ApiResult<DanmakuFetchRecord[]>>
     fetchLogClear(): Promise<ApiResult<{ removed: number; records: DanmakuFetchRecord[] }>>
+    /** V1.2：获取进度快照（「播放流详情」面板按秒轮询，显示"第 3/5 步"） */
+    progress(): Promise<ApiResult<DanmakuProgressSnapshot>>
+    /** V1.2：运行期统计（网络请求/缓存命中/缓存目录），自检用来证明缓存命中不发请求 */
+    stats(): Promise<ApiResult<DanmakuRuntimeStats>>
+    /** V1.2：清零统计（每次自检前后各调一次，数字才可比较） */
+    statsReset(): Promise<ApiResult<boolean>>
   }
   /**
    * uosc_danmaku（mpv 弹幕插件）集成（v0.2.9）。
@@ -1000,7 +1094,18 @@ export interface SakanaApi {
      * `bar`（v0.2.18）= uosc 本体是否挂上（控制栏画不画得出来）；为 false 时渲染层要回落到旧控制栏。
      */
     status(): Promise<
-      ApiResult<{ requested: boolean; active: boolean; loaded: boolean; pending: boolean; bar: boolean }>
+      ApiResult<{
+        requested: boolean
+        active: boolean
+        loaded: boolean
+        pending: boolean
+        bar: boolean
+        /**
+         * v1.1.4：桥接脚本侧的硬证据（uosc 版本 / 实际下发的按钮 / set-button 次数）。
+         * 控制栏按钮画在 mpv 的 ASS 图层上，DOM 里看不到，自检只能读这份。
+         */
+        bridge: { version: string; buttons: string[]; setCalls: number; ready: string }
+      }>
     >
     /** 打开插件的菜单（uosc 渲染）：搜索弹幕 / 总菜单 / 弹幕样式 / 源延迟 / 从源添加 */
     menu(which: 'search' | 'total' | 'style' | 'delay' | 'add'): Promise<ApiResult<boolean>>
@@ -1015,6 +1120,11 @@ export interface SakanaApi {
      * 主进程按内容去重（同一份状态不会重复下发），所以调用方「变了就推」即可。
      */
     bar(payload: UoscBarState): Promise<ApiResult<boolean>>
+    /**
+     * v1.1.4：自检/排障用的按钮旁路（与按钮点击走同一条 `script-message sakana-ctrl`）。
+     * 正常播放时不要调用；它只用来在 CDP 里验证动作链路，不参与业务。
+     */
+    ctrl(action: string): Promise<ApiResult<boolean>>
     /** v0.3.3：让 uosc 立刻把控制栏显示出来（uosc 默认只在靠近底部时才显示，见 mpv.ts 的注释） */
     reveal(): Promise<ApiResult<boolean>>
   }

@@ -87,6 +87,11 @@ Thumbs.db
 .e2e/
 .patchpeek/
 
+# ---- 本机排障产物 ----
+# .acl-repair/ 是 Windows 文件权限修复脚本留下的备份与报告（含 SID、DACL 原始内容）。
+# 它属于"这台机器当时出了什么问题"，对代码没有意义，也不该带着机器标识进仓库。
+.acl-repair/
+
 # ---- v0.2.12：只留在本地的构建期信息 ----
 # 用户要求「关于页显示项目作者，但作者名字不要传到 git 仓库」：
 # 名字放在这个被忽略的文件里，构建时由 electron.vite.config.ts 读进 __SAKANA_AUTHOR__。
@@ -101,3 +106,6 @@ streamBoostLog.json
 # ---- 真机验证的临时产物（截图 / uiautomator dump），只留本地 ----
 .verify/
 
+
+# npm ����ʱ����Ŀ¼�����ý��ֿ⣩
+tmp-npmcache/

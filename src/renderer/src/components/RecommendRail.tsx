@@ -341,7 +341,12 @@ function useRecommendations(): {
         if (y === nowYear && (q - 1) * 3 + 1 > nowMonth) continue
         jobs.push(
           api.bangumi
-            .season(y, (q - 1) * 3 + 1)
+            /*
+             * v1.1.4：随机推荐的采样是**B 级**（用户明确要求）。
+             * 这里一次会打 5 个年份 × 各季度，是应用里最重的后台流量；
+             * 走 B 级后它最多同时 1 个请求，且番剧表/详情（S）排队时它会让路。
+             */
+            .season(y, (q - 1) * 3 + 1, false, 'B')
             .then((r) => {
               if (!r.ok) {
                 failure = failure || r.error

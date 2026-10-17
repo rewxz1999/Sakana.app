@@ -1,4 +1,4 @@
-import type { PlayFlowSnapshot, PlayFlowStage, PlayFlowStageKey } from '@shared/types'
+import type { DanmakuProgressSnapshot, PlayFlowSnapshot, PlayFlowStage, PlayFlowStageKey } from '@shared/types'
 
 /**
  * 播放过程进度显示器（v0.3.9）。
@@ -194,6 +194,11 @@ export function metricsLine(flow: PlayFlowSnapshot | null | undefined): string {
   if (m.ttfbMs !== null && m.ttfbMs !== undefined) parts.push(`首字节 ${fmtMs(m.ttfbMs)}`)
   if (m.bytes > 0) parts.push(`已收 ${fmtBytes(m.bytes)}`)
   if (m.rateBps > 0) parts.push(`速率 ${fmtRate(m.rateBps)}`)
+  /*
+   * 指标来源（v1.1）——「内核实测」这几个字是用户要的凭据：
+   * 以前速度只在"交给内核之前"那一次探测里出现，用户分不清看到的是探测值还是内核正在跑的读数。
+   */
+  if (m.source === 'engine') parts.push('内核实测')
   if (m.status) parts.push(`HTTP ${m.status}`)
   if (m.contentType) parts.push(m.contentType.split(';')[0])
   return parts.join(' · ')
@@ -315,4 +320,54 @@ export const STAGE_LABELS: Record<PlayFlowStageKey, string> = {
   locate: '找播放资源',
   acquire: '获取播放资源',
   inject: '注入播放器'
+}
+
+/**
+ * 弹幕获取进度（V1.2，用户要求显示在「播放流详情」里）。
+ *
+ * 为什么单独做成一行而不是并进播放三阶段：播放三阶段说的是"视频流有没有起来"，
+ * 弹幕是**另一条并行链路**（它慢不该让用户以为播放卡住）。这里把主进程真实上报的
+ * 「第 3/4 步 · 正在从巴哈姆特取弹幕…」原样显示，并带上每个源自己的状态。
+ * 文案里的步数是主进程给的，不是这里按时间猜的 —— 不会出现进度条走完却没拿到弹幕。
+ */
+export function DanmakuProgressLine({
+  progress,
+  tone = 'surface'
+}: {
+  progress: DanmakuProgressSnapshot | null | undefined
+  tone?: Tone
+}): React.ReactElement | null {
+  if (!progress?.current) return null
+  const t = TONE[tone]
+  const cur = progress.current
+  const elapsed = Math.max(0, cur.updatedAt - cur.startedAt)
+  return (
+    <div className="flex flex-col gap-1 text-[11px] leading-relaxed">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className={t.primary}>
+          {cur.active ? `正在从${cur.sourceName}取弹幕…` : cur.error ? `${cur.sourceName}取弹幕失败` : `${cur.sourceName}弹幕已就绪`}
+        </span>
+        <span className={`rounded px-1 ${cur.error ? t.chipDanger : cur.active ? t.chipWarn : t.chipOk}`}>
+          第 {cur.step}/{cur.total} 步
+        </span>
+        <span className={t.secondary}>{cur.label}</span>
+        {elapsed > 0 ? <span className={t.secondary}>{fmtMs(elapsed)}</span> : null}
+      </div>
+      {cur.title ? (
+        <div className={`text-[10px] ${t.secondary}`}>
+          《{cur.title}》{cur.episode > 0 ? ` 第 ${cur.episode} 集` : ''}
+          {cur.error ? <span className={`ml-1 rounded px-1 ${t.chipDanger} ${t.danger}`}>{cur.error}</span> : null}
+        </div>
+      ) : null}
+      {progress.sources.length > 1 ? (
+        <div className={`flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] ${t.secondary}`}>
+          {progress.sources.map((s) => (
+            <span key={`${s.sourceId}-${s.sourceName}-${s.title}-${s.episode}`}>
+              {s.sourceName}：{s.active ? `第 ${s.step}/${s.total} 步` : s.error ? `失败` : s.done ? '完成' : '等待'}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
 }

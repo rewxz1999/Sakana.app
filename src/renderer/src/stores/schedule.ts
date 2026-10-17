@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { CalendarDay, SourceError } from '@shared/types'
+import type { CalendarDay, CalendarResult, SourceError } from '@shared/types'
 import {
   DEFAULT_SCHEDULE_BLOCK,
   fetchTagsThrottled,
@@ -15,6 +15,8 @@ interface ScheduleState {
   fetchedAt: number | null
   fromCache: boolean
   stale: boolean
+  /** v1.1.4：当前显示的是缓存，且主进程正在后台刷新（成功后自动替换） */
+  refreshing: boolean
   /**
    * v0.3.2：本次番剧表是不是**备用数据源（Jikan/AniList）兜底**来的。
    *
@@ -35,6 +37,14 @@ interface ScheduleState {
    */
   ratingsAt: number
   load: (force?: boolean) => Promise<void>
+  /**
+   * v1.1.4：把主进程**后台刷新**回来的番剧表应用上。
+   *
+   * 为什么需要单独的入口：首屏现在直接吃磁盘缓存（毫秒级），联网刷新在后台做；
+   * 没有这个入口时，后台拿到的新数据只能等用户下次进页面才生效，
+   * 甚至会被下一次 `load()` 的旧缓存覆盖。
+   */
+  applyCalendar: (r: CalendarResult) => void
   loadRatings: (ids: number[], force?: boolean) => Promise<void>
   selectDay: (day: number) => void
   shiftWeek: (delta: number) => void
@@ -50,6 +60,7 @@ export const useSchedule = create<ScheduleState>((set, get) => ({
   fetchedAt: null,
   fromCache: false,
   stale: false,
+  refreshing: false,
   fallbackSource: null,
   ratings: {},
   ratingsAt: 0,
@@ -63,22 +74,14 @@ export const useSchedule = create<ScheduleState>((set, get) => ({
     set({ loading: true })
     const r = await api.bangumi.calendar(force)
     if (r.ok) {
-      set({
-        days: r.data.days,
-        error: r.data.error ?? null,
-        fetchedAt: r.data.fetchedAt,
-        fromCache: r.data.fromCache,
-        stale: !!r.data.stale,
-        // 主进程只在「走了兜底」时才挂 dataSource，缺失即代表主数据源数据
-        fallbackSource: r.data.dataSource?.source === 'jikan' ? 'jikan' : null,
-        loading: false
-      })
+      get().applyCalendar(r.data)
       /*
        * 只补「没有评分」的条目（v0.2.7）。
        *
        * 过去这里把整周 111 个 id 全部丢给评分补全 → 主进程会对每个 id 单独请求一次条目接口。
        * 换了自建反代之后，这一波并发会把反代打到 503，表现就是「很多番剧详情加载不出来」。
        * 而放送数据本身**已经带评分**（反代返回的 104/111 条都带 score），根本不需要补。
+       * v1.1.4：补评分走的是主进程 B 级队列（见 bangumi.ratings 的注释），不会挤占 S 级。
        */
       const missingIds = r.data.days
         .flatMap((d) => d.items)
@@ -91,6 +94,19 @@ export const useSchedule = create<ScheduleState>((set, get) => ({
         loading: false
       })
     }
+  },
+  applyCalendar: (r) => {
+    set({
+      days: r.days,
+      error: r.error ?? null,
+      fetchedAt: r.fetchedAt,
+      fromCache: r.fromCache,
+      stale: !!r.stale,
+      refreshing: !!r.refreshing,
+      // 主进程只在「走了兜底」时才挂 dataSource，缺失即代表主数据源数据
+      fallbackSource: r.dataSource?.source === 'jikan' ? 'jikan' : null,
+      loading: false
+    })
   },
   selectDay: (day) => set({ selectedDay: day }),
   loadRatings: async (ids, force = false) => {
@@ -276,7 +292,8 @@ export const useScheduleTags = create<ScheduleTagState>((set, get) => {
    * 失败、详情为空、tags 为空数组都返回 null —— 调用方据此把该条目记入 failed 并**不屏蔽**它。
    */
   const fetchOne = async (id: number): Promise<string[] | null> => {
-    const r = await api.bangumi.subject(id)
+    // 标签补齐是**后台动作**（v1.1.4）：走 B 级，不和番剧表/详情抢 S 级的槽
+    const r = await api.bangumi.subject(id, 'B')
     if (!r.ok) return null
     const detail = r.data.data
     if (!detail) return null

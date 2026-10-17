@@ -14,10 +14,11 @@ import { AssetLink, Card, SubPage } from '@/components/SettingsShell'
  *
  * 为什么这两块适合放一起：它们的共同点是「平时不用动，出问题时才来改」——
  * FFmpeg 是转码兜底/在线流中转的可执行文件路径（正常用户用内置的那份就够），
- * 播放器控制栏则是整套控制栏实现的切换（uosc 属于实验性，默认用应用自己的控制栏）。
+ * 播放器控制栏则在 v1.1.4 固定成 uosc（旧自绘栏已剥离，这里只留说明，不再提供切换开关）。
  * 放在普通设置项里只会让「想调画质 / 音量」的人多滚两屏，所以单独归到「测试性」区域。
  *
- * 设置字段名没有变：`settings.ffmpegPath`、`settings.uoscControlBar`。
+ * 设置字段 `settings.uoscControlBar` 还保留在类型里（旧 settings.json 兼容），
+ * 但主进程与渲染层都已不再读它 —— 详见 shared/types.ts 的字段注释。
  */
 export function ExperimentalSettingsPage() {
   const { settings, save } = useSettings()
@@ -70,38 +71,27 @@ export function ExperimentalSettingsPage() {
       {/* ---------------- 播放器控制栏 ---------------- */}
       <Card
         title="播放器控制栏"
-        desc="默认使用应用自己的悬浮窗控制栏（含超分/画质按钮）；也可切换成 mpv 的 uosc 控制栏"
+        desc="v1.1.4 起固定使用 mpv 的 uosc 控制栏（旧的自绘控制栏已停用）"
       >
         <div className="flex flex-col gap-2.5">
-          <label className="flex items-center gap-2 text-xs text-text">
-            <input
-              type="checkbox"
-              checked={settings.uoscControlBar === true}
-              onChange={(e) => save({ uoscControlBar: e.target.checked })}
-              className="h-3.5 w-3.5 accent-accent"
-            />
-            改用 mpv 的 uosc 控制栏（实验性）
-          </label>
           <p className="text-[11px] leading-relaxed text-faint">
-            <span className="font-semibold text-text">默认（不勾选）：</span>
-            用应用自己的悬浮窗控制栏 —— 进度条、播放控制、选集、字幕、倍速、画面比例、弹幕、
-            <span className="text-dim">画质（Anime4K 超分）</span>、全屏与退出都在里面，
-            按钮与菜单都是应用自己的界面，改起来、查起来都最直接。
-          </p>
-          <p className="text-[11px] leading-relaxed text-faint">
-            <span className="font-semibold text-text">勾选后：</span>
-            控制栏改由 mpv 的 uosc 绘制（画在视频画面上）。布局与时间显示在
-            <code className="mx-1 font-mono">resources/mpv-config/script-opts/uosc.conf</code>
-            ，快捷键在
+            <span className="font-semibold text-text">现在没有开关了：</span>
+            uosc 是唯一控制栏。布局与时间显示在
+            <code className="mx-1 font-mono">resources/mpv-config/script-opts/uosc.conf.base</code>
+            （起播前会按当前主题生成同目录的
+            <code className="mx-1 font-mono">uosc.conf</code>
+            ），快捷键在
             <code className="mx-1 font-mono">resources/mpv-config/input.conf</code>
             ，按钮与菜单由
             <code className="mx-1 font-mono">resources/mpv-scripts/sakana-uosc-ctrl.lua</code>
             驱动。
-            <span className="text-dim">
-              {' '}
-              切换在<strong className="font-medium">下次进入播放器</strong>时生效；无论用哪一个，
-              弹幕画布、番剧详情浮层、选集抽屉都不受影响。
-            </span>
+          </p>
+          <p className="text-[11px] leading-relaxed text-faint">
+            <span className="font-semibold text-text">为什么删掉切换：</span>
+            旧的自绘控制栏已经整体搬到
+            <code className="mx-1 font-mono">components/playerLegacy/PlayerOverlayBar.tsx</code>
+            并停止渲染；再保留“切回应用控制栏”的开关只会得到一条控制栏都没有的结果，
+            反而制造“按钮全失灵”的假故障。
           </p>
           <p className="text-[11px] leading-relaxed text-faint">
             <span className="font-semibold text-text">uosc 模式怎么唤出：</span>
@@ -114,13 +104,13 @@ export function ExperimentalSettingsPage() {
       {/* ---------------- 为什么在这里 ---------------- */}
       <Card title="说明" desc="为什么这些项被归为「测试性」">
         <div className="text-[11px] leading-relaxed text-faint">
-          1. 两者都有<b>可用性够好的默认值</b>：FFmpeg 用内置那份、控制栏用应用自己实现的悬浮窗；
-          只有在排障（转码失败、控制栏不显示）时才需要动。
+          1. 两者都有<b>可用性够好的默认值</b>：FFmpeg 用内置那份；控制栏从 v1.1.4 起固定用 uosc，
+          不再提供切换。
           <br />
-          2. 控制栏切换属于<b>整套实现二选一</b>，改错了会出现「两种控制栏都不显示」的观感问题，
-          所以不放在日常调整的播放器设置里。
+          2. 控制栏属于<b>整套实现</b>：旧自绘栏已剥离并停止渲染，所以这里只留下说明，
+          不再放一个会把人带进“两种都不显示”的开关。
           <br />
-          3. 改动都会实时写入设置；FFmpeg 路径在下次转码时生效，控制栏在下次进入播放器时生效。
+          3. 改动都会实时写入设置；FFmpeg 路径在下次转码时生效。
         </div>
       </Card>
     </SubPage>

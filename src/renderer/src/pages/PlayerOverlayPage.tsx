@@ -1,36 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
-import {
-  Camera,
-  Cast,
-  Crop,
-  Expand,
-  Info,
-  ListVideo,
-  LogOut,
-  Maximize,
-  MessageSquareOff,
-  MessagesSquare,
-  Minimize,
-  Pause,
-  Play,
-  RectangleHorizontal,
-  Rewind,
-  FastForward,
-  SkipBack,
-  SkipForward,
-  SlidersHorizontal,
-  Sparkles,
-  Subtitles,
-  TriangleAlert,
-  Volume1,
-  Volume2,
-  VolumeX,
-  X
-} from 'lucide-react'
+import { Cast, TriangleAlert, X } from 'lucide-react'
 import type { OverlayAction, OverlayDanmaku, OverlayEpisodes, OverlayState } from '@shared/api'
-import type { Anime4kSettings, AspectMode, CastDevice, CastReceiverInfo, SubjectDetail } from '@shared/types'
-import { ANIME4K_MODES, ANIME4K_TIERS } from '@shared/anime4k'
+import type { CastDevice, CastReceiverInfo, PlayFlowSnapshot, SubjectDetail } from '@shared/types'
 import { api } from '@/lib/api'
 import { StreamInfoModal } from '@/components/StreamInfoModal'
 import { PlayFlowStages, flowHeadline } from '@/components/PlayFlowProgress'
@@ -38,26 +10,17 @@ import { CoverImage } from '@/components/CoverImage'
 import { DanmakuLayer } from '@/components/DanmakuLayer'
 
 /**
- * 全屏控制栏悬浮窗（透明窗口内的控制栏）
+ * 播放器悬浮窗（v1.1.4 起**不再画控制栏**）
  *
- * 原生视频窗口永远盖在网页之上，所以全屏时画面铺满整屏后，
- * 主窗口页面里的控制栏会被画面挡住 —— 控制栏必须画在这个独立的透明窗口里。
- * 本窗口默认点击穿透（鼠标移动仍会转发进来用于唤出控制栏），
- * 控制栏出现时才接收鼠标事件。
+ * 原生视频窗口永远盖在网页之上，所以全屏时画面铺满整屏后，应用自己的浮层必须画在
+ * 这个独立的透明窗口里。控制栏已经整体交给 mpv 的 uosc（画在视频子窗口里），
+ * 本窗口只剩三类东西：
+ *   · 弹幕画布（内置 canvas 渲染方式时）；
+ *   · 按需打开的应用面板（番剧详情、选集抽屉、投屏、流详情）；
+ *   · 加载/错误/自救/续播等提示。
+ * 旧顶栏/底栏及全部 popover 已搬到 `components/playerLegacy/PlayerOverlayBar.tsx`，
+ * 本文件不再引用它（用户要求保留实现、但默认不渲染）。
  */
-
-const ASPECT_LABEL: Record<AspectMode, string> = {
-  fit: '适应',
-  cover: '裁剪铺满',
-  stretch: '拉伸铺满'
-}
-
-/**
- * 画质按钮角标用的模式短名（v0.3.3）。
- * 直接从 `@shared/anime4k` 的模式表里取 `short`，与设置页、mpv 桥接脚本三处口径一致 ——
- * 不再手写一遍，免得以后加模式时漏改。
- */
-const A4K_SHORT: Record<string, string> = Object.fromEntries(ANIME4K_MODES.map((m) => [m.id, m.short]))
 
 function fmt(sec: number): string {
   if (!Number.isFinite(sec) || sec < 0) sec = 0
@@ -101,96 +64,6 @@ function detailRows(d: SubjectDetail): { key: string; value: string }[] {
     .slice(0, 8)
     .map((r) => ({ key: r.key, value: typeof r.value === 'string' ? r.value : String(r.value) }))
 }
-
-/**
- * 音量滑杆（v0.2.9；v0.3.6 扩到 200%）。
- *
- * 用户要求：控制栏要能调音量，**不需要静音键**。
- * 所以这里没有「点一下静音」的行为 —— 图标只是当前音量档位的指示（拖到 0 自然就没声音），
- * 拖动过程中持续发送 setVolume；用 pointer capture 保证拖出滑杆外也不断。
- *
- * v0.3.6：滑杆上限从 100 提到 **200**。用户反馈「100% 也有点偏小」，
- * 主进程那边 `volume-max` 也同步抬到 200（不设那条 mpv 会把音量夹回 100）。
- * 100% 的位置画一条刻度线：**200 的滑杆如果没有任何标记，用户会以为拖到底才是正常音量**。
- */
-const VOLUME_UI_MAX = 200
-
-function VolumeSlider({ volume, onSet }: { volume: number; onSet: (v: number) => void }): React.ReactElement {
-  const trackRef = useRef<HTMLDivElement | null>(null)
-  const [dragging, setDragging] = useState(false)
-  const v = Math.max(0, Math.min(VOLUME_UI_MAX, volume))
-  /** 100% 在滑杆上的位置（百分比），用来画那条刻度线 */
-  const hundredPct = 100 / (VOLUME_UI_MAX / 100)
-
-  const applyFromEvent = (clientX: number): void => {
-    const el = trackRef.current
-    if (!el) return
-    const r = el.getBoundingClientRect()
-    const ratio = r.width > 0 ? (clientX - r.left) / r.width : 0
-    onSet(Math.round(Math.max(0, Math.min(1, ratio)) * VOLUME_UI_MAX))
-  }
-
-  const Icon = v === 0 ? VolumeX : v > 50 ? Volume2 : Volume1
-  return (
-    <div className="ml-1 flex items-center gap-1.5" title={`音量 ${v}%`}>
-      <Icon size={16} className="shrink-0 text-white/80" />
-      <div
-        ref={trackRef}
-        data-sakana-volume={v}
-        className="group relative flex h-6 w-[76px] cursor-pointer items-center"
-        onPointerDown={(e) => {
-          if (e.button !== 0) return
-          e.stopPropagation()
-          /*
-           * 指针捕获要用 try/catch 包住：合成事件（自检里 dispatch 的 PointerEvent）没有真实
-           * pointerId，setPointerCapture 会抛 NotFoundError；抛出去会把整个拖动逻辑打断。
-           */
-          try {
-            ;(e.target as HTMLElement).setPointerCapture?.(e.pointerId)
-          } catch {
-            /* 忽略：拿不到捕获也不影响按位置计算音量 */
-          }
-          setDragging(true)
-          applyFromEvent(e.clientX)
-        }}
-        onPointerMove={(e) => {
-          if (!dragging) return
-          e.stopPropagation()
-          applyFromEvent(e.clientX)
-        }}
-        onPointerUp={(e) => {
-          if (!dragging) return
-          e.stopPropagation()
-          setDragging(false)
-          applyFromEvent(e.clientX)
-        }}
-        onPointerCancel={() => setDragging(false)}
-      >
-        <div className="h-1 w-full overflow-hidden rounded-full bg-white/25">
-          {/* 填充宽度按 200 的满量程算；100% 处另画一条刻度（见 VOLUME_UI_MAX 的说明） */}
-          <div className="h-full rounded-full bg-white/85" style={{ width: `${(v / VOLUME_UI_MAX) * 100}%` }} />
-        </div>
-        {/* 100% 刻度线：越过它就进入「增益」区，超过这个点才需要限幅器 */}
-        <div
-          aria-hidden
-          className="pointer-events-none absolute top-1/2 h-2.5 w-px -translate-y-1/2 bg-white/45"
-          style={{ left: `${hundredPct}%` }}
-        />
-        <div
-          className={`absolute top-1/2 h-3 w-3 -translate-y-1/2 rounded-full bg-white shadow transition-opacity ${
-            dragging ? 'opacity-100' : 'opacity-80 group-hover:opacity-100'
-          }`}
-          style={{ left: `calc(${(v / VOLUME_UI_MAX) * 100}% - 6px)` }}
-        />
-      </div>
-      <span className="w-9 shrink-0 text-[11px] tabular-nums text-white/60">{v}%</span>
-    </div>
-  )
-}
-
-/** 倍速档位（与控制栏按钮里的显示顺序一致；播放页那份是给快捷键循环用的） */
-const SPEED_CHOICES = [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3]
-const fmtSpeed = (s: number): string => `${Number.isInteger(s) ? s.toFixed(1) : s}x`
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -388,9 +261,6 @@ if (api.overlay.isOverlay && !window.location.hash.includes('part=danmaku')) {
   )
 }
 
-/** 拖动进度条时下发 seek 的最小间隔（ms），见 seekTo 的说明 */
-const SEEK_THROTTLE_MS = 120
-
 /** 主进程（playerOverlay.ts）会通过这几个全局函数按需查询命中结果与可交互区域 */
 interface HitProbeWindow extends Window {
   __sakanaHitAt?: (x: number, y: number) => boolean
@@ -440,7 +310,8 @@ interface HitProbeWindow extends Window {
     hasTopBar: boolean
     hasBottomBar: boolean
     hitCount: number
-    barVisible: boolean
+    /** 旧底栏已剥离时没有这个值（不再把"没有底栏"误报成"自动收起"） */
+    barVisible?: boolean
     regions: number
   }
   /**
@@ -529,45 +400,19 @@ function danmakuRect(
   }
 }
 
-/** 弹幕设置面板的一行：左侧标签 + 右侧一组胶囊 */function SettingRow({ label, children }: { label: string; children: React.ReactNode }): React.ReactElement {
-  return (
-    <div className="mt-1.5 flex items-center gap-2">
-      <span className="w-14 shrink-0 text-[11px] text-white/55">{label}</span>
-      <div className="flex flex-wrap items-center gap-1">{children}</div>
-    </div>
-  )
-}
-
-function IconBtn({
-  title,
-  onClick,
-  children,
-  active
-}: {
-  title: string
-  onClick: () => void
-  children: React.ReactNode
-  active?: boolean
-}) {
-  return (
-    <button
-      title={title}
-      onPointerDown={(e) => {
-        if (e.button !== 0) return
-        e.stopPropagation()
-        onClick()
-      }}
-      className={`flex h-10 w-10 items-center justify-center rounded-full text-white/90 transition-colors hover:bg-white/20 hover:text-white active:bg-white/30 ${
-        active ? 'bg-white/20 text-white' : ''
-      } whitespace-nowrap `}
-    >
-      {children}
-    </button>
-  )
-}
-
 export default function PlayerOverlay(): React.ReactElement {
   const [state, setState] = useState<OverlayState | null>(null)
+  /**
+   * 播放过程进度（v1.1：悬浮窗自己按秒拉）。
+   *
+   * 为什么不靠 `OverlayState.flow`：那条推送是"低频字段"通道（选集列表等，按内容去重），
+   * 而速度/流量每秒都在变；`api.player.flow()` 是纯内存读（不联网、不读盘），
+   * 每秒拉一次代价可以忽略。
+   * 顺带补上一个真实缺口：`OverlayState.flow` 以前**没有任何地方赋值**，
+   * 所以悬浮窗里的过程进度与速度一直是空的（用户报的"没有速度显示"里就有这一处）。
+   */
+  const [flowLive, setFlowLive] = useState<PlayFlowSnapshot | null>(null)
+  const flow = flowLive ?? state?.flow ?? null
   /**
    * 本窗口的角色（v0.3.9 第三轮拆窗口）：主进程用 `#/overlay?part=ui|danmaku` 加载两块窗口，
    * 这里按 part 决定渲染哪一半 —— 弹幕窗口只画弹幕，UI 窗口画控制栏与所有面板。
@@ -578,20 +423,7 @@ export default function PlayerOverlay(): React.ReactElement {
   const [episodes, setEpisodes] = useState<OverlayEpisodes | null>(null)
   /** v0.2.8：弹幕数据与设置（由播放页推送，换集/改设置时更新） */
   const [danmaku, setDanmaku] = useState<OverlayDanmaku | null>(null)
-  const [danmakuMenu, setDanmakuMenu] = useState(false)
   const [visible, setVisible] = useState(false)
-  const [subMenu, setSubMenu] = useState(false)
-  const [aspectMenu, setAspectMenu] = useState(false)
-  // v0.2.9 最后更新：倍速菜单
-  const [speedMenu, setSpeedMenu] = useState(false)
-  /**
-   * 画质（Anime4K）菜单与当前设置（v0.3.3）。
-   *
-   * 为什么悬浮窗要自己读一遍 settings：超分设置存在主进程，而这里要显示角标
-   * （开着时显示当前模式 A/B/C…）。挂载时读一次，打开菜单时再读一次保证是最新的；
-   * 改动写回 settings 后主进程的 store 钩子会立刻重挂着色器链 —— 播放中即时生效。
-   */
-  const [qualityMenu, setQualityMenu] = useState(false)
   /**
    * 「疑似点击击穿」自救浮层（v0.3.6）。
    *
@@ -602,7 +434,6 @@ export default function PlayerOverlay(): React.ReactElement {
    * 为什么这两条有用、以及这个 bug 的成因，写在 playerOverlay.ts 的 noteOverlayMissedClick 上面。
    */
   const [clickThrough, setClickThrough] = useState(false)
-  const [a4k, setA4k] = useState<Anime4kSettings>({})
   const [showInfo, setShowInfo] = useState(false)
   /** 选集浮层里正在查看的线路（悬浮窗本地状态，切换线路不打断播放） */
   const [browseLine, setBrowseLine] = useState(0)
@@ -621,15 +452,6 @@ export default function PlayerOverlay(): React.ReactElement {
   const [detail, setDetail] = useState<SubjectDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const hideTimer = useRef<number | undefined>(undefined)
-  const seekRef = useRef<HTMLDivElement | null>(null)
-  const [dragging, setDragging] = useState(false)
-  /**
-   * 拖动中的进度（0~100）。为 null 表示"没在拖"，显示跟随内核真实进度。
-   * 为什么要有本地值：见下面 `shownPercent` 的说明 —— 拖动时不能再被回推的进度覆盖。
-   */
-  const [dragPercent, setDragPercent] = useState<number | null>(null)
-  /** 上一次真的发出 seek 的时刻（节流用，见 seekTo） */
-  const lastSeekAtRef = useRef(0)
   /** 菜单/浮层打开期间禁止自动隐藏（否则 5 秒后控制栏收起，浮层就点不动了） */
   const holdRef = useRef(false)
 
@@ -964,19 +786,25 @@ export default function PlayerOverlay(): React.ReactElement {
       const top = document.querySelector<HTMLElement>(TOPBAR_SEL)
       const bottom = document.querySelector<HTMLElement>(BOTTOMBAR_SEL)
       /*
-       * uosc 判定**只看 DOM**（不看 React state）：与区域收集用的是同一个条件 ——
-       * 两条控制栏都存在、但谁都没带 `data-sakana-hit`，就是"控制栏交给 mpv 画"。
-       * 顺便避免了在 effect 闭包里读 state 的过期值问题。
+       * v1.1.4：这里**恒定返回 true**。
+       *
+       * 语义不是"uosc 是否加载成功"，而是主进程真正需要的那句话：
+       * 「应用此刻没有自绘控制栏；空区域是设计意图，可以隐藏这个透明窗口」。
+       * 旧顶栏/底栏已整体剥离，本页剩下的只有按需打开的面板（选集/详情/错误/自救…）——
+       * 它们自带 `data-sakana-hit`，一出现就会把区域从空变成非空，主进程会把窗口重新显示出来。
+       * 反过来说，如果这里还按"uoscBar 是否为 true"返回 false，那么 uosc 加载失败或状态还没到时，
+       * 主进程会把空区域当成异常退化成整窗形状 —— 那个透明窗会整窗吃掉鼠标，
+       * 用户看到的就是"画面点不动、控制栏也没有"。
        */
-      const uosc = !!(top || bottom) && !top?.hasAttribute(HIT_ATTR) && !bottom?.hasAttribute(HIT_ATTR)
+      const uosc = true
       return {
         ready: true,
         uosc,
         hasTopBar: !!top,
         hasBottomBar: !!bottom,
         hitCount: document.querySelectorAll(`[${HIT_ATTR}]`).length,
-        /* 控制栏自动收起时容器带 pointer-events:none —— 直接量 DOM，不依赖 React 闭包 */
-        barVisible: !!bottom && getComputedStyle(bottom).pointerEvents !== 'none',
+        /* 旧底栏已不存在时不要报 "barVisible:false"——那会被日志误读成"控制栏自动收起" */
+        barVisible: bottom ? getComputedStyle(bottom).pointerEvents !== 'none' : undefined,
         regions: hitRegionsNow().length
       }
     }
@@ -1329,12 +1157,11 @@ export default function PlayerOverlay(): React.ReactElement {
     window.clearTimeout(hideTimer.current)
     hideTimer.current = window.setTimeout(() => {
       if (holdRef.current) return
-      setSubMenu(false)
-      setAspectMenu(false)
-      setSpeedMenu(false)
-      setDanmakuMenu(false)
-      // v0.3.3：画质菜单也要一起收起来，否则控制栏藏了、菜单还挂在屏幕上点不到
-      setQualityMenu(false)
+      /*
+       * v1.1.4：这里过去要顺手关掉自绘控制栏的五个 popover（字幕/倍速/比例/弹幕/画质）。
+       * 它们已整体搬到 playerLegacy/PlayerOverlayBar.tsx，本窗口不再有那些菜单，
+       * 所以只剩"让控制栏容器进入隐藏态"这一件事（命中/穿透由 syncInteractive 跟着算）。
+       */
       setVisible(false)
     }, 5000)
   }, [])
@@ -1416,64 +1243,40 @@ export default function PlayerOverlay(): React.ReactElement {
     if (state?.showEpisodes && episodes) setBrowseLine(episodes.currentLine)
   }, [state?.showEpisodes, episodes])
 
-  // 浮层/菜单打开时不要按 5 秒计时自动隐藏（否则菜单还在屏幕上、控制栏连窗口一起收了）
+  // 浮层打开时不要按 5 秒计时自动隐藏（否则面板还在屏幕上、窗口一起收了）
   useEffect(() => {
-    holdRef.current =
-      showInfo ||
-      subMenu ||
-      aspectMenu ||
-      speedMenu ||
-      danmakuMenu ||
-      // v0.3.3：画质菜单同理 —— 不把它算进来，菜单开着的时候控制栏会按 5 秒计时收走，
-      // 用户点菜单就是在点一个「已经不接收点击」的东西。
-      qualityMenu ||
-      showInfoPanel ||
-      state?.showEpisodes === true
+    holdRef.current = showInfo || showInfoPanel || state?.showEpisodes === true
     if (holdRef.current) setVisible(true)
     else poke()
     /*
-     * v0.3.2：依赖数组补全。以前只盯着「应用自己的三个本地菜单」，漏了
-     * `danmakuMenu`、`showInfoPanel`（番剧详情）与 `state.showEpisodes`（选集）——
-     * 后三个是从 uosc 菜单/桥接脚本回传过来的，依赖不全时这个 effect 不会重跑。
-     * v0.3.9：补上 `speedMenu`（同一个坑：倍速菜单开着时控制栏会 5 秒收走）；
-     * 并去掉这里过去的 `setInteractive(true)` —— "要不要接收点击"现在**只**看鼠标在哪，
-     * 不再由"哪个面板开着"猜（见 HIT_ATTR 上面的说明）。
+     * 依赖只放"会打开应用自绘浮层"的那几个开关。
+     * 旧控制栏的弹幕/字幕/倍速菜单已经剥离（见 playerLegacy/PlayerOverlayBar.tsx），
+     * 不再参与这里的显隐判断 —— 留着只会让 effect 因为不存在的菜单反复重跑。
      */
-  }, [showInfo, subMenu, aspectMenu, speedMenu, danmakuMenu, qualityMenu, showInfoPanel, state?.showEpisodes, poke])
+  }, [showInfo, showInfoPanel, state?.showEpisodes, poke])
 
   useEffect(() => api.overlay.onState(setState), [])
 
   /*
-   * 画质设置：挂载时读一次（给按钮角标用），打开菜单时再读一次（保证是最新值）。
-   * 写回走的也是同一个 settings，主进程的 store 钩子会立刻重挂着色器链。
+   * 过程进度/速度：每秒拉一次纯内存快照（v1.1）。
+   * 只在 UI 窗口拉：弹幕窗口不显示这些，没必要让它也每秒发一次 IPC。
    */
-  const loadA4k = useCallback(async (): Promise<void> => {
-    const r = await api.store.get('settings')
-    if (!r.ok || !r.data || typeof r.data !== 'object') return
-    const s = (r.data as Record<string, unknown>).anime4k
-    setA4k(s && typeof s === 'object' ? (s as Anime4kSettings) : {})
-  }, [])
   useEffect(() => {
-    void loadA4k()
-  }, [loadA4k])
-  useEffect(() => {
-    if (qualityMenu) void loadA4k()
-  }, [qualityMenu, loadA4k])
-  /** 改一项画质设置：先更新本地（角标立刻跟手），再整份写回 settings */
-  const patchA4k = useCallback((patch: Partial<Anime4kSettings>): void => {
-    setA4k((prev) => {
-      const next = { ...prev, ...patch }
-      void api.store.get('settings').then((r) => {
-        const cur = (r.ok && r.data && typeof r.data === 'object' ? r.data : {}) as Record<string, unknown>
-        void api.store.set('settings', { ...cur, anime4k: next })
+    if (isDanmakuPart) return
+    let alive = true
+    const tick = (): void => {
+      void api.player.flow().then((r) => {
+        if (alive && r.ok) setFlowLive(r.data)
       })
-      return next
-    })
-  }, [])
-  const a4kEnabled = a4k.enabled === true
-  const a4kMode = a4k.mode ?? 'A'
-  const a4kTier = a4k.tier ?? 'fast'
-  const a4kShort = A4K_SHORT[a4kMode] ?? a4kMode
+    }
+    tick()
+    const t = window.setInterval(tick, 1000)
+    return () => {
+      alive = false
+      window.clearInterval(t)
+    }
+  }, [isDanmakuPart])
+
   // 透明窗口：给根元素打标记，让全局样式把底色设为透明（否则会盖住整屏画面）
   useEffect(() => {
     /*
@@ -1509,11 +1312,6 @@ export default function PlayerOverlay(): React.ReactElement {
     visible,
     uoscBar,
     showInfo,
-    subMenu,
-    aspectMenu,
-    speedMenu,
-    danmakuMenu,
-    qualityMenu,
     castPanel,
     clickThrough,
     showInfoPanel,
@@ -1621,49 +1419,8 @@ export default function PlayerOverlay(): React.ReactElement {
     // syncInteractive 仍被 onMove（命中判定）用到，依赖必须保留
   }, [poke, syncInteractive])
 
-  /** 进度条拖动 */
-  const ratioFromEvent = (clientX: number): number => {
-    const el = seekRef.current
-    if (!el) return 0
-    const r = el.getBoundingClientRect()
-    if (r.width <= 0) return 0
-    return Math.min(1, Math.max(0, (clientX - r.left) / r.width))
-  }
 
-  /**
-   * 拖动时真正下发 seek（节流）。
-   *
-   * 为什么要节流：一次 seek 在 mpv 侧是"冲刷解复用器 + 重新定位"的重动作，
-   * 拖一下发几十次会让解码一直重启 —— 用户感觉是"拖进度条卡、画面一顿一顿"。
-   * 120ms 的间隔既能让画面跟上（约每 8 帧跳一次），又不会把解码器打爆。
-   * `force = true` 用于按下与松手：这两个时刻必须精确落到用户点的位置，不能等节流。
-   */
-  const seekTo = (sec: number, force = false): void => {
-    if (!Number.isFinite(sec) || sec < 0) return
-    const now = Date.now()
-    if (!force && now - lastSeekAtRef.current < SEEK_THROTTLE_MS) return
-    lastSeekAtRef.current = now
-    send({ type: 'seek', time: sec })
-  }
 
-  const duration = state?.duration ?? 0
-  const current = state?.current ?? 0
-  /*
-   * ── 进度条显示的"跟手"问题（v0.3.9）──
-   *
-   * 改前：拖动时 progress 仍取 `state.current`（内核每秒推 2~4 次的真实播放进度），
-   * 于是拖动中滑块会**在手指位置与真实进度之间来回跳**（松手前看到的其实是没跟上的位置），
-   * 同时每一次 pointermove 都发一个 `seek` IPC → 主进程每次都真的去 seek mpv
-   * （seek 要冲刷解复用器） —— 拖一下发几十次，画面就会一顿一顿的，这就是"拖进度条卡"。
-   *
-   * 改后：
-   *   · 拖动期间**用本地值显示**（dragPercent），不再被回推的进度覆盖；
-   *   · 真正发给内核的 seek 节流到 ~120ms 一次（拖动结束一定补发最后那个位置），
-   *     这样每帧都在动的是 UI，mpv 只在必要时真的跳。
-   */
-  const shownPercent = dragging && dragPercent !== null ? dragPercent : duration > 0 ? Math.min(100, (current / duration) * 100) : 0
-  const displayedTime = dragging && dragPercent !== null ? (dragPercent / 100) * duration : current
-  const currentSubId = state && state.subIdx >= 0 ? state.subs[state.subIdx]?.id : undefined
 
   return (
     <div
@@ -1720,16 +1477,16 @@ export default function PlayerOverlay(): React.ReactElement {
               <div className="flex max-w-lg flex-col items-center gap-2 rounded-2xl bg-black/70 px-5 py-4 text-xs text-white backdrop-blur">
                 <div className="flex items-center gap-2 whitespace-nowrap">
                   <span className="h-2 w-2 animate-pulse rounded-full bg-amber-300" />
-                  {state.flow && state.flow.stages.some((s) => s.startedAt !== null) ? (
+                  {flow && flow.stages.some((s) => s.startedAt !== null) ? (
                     // 进度已经在跑：标题直接说「现在在做什么」，不再叠一句「加载中」
-                    <span className="text-white/90">{flowHeadline(state.flow)}</span>
+                    <span className="text-white/90">{flowHeadline(flow)}</span>
                   ) : (
                     <span className="text-white/90">加载中…</span>
                   )}
                 </div>
                 {/* 三阶段过程进度：全屏下这是唯一能看出「卡在哪一步」的地方 */}
-                <PlayFlowStages flow={state.flow} tone="onVideo" />
-                {state.flow?.reason === 'slow' ? (
+                <PlayFlowStages flow={flow} tone="onVideo" />
+                {flow?.reason === 'slow' ? (
                   <div className="text-[11px] text-amber-300">
                     资源获取速度过慢，仍在继续等待（有数据在动就不结束）
                   </div>
@@ -2061,631 +1818,22 @@ export default function PlayerOverlay(): React.ReactElement {
               </button>
             </div>
             {/* 失败时把三阶段摊开：用户要的就是「卡在哪一步、为什么」 */}
-            <PlayFlowStages flow={state.flow} tone="onVideo" />
+            <PlayFlowStages flow={flow} tone="onVideo" />
           </div>
         </div>
       ) : null}
 
-      {/* 顶部：退出 / 标题 / 状态 / 详情 / 截图（v0.2.18：uosc 接管控制栏后只留标题与状态） */}
-      <div
-        /*
-         * v0.3.9：uosc 接管控制栏时，整条顶栏**不再**算可点区域 ——
-         * 那时控制栏由 mpv 画（包括它自己的顶栏），鼠标必须留给 mpv；
-         * 应用只剩「状态药丸」这一个需要点的东西，它自己单独标了 data-sakana-hit。
-         */
-        data-sakana-hit={uoscBar ? undefined : '1'}
-        data-sakana-topbar="1"
-        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
-        className={`absolute inset-x-0 top-0 z-30 flex h-14 items-center justify-between bg-gradient-to-b from-black/70 via-black/25 to-transparent px-2 transition-opacity duration-300 ${
-          visible ? 'opacity-100' : 'pointer-events-none opacity-0'
-        }`}
-      >
-        {/* 小窗口时「✕」表示退出播放（没有全屏可退），全屏时先退全屏 */}
-        {uoscBar ? null : (
-          <IconBtn
-            title={state?.fullscreen ? '退出全屏' : '退出播放'}
-            onClick={() => send({ type: state?.fullscreen ? 'exitFullscreen' : 'exitPlayer' })}
-          >
-            <X size={22} />
-          </IconBtn>
-        )}
-        <div className="pointer-events-none min-w-0 flex-1 px-2">
-          <div className="truncate text-sm font-medium text-white drop-shadow">
-            {state?.title ?? ''}
-          </div>
-          <div className="truncate text-[10px] text-white/60">{state?.subtitle ?? ''}</div>
-        </div>
-        {/* 状态药丸：点击查看流详情（地址/播放列表/分辨率/码率） */}
-        <button
-          title="查看播放状态与流详情"
-          /* v0.3.9：uosc 模式顶栏不算可点区域，这个药丸自己标一个（它仍由应用绘制） */
-          data-sakana-hit="1"
-          onPointerDown={(e) => {
-            e.stopPropagation()
-            setShowInfo(true)
-          }}
-          className={`flex h-9 shrink-0 items-center gap-1.5 rounded-full px-3 text-[11px] transition-colors ${
-            state?.status.kind === 'failed'
-              ? 'bg-danger/30 text-white hover:bg-danger/45'
-              : 'bg-white/15 text-white hover:bg-white/30'
-          } whitespace-nowrap `}
-        >
-          <span
-            className={`h-1.5 w-1.5 rounded-full ${
-              state?.status.kind === 'playing'
-                ? 'bg-ok'
-                : state?.status.kind === 'failed'
-                  ? 'bg-danger'
-                  : 'animate-pulse bg-warn'
-            }`}
-          />
-          {/*
-            v0.3.9 补充：药丸里**同一时刻只说一件事**，而且**只在别处没有进度提示时才说**。
-            用户给的判据是「进播放到出画面这段过程里，屏幕上只出现一处进度/加载提示」，
-            而上面那张居中卡恰好覆盖了「还没出画面」的整段时间 —— 所以那段时间里药丸必须闭嘴，
-            否则就是「卡片 + 药丸」两处同时在报进度。
-            它只在「已经开播过（卡片已消失）× 流程还在跑（例如播放中触发的重嗅探）」时
-            才显示过程进度；其余时候显示状态词（「播放中 / 已暂停」，那不是进度提示）。
-          */}
-          {state?.flow && state.flow.running && state.startedOnce && !state.error ? (
-            <PlayFlowStages flow={state.flow} compact tone="onVideo" />
-          ) : (
-            (state?.status.text ?? '加载中')
-          )}
-        </button>
-        <div className="flex items-center gap-1">
-          {uoscBar ? null : (
-            <>
-              <IconBtn title="番剧详情" onClick={() => send({ type: 'toggleInfo' })}>
-                <Info size={20} />
-              </IconBtn>
-              <IconBtn title="截图" onClick={() => send({ type: 'snapshot' })}>
-                <Camera size={20} />
-              </IconBtn>
-            </>
-          )}
-        </div>
-      </div>
-
       {/*
-        底部：进度条 + 控制按钮
-        v0.2.8：弹幕开关与弹幕设置放在**控制栏上方**（同一容器里、进度条之前），
-        跟着控制栏一起显隐，不额外占用画面。
-        v0.2.18：控制栏交给 uosc 后，这整条（含弹幕设置面板）不再显示 ——
-        进度条/播放控制/倍速/字幕/比例/弹幕菜单全部由 uosc 画在视频画面上。
-        这里只关显隐、不删代码：设置里把「播放器控制栏」切回旧版即可原样恢复。
+        旧控制栏（顶栏 / 底栏 / 所有 popover 及其本地状态）已整体剥离到
+        `src/renderer/src/components/playerLegacy/PlayerOverlayBar.tsx`（v1.1.4）。
+        uosc 现在是唯一控制栏，这里不再渲染任何自绘控件 —— 保留那个文件只为不丢掉实现，
+        需要回退时改 import 即可，不必从 git 历史里找。
       */}
-      <div
-        /*
-         * v0.3.9：**整条底栏**都是可点区域（含进度条、按钮、以及挂在它上面的各种菜单/面板）。
-         *
-         * 为什么标在容器上而不是逐个按钮：鼠标在按钮之间的空隙上也应当算"在控制栏上" ——
-         * 否则点空隙会穿透到 mpv（把画面点成暂停），用户会以为又失灵了。
-         * 控制栏收起时容器带 `pointer-events-none`，`elementFromPoint` 会跳过它 → 自动变回穿透，
-         * 不需要额外同步状态（见 HIT_ATTR 的说明）。
-         */
-        data-sakana-hit={uoscBar ? undefined : '1'}
-        data-sakana-bottombar="1"
-        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
-        className={`absolute inset-x-0 bottom-0 z-30 flex flex-col gap-1 bg-gradient-to-t from-black/75 via-black/30 to-transparent px-3 pb-2 pt-6 transition-opacity duration-300 ${
-          visible && !uoscBar ? 'opacity-100' : 'pointer-events-none opacity-0'
-        }`}
-      >
-        {/* 弹幕设置面板（覆盖区域 / 弹幕数量 / 时间轴 / 别名检测 + 更多设置） */}
-        {danmakuMenu ? (
-          <div
-            /* v0.3.9 第六轮：popover 挂在底栏容器里、却**伸到容器上方**（absolute bottom-[86px]）——
-               不打这两个标记，伸出去的部分就会被窗口形状裁掉（用户实测 ①「弹幕设置被遮盖」）。 */
-            data-sakana-hit="1"
-            data-sakana-popover="1"
-            className="absolute bottom-[86px] right-3 z-40 w-80 rounded-xl border border-white/15 bg-black/85 p-3 text-white shadow-2xl backdrop-blur"
-          >
-            <div className="mb-2 flex items-center justify-between">
-              <span className="text-xs font-medium">弹幕设置</span>
-              <button
-                className="rounded-md p-1 text-white/60 hover:bg-white/10 hover:text-white"
-                onPointerDown={(e) => {
-                  e.stopPropagation()
-                  setDanmakuMenu(false)
-                }}
-              >
-                <X size={14} />
-              </button>
-            </div>
-            {danmaku ? (
-              <>
-                <div className="mb-1 text-[10px] text-white/45">
-                  {danmaku.source ? `来源：${danmaku.source}` : '未匹配到弹幕库条目'}
-                </div>
-                <SettingRow label="覆盖区域">
-                  {[
-                    { v: 0.25, t: '1/4' },
-                    { v: 0.5, t: '1/2' },
-                    { v: 0.75, t: '3/4' },
-                    { v: 1, t: '全屏' }
-                  ].map((o) => (
-                    <Chip
-                      key={o.t}
-                      active={Math.abs(danmaku.settings.area - o.v) < 0.01}
-                      onClick={() => send({ type: 'danmakuSetting', key: 'area', value: o.v })}
-                    >
-                      {o.t}
-                    </Chip>
-                  ))}
-                </SettingRow>
-                <SettingRow label="弹幕数量">
-                  {[10, 20, 30, 50, 80].map((n) => (
-                    <Chip
-                      key={n}
-                      active={danmaku.settings.maxCount === n}
-                      onClick={() => send({ type: 'danmakuSetting', key: 'maxCount', value: n })}
-                    >
-                      {n}
-                    </Chip>
-                  ))}
-                </SettingRow>
-                <SettingRow label="时间轴">
-                  <Chip onClick={() => send({ type: 'danmakuSetting', key: 'offsetMs', value: danmaku.settings.offsetMs - 500 })}>
-                    −0.5s
-                  </Chip>
-                  <span className="min-w-[52px] text-center text-[11px] tabular-nums text-white/80">
-                    {(danmaku.settings.offsetMs / 1000).toFixed(1)}s
-                  </span>
-                  <Chip onClick={() => send({ type: 'danmakuSetting', key: 'offsetMs', value: danmaku.settings.offsetMs + 500 })}>
-                    +0.5s
-                  </Chip>
-                  <Chip active={danmaku.settings.offsetMs === 0} onClick={() => send({ type: 'danmakuSetting', key: 'offsetMs', value: 0 })}>
-                    重置
-                  </Chip>
-                </SettingRow>
-                <SettingRow label="显示类型">
-                  <Chip
-                    active={danmaku.settings.showScroll}
-                    onClick={() => send({ type: 'danmakuSetting', key: 'showScroll', value: !danmaku.settings.showScroll })}
-                  >
-                    滚动
-                  </Chip>
-                  <Chip
-                    active={danmaku.settings.showTop}
-                    onClick={() => send({ type: 'danmakuSetting', key: 'showTop', value: !danmaku.settings.showTop })}
-                  >
-                    顶部
-                  </Chip>
-                  <Chip
-                    active={danmaku.settings.showBottom}
-                    onClick={() => send({ type: 'danmakuSetting', key: 'showBottom', value: !danmaku.settings.showBottom })}
-                  >
-                    底部
-                  </Chip>
-                </SettingRow>
-                {/*
-                  v0.2.9：插件渲染时，画面上的弹幕由 mpv 的 uosc_danmaku 负责，
-                  它自带一套菜单（搜索弹幕 / 弹幕样式 / 弹幕源延迟 / 总菜单）。
-                  这里只做「入口」——菜单本身由插件用 uosc 画在画面上。
-                */}
-                {danmaku.pluginActive ? (
-                  <SettingRow label="插件菜单">
-                    <Chip onClick={() => send({ type: 'uoscMenu', key: 'search' })}>搜索弹幕</Chip>
-                    <Chip onClick={() => send({ type: 'uoscMenu', key: 'style' })}>弹幕样式</Chip>
-                    <Chip onClick={() => send({ type: 'uoscMenu', key: 'delay' })}>源延迟</Chip>
-                    <Chip onClick={() => send({ type: 'uoscMenu', key: 'total' })}>总菜单</Chip>
-                  </SettingRow>
-                ) : null}
-                <div className="mt-2 flex items-center justify-between gap-2 border-t border-white/10 pt-2">
-                  <div className="flex flex-wrap items-center gap-2">
-                    {/*
-                      v0.2.8：两个检测入口 ——
-                      「别名检测弹幕」会用番剧别名（番剧库别名 + 弹幕库自身别名）再搜一轮，
-                      中文译名/日文原名/其它译名不一致时特别有用；
-                      「重新检测弹幕」按当前番剧名重查一次（也会绕过本地缓存重新拉取）。
-                    */}
-                    <button
-                      className="rounded-md border border-white/20 px-2 py-0.5 text-[11px] text-white/80 hover:bg-white/10 whitespace-nowrap"
-                      onPointerDown={(e) => {
-                        e.stopPropagation()
-                        send({ type: 'detectDanmakuAlias' })
-                      }}
-                    >
-                      别名检测弹幕
-                    </button>
-                    <button
-                      className="rounded-md border border-white/20 px-2 py-0.5 text-[11px] text-white/80 hover:bg-white/10 whitespace-nowrap"
-                      onPointerDown={(e) => {
-                        e.stopPropagation()
-                        send({ type: 'reloadDanmaku' })
-                      }}
-                    >
-                      重新检测弹幕
-                    </button>
-                  </div>
-                  <button
-                    className="shrink-0 text-[11px] text-accent hover:underline whitespace-nowrap"
-                    onPointerDown={(e) => {
-                      e.stopPropagation()
-                      send({ type: 'openDanmakuSettings' })
-                    }}
-                  >
-                    更多设置 ›
-                  </button>
-                </div>
-              </>
-            ) : (
-              <div className="py-3 text-center text-[11px] text-white/60">弹幕数据还没到，稍候…</div>
-            )}
-          </div>
-        ) : null}
 
-        <div
-          ref={seekRef}
-          data-sakana-hit="1"
-          data-sakana-seek="1"
-          className="group relative flex h-6 cursor-pointer items-center"
-          onPointerDown={(e) => {
-            if (e.button !== 0) return
-            e.stopPropagation()
-            /*
-             * 指针捕获：拖动中指针移出进度条（往上滑到画面、拖到窗口外）时事件仍然回到这里。
-             * 改前没有捕获，靠 `onPointerLeave` 把 dragging 置 false ——
-             * 于是"手往上抖一下就断"，而且要重按一次才能继续拖。
-             * 合成事件（自检里 dispatch 的 PointerEvent）没有真实 pointerId，会抛 NotFoundError，
-             * 所以和音量滑杆一样用 try/catch 兜住。
-             */
-            try {
-              ;(e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId)
-            } catch {
-              /* 拿不到捕获也不影响按位置计算进度 */
-            }
-            setDragging(true)
-            const r = ratioFromEvent(e.clientX)
-            setDragPercent(r * 100)
-            seekTo(r * duration, true)
-          }}
-          onPointerMove={(e) => {
-            if (!dragging) return
-            e.stopPropagation()
-            const r = ratioFromEvent(e.clientX)
-            setDragPercent(r * 100)
-            seekTo(r * duration, false)
-          }}
-          onPointerUp={(e) => {
-            if (!dragging) return
-            e.stopPropagation()
-            setDragging(false)
-            const r = ratioFromEvent(e.clientX)
-            setDragPercent(null)
-            // 松手时**一定**把最后的位置补发一次：节流期间被丢掉的中间位置以这次为准
-            seekTo(r * duration, true)
-          }}
-          onPointerCancel={() => {
-            setDragging(false)
-            setDragPercent(null)
-          }}
-        >
-          <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/25">
-            <div className="h-full rounded-full bg-accent" style={{ width: `${shownPercent}%` }} />
-          </div>
-          <div
-            className="absolute top-1/2 h-3.5 w-3.5 -translate-y-1/2 rounded-full bg-white shadow"
-            style={{ left: `calc(${shownPercent}% - 7px)` }}
-          />
-        </div>
 
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-0.5">
-            <IconBtn title="播放/暂停" onClick={() => send({ type: 'playPause' })}>
-              {state?.playing ? <Pause size={20} /> : <Play size={20} fill="currentColor" />}
-            </IconBtn>
-            <IconBtn title="上一集" onClick={() => send({ type: 'prevEpisode' })}>
-              <SkipBack size={18} />
-            </IconBtn>
-            <IconBtn title="下一集" onClick={() => send({ type: 'nextEpisode' })}>
-              <SkipForward size={18} />
-            </IconBtn>
-            <IconBtn title="后退 10 秒" onClick={() => send({ type: 'back10' })}>
-              <Rewind size={18} />
-            </IconBtn>
-            <IconBtn title="前进 10 秒" onClick={() => send({ type: 'forward10' })}>
-              <FastForward size={18} />
-            </IconBtn>
-            <span className="ml-1 text-[11px] tabular-nums text-white/80">
-              {fmt(displayedTime)} / {fmt(duration)}
-            </span>
-            {/* v0.2.9：音量改为滑杆（用户要求，不加静音键） */}
-            <VolumeSlider volume={state?.volume ?? 0} onSet={(nv) => send({ type: 'setVolume', value: nv })} />
-          </div>
 
-          <div className="flex items-center gap-0.5">
-            {/* 选集（需要空间：交给主窗口打开抽屉，画面会让出位置） */}
-            <IconBtn title="选集" onClick={() => send({ type: 'toggleEpisodes' })}>
-              <ListVideo size={18} />
-            </IconBtn>
 
-            {/* 字幕 */}
-            <div className="relative">
-              <IconBtn
-                title="字幕"
-                active={subMenu}
-                onClick={() => {
-                  setSubMenu(!subMenu)
-                  setAspectMenu(false)
-                }}
-              >
-                <Subtitles size={18} />
-              </IconBtn>
-              {subMenu && (
-                <div
-                  data-sakana-hit="1"
-                  data-sakana-popover="1"
-                  className="absolute bottom-12 right-0 z-40 max-h-64 w-48 overflow-y-auto rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur"
-                >
-                  <button
-                    className="block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 whitespace-nowrap"
-                    onClick={() => {
-                      send({ type: 'cycleSubtitle' })
-                      setSubMenu(false)
-                    }}
-                  >
-                    切换字幕（下一轨 / 关闭）
-                  </button>
-                  {(state?.subs ?? []).length === 0 ? (
-                    <div className="px-2 py-1.5 text-[11px] text-white/45">未检测到字幕轨</div>
-                  ) : (
-                    (state?.subs ?? []).map((s) => (
-                      <button
-                        key={s.id}
-                        className={`block w-full truncate rounded px-2 py-1.5 text-left hover:bg-white/10 ${
-                          currentSubId != null && currentSubId === s.id ? 'text-accent' : ''
-                        }`}
-                        onClick={() => {
-                          send({ type: 'setSubtitle', id: s.id })
-                          setSubMenu(false)
-                        }}
-                      >
-                        {s.label}
-                      </button>
-                    ))
-                  )}
-                </div>
-              )}
-            </div>
 
-            {/*
-              v0.2.9 最后更新：倍速。与画面比例同一套写法（点按钮弹出档位菜单），
-              当前档位直接显示在按钮上，非 1x 时用强调色，避免「忘了自己开过倍速」。
-            */}
-            <div className="relative">
-              <IconBtn
-                title="播放倍速"
-                active={speedMenu || (state?.speed ?? 1) !== 1}
-                onClick={() => {
-                  setSpeedMenu(!speedMenu)
-                  setAspectMenu(false)
-                  setSubMenu(false)
-                }}
-              >
-                <span className="min-w-[30px] text-center text-[12px] font-semibold tabular-nums whitespace-nowrap">
-                  {fmtSpeed(state?.speed ?? 1)}
-                </span>
-              </IconBtn>
-              {speedMenu && (
-                <div
-                  data-sakana-hit="1"
-                  data-sakana-popover="1"
-                  className="absolute bottom-12 right-0 z-40 w-28 rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur"
-                >
-                  {SPEED_CHOICES.map((s) => (
-                    <button
-                      key={s}
-                      className={`block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 ${
-                        Math.abs((state?.speed ?? 1) - s) < 0.001 ? 'text-accent' : ''
-                      } whitespace-nowrap`}
-                      onClick={() => {
-                        send({ type: 'setSpeed', value: s })
-                        setSpeedMenu(false)
-                      }}
-                    >
-                      {fmtSpeed(s)}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/*
-              v0.2.8：弹幕开关与弹幕设置放进**控制栏内部**（与选集/字幕/比例同一排），
-              不再单独占控制栏外的一行。
-            */}
-            <IconBtn
-              title={
-                danmaku?.loading
-                  ? '弹幕加载中…'
-                  : danmaku?.settings.enabled === false
-                    ? '打开弹幕'
-                    : `关闭弹幕${danmaku ? `（${danmaku.comments.length} 条）` : ''}`
-              }
-              active={danmaku?.settings.enabled !== false}
-              onClick={() => send({ type: 'toggleDanmaku' })}
-            >
-              {danmaku?.settings.enabled === false ? <MessageSquareOff size={18} /> : <MessagesSquare size={18} />}
-            </IconBtn>
-            <div className="relative">
-              <IconBtn
-                title="弹幕设置"
-                active={danmakuMenu}
-                onClick={() => {
-                  setDanmakuMenu(!danmakuMenu)
-                  setSubMenu(false)
-                  setAspectMenu(false)
-                }}
-              >
-                <SlidersHorizontal size={18} />
-              </IconBtn>
-            </div>
-
-            {/* 画面比例 */}
-            <div className="relative">
-              <IconBtn
-                title={`画面比例：${ASPECT_LABEL[state?.aspect ?? 'fit']}`}
-                active={aspectMenu}
-                onClick={() => {
-                  setAspectMenu(!aspectMenu)
-                  setSubMenu(false)
-                }}
-              >
-                {state?.aspect === 'cover' ? (
-                  <Crop size={18} />
-                ) : state?.aspect === 'stretch' ? (
-                  <RectangleHorizontal size={18} />
-                ) : (
-                  <Expand size={18} />
-                )}
-              </IconBtn>
-              {aspectMenu && (
-                <div
-                  data-sakana-hit="1"
-                  data-sakana-popover="1"
-                  className="absolute bottom-12 right-0 z-40 w-40 rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur"
-                >
-                  {(['fit', 'cover', 'stretch'] as AspectMode[]).map((m) => (
-                    <button
-                      key={m}
-                      className={`block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 ${
-                        state?.aspect === m ? 'text-accent' : ''
-                      } whitespace-nowrap `}
-                      onClick={() => {
-                        send({ type: 'setAspect', aspect: m })
-                        setAspectMenu(false)
-                      }}
-                    >
-                      {ASPECT_LABEL[m]}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/*
-              画质（Anime4K 超分，v0.3.3）。
-              用户要求「控制栏里要有超分辨率按钮」——以前只能进设置页改，播放中没法切。
-              数据来源是主进程的 settings（走 api.store 读写），主进程在 store 写入钩子里
-              会立刻重挂着色器链，所以这里是**播放中即时生效**；按钮角标显示当前模式。
-            */}
-            <div className="relative">
-              <IconBtn
-                title={`画质（Anime4K 超分）：${a4kEnabled ? `模式 ${a4kShort}` : '已关闭'}`}
-                active={qualityMenu || a4kEnabled}
-                onClick={() => {
-                  setQualityMenu(!qualityMenu)
-                  setSubMenu(false)
-                  setAspectMenu(false)
-                }}
-              >
-                <span className="flex items-center gap-0.5">
-                  <Sparkles size={18} />
-                  <span className="min-w-[14px] text-[10px] font-semibold tabular-nums">
-                    {a4kEnabled ? a4kShort : '关'}
-                  </span>
-                </span>
-              </IconBtn>
-              {qualityMenu && (
-                <div
-                  data-sakana-hit="1"
-                  data-sakana-popover="1"
-                  className="absolute bottom-12 right-0 z-40 w-60 rounded-lg border border-white/10 bg-black/85 p-1 text-xs text-white/85 backdrop-blur"
-                >
-                  <div className="px-2 py-1 text-[10px] text-white/50">
-                    Anime4K 超分（改完立刻生效）
-                  </div>
-                  <button
-                    className={`block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 ${
-                      a4kEnabled ? '' : 'text-accent'
-                    }`}
-                    onClick={() => {
-                      patchA4k({ enabled: false })
-                      setQualityMenu(false)
-                    }}
-                  >
-                    关闭超分
-                  </button>
-                  {ANIME4K_MODES.filter((m) => m.id !== 'custom').map((m) => (
-                    <button
-                      key={m.id}
-                      className={`block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 ${
-                        a4kEnabled && a4kMode === m.id ? 'text-accent' : ''
-                      }`}
-                      onClick={() => {
-                        patchA4k({ enabled: true, mode: m.id })
-                        setQualityMenu(false)
-                      }}
-                    >
-                      <span className="font-medium">{m.short}</span>
-                      <span className="ml-2 text-[10px] text-white/50">{m.desc}</span>
-                    </button>
-                  ))}
-                  <div className="my-1 border-t border-white/10" />
-                  <div className="px-2 py-1 text-[10px] text-white/50">显卡档位</div>
-                  {ANIME4K_TIERS.map((t) => (
-                    <button
-                      key={t.id}
-                      className={`block w-full rounded px-2 py-1.5 text-left hover:bg-white/10 ${
-                        a4kTier === t.id ? 'text-accent' : ''
-                      }`}
-                      onClick={() => {
-                        patchA4k({ tier: t.id })
-                        setQualityMenu(false)
-                      }}
-                    >
-                      <span className="font-medium">{t.label}</span>
-                      <span className="ml-2 text-[10px] text-white/50">{t.desc}</span>
-                    </button>
-                  ))}
-                  <div className="my-1 border-t border-white/10" />
-                  <button
-                    className="block w-full rounded px-2 py-1.5 text-left hover:bg-white/10"
-                    onClick={() => {
-                      setQualityMenu(false)
-                      send({ type: 'openQualitySettings' })
-                    }}
-                  >
-                    完整画质设置…
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* 全屏按钮：小窗口时无意义（不能自由拉伸窗口），隐藏 */}
-            {state?.fullscreen ? (
-              <IconBtn title="退出全屏" onClick={() => send({ type: 'exitFullscreen' })}>
-                <Minimize size={18} />
-              </IconBtn>
-            ) : (
-              <IconBtn title="全屏播放" onClick={() => send({ type: 'toggleFullscreen' })}>
-                <Maximize size={18} />
-              </IconBtn>
-            )}
-            {/*
-              投屏（v0.3.8）。放在「全屏 / 退出」左边：它属于"输出到哪"这一类动作，
-              与画面比例、全屏同组，符合用户找它的习惯。
-              面板也画在悬浮窗里 —— 画面是原生子窗口，画在播放页里的面板会被它整个盖住。
-            */}
-            <IconBtn
-              title={castActive ? `正在投屏：${castDevice?.name ?? ''}` : '投屏到电视 / 接收端'}
-              active={castPanel}
-              onClick={() => {
-                setCastPanel(!castPanel)
-                setSubMenu(false)
-                setAspectMenu(false)
-                if (!castPanel) void refreshCastDevices()
-              }}
-            >
-              {castActive ? <Cast size={18} className="text-accent" /> : <Cast size={18} />}
-            </IconBtn>
-            <IconBtn title="退出播放" onClick={() => send({ type: 'exitPlayer' })}>
-              <LogOut size={18} />
-            </IconBtn>
-          </div>
-        </div>
-      </div>
 
       {/* 投屏面板（v0.3.8）：设备列表 + 手动连接 + 投屏中的遥控 */}
       {castPanel ? (

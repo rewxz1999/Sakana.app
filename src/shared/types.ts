@@ -86,9 +86,17 @@ export interface SourceError {
   tried: string[]
 }
 
+/** 分级网络优先级（v1.1.4，语义见 main/net-priority.ts 与 main/net.ts 的分类器） */
+export type NetPriority = 'S' | 'A' | 'B'
+
 export interface CalendarResult {
   fromCache: boolean
   stale?: boolean
+  /**
+   * v1.1.4：返回的是缓存、且主进程**正在后台刷新**。
+   * 界面据此显示「正在后台更新」，刷新结束（成功或失败）都会再推一次 `refreshing:false`。
+   */
+  refreshing?: boolean
   fetchedAt: number | null
   days: CalendarDay[]
   error?: SourceError
@@ -141,11 +149,38 @@ export interface SeasonResult {
   fromCache: boolean
   /** 命中的是**已过期**的缓存（数据仍照常返回，界面照常渲染） */
   stale?: boolean
+  /**
+   * v1.1.4：只拿到了「部分月份」的缓存（其余月份还在后台补）。
+   * 界面照常渲染已到的条目，不必等全量 —— 与详情页「分板块先到先显」同一原则。
+   */
+  partial?: boolean
   fetchedAt: number | null
   items: SeasonItem[]
   error?: SourceError
   /** v0.3.2：季度列表是否来自备用数据源兜底（见 JikanFallbackMeta） */
   dataSource?: JikanFallbackMeta
+}
+
+/**
+ * 详情页首屏用的**纯缓存快照**（v1.1.4）。
+ *
+ * 为什么单独一个返回类型：详情页要「先到先显」，第一步必须在毫秒级拿到已缓存的
+ * 标题/封面/简介/评分（绝不联网）。`SubjectResult` 带有「联网结果」的语义（fromCache/error），
+ * 容易被误读成「这次请求完成了」，所以这里用独立的窄类型，一眼能看出「只是读缓存」。
+ */
+export interface CachedSubjectResult {
+  data: SubjectDetail | null
+  fetchedAt: number | null
+}
+
+/** 评分板块的独立结果（详情页的评分先显示缓存值，再在后台换成新值） */
+export interface RatingResult {
+  score: number | null
+  total: number
+  fetchedAt: number | null
+  /** 是否来自缓存（false = 本次刚联网取到） */
+  fromCache: boolean
+  error?: SourceError
 }
 
 /**
@@ -609,6 +644,14 @@ export interface PlayFlowMetrics {
   lastError?: string
   /** 响应头里挑出来的关键几行 */
   headers?: Record<string, string>
+  /**
+   * 这组指标是谁写的（v1.1）。
+   *
+   * `probe` = 交给内核之前那次可达性探测；`engine` = 内核（mpv）自己在拉流时的
+   * `cache-speed` / `fw-bytes` 采样。界面据此说明「这是内核实测」还是「交付前探测」——
+   * 用户报的「交给内核后就没有速度了」正是后者覆盖不了前者之后的空窗期。
+   */
+  source?: 'probe' | 'engine'
 }
 
 export interface PlayFlowSnapshot {
@@ -924,6 +967,78 @@ export interface DanmakuMatch {
   episodeTitle: string
 }
 
+/**
+ * 一个弹幕获取器（fetcher）的 id（V1.2 弹幕重构）。
+ *
+ * 为什么把它单独做成联合类型：设置里「选择启用弹幕源」直接存这组 id，主进程按 id 找 fetcher；
+ * 拼错 id 会在 tsc 阶段被拦下，而不是运行时静默不生效。
+ * `link` 不在界面上单独开关（它来自用户自己加的直链规则），保留在类型里是为了让老规则继续工作。
+ */
+export type DanmakuFetcherId = 'bahamut' | 'danmubox' | 'link'
+
+/** 一次加载里某个源的结果摘要（播放器状态区/详情面板据此显示「哪几个源、各多少条、是否缓存」） */
+export interface DanmakuSourceRunInfo {
+  sourceId: string
+  sourceName: string
+  count: number
+  /** 这一批是否来自本地缓存（true = 没有为该源发网络请求） */
+  fromCache: boolean
+  /** 命中条目/文件的一句话说明 */
+  detail: string
+  /** 这个源这一趟花了多少毫秒 */
+  ms?: number
+}
+
+/**
+ * 弹幕获取进度（V1.2，用户要求「进播放器就在流详情里显示正在从哪个源取、第几步」）。
+ *
+ * 为什么由主进程维护而不是渲染层自己数：真正的步骤发生在主进程（搜索 → 取集 → 取弹幕 → 写缓存），
+ * 渲染层只负责显示；如果渲染层自己编步骤，一旦网络失败就会出现"进度条走完了但没拿到弹幕"的假状态。
+ */
+export interface DanmakuLoadProgress {
+  /** 这条进度是否仍在进行（false = 已完成/失败） */
+  active: boolean
+  title: string
+  episode: number
+  sourceId: string
+  sourceName: string
+  /** 第几步（1 起） */
+  step: number
+  /** 这个源一共几步（目前 4：搜索 → 取集 → 取弹幕 → 写缓存） */
+  total: number
+  /** 一句人话，例如「正在从巴哈姆特动画疯取弹幕…」 */
+  label: string
+  startedAt: number
+  updatedAt: number
+  /** 已成功结束 */
+  done: boolean
+  /** 失败原因（active=false 且 error 非空） */
+  error?: string
+}
+
+/** 进度快照：播放页每 1 秒拉一次（只在流详情面板打开时拉，不增加常驻开销） */
+export interface DanmakuProgressSnapshot {
+  /** 最近一次进度（进行中的优先） */
+  current: DanmakuLoadProgress | null
+  /** 每个源最近一步（多源并行时能看出卡在哪个源） */
+  sources: DanmakuLoadProgress[]
+  /** 最近两条完整链路的关键步骤（详情面板显示一行流水） */
+  steps: DanmakuLoadProgress[]
+}
+
+/**
+ * 弹幕运行期统计（自检 / 详情面板用）。
+ *
+ * 用户要求「第二次进同一集不应出现网络请求」—— 这必须是个能断言的数字，
+ * 所以主进程把「网络请求次数 / 缓存命中次数 / 缓存目录」一并暴露出来。
+ */
+export interface DanmakuRuntimeStats {
+  cacheRoot: string
+  runner: { networkFetches: number; cacheHits: number; cacheMisses: number }
+  cache: { hits: number; misses: number; writes: number; lastHit: string; lastWrite: string }
+  progress: DanmakuProgressSnapshot
+}
+
 /** v0.2.8：一次拿到的完整弹幕结果（播放器与本地播放共用） */
 export interface DanmakuLoadResult extends DanmakuMatch {
   count: number
@@ -950,6 +1065,11 @@ export interface DanmakuLoadResult extends DanmakuMatch {
   sourcesPending?: boolean
   /** v1.1.2：本次返回的**只有数据源那一批**（第二段），渲染层据此走合并而不是替换 */
   sourcesOnly?: boolean
+  /**
+   * V1.2：这一批由哪些源组成（每个源的条数与是否命中缓存）。
+   * 多源合并后单看 `origin` 会丢掉"另一半从哪来"，排障与状态区都要它。
+   */
+  sources?: DanmakuSourceRunInfo[]
 }
 
 // ---------------- 弹幕数据源集合器（v1.1） ----------------
@@ -1163,8 +1283,27 @@ export interface DanmakuSettings {
    * 内置弹弹play 弹幕库始终作为默认源，`sources` 是它之外的补充，不会互相顶掉。
    */
   sources?: DanmakuSource[]
-  /** v1.1：本地弹幕库目录（留空 = `<缓存目录>/danmaku`） */
+  /**
+   * V1.2：**启用哪些内置弹幕源**（默认只启用巴哈姆特动画疯）。
+   *
+   * 为什么不用 `sources[].enabled` 当唯一开关：`sources` 是高级规则表（可配自建反代、直链），
+   * 新用户一进来是空的；用户要的是"默认就能用巴哈"，所以这里单独存一份内置源开关，
+   * 与高级规则互不干扰。`link` 不在这里出现。
+   */
+  enabledSources?: DanmakuFetcherId[]
+  /** V1.1：弹幕数据缓存根目录（留空 = `<缓存目录>/弹幕`；文件落在 `<根>/<番剧名>/第01集-<源名>.xml`） */
   libraryDir?: string
+  /**
+   * V1.2「弹幕误差」：多源合并时，时间相差多少毫秒以内算同一条弹幕。
+   *
+   * 为什么需要可调：不同源对同一句话的时间戳常差 0.1~0.5 秒。取太小会留下成对的重复弹幕，
+   * 取太大又会误杀"同一秒真的发了两条"；默认 100ms 是实测比较稳的值。
+   */
+  errorToleranceMs?: number
+  /** V1.2「特殊弹幕调整」：顶部/底部弹幕的字号倍率（相对普通弹幕） */
+  specialScale?: number
+  /** V1.2「特殊弹幕调整」：顶部/底部弹幕停留秒数 */
+  specialDurationSec?: number
   /**
    * v1.1：进播放器时是否自动尝试已启用的数据源。
    * 关掉后集合器只用于「手动搜索下载」，不会在播放时发网络请求（流量敏感场景）。
@@ -1190,6 +1329,12 @@ export const DEFAULT_DANMAKU_SETTINGS: DanmakuSettings = {
   // v1.1：默认**开启**自动加载（用户要求「进播放器时启用的数据源自动开始找弹幕」），
   // 集合器一开始是空的，所以开着也不会产生任何请求 —— 用户加了源才生效。
   autoSources: true,
+  // V1.2：用户点名「默认启用巴哈姆特」。弹幕盒子只收录 2019–2021 的存档，新番基本搜不到，
+  // 所以默认只开巴哈；需要老番存档的可以自己打开弹幕盒子。
+  enabledSources: ['bahamut'],
+  errorToleranceMs: 100,
+  specialScale: 1,
+  specialDurationSec: 4,
   sources: []
 }
 
@@ -1219,7 +1364,17 @@ export function resolveDanmakuSettings(raw: Partial<DanmakuSettings> | undefined
     sources: (Array.isArray(raw.sources) ? raw.sources : []).filter(
       (s): s is DanmakuSource => !!s && typeof s.id === 'string' && typeof s.adapter === 'string'
     ),
-    libraryDir: typeof raw.libraryDir === 'string' ? raw.libraryDir : ''
+    libraryDir: typeof raw.libraryDir === 'string' ? raw.libraryDir : '',
+    /*
+     * V1.2：启用弹幕源。历史设置里没有这个字段（undefined）时用默认的「巴哈姆特」；
+     * 用户显式清空（[]）则尊重清空（不会每次启动又把巴哈加回来）。
+     */
+    enabledSources: Array.isArray(raw.enabledSources)
+      ? raw.enabledSources.filter((s): s is DanmakuFetcherId => s === 'bahamut' || s === 'danmubox' || s === 'link')
+      : [...(d.enabledSources ?? ['bahamut'])],
+    errorToleranceMs: Math.min(1000, Math.max(10, num(raw.errorToleranceMs, d.errorToleranceMs ?? 100))),
+    specialScale: Math.min(2, Math.max(0.6, num(raw.specialScale, d.specialScale ?? 1))),
+    specialDurationSec: Math.min(10, Math.max(1, num(raw.specialDurationSec, d.specialDurationSec ?? 4)))
   }
 }
 
@@ -1369,6 +1524,23 @@ export interface RuleEpisodesDef {
  */
 export type RuleOrigin = 'builtin' | 'repo' | 'local'
 
+/**
+ * 规则的**执行形态**（v1.1 新增，专为巴哈姆特而加）。
+ *
+ * 为什么需要它：现有规则引擎把「搜索结果 / 剧集 / 播放地址」描述成一组
+ * XPath（HTML）或 JSONPath（接口）**数据**。巴哈姆特不是这个形状 ——
+ * 它的数据来自 `bahamut-anime` 这个 npm 包（本质是对 `api.gamer.com.tw` 的封装），
+ * 没有可写的 XPath/JSONPath 字段：搜索要先用番剧的**日文原名/繁体名**去问接口，
+ * 选集要按「日语版/剧场版/OVA/中配」四个卷分组，播放页地址要由 `video_sn` 拼。
+ * 硬塞进 XPath 引擎只会得到一条永远解析不出东西的规则，还会让既有引擎为了它变形。
+ *
+ * 所以这里只加一个**执行分支选择**：
+ *   · 缺省（undefined）= 'xpath'，走原来那套 XPath/JSONPath 引擎，一行都没动；
+ *   · 'bahamut' = 交给主进程的 `services/bahamut.ts`（库驱动分支）。
+ * 规则管理页、启用/停用、置顶、预嗅探都按同一份 `PlayRule` 处理，不需要第二套列表。
+ */
+export type RuleEngine = 'xpath' | 'bahamut'
+
 export interface PlayRule {
   id: string
   name: string
@@ -1383,6 +1555,17 @@ export interface PlayRule {
    * （default- → 内置、repo- → 仓库），所以这里是可选的、不需要数据迁移。
    */
   origin?: RuleOrigin
+  /** 执行形态（缺省 = xpath）。见 `RuleEngine` 的说明 */
+  engine?: RuleEngine
+  /**
+   * 可选：**给用户看的限制说明**（选择数据源界面里显示在这条规则下面）。
+   *
+   * 为什么规则本体要携带这句话：有些线路的能力天然不完整（例如巴哈姆特只能给到
+   * 条目与选集，视频直链要靠站点自己的播放器、且只对台湾网络开放）。
+   * 如果界面只给一个「看起来能播」的按钮，用户点下去只会得到「加载中」然后什么都没有 ——
+   * 所以这条限制必须由规则自己声明、界面如实显示，而不是让每个调用方各写一句。
+   */
+  playbackNote?: string
 }
 
 export function emptyRule(): PlayRule {
@@ -1789,17 +1972,17 @@ export interface AppSettings {
    */
   scheduleFilters?: Partial<ScheduleDisplayFilters>
   /**
-   * 播放器控制栏是否交给 uosc（v0.2.18 引入；**v0.3.3 起默认关闭**）。
+   * 播放器控制栏实现（**v1.1.4 起 uosc 是唯一控制栏**）。
    *
-   * - 缺省 / false：用**应用自己的悬浮窗控制栏**（v0.3.3 起这是默认）——
-   *   进度条、播放控制、选集、字幕、倍速、画面比例、弹幕、画质（Anime4K 超分）、全屏与退出
-   *   都在里面，按钮/菜单是应用自己的界面（见 renderer 的 PlayerOverlayPage）；
-   * - true：改由 mpv 的 uosc 画控制栏（布局在 resources/mpv-config/script-opts/uosc.conf，
-   *   快捷键在 resources/mpv-config/input.conf，按钮/菜单由 resources/mpv-scripts/sakana-uosc-ctrl.lua 驱动）。
+   * - 缺省 / true：mpv 的 uosc 画控制栏（布局在 resources/mpv-config/script-opts/uosc.conf，
+   *   快捷键在 resources/mpv-config/input.conf，按钮/菜单由 resources/mpv-scripts/sakana-uosc-ctrl.lua 驱动）；
+   * - false：**已失去意义**。v1.1.4 把旧的自绘控制栏整体剥离到
+   *   `renderer/src/components/playerLegacy/PlayerOverlayBar.tsx` 并停止渲染，再按 false
+   *   回退只会得到"一条控制栏都没有"的结果。所以主进程/渲染层现在都不再读它 ——
+   *   保留字段只是为了让旧设置文件不报错，以及让设置页能说清楚这个键已经废弃。
    *
-   * ⚠️ 主进程与渲染层两处判定必须一致（mpv.ts 的 `uoscControlBarRequested()` 与
-   * PlayerPage 的 `uoscBarMode`），否则会出现「uosc 不画 + 自建控制栏也不画」= 完全没有控制栏。
-   * 内置 uosc 缺失（安装目录不完整）时也会自动回落，不需要用户去改这个开关。
+   * 默认值必须与 `DEFAULT_SETTINGS` 的 `uoscControlBar: true` 一致：老用户的 settings.json
+   * 里没有这个键时，`getSettings()` 的 `{...DEFAULT_SETTINGS, ...磁盘}` 会补成 true。
    */
   uoscControlBar?: boolean
   /**
@@ -1878,6 +2061,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
   ffmpegPath: '',
   aspectMode: 'fit',
   cacheDir: '',
+  /*
+   * v1.1.4：uosc 是唯一控制栏，默认开。
+   *
+   * 老用户的 settings.json 里没有这个键时，`getSettings()` 的
+   * `{...DEFAULT_SETTINGS, ...磁盘设置}` 会把这里补上去 —— 这正是"老用户也走 true"的实现，
+   * 不需要在读取处再写一次 `!== false`（主进程与渲染层都已经不再读这个键）。
+   */
+  uoscControlBar: true,
   downloader: {
     type: 'aria2',
     dual: false,
@@ -2676,6 +2867,17 @@ export interface BatchProbeUpdate {
   cached?: boolean
   /** 这份缓存的探测时间（毫秒时间戳）；仅 cached=true 时有值 */
   probedAt?: number
+  /**
+   * 这条规则拿到的**搜索结果**与**第一条结果的剧集**（v1.1）。
+   *
+   * 为什么把它们放进探测结果里：用户要求「点开某个源时不要再重新加载/重新嗅探，
+   * 直接用已有的结果渲染」。预嗅探本来就已经跑过搜索与选集（不然算不出集数），
+   * 那两个结果若不带给界面，点开源时只能**再发一轮一模一样的请求** ——
+   * 既慢，又对站点重复施压。带出来之后，点开源/点开结果都是纯本地渲染。
+   */
+  items?: RuleSearchEntry[]
+  groups?: RuleEpisodeGroup[]
+  vars?: Record<string, string>
 }
 
 // ============================================================

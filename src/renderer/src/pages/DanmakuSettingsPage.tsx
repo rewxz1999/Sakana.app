@@ -9,6 +9,7 @@ import { DanmakuSourcesCard } from '@/components/danmaku/DanmakuSourcesCard'
 import { DanmakuBoxCard } from '@/components/danmaku/DanmakuBoxCard'
 import { DanmakuLibraryCard } from '@/components/danmaku/DanmakuLibraryCard'
 import { DanmakuFetchLogCard } from '@/components/danmaku/DanmakuFetchLogCard'
+import { DanmakuEnabledSourcesCard } from '@/components/danmaku/DanmakuEnabledSourcesCard'
 import { Button, Input } from '@/components/ui'
 import { Card, SubPage } from '@/components/SettingsShell'
 
@@ -48,7 +49,7 @@ export function DanmakuSettingsPage() {
     <SubPage
       icon={MessageSquare}
       title="弹幕设置"
-      desc="弹幕按「番剧名 + 集数」自动匹配：先查本地弹幕库，再走内置弹弹play 弹幕库，最后按优先级尝试下面的数据源；本地播放同样可用"
+      desc="链路：弹幕源 → 获取器 → 本地缓存 → 集成器（多源合并）→ 播放器。进播放器先查缓存，没缓存才按优先级并行请求；默认启用巴哈姆特"
       maxWidth="max-w-2xl"
       actions={
         <Button
@@ -86,16 +87,14 @@ export function DanmakuSettingsPage() {
         </div>
       </Card>
 
-      {/* ---------------- V1.1：数据源集合器 / 弹幕盒子 / 本地弹幕库 ---------------- */}
-      <DanmakuSourcesCard catalog={catalog} />
-      <DanmakuBoxCard />
-      <DanmakuLibraryCard catalog={catalog} />
-      {/* v1.1.2：每次去数据源要弹幕的记录（排障用，默认折叠） */}
-      <DanmakuFetchLogCard />
+      {/* ---------------- V1.2：启用源 + 四项样式设置 ---------------- */}
+      <DanmakuEnabledSourcesCard catalog={catalog} />
 
-      <Card title="显示" desc="影响画面上的弹幕观感">
-        <Toggle label="显示弹幕" desc="关闭后完全不绘制弹幕（数据仍会匹配）" value={d.enabled} onChange={(v) => patch({ enabled: v })} />
-        <Row label="覆盖区域" desc="弹幕只占画面上方多大范围">
+      <Card
+        title="弹幕设置（样式）"
+        desc="用户要求的四项：播放区域、播放速度、字体大小、弹幕时序（相对画面的偏移）"
+      >
+        <Row label="弹幕播放区域" desc="弹幕只占画面上方多大范围（底部弹幕仍贴画面底部）">
           {[
             { v: 0.25, t: '1/4' },
             { v: 0.5, t: '1/2' },
@@ -107,6 +106,45 @@ export function DanmakuSettingsPage() {
             </Pill>
           ))}
         </Row>
+        <Row label="弹幕播放速度" desc="一条滚动弹幕穿过屏幕所需秒数，越小越快">
+          {[5, 6, 8, 10, 12].map((n) => (
+            <Pill key={n} active={d.speedSec === n} onClick={() => patch({ speedSec: n })}>
+              {n}s
+            </Pill>
+          ))}
+        </Row>
+        <Row label="弹幕字体大小" desc="字号（px）；顶部/底部弹幕另受「特殊弹幕调整」的倍率影响">
+          {[16, 18, 20, 22, 26, 30, 34].map((n) => (
+            <Pill key={n} active={d.fontSize === n} onClick={() => patch({ fontSize: n })}>
+              {n}
+            </Pill>
+          ))}
+        </Row>
+        <Row label="弹幕时序" desc="弹幕相对画面的偏移（正数 = 弹幕提前出现）；两种渲染方式共用">
+          {[-2000, -1000, -500, 0, 500, 1000, 2000].map((ms) => (
+            <Pill key={ms} active={d.offsetMs === ms} onClick={() => patch({ offsetMs: ms })}>
+              {ms === 0 ? '0' : `${ms > 0 ? '+' : ''}${(ms / 1000).toFixed(1)}s`}
+            </Pill>
+          ))}
+        </Row>
+        <Row label="时序细调">
+          <Button size="sm" variant="outline" onClick={() => patch({ offsetMs: Math.max(-10000, d.offsetMs - 100) })}>
+            −0.1s
+          </Button>
+          <span className="min-w-[64px] text-center text-xs tabular-nums text-dim">{(d.offsetMs / 1000).toFixed(1)}s</span>
+          <Button size="sm" variant="outline" onClick={() => patch({ offsetMs: Math.min(10000, d.offsetMs + 100) })}>
+            +0.1s
+          </Button>
+        </Row>
+      </Card>
+      <DanmakuSourcesCard catalog={catalog} />
+      <DanmakuBoxCard />
+      <DanmakuLibraryCard catalog={catalog} />
+      {/* v1.1.2：每次去数据源要弹幕的记录（排障用，默认折叠） */}
+      <DanmakuFetchLogCard />
+
+      <Card title="显示" desc="影响画面上的弹幕观感（区域/速度/字号/时序在上一张卡片）">
+        <Toggle label="显示弹幕" desc="关闭后完全不绘制弹幕（数据仍会匹配）" value={d.enabled} onChange={(v) => patch({ enabled: v })} />
         <Row label="弹幕数量" desc="同一屏最多显示多少条">
           {[10, 20, 30, 50, 80, 120].map((n) => (
             <Pill key={n} active={d.maxCount === n} onClick={() => patch({ maxCount: n })}>
@@ -125,24 +163,10 @@ export function DanmakuSettingsPage() {
             底部
           </Pill>
         </Row>
-        <Row label="字号" desc="越大越显眼，也越容易挡画面">
-          {[16, 18, 20, 22, 26, 30, 34].map((n) => (
-            <Pill key={n} active={d.fontSize === n} onClick={() => patch({ fontSize: n })}>
-              {n}
-            </Pill>
-          ))}
-        </Row>
         <Row label="不透明度">
           {[0.4, 0.6, 0.8, 0.9, 1].map((n) => (
             <Pill key={n} active={Math.abs(d.opacity - n) < 0.01} onClick={() => patch({ opacity: n })}>
               {Math.round(n * 100)}%
-            </Pill>
-          ))}
-        </Row>
-        <Row label="滚动速度" desc="一条弹幕穿过屏幕所需秒数，越小越快">
-          {[5, 6, 8, 10, 12].map((n) => (
-            <Pill key={n} active={d.speedSec === n} onClick={() => patch({ speedSec: n })}>
-              {n}s
             </Pill>
           ))}
         </Row>
@@ -152,23 +176,52 @@ export function DanmakuSettingsPage() {
         <Toggle label="阴影" desc="柔和一点；与描边同开时最清楚" value={d.shadow === true} onChange={(v) => patch({ shadow: v })} />
       </Card>
 
-      <Card title="时间轴" desc="弹幕与画面不同步时在这里微调（正数 = 弹幕提前出现）">
-        <Row label="偏移">
-          {[-2000, -1000, -500, 0, 500, 1000, 2000].map((ms) => (
-            <Pill key={ms} active={d.offsetMs === ms} onClick={() => patch({ offsetMs: ms })}>
-              {ms === 0 ? '0' : `${ms > 0 ? '+' : ''}${(ms / 1000).toFixed(1)}s`}
+      <Card
+        title="详细弹幕设置"
+        desc="排障与精细控制：误差、特殊弹幕、获取器记录、缓存目录、本地弹幕查看/删除、获取规则、启用源"
+      >
+        <Row label="弹幕误差" desc="多源合并时，时间相差多少毫秒以内算同一条（越大去重越狠；默认 100ms）">
+          {[50, 100, 200, 300, 500].map((ms) => (
+            <Pill key={ms} active={d.errorToleranceMs === ms} onClick={() => patch({ errorToleranceMs: ms })}>
+              {ms}ms
             </Pill>
           ))}
         </Row>
-        <Row label="细调">
-          <Button size="sm" variant="outline" onClick={() => patch({ offsetMs: Math.max(-10000, d.offsetMs - 100) })}>
-            −0.1s
-          </Button>
-          <span className="min-w-[64px] text-center text-xs tabular-nums text-dim">{(d.offsetMs / 1000).toFixed(1)}s</span>
-          <Button size="sm" variant="outline" onClick={() => patch({ offsetMs: Math.min(10000, d.offsetMs + 100) })}>
-            +0.1s
-          </Button>
+        <div className="border-t border-border pt-2.5 text-[11px] font-medium text-dim">特殊弹幕调整</div>
+        <Row label="特殊弹幕字号" desc="顶部/底部弹幕相对普通弹幕的倍率（特殊弹幕不滚动，太大容易挡画面）">
+          {[0.8, 0.9, 1, 1.1, 1.2, 1.4].map((n) => (
+            <Pill key={n} active={Math.abs((d.specialScale ?? 1) - n) < 0.01} onClick={() => patch({ specialScale: n })}>
+              ×{n}
+            </Pill>
+          ))}
         </Row>
+        <Row label="特殊弹幕停留" desc="顶部/底部弹幕在画面上停留几秒">
+          {[2, 3, 4, 5, 6].map((n) => (
+            <Pill key={n} active={d.specialDurationSec === n} onClick={() => patch({ specialDurationSec: n })}>
+              {n}s
+            </Pill>
+          ))}
+        </Row>
+        {/* 下面这些是"入口说明"：真正的控件在对应的卡片里（保持一个功能只有一个实现） */}
+        <div className="mt-2 flex flex-col gap-1.5 border-t border-border pt-2.5 text-[11px] leading-relaxed text-faint">
+          <div>
+            <b className="text-dim">显示弹幕获取器记录</b>：见上方「显示弹幕获取器记录」卡片 —— 每次去哪个源、用什么关键词、
+            花了多久、拿到多少条/为什么没拿到，都在那里。
+          </div>
+          <div>
+            <b className="text-dim">选择弹幕数据缓存文件夹</b> / <b className="text-dim">在应用内查看本地弹幕</b> /{' '}
+            <b className="text-dim">选择本地弹幕删除</b>：见上方「本地弹幕缓存」卡片（文件按
+            <code className="mx-1 font-mono">&lt;缓存根&gt;/弹幕/&lt;番剧名&gt;/第01集-&lt;源名&gt;.xml</code>
+            存放，文件名带来源名）。
+          </div>
+          <div>
+            <b className="text-dim">为弹幕获取器添加新的弹幕规则</b>：见上方「弹幕获取规则」卡片（可加巴哈反代、
+            弹幕盒子、直链模板，并逐条真测试）。
+          </div>
+          <div>
+            <b className="text-dim">选择启用弹幕源</b>：本页最上面的「选择启用弹幕源」，默认只启用巴哈姆特动画疯。
+          </div>
+        </div>
       </Card>
 
       <Card title="屏蔽" desc="命中任一关键词的弹幕不显示（逗号或换行分隔）">
@@ -255,17 +308,16 @@ export function DanmakuSettingsPage() {
         </div>
       </Card>
 
-      <Card title="说明" desc="关于弹幕来源">
+      <Card title="说明" desc="关于弹幕来源与加载顺序">
         <div className="text-[11px] leading-relaxed text-faint">
-          弹幕按「番剧名 + 集数」自动匹配弹幕库，找不到对应条目时播放器会显示「未找到弹幕」，不影响播放。
-          同一集只会请求一次，之后走本地缓存；播放器悬浮窗里的「重新检测弹幕」可以强制重新拉取，
-          「别名检测弹幕」则会连别名一起搜（番剧名与弹幕库标题对不上时用它）。
+          链路是「弹幕源 → 获取器 → 本地缓存 → 集成器 → 播放器」：每个源各自搜索、取该集、
+          写成带来源名的缓存文件；集成器再按「时间 + 正文」去重、按时间排序后交给播放器。
           <div className="mt-1.5">
-            进播放器时的尝试顺序：<b className="text-dim">本地弹幕库</b>（命中则不发请求）→{' '}
-            <b className="text-dim">内置弹弹play</b> → <b className="text-dim">上面启用的数据源</b>
-            （按优先级 1、2、3…）。拿到第一条有内容的就停止，播放器状态区会写明
-            <b className="text-dim">这条弹幕来自哪个源</b>；全部失败时会列出每个源各自的原因
-            （未匹配 / 下载失败 / 格式不支持）。
+            进播放器时的顺序：<b className="text-dim">先查每个启用源 + 内置弹弹play 的本地缓存</b>
+            （命中就直接用，不发请求）→ 缓存缺失的部分才并行请求。第一段先上屏，第二段回来后再合并，
+            所以"快"和"源一定要被调用"同时成立。播放器状态区会写明
+            <b className="text-dim">每个源各多少条、哪些来自缓存</b>；全部失败时「显示弹幕获取器记录」里
+            能看到每个源各自的原因（未匹配 / 下载失败 / 格式不支持）。
           </div>
         </div>
       </Card>

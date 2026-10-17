@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import type { DanmakuComment, DanmakuSettings } from '@shared/types'
+import { danmakuWindowRange, lowerBoundByTime } from '@shared/danmakuTimeline'
 
 /**
  * 弹幕渲染层（v0.2.8 起；v0.3.8 重写布局与绘制）
@@ -45,8 +46,10 @@ interface ActiveItem {
   /** 该条弹幕的开始播放时间（秒，已含时间轴微调） */
   start: number
   width: number
-  /** 滚动弹幕：穿过屏幕所需秒数 */
+  /** 滚动弹幕：穿过屏幕所需秒数；特殊弹幕：停留秒数 */
   duration: number
+  /** 实际绘制字号（特殊弹幕会乘「特殊弹幕字号」倍率） */
+  fontSize: number
 }
 
 interface Props {
@@ -61,8 +64,6 @@ interface Props {
   scale?: number
 }
 
-/** 顶部/底部弹幕的停留时长（秒） */
-const FIXED_DURATION = 4
 /** 每秒最多新出现的弹幕条数（防止瞬间糊屏） */
 const SPAWN_PER_SECOND = 24
 /** 文本宽度测量缓存的上限（一集常见的弹幕文本远小于这个数，避免无限增长） */
@@ -88,6 +89,16 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
   /** 每次 e 变化都要重建的常量放到 ref，避免闭包过期 */
   const cfgRef = useRef({ settings, comments, rect, playing })
   cfgRef.current = { settings, comments, rect, playing }
+  /**
+   * 渲染窗口（V1.2「切时间轴要快」）。
+   *
+   * 旧实现每次 seek/换集都把游标归零，下一帧从数组头扫到当前时间 —— 几千条时拖动进度
+   * 会明显卡一下。现在窗口用**二分**定位 `[当前-1.5s, 当前+12s]`，每帧只处理这个区间；
+   * `seekMs` 记录最近一次重新定位耗时，自检脚本可以直接断言"几十毫秒内"。
+   */
+  const windowRef = useRef({ start: 0, end: 0, at: Number.NaN, version: -1 })
+  const seekMsRef = useRef(0)
+  const commentsVersionRef = useRef(0)
 
   // 外部时间跳变（拖动进度 / 换集）时重置
   useEffect(() => {
@@ -95,25 +106,27 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
     if (Math.abs(time - base.time) > 1.5 || time < base.time - 0.05) {
       itemsRef.current = []
       laneLastRef.current = []
-      // 重新定位游标：找到第一条 >= 当前时间的弹幕
-      const list = comments
-      let lo = 0
-      let hi = list.length
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1
-        if (list[mid].time < time) lo = mid + 1
-        else hi = mid
-      }
-      cursorRef.current = lo
+      // 重新定位游标：二分找第一条 >= 当前时间的弹幕（O(log n)，不再从头扫）
+      const t0 = performance.now()
+      cursorRef.current = lowerBoundByTime(comments, time)
+      windowRef.current = { start: 0, end: 0, at: Number.NaN, version: commentsVersionRef.current }
+      seekMsRef.current = performance.now() - t0
     }
     baseRef.current = { time, clock: performance.now() }
   }, [time, comments])
 
   useEffect(() => {
-    // 换集 / 改设置：整体重置
+    /*
+     * 换集 / 两段式合并（comments 数组换了）：整体重置，但**游标按当前时间二分定位**。
+     * 旧代码这里写 `cursor = 0`，合并后第一帧要从头扫到 t（几千条）—— 这正是"切时间轴慢"的来源之一。
+     */
+    commentsVersionRef.current++
     itemsRef.current = []
     laneLastRef.current = []
-    cursorRef.current = 0
+    const t0 = performance.now()
+    cursorRef.current = lowerBoundByTime(comments, baseRef.current.time)
+    windowRef.current = { start: 0, end: 0, at: Number.NaN, version: commentsVersionRef.current }
+    seekMsRef.current = performance.now() - t0
     baseRef.current = { time: baseRef.current.time, clock: performance.now() }
   }, [comments])
 
@@ -153,7 +166,7 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
     }
 
     /** 一条弹幕在它那条道上何时腾出位置（秒，相对当前时间）；越小越该优先用 */
-    const laneFreeIn = (lane: number, mode: number, t: number, w: number): number => {
+    const laneFreeIn = (lane: number, mode: number, t: number, w: number, duration: number): number => {
       const last = laneLastRef.current[lane]
       if (!last || last.mode !== mode) return 0
       const age = t - last.start
@@ -163,7 +176,7 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
         // 尾巴离屏幕左侧还有多远 → 换算成"还要多久才会完全离开"
         return tail > 0 ? 0 : Math.max(0, (Math.abs(tail) + 12) / Math.max(1, travel / last.duration))
       }
-      return Math.max(0, FIXED_DURATION - age)
+      return Math.max(0, duration - age)
     }
 
     const draw = (): void => {
@@ -218,7 +231,28 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
       ctx.font = `${bold ? '700 ' : ''}${fontSize}px "Microsoft YaHei", "PingFang SC", sans-serif`
       const fontKey = `${bold ? 'b' : 'n'}${fontSize}`
 
-      // 1) 补生成：把 [t-0.4, t] 之间应当出现的弹幕放进来
+      // 1) 渲染窗口：只处理 [t-1.5s, t+12s]（V1.2 切时间轴快的关键）
+      const version = commentsVersionRef.current
+      const win = windowRef.current
+      /*
+       * 窗口往前留够「特殊弹幕停留时间 + 0.5s」：顶部/底部弹幕停留 4~6 秒，
+       * 如果只留 1.5 秒，拖动进度回到它已经出现 3 秒的位置时它会消失（本该还在画面上）。
+       */
+      const behindSec = Math.max(2, (Number(cfg.specialDurationSec) || 4) + 0.5)
+      if (
+        win.version !== version ||
+        !Number.isFinite(win.at) ||
+        t < win.at - 0.5 ||
+        t > win.at + 8
+      ) {
+        const t0 = performance.now()
+        const range = danmakuWindowRange(list, t, behindSec, 12)
+        windowRef.current = { ...range, at: t, version }
+        seekMsRef.current = performance.now() - t0
+      }
+      const curWin = windowRef.current
+
+      // 2) 补生成：把窗口内 [t-1.5, t] 之间应当出现的弹幕放进来
       const spawnAt = spawnWindowRef.current
       const nowSec = Math.floor(t * 4) / 4
       if (spawnAt.at !== nowSec) {
@@ -226,10 +260,13 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
         spawnAt.used = 0
       }
       let cursor = cursorRef.current
-      // 游标落后太多（长时间暂停后拖动）：直接对齐
-      while (cursor < list.length && list[cursor].time < t - 1) cursor++
+      // 游标落在窗口外（拖动/合并）：直接对齐到窗口起点，不再从头扫
+      if (cursor < curWin.start || cursor > curWin.end) cursor = curWin.start
+      while (cursor < curWin.end && (Number(list[cursor]?.time) || 0) < t - 1) cursor++
       const blocked = blockList()
-      while (cursor < list.length && list[cursor].time <= t) {
+      const specialScale = Math.min(2, Math.max(0.6, Number(cfg.specialScale) || 1))
+      const specialDuration = Math.max(1, Math.min(10, Number(cfg.specialDurationSec) || 4))
+      while (cursor < curWin.end && list[cursor].time <= t) {
         const c = list[cursor]
         cursor++
         const mode = c.mode === 4 ? 4 : c.mode === 5 ? 5 : 1
@@ -245,8 +282,14 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
         if (spawnAt.used >= SPAWN_PER_SECOND) continue
         // 同屏上限
         if (itemsRef.current.length >= Math.max(1, cfg.maxCount)) continue
-        const duration = speed * (1 + Math.min(text.length, 40) / 60)
-        const width = measure(text, fontKey, fontSize, bold)
+        /*
+         * 特殊弹幕（顶部/底部）用「特殊弹幕字号」倍率与「特殊弹幕停留」秒数；
+         * 滚动弹幕仍按播放速度。宽度必须用实际字号量，否则字号倍率一开就会重叠。
+         */
+        const itemFontSize = mode === 1 ? fontSize : Math.max(10, Math.round(fontSize * specialScale))
+        const itemFontKey = `${fontKey}|${itemFontSize}`
+        const duration = mode === 1 ? speed * (1 + Math.min(text.length, 40) / 60) : specialDuration
+        const width = measure(text, itemFontKey, itemFontSize, bold)
         /*
          * 选道（v0.3.8）：**可用的道里优先"最久没用过的"**，都被占着就挑"最快腾出来"的。
          *
@@ -259,7 +302,7 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
         let best = -1
         let bestKey = Number.POSITIVE_INFINITY
         for (let i = 0; i < laneCount; i++) {
-          const free = laneFreeIn(i, mode, t, w)
+          const free = laneFreeIn(i, mode, t, width, duration)
           if (free > 1.2) continue // 这条道还要等太久，换别的
           // 立刻可用（free<=0）→ 按"上次使用时间"排（越小越久没用过，越优先）
           // 需要等一会儿 → 按等待时间排（越快腾出来越优先），加个大常数保证排在可用道之后
@@ -279,14 +322,15 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
           lane: best,
           start: c.time,
           width,
-          duration
+          duration,
+          fontSize: itemFontSize
         }
         itemsRef.current.push(item)
         if (mode !== 4 && best < laneLastRef.current.length) laneLastRef.current[best] = item
       }
       cursorRef.current = cursor
 
-      // 排障探针（自检脚本读它）：能直接看出「时间对不对、有没有生成、画了几条、几条道」
+      // 排障探针（自检脚本读它）：能直接看出「时间对不对、有没有生成、画了几条、几条道、切时间轴耗时」
       ;(window as unknown as Record<string, unknown>).__sakanaDanmaku = {
         t: Math.round(t * 10) / 10,
         cursor,
@@ -297,7 +341,10 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
         lanes,
         playing: isPlaying,
         offsetMs: cfg.offsetMs,
-        area: cfg.area
+        area: cfg.area,
+        windowStart: curWin.start,
+        windowEnd: curWin.end,
+        seekMs: Math.round(seekMsRef.current * 100) / 100
       }
 
       // 2) 绘制 + 回收
@@ -318,6 +365,7 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
         ctx.shadowBlur = Math.max(2, Math.round(fontSize / 5))
         ctx.shadowOffsetY = 1
       }
+      let drawnFont = fontSize
       for (const it of itemsRef.current) {
         const age = t - it.start
         let x = 0
@@ -328,13 +376,22 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
           if (x + it.width < -8) continue // 已出画
           y = it.lane * lineH
         } else if (it.mode === 5) {
-          if (age > FIXED_DURATION) continue
+          if (age > it.duration) continue
           y = it.lane * lineH
           x = Math.round((w - it.width) / 2)
         } else {
-          if (age > FIXED_DURATION) continue
+          if (age > it.duration) continue
           y = h - (it.lane + 1) * lineH
           x = Math.round((w - it.width) / 2)
+        }
+        /*
+         * 特殊弹幕字号可能不同：只在**字号真的变了**时重设 font（canvas 的字体解析较贵，
+         * 滚动弹幕占绝大多数，不能每条都设一次）。
+         */
+        if (it.fontSize !== drawnFont) {
+          ctx.font = `${bold ? '700 ' : ''}${it.fontSize}px "Microsoft YaHei", "PingFang SC", sans-serif`
+          if (stroke) ctx.lineWidth = Math.max(2, Math.round(it.fontSize / 8))
+          drawnFont = it.fontSize
         }
         // 取整避免半像素字发虚（滚动位置本身仍是连续的，因为 x 是浮点算出来的）
         const px = it.mode === 1 ? x : x

@@ -215,9 +215,13 @@ export function PlayerSourcePage({
   }, [open, keyword, rules])
 
   /**
-   * 发起一批探测（v0.3.7 的缓存语义原样保留）。
-   * `force=false` 时主进程先看 30 分钟内的结果缓存 —— 命中就直接回放，
-   * 不开窗口、不打扰站点；用户想拿最新结论时点「重新探测」（force=true）。
+   * 发起一批探测。
+   *
+   * v1.1 的语义变化（用户要求「默认三规则同时开始、其它排队、结果常驻」）：
+   * · 主进程按「规则 + 番剧」逐条查常驻缓存，命中的毫秒级直接回放；
+   * · AGE / aafun / sorani 三条同时开始，其余规则排在后面的 3 并发队列里；
+   * · 探测结果里**带着搜索结果与剧集**，所以点开源/点结果时不再重新搜索（见 selectRule）。
+   * `force=true`（点「重新探测」）仍然会跳过缓存重跑。
    */
   const runProbe = async (force: boolean, list: PlayRule[]): Promise<void> => {
     if (force) setProbe({})
@@ -225,6 +229,8 @@ export function PlayerSourcePage({
     setProbeMeta({ cached: false, probedAt: undefined, started: true })
     const r = await api.ruleBatchProbe.start({
       keyword,
+      // 库驱动规则（巴哈姆特）要用番剧条目 id 换日文原名，其它规则忽略
+      subjectId,
       rules: list.map((x) => ({ id: x.id, name: x.name, baseUrl: x.baseUrl })),
       force
     })
@@ -263,13 +269,39 @@ export function PlayerSourcePage({
 
   // ---------------- 5) 搜索 / 取集 ----------------
 
+  /**
+   * 预嗅探已经替我们搜过的结果（v1.1）。
+   *
+   * 用户要求「点开某个源时不要再重新加载/重新嗅探，直接用已有的结果渲染」。
+   * 预嗅探跑的就是同一个 `ruleSearch`，结果现在跟着探测事件一起回来了，
+   * 所以只要「关键词没被用户改过」且这条规则的探测已出结果，就可以纯本地渲染。
+   * 返回 null = 没有可用结果（老缓存没有 items 字段 / 还没探完），走正常搜索。
+   */
+  const probedSearchItems = (ruleId: string): RuleSearchEntry[] | null => {
+    if (manualKw.trim() !== keyword.trim()) return null
+    const p = probe[ruleId]
+    if (!p || p.phase !== 'done' || !p.items) return null
+    return p.items
+  }
+
+  /** 预嗅探带回来的剧集（只对应搜索结果的第一条；其它条目仍按需解析） */
+  const probedGroupsFor = (
+    ruleId: string,
+    item: RuleSearchEntry
+  ): { groups: RuleEpisodeGroup[]; vars: Record<string, string> } | null => {
+    const p = probe[ruleId]
+    if (!p || p.phase !== 'done' || !p.groups?.length) return null
+    if (!p.items?.length || p.items[0].link !== item.link) return null
+    return { groups: p.groups, vars: p.vars ?? {} }
+  }
+
   /** 搜索某条线路；结果只认最后一次（见 searchSeq 的说明） */
   const runSearch = async (rule: PlayRule, kwOverride?: string): Promise<void> => {
     const kw = (kwOverride ?? manualKw).trim() || keyword
     const seq = ++searchSeq.current
     setSearching(true)
     setSearchFailure(null)
-    const res = await api.rules.search(rule.id, kw)
+    const res = await api.rules.search(rule.id, kw, subjectId)
     if (seq !== searchSeq.current) return
     setSearching(false)
     if (!res.ok) {
@@ -335,6 +367,20 @@ export function PlayerSourcePage({
     setEpsFailure(null)
     setLineIndex(0)
     setKb({ col: 1, idx: 0 })
+    /*
+     * v1.1：预嗅探已经搜过这条线路的这部番 → 直接渲染它的结果，不再发一次搜索请求。
+     * 这是用户点名的「点开源不要重新加载」：命中时这一列是**瞬间出现**的。
+     */
+    const pre = probedSearchItems(rule.id)
+    if (pre) {
+      setSearching(false)
+      setResults(pre)
+      if (pre.length === 0) {
+        const p = probe[rule.id]
+        setSearchFailure(classifySourceFailure(p?.message ?? '', 'search'))
+      }
+      return
+    }
     void runSearch(rule)
   }
 
@@ -359,6 +405,15 @@ export function PlayerSourcePage({
     setEpsFailure(null)
     setLineIndex(0)
     setKb({ col: 2, idx: 0 })
+    // v1.1：预嗅探已解析过这条结果的剧集 → 本地直接渲染，不再请求站点
+    const pre = activeRule ? probedGroupsFor(activeRule.id, item) : null
+    if (pre) {
+      setLoadingEps(false)
+      setGroups(pre.groups)
+      setVars(pre.vars)
+      setEpsFailure(null)
+      return
+    }
     void runEpisodes(activeRule, item)
   }
 
@@ -373,6 +428,14 @@ export function PlayerSourcePage({
   const playEpisode = async (groupIdx: number, epIdx: number, episodeLink: string): Promise<void> => {
     if (!activeRule || !entry || starting) return
     setStarting(true)
+    /*
+     * 先把「这条线路能力有限」这句话说出来（v1.1）。
+     *
+     * 巴哈姆特这类库驱动规则给不出视频直链，只能把官方观看页交给嗅探 ——
+     * 用户点下去之后最坏的结果是「一直在找流」。所以点击时就如实提示，
+     * 而不是让他等半分钟再猜发生了什么。
+     */
+    if (activeRule.playbackNote) toast.warn(activeRule.playbackNote)
     const res = await api.rules.play(activeRule.id, entry, groupIdx, epIdx, episodeLink, vars)
     if (!res.ok) {
       setStarting(false)
@@ -721,7 +784,13 @@ export function PlayerSourcePage({
                                 {rule.name}
                               </span>
                               <Badge tone="neutral">v{rule.version}</Badge>
-                              <Badge tone="accent">{rule.search.type === 'xpath' ? 'XPath' : 'API'}</Badge>
+                              <Badge tone="accent">
+                                {rule.engine === 'bahamut'
+                                  ? '库驱动'
+                                  : rule.search.type === 'xpath'
+                                    ? 'XPath'
+                                    : 'API'}
+                              </Badge>
                               {recommended ? <Badge tone="ok">推荐</Badge> : null}
                               {probeBadge(rule.id)}
                               {needVerify ? <Badge tone="warn">需人机验证</Badge> : null}
@@ -729,6 +798,14 @@ export function PlayerSourcePage({
                             <div className="truncate text-[10.5px] text-faint">
                               {p?.phase === 'done' && p.message ? p.message : rule.baseUrl}
                             </div>
+                            {/* 规则自己声明的能力限制（例：巴哈姆特只能给条目/选集，直链要靠网页播放器）：
+                                必须显示在条目上，否则用户点进去只会看到「加载中」然后什么都没有 —— 
+                                那正是用户说的「点了没反应的按钮」 */}
+                            {rule.playbackNote ? (
+                              <div className="text-[10px] leading-relaxed text-warn/90">
+                                ⚠ {rule.playbackNote}
+                              </div>
+                            ) : null}
                           </button>
                         )
                       })}

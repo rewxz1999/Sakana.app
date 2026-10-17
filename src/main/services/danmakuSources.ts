@@ -437,7 +437,9 @@ export const DANMAKU_ADAPTERS: DanmakuAdapterInfo[] = [
     desc:
       'ani.gamer.com.tw：搜索 → 取集（本篇/剧场版/OVA/中配）→ 取弹幕。' +
       '实测：官方 api.gamer.com.tw 国内直连不通（站方地区限制，弹幕接口自带 geo=TW,HK），' +
-      '默认基址是社区反代（可换成自建反代）；反代下实测搜到《敗北女角太多了！》第 1 集 3001 条。'
+      '默认基址是社区反代（可换成自建反代）；反代下实测搜到《敗北女角太多了！》第 1 集 3001 条。' +
+      '应用会优先使用 npm 包 bahamut-anime 的搜索/取集（包接受自定义 base）；' +
+      '包的 episode.danmu() 不可用（token.php 不返回 danmu 字段），弹幕统一走 anime/v1/danmu.php。'
   },
   {
     id: 'link',
@@ -651,9 +653,17 @@ export async function testSource(source: DanmakuSource, keyword?: string): Promi
 }
 
 // ============================================================
-// 自动加载：按优先级依次尝试已启用的数据源
+// 自动加载（V1.2 已停用）：保留旧的"按优先级取第一个命中"实现
 // ============================================================
 
+/*
+ * ⚠️ V1.2 起自动加载**不再走这里**：`danmakuSourceRunner.runEnabledSources` 会并行跑所有
+ * 启用的 fetcher，再交给 `danmakuIntegrator.integrateDanmaku` 合并（用户要求多源合并是唯一入口）。
+ * 这个函数保留有两个原因：
+ *   1. 它是上一版"第一个命中即停止"的实现，回滚时能直接对拍；
+ *   2. `testSource` 的逐步测试还复用下面的 `bahamutSearch/Episodes/Danmu` 等底层函数。
+ * 新代码不要再 import `loadFromSources`。
+ */
 export interface SourceHit {
   comments: DanmakuComment[]
   sourceId: string

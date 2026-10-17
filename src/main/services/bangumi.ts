@@ -1,9 +1,10 @@
 import { app } from 'electron'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import axios from 'axios'
 import type {
+  CachedSubjectResult,
   CalendarDay,
   CalendarResult,
   CharacterItem,
@@ -12,6 +13,7 @@ import type {
   EpisodeProgress,
   MirrorTestResult,
   Rating,
+  RatingResult,
   SearchResult,
   SearchResultItem,
   SeasonItem,
@@ -22,6 +24,7 @@ import type {
 } from '@shared/types'
 import { monthsOfSeason, seasonIndexOfMonth, seasonOfDate } from '@shared/season'
 import { log } from '../log'
+import { beginNetTrace, type NetPriority } from '../net-priority'
 import { BROWSER_UA, buildProxyAgents, getSettings } from '../net'
 import { store } from '../store'
 import { parseCalendar, parseRatingOnly, parseSearchPage, parseSubjectPage } from './bangumiHtml'
@@ -74,15 +77,6 @@ const TTL_SEARCH = 30 * 60 * 1000
  */
 const TTL_RATING = 6 * 3600 * 1000
 /**
- * 进详情页时，「顺手补一次评分」最多等多久（v0.3.7）。
- *
- * 为什么要有上限：详情正文可以立刻用 30 天缓存渲染，但评分要新鲜 ——
- * 如果无脑 await 一次评分请求，反代慢的时候整个详情页就会被拖住（用户会觉得"页面卡"）。
- * 1.5 秒是个折中：绝大多数请求在这个时间内回来（本地反代 200~400ms），
- * 超时就先按旧值渲染，请求仍在后台跑完并落缓存（下次进详情页就是新的）。
- */
-const RATING_WAIT_MS = 1500
-/**
  * 分集进度缓存（「更新到第几集」）。
  *
  * 集数一周才动一次，理论上可以缓存很久；但用户点进详情页时最想看到的就是
@@ -116,14 +110,18 @@ const TTL_CHARACTERS = 30 * 24 * 3600 * 1000
 const SEASON_PAGE_LIMIT = 100
 const REQUEST_TIMEOUT = 12000
 /**
- * 自建反代的并发闸门（v0.2.7 附加）。
+ * 分级超时（v1.1.4）。
  *
- * 反代通常是单个 Worker，实测并发一高就返回 5xx/429，而 5xx 会让整页「详情加载不出来」——
- * 用户的要求是「减少压力但不削减详情」，所以这里只限并发、不砍字段、不加降级。
+ * 为什么 S 级要放宽到 45 秒：本次实测自建反代取一部番的 v0 详情
+ * **成功时也要 31~36 秒**（`/calendar` 则是 25 秒后返回 522）。
+ * 旧的 12 秒超时意味着「明明能成功的数据也一定失败」，而且会连着重试两次
+ * （12s + 1.2s + 12s + 3s + 12s ≈ 40 秒）才报错 —— 用户感知就是「又慢又加载不出来」。
+ * 放宽后由「必定失败」变成「一次成功」，失败重试也只在 45 秒内做一次。
+ * 低优先级不享受这个宽限：B 级（随机推荐）卡 12 秒就该让路，不能长期占着带宽。
  */
-const MAX_PROXY_CONCURRENCY = 2
-let proxyInFlight = 0
-const proxyQueue: (() => void)[] = []
+function requestTimeoutFor(level: NetPriority): number {
+  return level === 'S' ? 40000 : level === 'A' ? 20000 : REQUEST_TIMEOUT
+}
 
 /**
  * Jikan 兜底的缓存（v0.3.2 新增）。
@@ -182,6 +180,22 @@ function appendFallbackFailure(error: SourceError, meta: JikanFallbackMeta): voi
   if (meta.endpoints?.length) error.tried = [...error.tried, ...meta.endpoints]
 }
 
+/**
+ * 把请求地址压成「只含路径、不含主机」的日志标签。
+ *
+ * 为什么不用完整 URL：红线要求日志/界面绝不出现自建反代或内部接口地址。
+ * `log.append` 本身会脱敏，但多一层保险 —— 标签在进入日志系统之前就已经没有主机名了。
+ * 搜索关键词可能出现在路径里，所以搜索类请求**不调用这个函数**，直接传固定标签「搜索」。
+ */
+function safePathLabel(url: string): string {
+  try {
+    const p = new URL(url).pathname.replace(/\/+$/, '') || '/'
+    return p.length > 72 ? `${p.slice(0, 68)}…` : p
+  } catch {
+    return '请求'
+  }
+}
+
 interface CacheEntry<T> {
   fetchedAt: number
   data: T
@@ -197,24 +211,6 @@ function isApiHost(host: string): boolean {
 
 /** 已被墙的公共镜像：默认跳过（用户实测 bangumi.pro 已不可达，请求它只是白等） */
 const DEAD_MIRRORS = ['bangumi.pro']
-
-/**
- * 并发闸门：同一时刻最多 N 个请求在飞，其余排队。
- * 只用于自建反代（公共镜像本来就允许并行竞速，且它们的压力与我们无关）。
- */
-async function withProxySlot<T>(fn: () => Promise<T>): Promise<T> {
-  if (proxyInFlight >= MAX_PROXY_CONCURRENCY) {
-    await new Promise<void>((resolve) => proxyQueue.push(resolve))
-  }
-  proxyInFlight += 1
-  try {
-    return await fn()
-  } finally {
-    proxyInFlight -= 1
-    const next = proxyQueue.shift()
-    if (next) next()
-  }
-}
 
 /**
  * 单飞（single-flight）：完全相同的 URL 在同一时刻只发一次请求。
@@ -570,12 +566,69 @@ class BangumiService {
     return [...new Set(alive)]
   }
 
+  /**
+   * 进程内一级缓存（v1.1.4 性能改造）。
+   *
+   * 为什么需要：详情/日历/季度/评分全是「磁盘 JSON + 每次 JSON.parse」。
+   * 单个文件不大（详情约 8KB、日历 68KB），但番剧表一屏要读评分 ×N、
+   * 标签屏蔽打开时还要逐条读详情 —— 反复解析同一份 JSON 纯属浪费，
+   * 而用户抱怨的正是「读取慢」。这里按 (mtime, size) 判断文件是否被别的进程改过，
+   * 命中时**直接复用已解析对象**，把「读磁盘 + 解析」降到一次 Map 查找（约 0.01ms）。
+   *
+   * 为什么可以复用同一份对象而不每次深拷贝：本项目里缓存条目一律**只读**
+   * （所有写路径都是 read → 生成新对象 → writeCache），IPC 返回时 structuredClone 由 Electron 完成。
+   * 唯一需要小心的是「读到对象后原地改字段」，本文件里没有这种写法（mergeFreshRating 用展开生成新对象）。
+   */
+  private l1 = new Map<string, { mtimeMs: number; size: number; entry: CacheEntry<unknown> }>()
+
+  /**
+   * 已经打过「命中缓存」日志的键。
+   * 为什么要去重：详情页一次打开会读多条缓存，评分补齐还会重复读同一键；
+   * 每次都 `log.append` 会写 store + console，实测反而把「读取快」的优势吃掉（50 次读约 1ms 全花在日志上）。
+   * 这里每个键只在**本进程第一次**说明一次，命中率照样可查，热路径保持无日志。
+   */
+  private cacheLogged = new Set<string>()
+
+  /** 当前 L1 对应的缓存目录：设置里改缓存目录时整层作废，避免新旧目录同名键串数据 */
+  private l1Dir = ''
+
+  /** 清空进程内缓存（「设置 → 清理缓存」/切换缓存目录时调用，见 ipc 的 cacheClear） */
+  clearMemoryCache(): void {
+    this.l1.clear()
+    this.cacheLogged.clear()
+    this.l1Dir = ''
+  }
+
+  /** 目录切换检测：只在 getter 结果变化时清空，正常热路径只有一次字符串比较 */
+  private ensureL1Dir(): void {
+    const dir = this.cacheDir
+    if (dir !== this.l1Dir) {
+      this.l1.clear()
+      this.cacheLogged.clear()
+      this.l1Dir = dir
+    }
+  }
+
+  /**
+   * 读缓存并统计耗时。
+   * `label` 只用于日志（不含地址），`t0` 由调用方传入时能把「服务层整体读取耗时」算进去。
+   */
   private readCache<T>(key: string): CacheEntry<T> | null {
-    if (!this.cacheDir) return null
+    this.ensureL1Dir()
+    /*
+     * L1 命中直接返回，**不再 stat**（v1.1.4）。
+     * 为什么可以信任内存：缓存目录归本应用独占（单实例锁），所有写路径都会同步更新 L1，
+     * 「清缓存」也会调用 clearMemoryCache()；之前每次 stat 是为了防外部改动，
+     * 但实测 stat 本身就要 ~0.05ms，把「读缓存快」的优势吃掉了一半。
+     */
+    const hit = this.l1.get(key)
+    if (hit) return hit.entry as CacheEntry<T>
+    const f = join(this.cacheDir, `${key}.json`)
     try {
-      const f = join(this.cacheDir, `${key}.json`)
-      if (!existsSync(f)) return null
-      return JSON.parse(readFileSync(f, 'utf-8')) as CacheEntry<T>
+      const st = statSync(f)
+      const entry = JSON.parse(readFileSync(f, 'utf-8')) as CacheEntry<T>
+      this.l1.set(key, { mtimeMs: st.mtimeMs, size: st.size, entry: entry as CacheEntry<unknown> })
+      return entry
     } catch {
       return null
     }
@@ -585,7 +638,15 @@ class BangumiService {
     if (!this.cacheDir) return
     try {
       const f = join(this.cacheDir, `${key}.json`)
-      writeFileSync(f, JSON.stringify({ fetchedAt: Date.now(), data }), 'utf-8')
+      const entry: CacheEntry<T> = { fetchedAt: Date.now(), data }
+      writeFileSync(f, JSON.stringify(entry), 'utf-8')
+      // 写盘后同步一级缓存：否则紧接着的读取还要再解析一遍刚写下去的内容
+      try {
+        const st = statSync(f)
+        this.l1.set(key, { mtimeMs: st.mtimeMs, size: st.size, entry: entry as CacheEntry<unknown> })
+      } catch {
+        /* 文件状态拿不到时让下次读取走磁盘 */
+      }
     } catch (err) {
       log.append('warn', 'bangumi', `写缓存失败: ${String(err)}`)
     }
@@ -615,12 +676,36 @@ class BangumiService {
    *   「正在确认你是不是机器人！」），改用**离屏真实浏览器**重新打开该地址 ——
    *   导航会自动完成校验并返回真正的服务端渲染 HTML。
    */
-  private async fetchMirror(url: string, isApi: boolean): Promise<string> {
+  private async fetchMirror(
+    url: string,
+    isApi: boolean,
+    meta: { priority?: NetPriority; tag?: string } = {}
+  ): Promise<string> {
+    /*
+     * 请求级计时（v1.1.4）：按优先级打标并记录「接口 / 状态 / 大小 / 耗时 / 同时并发数」。
+     * 标签只取 pathname，不含主机名 —— 红线要求日志里不出现反代地址（log.append 还会再脱敏一次）。
+     */
+    const level: NetPriority = meta.priority ?? 'A'
+    const label = meta.tag ?? safePathLabel(url)
+    const traced = async <T>(fn: () => Promise<T>, bytesOf: (v: T) => number): Promise<T> => {
+      const done = beginNetTrace(level, label)
+      try {
+        const v = await fn()
+        done(200, bytesOf(v))
+        return v
+      } catch (err) {
+        done('error')
+        throw err
+      }
+    }
     const axiosOnce = async (): Promise<string> => {
       const res = await axios.get(url, {
-        timeout: REQUEST_TIMEOUT,
+        timeout: requestTimeoutFor(level),
         responseType: 'text',
         headers: { 'User-Agent': BROWSER_UA, Accept: '*/*' },
+        // 显式分级：全局队列据此排队（见 main/net.ts 的 installNetworkPriority）
+        netPriority: level,
+        netTag: label,
         ...buildProxyAgents(getSettings().proxy)
       })
       if (res.status !== 200) throw new Error(`HTTP ${res.status}`)
@@ -630,7 +715,7 @@ class BangumiService {
     let text: string | null = null
     let directError: unknown = null
     try {
-      text = await axiosOnce()
+      text = await traced(axiosOnce, (v) => Buffer.byteLength(v, 'utf-8'))
     } catch (err) {
       directError = err
     }
@@ -638,16 +723,30 @@ class BangumiService {
      * 重试两次（v0.2.7）：自建反代在并发下会瞬时返回 5xx / 429，
      * 或者连接被中间设备重置。这些都是一过性的，隔一会儿再来通常就通了 ——
      * 直接报错给用户会表现为「很多番剧详情加载不出来」。退避 1.2s → 3s。
+     *
+     * v1.1.4：加**总时限**。放宽 S 级超时后，如果每次都要等满 45 秒，
+     * 两次重试就是 90 秒以上（比旧版 40 秒还糟）。所以按级别给一个总预算，
+     * 预算用完就不再重试 —— 「一次成功」优先于「无限重试」。
      */
+    const retryDeadline = Date.now() + (level === 'S' ? 60000 : level === 'A' ? 30000 : 20000)
     for (const backoff of [1200, 3000]) {
       if (text) break
+      if (Date.now() + backoff >= retryDeadline) break
       const msg = String((directError as { message?: string })?.message ?? directError ?? '')
-      const retryable = isNetworkReset(directError) || /\b(5\d\d|429)\b/.test(msg)
+      /*
+       * v1.1.4：**超时不重试**。
+       * 反代慢到 40 秒才超时，说明对端就是在慢慢排队；再重试只会让用户多等一个 40 秒
+       * （实测冷启动曾因此拖到 123 秒才成功）。超时直接失败、交给界面显示骨架/缓存；
+       * 连接被重置（10 秒内 ECONNRESET）这类一过性问题仍然重试，成本只有 1.2 秒。
+       */
+      const code = String((directError as { code?: string })?.code ?? '')
+      const timedOut = code === 'ECONNABORTED' || /timeout of \d+ms exceeded/i.test(msg)
+      const retryable = !timedOut && (isNetworkReset(directError) || /\b(5\d\d|429)\b/.test(msg))
       if (!retryable) break
-      log.append('info', 'bangumi', `请求失败将重试（${msg.slice(0, 60)}）: ${url.slice(0, 80)}`)
+      log.append('info', 'bangumi', `请求失败将重试（${msg.slice(0, 60)}）: ${label}`)
       await new Promise((r) => setTimeout(r, backoff))
       try {
-        text = await axiosOnce()
+        text = await traced(axiosOnce, (v) => Buffer.byteLength(v, 'utf-8'))
         directError = null
       } catch (err) {
         directError = err
@@ -661,7 +760,10 @@ class BangumiService {
       throw directError ?? new Error('请求失败')
     }
     // 网页镜像：交给离屏浏览器（会自动完成机器人校验，应用内实测约 14 秒）
-    const viaBrowser = await offscreenGet(url, { waitMs: 30000 })
+    const viaBrowser = await traced(
+      () => offscreenGet(url, { waitMs: 30000 }),
+      (v) => Buffer.byteLength(v, 'utf-8')
+    )
     return viaBrowser
   }
 
@@ -669,12 +771,15 @@ class BangumiService {
    * 并行尝试所有镜像，返回第一个成功响应。
    * api 镜像走 JSON 路径，网页镜像走 HTML 路径。
    */
-  private async requestBest(paths: {
-    api: string
-    web: string
-    /** 自建反代专用的路径（缺省时用 api 路径） */
-    customApi?: string
-  }): Promise<{ text: string; mirror: string }> {
+  private async requestBest(
+    paths: {
+      api: string
+      web: string
+      /** 自建反代专用的路径（缺省时用 api 路径） */
+      customApi?: string
+    },
+    meta: { priority?: NetPriority; tag?: string } = {}
+  ): Promise<{ text: string; mirror: string }> {
     /*
      * v0.2.7：配了自建反代就**只用它**（用户要求：反代加载不出来时提示手动切换镜像，而不是自动回退）。
      *
@@ -688,10 +793,12 @@ class BangumiService {
       const url = `${custom}${this.calendarPathFor(custom, paths)}`
       try {
         /*
-         * 单飞 + 并发闸门（v0.2.7 附加）：不改变取到的数据，只减少反代实际收到的请求数。
-         * URL 相同的并发调用合并成一次；同时最多 2 个请求在飞，避免把个人 Worker 打成 5xx。
+         * 单飞：URL 相同的并发调用合并成一次（详情页与播放器详情面板会同时请求同一部番）。
+         * 并发上限交给全局分级队列（S=4）：这里不再单独压到 2 ——
+         * 那个 2 是 v0.2.7 在没有分级时的权宜之计，现在由 S 级闸门统一管理，
+         * 两处各压一次会让实际并发只剩 2，番剧表的三个月并行永远慢一拍。
          */
-        const text = await singleFlight(url, () => withProxySlot(() => this.fetchMirror(url, true)))
+        const text = await singleFlight(url, () => this.fetchMirror(url, true, meta))
         return { text, mirror: custom }
       } catch (err) {
         const e = err as { code?: string; message?: string }
@@ -716,7 +823,7 @@ class BangumiService {
         url = `${mirror}${paths.web}`
       }
       try {
-        return { text: await this.fetchMirror(url, isApi), mirror }
+        return { text: await this.fetchMirror(url, isApi, meta), mirror }
       } catch (err) {
         const e = err as { code?: string; message?: string }
         const reason = e?.code === 'ECONNABORTED' ? '超时' : (e?.message ?? String(err))
@@ -993,31 +1100,133 @@ class BangumiService {
     return withJikanFallback({ fromCache: false, data }, { source: 'jikan', endpoints: [r.endpoint], ms })
   }
 
-  async calendar(force = false): Promise<CalendarResult> {
-    const cache = this.readCache<CalendarDay[]>('calendar')
-    // 会话内只请求一次：应用打开后首次加载联网更新，之后一律直接使用本地数据（除非用户手动刷新）
-    if (!force) {
-      if (this.calendarSessionFresh && cache) {
-        return { fromCache: true, fetchedAt: cache.fetchedAt, days: cache.data }
+  /** 日历后台刷新完成后的监听（渲染层据此更新番剧表，不需要用户手动刷新） */
+  private calendarListeners = new Set<(r: CalendarResult) => void>()
+
+  /** 注册「番剧表在后台更新好了」的监听；返回取消函数（IPC 层转发给所有窗口） */
+  onCalendarUpdated(cb: (r: CalendarResult) => void): () => void {
+    this.calendarListeners.add(cb)
+    return () => this.calendarListeners.delete(cb)
+  }
+
+  private emitCalendar(r: CalendarResult): void {
+    for (const cb of this.calendarListeners) {
+      try {
+        cb(r)
+      } catch {
+        /* 单个监听器异常不影响其它窗口 */
       }
-      // 本会话尚未更新过：联网一次，成功即标记会话新鲜；失败回退缓存（带 stale 标记）
     }
-    try {
-      const { text, mirror } = await this.requestBest({
+  }
+
+  /** 后台刷新是否在飞（避免「启动 6 秒后的自动刷新」与「渲染层首屏加载」各打一次） */
+  private calendarRefreshing = false
+
+  /** 真正的一次日历取数 + 解析（前台/后台共用，行为完全一致） */
+  private async fetchCalendarFromSource(): Promise<CalendarDay[]> {
+    const { text, mirror } = await this.requestBest(
+      {
         api: '/v0/calendar',
         web: '/calendar',
         // 自建反代的每日放送在 /calendar，且直接返回本应用需要的 7 天 JSON
         customApi: '/calendar'
-      })
-      let days: CalendarDay[]
-      if (isApiMirror(mirror)) {
-        const parsed = JSON.parse(text) as unknown
-        if (!Array.isArray(parsed)) throw new Error('日历 JSON 格式异常')
-        days = parsed as CalendarDay[]
-      } else {
-        days = parseCalendar(text)
-        if (days.length === 0) throw new Error('日历页解析为空')
+      },
+      { priority: 'S', tag: '/calendar' }
+    )
+    if (isApiMirror(mirror)) {
+      const parsed = JSON.parse(text) as unknown
+      if (!Array.isArray(parsed)) throw new Error('日历 JSON 格式异常')
+      return parsed as CalendarDay[]
+    }
+    const days = parseCalendar(text)
+    if (days.length === 0) throw new Error('日历页解析为空')
+    return days
+  }
+
+  /**
+   * 后台刷新番剧表（v1.1.4 核心改动）。
+   *
+   * 用户报「番剧表用一般带宽很难加载完」，实测真因不是数据量（日历 JSON 只有 68KB），
+   * 而是**启动时拿不到网络就什么都不显示**：旧逻辑即使磁盘上有 68KB 缓存，
+   * 也要先联网（本次实测这台机器上，缓存命中的番剧表首屏整整等了 142 秒：
+   * 主源 3 次超时 + Jikan/AniList 兜底全部超时之后，才把缓存还给界面）。
+   * 现在改为 stale-while-revalidate：缓存立即返回，刷新在后台做，成功了再推事件给界面。
+   */
+  private refreshCalendarInBackground(): void {
+    if (this.calendarRefreshing) return
+    this.calendarRefreshing = true
+    const t0 = Date.now()
+    void (async () => {
+      try {
+        const days = await this.fetchCalendarFromSource()
+        this.writeCache('calendar', days)
+        this.calendarSessionFresh = true
+        const count = days.reduce((n, d) => n + d.items.length, 0)
+        log.append('info', 'bangumi', `番剧表后台更新完成：${count} 部，用时 ${Date.now() - t0}ms`)
+        this.emitCalendar({ fromCache: false, fetchedAt: Date.now(), days })
+      } catch (err) {
+        /*
+         * 后台刷新失败**不打扰用户**：缓存照常显示，下次启动/手动刷新再试。
+         * 这里也**不走 Jikan 兜底** —— 兜底是「主数据源全挂且用户没有可用数据」时的救援，
+         * 而后台刷新失败时用户手上已经有一份可看的番剧表，再打一轮兜底只会白耗流量。
+         */
+        log.append(
+          'warn',
+          'bangumi',
+          `番剧表后台更新失败（继续用缓存）：${String((err as Error)?.message ?? err)}`
+        )
+        /*
+         * 失败也要推一次（refreshing:false）：
+         * 否则界面上那行「正在后台更新」会永远转下去（用户会以为卡死）。
+         * 带 error 让番剧表如实显示「数据源不可达，当前显示缓存」。
+         */
+        const cached = this.readCache<CalendarDay[]>('calendar')
+        if (cached) {
+          this.emitCalendar({
+            fromCache: true,
+            refreshing: false,
+            stale: true,
+            fetchedAt: cached.fetchedAt,
+            days: cached.data,
+            error:
+              err && typeof err === 'object' && 'kind' in err
+                ? (err as SourceError)
+                : makeSourceError('NETWORK', String((err as Error)?.message ?? err), [])
+          })
+        }
+      } finally {
+        this.calendarRefreshing = false
       }
+    })()
+  }
+
+  async calendar(force = false): Promise<CalendarResult> {
+    const readT0 = performance.now()
+    const cache = this.readCache<CalendarDay[]>('calendar')
+    const readMs = performance.now() - readT0
+    if (cache) {
+      if (!this.cacheLogged.has('calendar')) {
+        this.cacheLogged.add('calendar')
+        log.append(
+          'info',
+          'bangumi',
+          `日历缓存命中（读取 ${readMs.toFixed(2)}ms，缓存年龄 ${((Date.now() - cache.fetchedAt) / 3600000).toFixed(1)}h，${cache.data.reduce((n, d) => n + d.items.length, 0)} 部）`
+        )
+      }
+    } else {
+      log.append('info', 'bangumi', `日历缓存未命中（读取 ${readMs.toFixed(2)}ms）`)
+    }
+    /*
+     * v1.1.4：**有缓存就立刻返回**（无论是否过期），刷新放后台。
+     * 手动刷新（force）仍然前台等网络 —— 用户点了「刷新」就是要看到新数据/失败提示。
+     */
+    if (!force && cache) {
+      const refreshing = !this.calendarSessionFresh
+      if (refreshing) this.refreshCalendarInBackground()
+      return { fromCache: true, refreshing, fetchedAt: cache.fetchedAt, days: cache.data }
+    }
+    try {
+      const days = await this.fetchCalendarFromSource()
       this.writeCache('calendar', days)
       this.calendarSessionFresh = true
       return { fromCache: false, fetchedAt: Date.now(), days }
@@ -1067,24 +1276,64 @@ class BangumiService {
    *
    * month 允许传该季度里的任意一个月，内部会规范化到季度（缓存键也只认季度）。
    */
-  async season(year: number, month: number, force = false): Promise<SeasonResult> {
+  async season(year: number, month: number, force = false, priority: NetPriority = 'S'): Promise<SeasonResult> {
     const y = Math.trunc(year) || new Date().getFullYear()
     const season = seasonIndexOfMonth(month)
     const key = `season-${y}-${season}`
+    const readT0 = performance.now()
     const cache = this.readCache<SeasonItem[]>(key)
+    if (!this.cacheLogged.has(key)) {
+      this.cacheLogged.add(key)
+      log.append(
+        'info',
+        'bangumi',
+        `季度 ${y}-Q${season} ${cache ? `命中磁盘缓存（读取 ${(performance.now() - readT0).toFixed(2)}ms，${cache.data.length} 条，年龄 ${((Date.now() - cache.fetchedAt) / 3600000).toFixed(1)}h）` : `无缓存（读取 ${(performance.now() - readT0).toFixed(2)}ms），需联网`}`
+      )
+    }
     if (!force && cache && Date.now() - cache.fetchedAt < TTL_SEASON) {
       return { year: y, season, fromCache: true, fetchedAt: cache.fetchedAt, items: cache.data }
     }
+    /*
+     * v1.1.4：过期缓存 / 月份级缓存也**立即返回**，刷新放后台。
+     * 过去这里会等三个月份全部回来（每月份还可能 rank→date 串两次请求），
+     * 一般带宽下经常要几十秒甚至超时，界面就一直停在骨架屏 —— 这就是「番剧表加载不完」。
+     * 现在只要有「任意月份」的缓存就先拼出一份可看的列表（partial），其余月份后台补。
+     */
+    if (!force) {
+      if (cache) {
+        this.refreshSeasonInBackground(y, season, key, priority)
+        return { year: y, season, fromCache: true, stale: true, fetchedAt: cache.fetchedAt, items: cache.data }
+      }
+      const monthCached = this.cachedSeasonMonths(y, season)
+      if (monthCached.items.length > 0) {
+        this.refreshSeasonInBackground(y, season, key, priority)
+        return {
+          year: y,
+          season,
+          fromCache: true,
+          partial: true,
+          fetchedAt: monthCached.fetchedAt,
+          items: monthCached.items
+        }
+      }
+    }
     try {
-      const items = await this.fetchSeason(y, season)
+      const { items, complete } = await this.fetchSeason(y, season, force, priority)
       /*
-       * v0.3.7：**空结果不写缓存**。
-       * 一个季度完全取不到条目，通常意味着「这一季还没开播 / 条目还没登记」，
-       * 而季度缓存是 7 天 —— 把空列表写进去，会让「明天就有了」变成「一周以后才有」。
-       * 不写缓存的话下次打开会重新问一遍，代价只是多一次请求。
+       * v0.3.7：**空结果不写缓存**（这一季还没登记，写进去 7 天内都不会再问）。
+       * v1.1.4：**不完整的季度也不写整季缓存** —— 三个月里只成功一个月时，
+       * 过去会把残缺列表冻 7 天（用户看到的番剧表莫名少一大半）。
+       * 月份级缓存已经在 fetchSeasonMonth 里各自写好，完整时才合并落整季键。
        */
-      if (items.length > 0) this.writeCache(key, items)
-      return { year: y, season, fromCache: false, fetchedAt: Date.now(), items }
+      if (complete && items.length > 0) this.writeCache(key, items)
+      return {
+        year: y,
+        season,
+        fromCache: false,
+        partial: complete ? undefined : true,
+        fetchedAt: Date.now(),
+        items
+      }
     } catch (err) {
       const error: SourceError =
         err && typeof err === 'object' && 'kind' in err
@@ -1108,23 +1357,37 @@ class BangumiService {
   }
 
   /**
-   * 拉取一个季度的三个月份并合并去重。
+   * 拉取一个季度的三个月份并合并去重（v1.1.4 改为返回「是否完整」）。
    *
-   * 三个月并行发（`requestBest` 内部的并发闸门会把实际并发压到 2，不会打爆个人反代）；
-   * **只要有一个月成功就返回该月的数据** —— 某个月偶发 5xx 时，
-   * 用户看到的是「少了几条、但列表照常可用」，而不是整块「该季度数据暂不可用」。
+   * 三个月并行发（全局 S 级队列把并发上限放到 4，正好让三个月同时飞，
+   * 不必再像旧实现那样排成两批）；**只要有一个月成功就返回该月的数据** ——
+   * 某个月偶发 5xx 时用户看到的是「少了几条、但列表照常可用」，而不是整块不可用。
+   * `complete = false` 时**不写整季缓存**（见 season() 的说明），月份级缓存各自已经写好。
    */
-  private async fetchSeason(year: number, season: number): Promise<SeasonItem[]> {
+  private async fetchSeason(
+    year: number,
+    season: number,
+    force = false,
+    priority: NetPriority = 'S'
+  ): Promise<{ items: SeasonItem[]; complete: boolean }> {
     const months = monthsOfSeason(season)
-    const settled = await Promise.allSettled(months.map((m) => this.fetchSeasonMonth(year, m)))
+    const settled = await Promise.allSettled(months.map((m) => this.fetchSeasonMonth(year, m, force, priority)))
     const lists = settled.filter((r) => r.status === 'fulfilled').map((r) => r.value)
     if (lists.length === 0) {
       const first = settled.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined
       throw first?.reason ?? new Error('季度取数失败')
     }
+    return {
+      items: this.mergeSeasonItems(lists),
+      // 三个月都有结果才算完整；空数组也算「成功但没数据」（该月确实没番）
+      complete: settled.every((r) => r.status === 'fulfilled')
+    }
+  }
+
+  /** 合并多个月的条目：保持接口顺序（热度/排名靠前的在前），仅按 id 去重 */
+  private mergeSeasonItems(lists: SeasonItem[][]): SeasonItem[] {
     const seen = new Set<number>()
     const items: SeasonItem[] = []
-    // 保持接口给的顺序（sort=rank：热度/排名靠前的在前），仅按 id 去重
     for (const list of lists) {
       for (const item of list) {
         if (item.id <= 0 || seen.has(item.id)) continue
@@ -1135,8 +1398,62 @@ class BangumiService {
     return items
   }
 
-  /** 取某个季度的单个月份（`/v0/subjects?type=2&year=&month=&sort=…`） */
-  private async fetchSeasonMonth(year: number, month: number): Promise<SeasonItem[]> {
+  /** 从「月份级缓存」拼出一份列表（只取仍在 TTL 内的；拼不出来时返回空） */
+  private cachedSeasonMonths(year: number, season: number): { items: SeasonItem[]; fetchedAt: number } {
+    const lists: SeasonItem[][] = []
+    let newest = 0
+    for (const m of monthsOfSeason(season)) {
+      const c = this.readCache<SeasonItem[]>(`season-month-${year}-${m}`)
+      if (!c || Date.now() - c.fetchedAt >= TTL_SEASON) continue
+      lists.push(c.data)
+      newest = Math.max(newest, c.fetchedAt)
+    }
+    return { items: this.mergeSeasonItems(lists), fetchedAt: newest || Date.now() }
+  }
+
+  /** 正在后台刷新的季度（键 = 年-季），避免历史表连点/StrictMode 双跑时重复请求 */
+  private seasonRefreshing = new Set<string>()
+
+  private refreshSeasonInBackground(
+    year: number,
+    season: number,
+    key: string,
+    priority: NetPriority = 'S'
+  ): void {
+    const tag = `${year}-${season}`
+    if (this.seasonRefreshing.has(tag)) return
+    this.seasonRefreshing.add(tag)
+    void this.fetchSeason(year, season, false, priority)
+      .then(({ items, complete }) => {
+        // 只有完整结果才覆盖整季缓存；不完整时月份缓存已经各自更新，下次再拼
+        if (complete && items.length > 0) this.writeCache(key, items)
+      })
+      .catch((err) =>
+        log.append('warn', 'bangumi', `季度后台刷新失败（${tag}，继续用缓存）: ${String((err as Error)?.message ?? err)}`)
+      )
+      .finally(() => this.seasonRefreshing.delete(tag))
+  }
+
+  /**
+   * 取某个季度的单个月份（`/v0/subjects?type=2&year=&month=&sort=…`）。
+   *
+   * v1.1.4：加**月份级缓存**。为什么按月份而不是只按季度：
+   * 一个季度要打三个月份的请求，反代一慢就很容易只成功一两个；
+   * 只缓存整季的话，一次超时就让「已经拿到的两个月」全部作废，下次从零开始 ——
+   * 这正是用户看到的「番剧表怎么都加载不完」。月份缓存让每次成功都能沉淀，
+   * 下次打开先拼出已有的两个月（秒开），第三个后台补。
+   */
+  private async fetchSeasonMonth(
+    year: number,
+    month: number,
+    force = false,
+    priority: NetPriority = 'S'
+  ): Promise<SeasonItem[]> {
+    const key = `season-month-${year}-${month}`
+    if (!force) {
+      const cached = this.readCache<SeasonItem[]>(key)
+      if (cached && Date.now() - cached.fetchedAt < TTL_SEASON) return cached.data
+    }
     /*
      * v0.3.7 修复（用户报「马上就要进入秋季了，10 月的番剧数据完全没有」）：
      *
@@ -1150,21 +1467,30 @@ class BangumiService {
      * 拿到的是「这一季登记在案的全部条目」（含未开播的）。
      * 反过来不直接用 date 是因为 rank 的排序对**已播完**的季度更有用（热度高的在前）。
      */
-    const byRank = await this.fetchSeasonMonthSorted(year, month, 'rank')
-    if (byRank.length > 0) return byRank
-    const byDate = await this.fetchSeasonMonthSorted(year, month, 'date')
-    if (byDate.length > 0) {
-      log.append(
-        'info',
-        'bangumi',
-        `季度检索 ${year}-${month} 用 sort=rank 取不到条目（多半是还没开播），已改用 sort=date 取到 ${byDate.length} 条`
-      )
+    const byRank = await this.fetchSeasonMonthSorted(year, month, 'rank', priority)
+    let items = byRank
+    if (items.length === 0) {
+      items = await this.fetchSeasonMonthSorted(year, month, 'date', priority)
+      if (items.length > 0) {
+        log.append(
+          'info',
+          'bangumi',
+          `季度检索 ${year}-${month} 用 sort=rank 取不到条目（多半是还没开播），已改用 sort=date 取到 ${items.length} 条`
+        )
+      }
     }
-    return byDate
+    // 空结果不写缓存（该月还没登记条目时，下周再来问）
+    if (items.length > 0) this.writeCache(key, items)
+    return items
   }
 
   /** 季度检索的单次请求（sort 由调用方决定，见 fetchSeasonMonth 的说明） */
-  private async fetchSeasonMonthSorted(year: number, month: number, sort: 'rank' | 'date'): Promise<SeasonItem[]> {
+  private async fetchSeasonMonthSorted(
+    year: number,
+    month: number,
+    sort: 'rank' | 'date',
+    priority: NetPriority = 'S'
+  ): Promise<SeasonItem[]> {
     const path = `/v0/subjects?type=2&year=${year}&month=${month}&sort=${sort}&limit=${SEASON_PAGE_LIMIT}`
     /*
      * 三个路径都给同一个地址：季度检索只有 v0 JSON 接口有（官方网页版的 /anime/browser
@@ -1173,7 +1499,10 @@ class BangumiService {
      * 这里会拿到 HTML —— 下面 isApiMirror 判定后直接报错，界面显示「该季度数据暂不可用」，
      * 而不是把 HTML 当 JSON 解析崩掉。
      */
-    const { text, mirror } = await this.requestBest({ api: path, web: path, customApi: path })
+    const { text, mirror } = await this.requestBest(
+      { api: path, web: path, customApi: path },
+      { priority, tag: '/v0/subjects(季度)' }
+    )
     if (!isApiMirror(mirror)) {
       throw makeSourceError('PARSE', '当前数据源不支持季度接口（需要用 API 型数据源，如自建反代）', [mirror])
     }
@@ -1196,7 +1525,7 @@ class BangumiService {
     }
   }
 
-  async subject(id: number): Promise<SubjectResult> {
+  async subject(id: number, priority: NetPriority = 'S'): Promise<SubjectResult> {
     /*
      * v0.3.2：**负数 id = Jikan 兜底条目**（`-MAL id`，见 jikanMap.jikanFallbackId）。
      *
@@ -1213,36 +1542,35 @@ class BangumiService {
      * 已经落盘的那些残缺详情必须在升级后立刻失效，否则用户仍会看到「详细信息为空」。
      */
     const key = `subject3-${id}`
+    const readT0 = performance.now()
     const cache = this.readCache<SubjectDetail>(key)
-    if (cache && Date.now() - cache.fetchedAt < TTL_SUBJECT) {
-      /*
-       * v0.3.7：详情正文与评分的**时效要求不一样**，不能共用同一个 TTL。
-       *
-       * 详情正文（简介 / 标签 / 制作信息）一个月不变也没关系，所以正文继续用 30 天缓存；
-       * 但评分与评分人数每天都在动 —— 过去它们被一起冻在 30 天里，
-       * 于是用户看到的就是「番剧的评分、评分人数更新不及时」（实测：详情页评分能旧到一个月）。
-       * 这里把评分单独交给 6 小时的 `rating-*` 缓存（见 mergeFreshRating 的说明）。
-       */
-      return { fromCache: true, data: await this.mergeFreshRating(id, cache.data) }
+    if (!this.cacheLogged.has(key)) {
+      this.cacheLogged.add(key)
+      log.append(
+        'info',
+        'bangumi',
+        `详情#${id} ${cache ? `命中磁盘缓存（读取 ${(performance.now() - readT0).toFixed(2)}ms，年龄 ${((Date.now() - cache.fetchedAt) / 86400000).toFixed(1)} 天）` : `无缓存（读取 ${(performance.now() - readT0).toFixed(2)}ms），需联网`}`
+      )
     }
-    /*
-     * v0.2.7 附加：过期缓存**先照常返回全部详情**，刷新放到后台静默做。
-     *
-     * 这样「打开详情页」永远不会因为反代慢/瞬时 5xx 而变成「信息加载不出来」——
-     * 用户看到的仍是完整详情（infobox/标签/制作信息一个都不少），
-     * 反代只在后台被请求一次（单飞去重），压力显著下降。
-     */
     if (cache) {
-      void this.fetchSubject(id)
-        .then((fresh) => {
-          this.writeCache(key, fresh)
-          this.noteRating(id, fresh.rating)
-        })
-        .catch((err) => log.append('warn', 'bangumi', `后台刷新详情失败 (#${id})，继续用缓存: ${String(err)}`))
-      return { fromCache: true, stale: true, data: await this.mergeFreshRating(id, cache.data) }
+      /*
+       * v1.1.4：**缓存命中一律立即返回，不再等评分**。
+       *
+       * 以前这里会 await `mergeFreshRating`：评分缓存过期时最多再等 1.5 秒，
+       * 于是「明明有 30 天缓存」的详情页也要卡 1.5 秒才画出来（用户感知就是"详情页慢"）。
+       * 现在正文立刻返回，评分由详情页单独调用 `rating()` 刷新（不阻塞任何板块）；
+       * 过期正文则后台静默重取（单飞去重），抓到的完整详情下次进页面就是新的。
+       */
+      const expired = Date.now() - cache.fetchedAt >= TTL_SUBJECT
+      if (expired) this.refreshSubjectInBackground(id, key, priority)
+      return {
+        fromCache: true,
+        stale: expired || undefined,
+        data: this.applyCachedRating(id, cache.data)
+      }
     }
     try {
-      const detail = await this.fetchSubject(id)
+      const detail = await this.fetchSubject(id, priority)
       this.writeCache(key, detail)
       // 刚拿到的详情里就带着评分：顺手写进 6 小时那份缓存，避免下次再为评分多打一次请求
       this.noteRating(id, detail.rating)
@@ -1254,6 +1582,93 @@ class BangumiService {
           : makeSourceError('NETWORK', String(err), [])
       log.append('warn', 'bangumi', `获取详情失败 (#${id}): ${error.message}`)
       return { fromCache: false, data: null, error }
+    }
+  }
+
+  /**
+   * 只读缓存、**绝不联网**的详情快照（v1.1.4，详情页首屏用）。
+   *
+   * 这是「先到先显示」的第一步：详情页挂载后先调它，有缓存就能在毫秒级把
+   * 标题/封面/简介/评分画出来，再让完整详情、角色、分集各自去取自己的板块。
+   * 没有缓存时返回 null，页面显示骨架屏，**不与网络请求耦合**。
+   */
+  subjectCached(id: number): CachedSubjectResult {
+    if (malIdFromFallbackId(id)) {
+      const mal = malIdFromFallbackId(id)!
+      const c = this.readCache<SubjectDetail>(`jikan-subject-${mal}`)
+      return { data: c?.data ?? null, fetchedAt: c?.fetchedAt ?? null }
+    }
+    const cache = this.readCache<SubjectDetail>(`subject3-${id}`)
+    if (!cache) return { data: null, fetchedAt: null }
+    return { data: this.applyCachedRating(id, cache.data), fetchedAt: cache.fetchedAt }
+  }
+
+  /** 正在后台刷新的详情 id（防止同一部番被重复刷新：单飞在 `requestBest` 内部还兜了一层） */
+  private subjectRefreshing = new Set<number>()
+
+  private refreshSubjectInBackground(id: number, key: string, priority: NetPriority = 'S'): void {
+    if (this.subjectRefreshing.has(id)) return
+    this.subjectRefreshing.add(id)
+    void this.fetchSubject(id, priority)
+      .then((fresh) => {
+        this.writeCache(key, fresh)
+        this.noteRating(id, fresh.rating)
+      })
+      .catch((err) => log.append('warn', 'bangumi', `后台刷新详情失败 (#${id})，继续用缓存: ${String(err)}`))
+      .finally(() => this.subjectRefreshing.delete(id))
+  }
+
+  /** 把 `rating-{id}` 缓存（6 小时那份）覆盖到详情副本上；纯内存操作，不联网 */
+  private applyCachedRating(id: number, detail: SubjectDetail): SubjectDetail {
+    if (id <= 0) return detail
+    const cached = this.readCache<{ score: number | null; total: number }>(`rating-${id}`)
+    if (!cached?.data) return detail
+    const { score, total } = cached.data
+    if (score == null && !total) return detail
+    return {
+      ...detail,
+      rating: { score: score ?? detail.rating?.score ?? null, total, rank: detail.rating?.rank }
+    }
+  }
+
+  /**
+   * 评分板块（v1.1.4）：**先给缓存值，再按需刷新**，绝不阻塞详情正文。
+   *
+   * `refresh = false`（页面首帧）：命中 6 小时缓存就直接返回，未命中也不发请求 ——
+   *   此时页面先用详情自带评分，等 `refresh = true` 的那次回来再更新。
+   * `refresh = true`（首帧之后在后台跑）：强制联网重取一次，失败就退回缓存值。
+   */
+  async rating(id: number, refresh = false): Promise<RatingResult> {
+    const sid = Math.trunc(Number(id))
+    if (!Number.isFinite(sid) || sid <= 0) {
+      return { score: null, total: 0, fetchedAt: null, fromCache: false }
+    }
+    const key = `rating-${sid}`
+    const cache = this.readCache<{ score: number | null; total: number }>(key)
+    /*
+     * 首帧（refresh = false）**绝不联网**：有缓存给缓存，没缓存返回空值。
+     * 只有页面在首帧之后显式调用 `rating(id, true)` 时才发请求 ——
+     * 否则详情页打开时会被一次 30 秒级的评分请求拖住（这正是「详情页慢」的老问题）。
+     */
+    if (!refresh) {
+      if (cache) {
+        return { score: cache.data.score, total: cache.data.total, fetchedAt: cache.fetchedAt, fromCache: true }
+      }
+      return { score: null, total: 0, fetchedAt: null, fromCache: false }
+    }
+    try {
+      const data = await this.fetchRating(sid, 'S')
+      this.writeCache(key, data)
+      return { score: data.score, total: data.total, fetchedAt: Date.now(), fromCache: false }
+    } catch (err) {
+      const error: SourceError =
+        err && typeof err === 'object' && 'kind' in err
+          ? (err as SourceError)
+          : makeSourceError('NETWORK', String((err as Error)?.message ?? err), [])
+      if (cache) {
+        return { score: cache.data.score, total: cache.data.total, fetchedAt: cache.fetchedAt, fromCache: true, error }
+      }
+      return { score: null, total: 0, fetchedAt: null, fromCache: false, error }
     }
   }
 
@@ -1270,51 +1685,17 @@ class BangumiService {
     this.writeCache(`rating-${id}`, { score, total: Number(rating.total ?? 0) })
   }
 
-  /**
-   * 返回一份「评分部分尽量新鲜」的详情副本（v0.3.7 修「评分/评分人数更新不及时」）。
-   *
-   * 规则：
-   *   · `rating-{id}` 缓存还在 6 小时内 → 直接用它的 score/total 覆盖详情里的旧值（零请求）；
-   *   · 已过期 → 补一次评分请求，但**最多等 1.5 秒**：等到了就用新值，
-   *     等不到就先按旧值渲染（请求仍在后台跑完并落缓存，下次进详情页就是新的）。
-   *     这样既不会把详情页拖慢，也不会像过去那样一旧就是 30 天。
-   */
-  private async mergeFreshRating(id: number, detail: SubjectDetail): Promise<SubjectDetail> {
-    if (id <= 0) return detail
-    const apply = (score: number | null, total: number): SubjectDetail => ({
-      ...detail,
-      rating: {
-        score: score ?? detail.rating?.score ?? null,
-        total,
-        rank: detail.rating?.rank
-      }
-    })
-    const cached = this.readCache<{ score: number | null; total: number }>(`rating-${id}`)
-    if (cached && Date.now() - cached.fetchedAt < TTL_RATING) {
-      if (cached.data && (cached.data.score != null || cached.data.total > 0)) {
-        return apply(cached.data.score, cached.data.total)
-      }
-      return detail
-    }
-    const fresh = await Promise.race([
-      this.fetchRating(id).catch(() => null),
-      new Promise<null>((r) => setTimeout(() => r(null), RATING_WAIT_MS))
-    ])
-    if (fresh) {
-      this.writeCache(`rating-${id}`, fresh)
-      return apply(fresh.score, fresh.total)
-    }
-    return detail
-  }
-
   /** 只取一部番剧的评分（评分的单条实现，ratings() 的批量循环与 mergeFreshRating 共用一份口径） */
-  private async fetchRating(id: number): Promise<{ score: number | null; total: number }> {
-    const { text, mirror } = await this.requestBest({
-      api: `/v0/subjects/${id}`,
-      web: `/subject/${id}`,
-      // 同 subject()：自建反代必须走 /v0/，否则拿到的是缺字段的旧版 API 形态
-      customApi: `/v0/subjects/${id}`
-    })
+  private async fetchRating(id: number, priority: NetPriority = 'S'): Promise<{ score: number | null; total: number }> {
+    const { text, mirror } = await this.requestBest(
+      {
+        api: `/v0/subjects/${id}`,
+        web: `/subject/${id}`,
+        // 同 subject()：自建反代必须走 /v0/，否则拿到的是缺字段的旧版 API 形态
+        customApi: `/v0/subjects/${id}`
+      },
+      { priority, tag: `/v0/subjects/${id}(评分)` }
+    )
     if (!isApiMirror(mirror)) return parseRatingOnly(text)
     const s = JSON.parse(text) as { rating?: { score?: number; total?: number } }
     const score = Number(s.rating?.score ?? 0)
@@ -1322,23 +1703,26 @@ class BangumiService {
   }
 
   /** 拉取并归一化一部番剧的完整详情（v0 走 JSON，网页镜像走 HTML 解析） */
-  private async fetchSubject(id: number): Promise<SubjectDetail> {
-    const { text, mirror } = await this.requestBest({
-      api: `/v0/subjects/${id}`,
-      web: `/subject/${id}`,
-      /*
-       * v0.2.7 关键修复：自建反代的详情必须显式走 `/v0/subjects/:id`。
-       *
-       * 此前这里没传 customApi，`calendarPathFor` 便回退到网页路径 `/subject/:id` ——
-       * 反代在该路径上返回的是**旧版 API 形态**（`{id,url,type,name,air_date,eps,rating}`，
-       * 实测 2192B），它天生没有 infobox / tags / platform / total_episodes。
-       * 于是 JSON 解析成功、页面看着「有数据」（标题、评分、日期、集数都在），
-       * 但「详细信息 / 类型标签 / 制作信息 / 监督 / 上映日期」整块消失 ——
-       * 用户反馈的「用反代很多番剧详情加载不出来」正是这个原因（不是反代缺数据）。
-       * 带 /v0/ 前缀时同一反代返回 5368B 完整 v0 数据（infobox 41 条、tags 30 个）。
-       */
-      customApi: `/v0/subjects/${id}`
-    })
+  private async fetchSubject(id: number, priority: NetPriority = 'S'): Promise<SubjectDetail> {
+    const { text, mirror } = await this.requestBest(
+      {
+        api: `/v0/subjects/${id}`,
+        web: `/subject/${id}`,
+        /*
+         * v0.2.7 关键修复：自建反代的详情必须显式走 `/v0/subjects/:id`。
+         *
+         * 此前这里没传 customApi，`calendarPathFor` 便回退到网页路径 `/subject/:id` ——
+         * 反代在该路径上返回的是**旧版 API 形态**（`{id,url,type,name,air_date,eps,rating}`，
+         * 实测 2192B），它天生没有 infobox / tags / platform / total_episodes。
+         * 于是 JSON 解析成功、页面看着「有数据」（标题、评分、日期、集数都在），
+         * 但「详细信息 / 类型标签 / 制作信息 / 监督 / 上映日期」整块消失 ——
+         * 用户反馈的「用反代很多番剧详情加载不出来」正是这个原因（不是反代缺数据）。
+         * 带 /v0/ 前缀时同一反代返回 5368B 完整 v0 数据（infobox 41 条、tags 30 个）。
+         */
+        customApi: `/v0/subjects/${id}`
+      },
+      { priority, tag: `/v0/subjects/${id}` }
+    )
     const detail: SubjectDetail | null = isApiMirror(mirror)
       ? this.normalizeSubject(JSON.parse(text) as Record<string, unknown>)
       : parseSubjectPage(text, id)
@@ -1428,8 +1812,8 @@ class BangumiService {
         const id = missing[i++]
         await new Promise((r) => setTimeout(r, 120))
         try {
-          // 与 mergeFreshRating 共用同一份取值口径（fetchRating）
-          const data = await this.fetchRating(id)
+          // 批量补评分属于「后台补齐」：B 级，绝不能和番剧表/详情抢 S 级的槽
+          const data = await this.fetchRating(id, 'B')
           this.writeCache(`rating-${id}`, data)
           out[id] = data
         } catch {
@@ -1454,7 +1838,7 @@ class BangumiService {
    * 实测（`.e2e/probe-episodes.mjs`）：反代的这个端点可用，一部 12 集的番约 300ms、返回 12 条。
    * 缓存 6 小时：集数一周才动一次，短缓存只是为了让「刚更新完的那一集」尽快出现。
    */
-  async episodeProgress(id: number): Promise<EpisodeProgress | null> {
+  async episodeProgress(id: number, priority: NetPriority = 'S'): Promise<EpisodeProgress | null> {
     const sid = Math.trunc(Number(id))
     // 负数 id = Jikan/AniList 兜底条目，bangumi 这边必然 404，直接不给（界面据此隐藏这一行）
     if (!Number.isFinite(sid) || sid <= 0) return null
@@ -1463,7 +1847,10 @@ class BangumiService {
     if (cache && Date.now() - cache.fetchedAt < TTL_EPISODES) return cache.data
     try {
       const path = `/v0/episodes?subject_id=${sid}&type=0&limit=100`
-      const { text, mirror } = await this.requestBest({ api: path, web: path, customApi: path })
+      const { text, mirror } = await this.requestBest(
+        { api: path, web: path, customApi: path },
+        { priority, tag: '/v0/episodes' }
+      )
       if (!isApiMirror(mirror)) return cache?.data ?? null
       const parsed = JSON.parse(text) as { data?: Record<string, unknown>[] }
       const list = Array.isArray(parsed?.data) ? parsed.data : []
@@ -1548,7 +1935,11 @@ class BangumiService {
   private async searchRace(keyword: string): Promise<SearchResultItem[]> {
     /** 网页镜像：直接抓搜索页 HTML */
     const viaMirror = async (mirror: string, kw: string): Promise<SearchResultItem[]> => {
-      const text = await this.fetchMirror(`${mirror}/subject_search/${encodeURIComponent(kw)}?cat=2`, false)
+      const text = await this.fetchMirror(
+        `${mirror}/subject_search/${encodeURIComponent(kw)}?cat=2`,
+        false,
+        { priority: 'B', tag: '搜索(网页)' }
+      )
       return parseSearchPage(text)
     }
 
@@ -1618,15 +2009,25 @@ class BangumiService {
 
   /** v0 搜索：POST + JSON body（带 type=2 过滤，免得把游戏/书籍也搜出来） */
   private async searchViaV0(base: string, keyword: string): Promise<SearchResultItem[]> {
-    const res = await axios.post(
-      `${base}/v0/search/subjects?limit=24&responseGroup=small`,
-      { keyword, filter: { type: [2] } },
-      {
-        timeout: REQUEST_TIMEOUT,
-        headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json', Accept: 'application/json' },
-        ...buildProxyAgents(getSettings().proxy)
-      }
-    )
+    const done = beginNetTrace('B', '搜索(v0)')
+    let res
+    try {
+      res = await axios.post(
+        `${base}/v0/search/subjects?limit=24&responseGroup=small`,
+        { keyword, filter: { type: [2] } },
+        {
+          timeout: REQUEST_TIMEOUT,
+          headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json', Accept: 'application/json' },
+          netPriority: 'B',
+          netTag: '搜索(v0)',
+          ...buildProxyAgents(getSettings().proxy)
+        }
+      )
+      done(res.status, JSON.stringify(res.data ?? null).length)
+    } catch (err) {
+      done('error')
+      throw err
+    }
     if (res.status !== 200) throw new Error(`${base}: HTTP ${res.status}`)
     const list = (res.data as { data?: Record<string, unknown>[] })?.data ?? []
     return list.map((raw) => this.normalizeItem(raw))
@@ -1640,14 +2041,24 @@ class BangumiService {
    * 交给 `rewriteImageUrl` 在取图时改写到自建图片反代即可（`media.ts` 已统一处理）。
    */
   private async searchViaLegacy(base: string, keyword: string): Promise<SearchResultItem[]> {
-    const res = await axios.get(
-      `${base}/search/subject/${encodeURIComponent(keyword)}?type=2&responseGroup=large`,
-      {
-        timeout: REQUEST_TIMEOUT,
-        headers: { 'User-Agent': BROWSER_UA, Accept: 'application/json' },
-        ...buildProxyAgents(getSettings().proxy)
-      }
-    )
+    const done = beginNetTrace('B', '搜索(老接口)')
+    let res
+    try {
+      res = await axios.get(
+        `${base}/search/subject/${encodeURIComponent(keyword)}?type=2&responseGroup=large`,
+        {
+          timeout: REQUEST_TIMEOUT,
+          headers: { 'User-Agent': BROWSER_UA, Accept: 'application/json' },
+          netPriority: 'B',
+          netTag: '搜索(老接口)',
+          ...buildProxyAgents(getSettings().proxy)
+        }
+      )
+      done(res.status, JSON.stringify(res.data ?? null).length)
+    } catch (err) {
+      done('error')
+      throw err
+    }
     if (res.status !== 200) throw new Error(`${base}: HTTP ${res.status}`)
     const body = res.data as { list?: Record<string, unknown>[] } | Record<string, unknown>[]
     const list = Array.isArray(body) ? body : (body?.list ?? [])
@@ -1769,11 +2180,14 @@ class BangumiService {
        * v0 角色接口：与详情一致，必须显式带 `/v0/` 前缀 ——
        * 自建反代在去掉前缀的路径上返回的是旧版 API 形态（没有 characters 段）。
        */
-      const { text, mirror } = await this.requestBest({
-        api: `/v0/subjects/${id}/characters`,
-        web: `/v0/subjects/${id}/characters`,
-        customApi: `/v0/subjects/${id}/characters`
-      })
+      const { text, mirror } = await this.requestBest(
+        {
+          api: `/v0/subjects/${id}/characters`,
+          web: `/v0/subjects/${id}/characters`,
+          customApi: `/v0/subjects/${id}/characters`
+        },
+        { priority: 'S', tag: `/v0/subjects/${id}/characters` }
+      )
       if (!isApiMirror(mirror)) throw new Error(`${mirror}: 网页镜像不提供 v0 角色接口`)
       const items = this.normalizeCharactersV0(JSON.parse(text) as unknown)
       if (items.length > 0) return { items, source: 'v0' }

@@ -210,6 +210,16 @@ if (!gotLock) {
     log.append('info', 'app', `Sakana v${app.getVersion()} 启动`)
     log.append('info', 'app', `数据根目录：${dataRootLabel()}${DATA_PATHS.fallback ? '（安装目录不可写）' : ''}`)
     bangumi.init()
+    /*
+     * v1.1.4：番剧表现在**先用磁盘缓存秒开**，联网刷新在后台做。
+     * 刷新成功后在这里广播给所有窗口（主窗口 + 小窗），界面立刻换上最新数据，
+     * 用户不需要「关掉再开」或手动点刷新 —— 这是「先出列表、再补齐」的另一半。
+     */
+    bangumi.onCalendarUpdated((r) => {
+      for (const w of BrowserWindow.getAllWindows()) {
+        if (!w.isDestroyed()) w.webContents.send(CH.evBgmCalendar, r)
+      }
+    })
     ensureDefaultRules()
     registerMediaProtocols()
     registerIpc()

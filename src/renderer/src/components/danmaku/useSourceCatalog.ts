@@ -38,7 +38,7 @@ export interface SourceCatalogState {
   moveSource: (id: string, delta: number) => Promise<void>
   /** 真测试：发一次真请求并把逐步骤结果记下来 */
   testSource: (source: DanmakuSource, keyword?: string) => Promise<void>
-  /** 改本地弹幕库目录（空串 = 回默认 `<缓存目录>/danmaku/library`） */
+  /** 改本地弹幕缓存目录（空串 = 回默认 `<缓存目录>/弹幕`） */
   saveLibraryDir: (dir: string) => Promise<void>
 }
 

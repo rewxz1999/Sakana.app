@@ -22,6 +22,12 @@ export const CH = {
   // bangumi 数据源
   bgmCalendar: 'bgm:calendar',
   bgmSubject: 'bgm:subject',
+  /** v1.1.4：只读缓存的详情快照（详情页首屏先画这个，绝不联网） */
+  bgmSubjectCached: 'bgm:subject-cached',
+  /** v1.1.4：评分板块（先给缓存，再按需刷新） */
+  bgmRating: 'bgm:rating',
+  /** v1.1.4：番剧表后台刷新完成（主进程 → 渲染层推送） */
+  evBgmCalendar: 'ev:bgm-calendar',
   bgmSearch: 'bgm:search',
   bgmRatings: 'bgm:ratings',
   /** 「更新到第几集」（v0.3.7）：按分集接口的 airdate 数已放送集数 */
@@ -160,6 +166,14 @@ export const CH = {
    */
   playerUoscBar: 'player:uosc-bar',
   /**
+   * v1.1.4：自检/排障用的 uosc 按钮旁路（`script-message sakana-ctrl <动作>`）。
+   *
+   * 为什么需要：按钮画在原生 mpv 子窗口里，CDP 无法往视频区域派发有效点击；
+   * 这条通道走的是按钮点击**完全相同**的命令路径，用来验证动作链路与状态变化。
+   * 它不是业务入口，渲染层正常播放时不会调用。
+   */
+  playerUoscCtrl: 'player:uosc-ctrl',
+  /**
    * v0.3.3：让 uosc 立刻把控制栏显示出来。
    *
    * 为什么需要：uosc 按设计只在鼠标靠近底部时显示控制栏，画面中间移动鼠标它不出来；
@@ -275,6 +289,11 @@ export const CH = {
   /** v1.1.2：数据源的「获取记录」（用户要求：在弹幕设置里点开就能看每次去要弹幕的结果） */
   danmakuFetchLog: 'danmaku:fetch-log',
   danmakuFetchLogClear: 'danmaku:fetch-log-clear',
+  /** V1.2：弹幕获取进度（流详情面板轮询；主进程维护真实步骤） */
+  danmakuProgress: 'danmaku:progress',
+  /** V1.2：运行期统计（网络请求/缓存命中/缓存目录），自检与详情面板用 */
+  danmakuStats: 'danmaku:stats',
+  danmakuStatsReset: 'danmaku:stats-reset',
 
   // 保存目录（立即生效）
   saveDirsSet: 'save-dirs:set',
@@ -296,6 +315,9 @@ export const CH = {
   rulesVerifyOpen: 'rules:verify-open',
   rulesVerifyBounds: 'rules:verify-bounds',
   rulesVerifyClose: 'rules:verify-close',
+  /** v1.1：验证页的真实加载状态（外框用它自己的 UI 显示进度/失败/重试） */
+  rulesVerifyReload: 'rules:verify-reload',
+  evRuleVerifyState: 'ev:rule-verify-state',
 
   // 投屏（v0.3.8）：发现设备、投屏、遥控
   castDiscover: 'cast:discover',

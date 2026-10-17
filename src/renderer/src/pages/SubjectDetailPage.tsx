@@ -13,10 +13,11 @@ import {
   Rss,
   Search,
   Star,
+  Users,
   X
 } from 'lucide-react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import type { EpisodeProgress, MikanItem, PlayRule, SubjectDetail } from '@shared/types'
+import type { CharacterItem, EpisodeProgress, MikanItem, PlayRule, SubjectDetail } from '@shared/types'
 // 值导入（不是 type）：置顶排序是运行时要用的 —— 来源列表的顺序就由它决定（v0.3.7）
 import { sortRulesPinnedFirst } from '@shared/types'
 import { api } from '@/lib/api'
@@ -86,6 +87,64 @@ function infoText(v: unknown): string {
   return v === null || v === undefined ? '' : String(v)
 }
 
+/**
+ * 骨架条（v1.1.4）。
+ *
+ * 详情页现在是「分板块先到先显」，每块在数据没到之前必须有自己的骨架，
+ * 而不是全页一个 Spinner —— 用户要的是「能先看到已有内容」，不是「等全部到齐再看」。
+ * 只用一个 animate-pulse 的灰条，避免引入新组件/新依赖。
+ */
+function Sk({ className = '' }: { className?: string }): React.ReactElement {
+  return <div className={`animate-pulse rounded bg-elev2 ${className}`} />
+}
+
+/** 「详细信息」板块的骨架：列数/行数对齐真实内容，数据到了不会跳版 */
+function InfoSkeleton(): React.ReactElement {
+  return (
+    <div className="mt-6 rounded-xl border border-border bg-elev1/80 p-4 backdrop-blur">
+      <Sk className="mb-3 h-4 w-20" />
+      <div className="grid grid-cols-1 gap-x-6 gap-y-2.5 sm:grid-cols-2">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div key={i} className="flex items-center gap-2">
+            <Sk className="h-3 w-16 shrink-0" />
+            <Sk className="h-3 flex-1" />
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * 详情页首屏骨架（完全没有缓存时才显示）。
+ *
+ * 与以前的「大 Spinner + 空白页」不同：这里保留真实的版面结构（封面块、标题行、徽章行、
+ * 简介行、信息面板），数据到达时是「填空」而不是「换页」，观感上不会突然跳一下。
+ */
+function DetailSkeleton(): React.ReactElement {
+  return (
+    <>
+      <div className="flex gap-6" data-detail-section="skeleton">
+        <Sk className="aspect-[3/4] w-52 shrink-0 rounded-xl" />
+        <div className="min-w-0 flex-1">
+          <Sk className="h-7 w-2/3" />
+          <div className="mt-3 flex gap-2">
+            <Sk className="h-5 w-16 rounded-full" />
+            <Sk className="h-5 w-24 rounded-full" />
+            <Sk className="h-5 w-14 rounded-full" />
+          </div>
+          <div className="mt-4 space-y-2">
+            <Sk className="h-3 w-full" />
+            <Sk className="h-3 w-11/12" />
+            <Sk className="h-3 w-4/5" />
+          </div>
+        </div>
+      </div>
+      <InfoSkeleton />
+    </>
+  )
+}
+
 export function SubjectDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
@@ -93,7 +152,23 @@ export function SubjectDetailPage() {
   /** 来源标记：搜索页以 navigate('/subject/:id', { state: { from: 'search' } }) 进入 */
   const fromSearch = (location.state as { from?: string } | null | undefined)?.from === 'search'
   const subjectId = Number(id)
+  /**
+   * 详情数据的三个来源**分开存**（v1.1.4「先到先显」）：
+   *   · quick：主进程磁盘/内存缓存快照（毫秒级返回，绝不联网）；
+   *   · detail：完整详情（缓存命中时也很快；未命中才联网，本次实测可能 30 秒以上）；
+   *   · rating：独立评分板块（先显示缓存值，再后台换成新值）。
+   * 渲染时 `view = detail ?? quick`，任何一份先到都能先把标题/封面/简介画出来，
+   * 而不是像以前那样整页只有一个 Spinner、必须等全部数据到齐。
+   */
+  const [quick, setQuick] = useState<SubjectDetail | null>(null)
   const [detail, setDetail] = useState<SubjectDetail | null>(null)
+  const [detailLoading, setDetailLoading] = useState(true)
+  const [detailFailed, setDetailFailed] = useState('')
+  /** 评分板块（与正文解耦：详情慢不影响评分先显示，评分慢也不影响正文） */
+  const [rating, setRating] = useState<{ score: number | null; total: number } | null>(null)
+  /** 角色板块：独立请求 + 独立骨架，慢/失败都不影响其它板块 */
+  const [characters, setCharacters] = useState<CharacterItem[] | null>(null)
+  const [charactersLoading, setCharactersLoading] = useState(true)
   /**
    * 「更新到第几集」（v0.3.7，用户要求）。
    * 单独一个请求（分集接口），失败/取不到就是 null —— 界面据此**整行不显示**。
@@ -101,8 +176,7 @@ export function SubjectDetailPage() {
    * 两者生命周期不同，混在一起会互相拖累。
    */
   const [epProgress, setEpProgress] = useState<EpisodeProgress | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [failed, setFailed] = useState('')
+  const [epLoading, setEpLoading] = useState(true)
   const [ruleOpen, setRuleOpen] = useState(false)
   const [mikanOpen, setMikanOpen] = useState(false)
   const [rules, setRules] = useState<PlayRule[]>([])
@@ -128,28 +202,111 @@ export function SubjectDetailPage() {
 
   useEffect(() => {
     let alive = true
+    // 换条目时先清空上一部番的板块数据（否则会闪一下上一部的封面/评分）
+    setQuick(null)
+    setDetail(null)
+    setRating(null)
+    setCharacters(null)
+    setCharactersLoading(true)
+    setDetailLoading(true)
+    setDetailFailed('')
+    setEpProgress(null)
+    setEpLoading(true)
+
+    /*
+     * ① 纯缓存快照：毫秒级返回，先把标题/封面/简介/评分画出来。
+     * 这是「分板块、先到先显」的第一块，绝不等待网络。
+     */
+    void api.bangumi.subjectCached(subjectId).then((r) => {
+      if (!alive || !r.ok || !r.data.data) return
+      setQuick(r.data.data)
+    })
+
+    // ② 完整详情（标签/详细信息所在）：命中缓存立即返回；没缓存才联网
     void (async () => {
       const r = await api.bangumi.subject(subjectId)
       if (!alive) return
-      if (r.ok && r.data.data) setDetail(r.data.data)
-      else if (!r.ok) setFailed(r.error)
-      else if (r.ok && r.data.error) setFailed(r.data.error.message)
-      setLoading(false)
+      if (r.ok && r.data.data) {
+        setDetail(r.data.data)
+        setDetailFailed('')
+      } else if (!r.ok) {
+        setDetailFailed(r.error)
+      } else if (r.data.error) {
+        setDetailFailed(r.data.error.message)
+      }
+      setDetailLoading(false)
     })()
+
     /*
-     * 集数进度与详情**并行**请求，谁先回来先渲染谁：
-     * 分集接口是独立的一次请求（约 300ms），串行只会让详情页整体慢一拍。
-     * 失败不置错、不弹提示 —— 这只是详情页的一个附加信息，不该因为它让整页显示「加载失败」。
+     * ③ 评分：先用 6 小时内缓存（零请求、毫秒级），再在后台强制刷新一次。
+     * 两个 await 都是独立的，不阻塞正文；评分慢只是这一块晚一点变新。
+     */
+    void (async () => {
+      const cached = await api.bangumi.rating(subjectId)
+      if (!alive) return
+      if (cached.ok) setRating({ score: cached.data.score, total: cached.data.total })
+      /*
+       * 只有「没有评分缓存」或「缓存超过 6 小时」才真的联网刷新。
+       * 为什么不能每次都刷新：一次评分请求就是一次 `/v0/subjects/:id`（实测 30 秒级），
+       * 每开一次详情页都打一次会把 S 级队列长期占满 —— 这正是旧的「详情页慢 + 番剧表加载不完」。
+       */
+      const SIX_HOURS = 6 * 3600 * 1000
+      const fresh = cached.ok && cached.data.fromCache && cached.data.fetchedAt != null && Date.now() - cached.data.fetchedAt < SIX_HOURS
+      if (fresh) return
+      const freshRating = await api.bangumi.rating(subjectId, true)
+      if (!alive) return
+      if (freshRating.ok && !freshRating.data.error) {
+        setRating({ score: freshRating.data.score, total: freshRating.data.total })
+      }
+    })()
+
+    /*
+     * ④ 分集进度：与详情**并行**（独立请求），失败只隐藏这一行，不置整页错误。
      */
     void (async () => {
       const p = await api.bangumi.episodeProgress(subjectId)
       if (!alive) return
       setEpProgress(p.ok ? p.data : null)
+      setEpLoading(false)
     })()
+
     return () => {
       alive = false
     }
   }, [subjectId])
+
+  /** 两个来源合成一份可渲染的详情：完整详情优先，其次缓存快照 */
+  const view = detail ?? quick
+  /**
+   * 评分取「独立刷新的值 → 详情自带值」：
+   * 评分缓存先到就先显示，后台刷新回来再替换；两者都没有时不显示 0 分。
+   */
+  const ratingScore = rating?.score ?? view?.rating?.score ?? null
+  const ratingTotal = rating?.total ?? view?.rating?.total ?? 0
+
+  /**
+   * 角色板块**延迟加载**（v1.1.4）。
+   *
+   * 为什么不等首屏一起发：角色接口在本次实测里会挂 70 秒以上（服务端慢），
+   * 和详情同时发会白占一个 S 级槽位，把番剧表的刷新挤到队尾。
+   * 首屏先出，250ms 后再补角色；用户滚到角色区时它通常已经在了。
+   */
+  useEffect(() => {
+    if (!view?.id) return
+    let alive = true
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const r = await api.bangumi.characters(view.id)
+        if (!alive) return
+        setCharacters(r.ok ? r.data.items : [])
+        setCharactersLoading(false)
+      })()
+    }, 250)
+    return () => {
+      alive = false
+      window.clearTimeout(timer)
+    }
+  }, [view?.id])
 
   // 全屏状态：原生窗口全屏（主进程事件）+ 页面级全屏（document.fullscreenElement）任一为真
   useEffect(() => {
@@ -173,8 +330,8 @@ export function SubjectDetailPage() {
 
   /** 观看进度摘要（已看集数 / 上次看到第几集 / 该集播放百分比） */
   const progress = useMemo(
-    () => progressSummary(progressItems, { subjectId, title: detail?.name_cn || detail?.name }),
-    [progressItems, subjectId, detail]
+    () => progressSummary(progressItems, { subjectId, title: view?.name_cn || view?.name }),
+    [progressItems, subjectId, view]
   )
 
   /** 返回：来自搜索列表时回退一步即回到搜索结果，其它来源沿用原有「返回上一页」行为 */
@@ -215,7 +372,7 @@ export function SubjectDetailPage() {
   }, [ruleOpen, mikanOpen, fromSearch])
 
   /** 本地播放传给播放页的标题 */
-  const playerTitle = detail?.name_cn || detail?.name || '本地播放'
+  const playerTitle = view?.name_cn || view?.name || '本地播放'
 
   /**
    * 本地播放（单个文件）：播放页的本地模式以「文件夹」为单位建立播放列表
@@ -261,7 +418,7 @@ export function SubjectDetailPage() {
     })
   }
 
-  const fav = detail ? favorites.find((f) => f.subjectId === detail.id) : null
+  const fav = view ? favorites.find((f) => f.subjectId === view.id) : null
   const isFav = !!fav
   // 已看完：手动标记时间，或自动判定的最后观看时间
   const watchedAt = fav?.watchedAt ?? null
@@ -270,11 +427,11 @@ export function SubjectDetailPage() {
     if (fav?.eps && fav.eps > 0) {
       const eps = new Set<number>()
       for (const h of watchHistory) {
-        if (h.subjectId === detail?.id && h.episode != null) eps.add(h.episode)
+        if (h.subjectId === view?.id && h.episode != null) eps.add(h.episode)
       }
       if (eps.size >= fav.eps) {
         const last = watchHistory
-          .filter((h) => h.subjectId === detail?.id)
+          .filter((h) => h.subjectId === view?.id)
           .sort((a, b) => b.watchedAt - a.watchedAt)[0]
         return last?.watchedAt ?? null
       }
@@ -296,12 +453,12 @@ export function SubjectDetailPage() {
    * 其余折在「展开全部」里，既不丢信息也不把页面撑爆。
    */
   const { rows: infoRows, rest: infoRest } = useMemo(() => {
-    if (!detail) return { rows: [], rest: 0 }
-    const rows = [...detail.infobox]
+    if (!view) return { rows: [], rest: 0 }
+    const rows = [...view.infobox]
     // 数据源额外给的平台/总集数也补成一行（v0 的字段不在 infobox 里）
-    if (detail.platform && !rows.some((r) => r.key === '平台')) rows.unshift({ key: '平台', value: detail.platform })
-    if (detail.totalEpisodes && !rows.some((r) => r.key === '总集数'))
-      rows.push({ key: '总集数', value: String(detail.totalEpisodes) })
+    if (view.platform && !rows.some((r) => r.key === '平台')) rows.unshift({ key: '平台', value: view.platform })
+    if (view.totalEpisodes && !rows.some((r) => r.key === '总集数'))
+      rows.push({ key: '总集数', value: String(view.totalEpisodes) })
     const score = (key: string): number => {
       const rules: [RegExp, number][] = [
         [/^(中文名|别名)$/, 0],
@@ -320,7 +477,7 @@ export function SubjectDetailPage() {
     }
     const sorted = rows.slice().sort((a, b) => score(a.key) - score(b.key))
     return { rows: sorted, rest: Math.max(0, sorted.length - 12) }
-  }, [detail])
+  }, [view])
   const [showAllInfo, setShowAllInfo] = useState(false)
   const infoShown = showAllInfo ? infoRows : infoRows.slice(0, 12)
 
@@ -351,19 +508,19 @@ export function SubjectDetailPage() {
   useEffect(() => {
     const st = location.state as { openSources?: boolean } | null
     if (!st?.openSources) return
-    if (!detail) return // 等详情加载完再弹，否则没有番剧名可用于搜索
+    if (!view) return // 等详情加载完再弹，否则没有番剧名可用于搜索
     void openRules()
     // 清掉标记，避免刷新/返回时再次弹出
     navigate(location.pathname, { replace: true, state: null })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detail, location.state])
+  }, [view, location.state])
 
   return (
     <div className="relative h-full overflow-y-auto">
-      {/* 毛玻璃背景（方案 3.7） */}
-      {detail?.images?.large ? (
+      {/* 毛玻璃背景（方案 3.7）：缓存快照先到就先用它，不必等完整详情 */}
+      {view?.images?.large ? (
         <div className="pointer-events-none fixed inset-0">
-          <CoverImage src={detail.images.large} className="h-full w-full opacity-40 blur-2xl" />
+          <CoverImage src={view.images.large} className="h-full w-full opacity-40 blur-2xl" />
           <div className="absolute inset-0 bg-gradient-to-b from-bg/60 via-bg/75 to-bg" />
         </div>
       ) : null}
@@ -392,59 +549,58 @@ export function SubjectDetailPage() {
           <ArrowLeft size={16} /> {fromSearch ? '返回搜索' : '返回'}
         </button>
 
-        {loading ? (
-          <div className="flex items-center justify-center py-24">
-            <Spinner size={26} />
-          </div>
-        ) : failed ? (
-          <EmptyState icon={CalendarDays} title="加载详情失败" desc={failed}>
-            <Button size="sm" onClick={goBack}>
-              返回
-            </Button>
-          </EmptyState>
-        ) : detail ? (
+        {view ? (
           <>
-            <div className="flex gap-6">
+            <div className="flex gap-6" data-detail-section="header">
               <motion.div
                 initial={{ opacity: 0, y: 12 }}
                 animate={{ opacity: 1, y: 0 }}
                 className="w-52 shrink-0"
               >
                 <CoverImage
-                  src={detail.images?.large ?? detail.images?.common ?? null}
+                  src={view.images?.large ?? view.images?.common ?? null}
                   className="aspect-[3/4] w-full rounded-xl shadow-xl shadow-black/25"
                 />
               </motion.div>
               <div className="min-w-0 flex-1">
                 <div className="flex items-start gap-3">
                   <div>
-                    <h1 className="text-2xl font-bold leading-tight">{detail.name_cn || detail.name}</h1>
-                    {detail.name_cn && detail.name !== detail.name_cn ? (
-                      <div className="mt-0.5 text-sm text-faint">{detail.name}</div>
+                    <h1 className="text-2xl font-bold leading-tight">{view.name_cn || view.name}</h1>
+                    {view.name_cn && view.name !== view.name_cn ? (
+                      <div className="mt-0.5 text-sm text-faint">{view.name}</div>
                     ) : null}
                   </div>
                 </div>
                 <div className="mt-3 flex flex-wrap items-center gap-2">
-                  {detail.rating?.score ? (
+                  {/*
+                    评分板块（独立加载）：先用缓存值，后台刷新到了再换。
+                    没有分数且还在加载时给一个骨架胶囊，避免"先没有后突然冒出来"的抖动。
+                  */}
+                  {ratingScore ? (
                     <Badge tone="warn">
-                      <Star size={11} fill="currentColor" /> {detail.rating.score.toFixed(1)}
-                      {detail.rating.total ? ` · ${detail.rating.total} 人评分` : ''}
+                      <Star size={11} fill="currentColor" /> {ratingScore.toFixed(1)}
+                      {ratingTotal ? ` · ${ratingTotal} 人评分` : ''}
                     </Badge>
+                  ) : !detailLoading || !quick ? (
+                    <Sk className="h-5 w-16 rounded-full" />
                   ) : null}
-                  {detail.air_date ? (
+                  {view.air_date ? (
                     <Badge tone="accent">
-                      <CalendarDays size={11} /> {detail.air_date}
+                      <CalendarDays size={11} /> {view.air_date}
                     </Badge>
                   ) : null}
-                  {detail.eps != null ? <Badge>全 {detail.eps} 话</Badge> : null}
+                  {view.eps != null ? <Badge>全 {view.eps} 话</Badge> : null}
                   {/*
                     「更新到第几集」（v0.3.7）：数据来自分集接口每集的放送日期，数出来的真值。
                     · 还在播：显示「更新至 第 N 集」（有下一集日期时补一句「下集 MM-DD」）；
                     · 已播完：显示「已完结 · 共 N 集」（和上面的「全 X 话」不重复 ——
                       那个是 bangumi 登记的计划集数，这个是真的播完了）。
                     取不到进度（离线 / 兜底数据源 / 没登记分集）时整块不渲染，不显示 0。
+                    v1.1.4：加载中显示骨架胶囊，成功后替换 —— 分集接口慢不再让这一行"凭空出现"。
                   */}
-                  {epProgress && epProgress.aired > 0 ? (
+                  {epLoading ? (
+                    <Sk className="h-5 w-28 rounded-full" />
+                  ) : epProgress && epProgress.aired > 0 ? (
                     epProgress.finished ? (
                       <Badge tone="ok">
                         <CircleCheck size={11} /> 已完结 · 共 {epProgress.total} 集
@@ -466,9 +622,20 @@ export function SubjectDetailPage() {
                       <CircleCheck size={11} /> 看完于 {fmtDateTime(finalWatchedAt)}
                     </Badge>
                   ) : null}
-                  {detail.tags.slice(0, 6).map((t) => (
-                    <Badge key={t.name}>{t.name}</Badge>
-                  ))}
+                  {/* 标签板块：完整详情到了才有；加载中显示三个骨架胶囊 */}
+                  {view.tags.length > 0 ? (
+                    <span className="contents" data-detail-section="tags">
+                      {view.tags.slice(0, 6).map((t) => (
+                        <Badge key={t.name}>{t.name}</Badge>
+                      ))}
+                    </span>
+                  ) : detailLoading ? (
+                    <>
+                      <Sk className="h-5 w-12 rounded-full" />
+                      <Sk className="h-5 w-16 rounded-full" />
+                      <Sk className="h-5 w-10 rounded-full" />
+                    </>
+                  ) : null}
                 </div>
                 {/* 观看进度（无记录时不显示） */}
                 {progress.item ? (
@@ -478,14 +645,39 @@ export function SubjectDetailPage() {
                     {progress.percent > 0 ? <ProgressBar value={progress.percent} className="w-24" /> : null}
                   </div>
                 ) : null}
-                <p className="mt-4 max-h-44 overflow-y-auto whitespace-pre-wrap text-[13px] leading-relaxed text-dim">
-                  {detail.summary || '暂无简介'}
+                {/* 简介板块：缓存快照里就带 summary，通常首屏即可见 */}
+                <p
+                  className="mt-4 max-h-44 overflow-y-auto whitespace-pre-wrap text-[13px] leading-relaxed text-dim"
+                  data-detail-section="summary"
+                >
+                  {view.summary || (!detailLoading ? '暂无简介' : '')}
                 </p>
+                {detailLoading && !view.summary ? (
+                  <div className="mt-2 space-y-2">
+                    <Sk className="h-3 w-full" />
+                    <Sk className="h-3 w-11/12" />
+                    <Sk className="h-3 w-3/4" />
+                  </div>
+                ) : null}
               </div>
             </div>
 
+            {/*
+              完整详情失败但缓存快照可用：不整页报错，只给一行不打扰的说明 ——
+              用户至少还能看标题/封面/简介，并继续点「播放」。
+            */}
+            {quick && detailFailed ? (
+              <div className="mt-4 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-[11px] text-warn">
+                完整详情暂时取不到，当前显示的是本地缓存（{detailFailed}）
+              </div>
+            ) : null}
+
+            {/* 详细信息板块：完整详情到达后才渲染；未到且无数据时显示骨架 */}
             {infoRows.length > 0 ? (
-              <div className="mt-6 rounded-xl border border-border bg-elev1/80 p-4 backdrop-blur">
+              <div
+                className="mt-6 rounded-xl border border-border bg-elev1/80 p-4 backdrop-blur"
+                data-detail-section="infobox"
+              >
                 <div className="mb-3 flex items-center justify-between">
                   <span className="text-sm font-semibold">详细信息</span>
                   {infoRest > 0 ? (
@@ -506,13 +698,71 @@ export function SubjectDetailPage() {
                   ))}
                 </div>
               </div>
+            ) : detailLoading ? (
+              <InfoSkeleton />
             ) : null}
+
+            {/*
+              角色板块（v1.1.4 新增为独立板块）。
+              为什么要单独一块：角色列表是另一个接口、生命周期与详情不同，
+              首屏不该被它拖住；它到了就追加显示，没到就显示这一块的骨架屏。
+            */}
+            <div
+              className="mt-6 rounded-xl border border-border bg-elev1/80 p-4 backdrop-blur"
+              data-detail-section="characters"
+            >
+              <div className="mb-3 flex items-center justify-between">
+                <span className="flex items-center gap-1.5 text-sm font-semibold">
+                  <Users size={14} className="text-accent" /> 角色
+                </span>
+                {charactersLoading ? <span className="text-[11px] text-faint">加载中…</span> : null}
+              </div>
+              {charactersLoading ? (
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  {Array.from({ length: 4 }).map((_, i) => (
+                    <div key={i} className="flex items-center gap-2 rounded-lg bg-elev2/40 p-2">
+                      <Sk className="h-11 w-9 shrink-0 rounded-md" />
+                      <div className="min-w-0 flex-1 space-y-1.5">
+                        <Sk className="h-2.5 w-4/5" />
+                        <Sk className="h-2 w-2/5" />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : characters && characters.length > 0 ? (
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  {characters.slice(0, 8).map((c) => (
+                    <div key={`${c.id}-${c.name}`} className="flex items-center gap-2 rounded-lg bg-elev2/40 p-2">
+                      <CoverImage
+                        src={c.images?.grid ?? c.images?.small ?? c.images?.common ?? null}
+                        className="h-11 w-9 shrink-0"
+                        rounded="rounded-md"
+                      />
+                      <div className="min-w-0">
+                        <div className="line-clamp-1 text-[12px] text-text">{c.name_cn || c.name}</div>
+                        <div className="line-clamp-1 text-[10px] text-faint">{c.relation || '角色'}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="py-2 text-[11px] text-faint">暂无角色数据（数据源未返回或接口暂时不可用）</div>
+              )}
+            </div>
           </>
+        ) : detailLoading ? (
+          <DetailSkeleton />
+        ) : detailFailed ? (
+          <EmptyState icon={CalendarDays} title="加载详情失败" desc={detailFailed}>
+            <Button size="sm" onClick={goBack}>
+              返回
+            </Button>
+          </EmptyState>
         ) : null}
       </div>
 
       {/* 左下角操作按钮（方案 3.7） */}
-      {detail ? (
+      {view ? (
         <motion.div
           initial={{ opacity: 0, y: 16 }}
           animate={{ opacity: 1, y: 0 }}
@@ -538,7 +788,7 @@ export function SubjectDetailPage() {
             variant={isFav ? 'soft' : 'outline'}
             icon={Heart}
             onClick={() => {
-              toggleFavorite(detail)
+              toggleFavorite(view)
               toast.success(isFav ? '已取消收藏' : '已收藏')
             }}
           >
@@ -552,7 +802,7 @@ export function SubjectDetailPage() {
                 toast.info('请先收藏该番剧，再标记看完')
                 return
               }
-              toggleWatched(detail.id)
+              toggleWatched(view.id)
               toast.success(finalWatchedAt ? '已取消看完标记' : '已标记为看完')
             }}
           >
@@ -566,8 +816,8 @@ export function SubjectDetailPage() {
                 value={finishDateStr(finalWatchedAt)}
                 onChange={(e) => {
                   const v = e.target.value
-                  if (v) setWatchedAt(detail.id, new Date(`${v}T12:00:00`).getTime())
-                  else setWatchedAt(detail.id, null)
+                  if (v) setWatchedAt(view.id, new Date(`${v}T12:00:00`).getTime())
+                  else setWatchedAt(view.id, null)
                 }}
                 className="h-8 rounded-lg border border-border bg-elev1 px-2 text-[11px] text-dim outline-none focus:border-accent"
               />
@@ -588,9 +838,9 @@ export function SubjectDetailPage() {
           setInitialRule(null)
         }}
         rules={rules}
-        keyword={detail?.name_cn || detail?.name || ''}
-        title={detail?.name_cn || detail?.name || '播放'}
-        subjectId={detail?.id}
+        keyword={view?.name_cn || view?.name || ''}
+        title={view?.name_cn || view?.name || '播放'}
+        subjectId={view?.id}
         initialRule={initialRule}
         onNeedVerify={(rule) => {
           setRuleOpen(false)
@@ -600,7 +850,7 @@ export function SubjectDetailPage() {
       <VerifyModal
         open={!!verify}
         rule={verify?.rule ?? null}
-        keyword={detail?.name_cn || detail?.name || ''}
+        keyword={view?.name_cn || view?.name || ''}
         onClose={() => setVerify(null)}
         onPassed={() => {
           const r = verify?.rule ?? null
@@ -615,8 +865,8 @@ export function SubjectDetailPage() {
       <MikanSelectModal
         open={mikanOpen}
         onClose={() => setMikanOpen(false)}
-        keyword={detail?.name_cn || detail?.name || ''}
-        subject={detail ? { subjectId: detail.id, name: detail.name, nameCn: detail.name_cn, cover: detail.images?.large ?? '' } : null}
+        keyword={view?.name_cn || view?.name || ''}
+        subject={view ? { subjectId: view.id, name: view.name, nameCn: view.name_cn, cover: view.images?.large ?? '' } : null}
         onDone={() => {
           setMikanOpen(false)
           navigate('/subs')
@@ -626,19 +876,32 @@ export function SubjectDetailPage() {
   )
 }
 
-// ---------------- 人机验证弹窗（v0.3.7） ----------------
+// ---------------- 人机验证弹窗（v0.3.7，v1.1 改成应用内一体化） ----------------
 
 /**
  * 站点要求人机验证时的应用内弹窗。
  *
- * 为什么做成"蒙层 + 中间一块洞"：验证本身就是**真实的网页**，只能交给真实的浏览器窗口去渲染。
- * 所以这里弹一层说明蒙层，把中间那块矩形报给主进程，主进程开一个属于本窗口的子窗口盖在那里
- * （与播放页把探针网页视图摆在画面区域上是同一个手法）。
- * 用户过完验证点「继续」，那之后这条线路就带上验证 Cookie 了（主进程用同一个会话）。
+ * ## 为什么中间必须是一块"洞"
  *
- * 备注（v0.3.9）：原来这里还有一个局部函数 `VerifyNeedles()`（一组「这条消息是不是验证墙」
- * 的正则）。它随两级弹窗一起消失了 —— 现在判验证墙的是
- * `components/playerSource/sourceFailure.ts` 的 `isVerifyWall()`，那才是唯一一份。
+ * 验证本身是**真实的网页**，只能交给真实浏览器窗口去渲染 —— 不能用 iframe：
+ * 这些站点的 `X-Frame-Options` / CSP `frame-ancestors` 会直接拒绝被嵌，塞进主窗口 DOM 只会白屏。
+ * 所以外框是应用 UI，中间那块矩形报给主进程，由它开一个属于本窗口的子窗口盖在那里
+ * （与播放页把探针网页视图摆在画面区域上是同一个手法）。
+ *
+ * ## v1.1 改了什么（用户：「优化一下验证窗口，可以使用我们的应用 UI」）
+ *
+ * ① **外框开始反映里面的真实状态**：以前中间永远是那句「验证窗口正在这里打开…」，
+ *    页面明明已经 404/超时了那句话还在 —— 这就是"原生窗口与网页拼在一起"的割裂感。
+ *    现在主进程把 did-start/stop/fail-load 转成事件推来（`ruleVerify.onState`），
+ *    标题栏的状态点、进度条、失败原因、重试按钮全部由应用 UI 渲染。
+ * ② **对齐用 ResizeObserver 而不是 800ms 轮询**：轮询最多会差 0.8 秒，
+ *    用户拖窗口时能看到网页和框错位；ResizeObserver 是"尺寸真的变了才发"，既准又不刷屏。
+ * ③ 按钮状态跟着状态走：加载失败时「我已完成验证」不该还能点（点了也没用），
+ *    改成可点的「重新加载」。
+ * ④ 外框留出一圈内边距 + 圆角，视觉上把子窗口收进弹窗内部，而不是两块拼在一起。
+ *
+ * 备注（v0.3.9）：判「这条消息是不是验证墙」的唯一实现在
+ * `components/playerSource/sourceFailure.ts` 的 `isVerifyWall()`，这里不重复一份。
  */
 function VerifyModal({
   open,
@@ -654,10 +917,24 @@ function VerifyModal({
   onPassed: () => void
 }) {
   const holeRef = useRef<HTMLDivElement>(null)
+  /**
+   * 验证页的真实加载状态（来自主进程）。
+   * `null` = 还没收到第一条（刚打开的那一瞬间），UI 按「正在打开」处理。
+   */
+  const [vs, setVs] = useState<{
+    status: 'loading' | 'loaded' | 'failed' | 'closed'
+    progress: number
+    error?: string
+    host?: string
+  } | null>(null)
 
   useEffect(() => {
     if (!open || !rule) return
     let alive = true
+    setVs(null)
+    const off = api.ruleVerify.onState((st) => {
+      if (alive) setVs(st)
+    })
     const sendBounds = (): void => {
       const r = holeRef.current?.getBoundingClientRect()
       if (!r || r.width < 50) return
@@ -676,12 +953,17 @@ function VerifyModal({
         if (!r.ok) toast.error(`验证窗口打不开：${r.error}`)
         else if (!r.data.ok) toast.error(`验证窗口打不开：这条规则的搜索地址不可用`)
       })
-    // 窗口尺寸/蒙层大小变化时让验证窗口跟着走（节流到 800ms，够用且不刷屏）
-    const timer = window.setInterval(sendBounds, 800)
+    /*
+     * 尺寸对齐：ResizeObserver（弹窗本身 + 那块洞）+ 窗口 resize 兜底。
+     * 不再用 800ms 轮询 —— 轮询会慢半拍，拖动窗口时能明显看到错位。
+     */
+    const ro = new ResizeObserver(() => sendBounds())
+    if (holeRef.current) ro.observe(holeRef.current)
     window.addEventListener('resize', sendBounds)
     return () => {
       alive = false
-      window.clearInterval(timer)
+      off()
+      ro.disconnect()
       window.removeEventListener('resize', sendBounds)
       void api.ruleVerify.close()
     }
@@ -689,41 +971,109 @@ function VerifyModal({
 
   if (!open || !rule) return null
 
+  const failed = vs?.status === 'failed'
+  const loaded = vs?.status === 'loaded'
+  const host = vs?.host ?? ''
+
   return (
     <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-6">
-      <div className="flex h-[86vh] w-[860px] max-w-full flex-col overflow-hidden rounded-xl border border-border bg-elev1 shadow-2xl">
-        <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
+      <div className="flex h-[86vh] w-[900px] max-w-full flex-col overflow-hidden rounded-2xl border border-border bg-elev1 shadow-2xl">
+        {/* ---------- 头部：标题 + 真实状态 ---------- */}
+        <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
           <div className="min-w-0">
-            <div className="text-sm font-semibold text-text">需要人机验证 · {rule.name}</div>
-            <div className="mt-0.5 text-[11px] text-faint">
-              这条线路要求先通过人机验证（站点对我们返回了验证页）。请在下面的窗口里完成验证，
-              然后点「我已完成验证」。验证状态保存在本机会话里，之后这条线路可以正常搜索与播放。
+            <div className="flex items-center gap-2">
+              <span
+                className={`h-2 w-2 shrink-0 rounded-full ${
+                  failed
+                    ? 'bg-danger'
+                    : loaded
+                      ? 'bg-ok'
+                      : vs?.status === 'closed'
+                        ? 'bg-faint'
+                        : 'animate-pulse bg-warn'
+                }`}
+              />
+              <span className="text-sm font-semibold text-text">人机验证 · {rule.name}</span>
+              <Badge tone={failed ? 'danger' : loaded ? 'ok' : 'neutral'}>
+                {failed ? '加载失败' : loaded ? '已加载' : vs?.status === 'closed' ? '已关闭' : '正在加载'}
+              </Badge>
+              {host ? <span className="truncate text-[10.5px] text-faint">{host}</span> : null}
+            </div>
+            <div className="mt-1 text-[11px] leading-relaxed text-faint">
+              {failed
+                ? '验证页没能加载出来：这通常是站点自身不可用或被网络拦截。可以点右下角「重新加载」再试，或换一条线路。'
+                : loaded
+                  ? '请在下面的窗口里完成验证（滑块/点选等），完成后点「我已完成验证」。验证状态保存在本机会话里。'
+                  : '正在打开这条线路的验证页，稍等一下；如果一直停在这里，说明站点响应很慢。'}
             </div>
           </div>
-          <button className="rounded-md p-1 text-dim hover:bg-elev2 hover:text-text" onClick={onClose}>
+          <button
+            className="shrink-0 rounded-md p-1 text-dim transition-colors hover:bg-elev2 hover:text-text"
+            title="关闭验证（Esc）"
+            onClick={onClose}
+          >
             <X size={16} />
           </button>
         </div>
-        {/* 这块空白处由主进程的验证窗口盖住；边框只是为了让用户知道窗口应该出现在这里 */}
-        <div className="relative min-h-0 flex-1">
+
+        {/* ---------- 进度条：不确定进度（loading）→ 100%（loaded） ---------- */}
+        <div className="h-1 shrink-0 overflow-hidden bg-elev2">
           <div
-            ref={holeRef}
-            className="absolute inset-3 rounded-lg border border-dashed border-border bg-elev2/40"
+            className={`h-full transition-all duration-300 ${
+              failed ? 'bg-danger' : loaded ? 'bg-ok' : 'animate-pulse bg-warn'
+            }`}
+            style={{ width: failed ? '100%' : loaded ? '100%' : vs ? '45%' : '15%' }}
           />
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-[11px] text-faint">
-            验证窗口正在这里打开…
-          </div>
         </div>
-        <div className="flex items-center justify-between gap-2 border-t border-border px-4 py-2.5">
-          <span className="text-[11px] leading-relaxed text-faint">
-            提示：验证过一次之后，本机再访问这条线路就不需要重复验证。
-            若窗口里一直加载不出来，可能是站点本身不可用，换一条线路即可。
+
+        {/* ---------- 中间：真实网页（由主进程的子窗口盖在这块洞上） ---------- */}
+        <div className="relative min-h-0 flex-1">
+          {/*
+            洞内留 3px 边距 + 圆角：子窗口是矩形原生窗口，没法自己画圆角；
+            外框这一圈底色把这个矩形"收"进弹窗里，视觉上不再像两块拼接。
+          */}
+          <div ref={holeRef} className="absolute inset-3 overflow-hidden rounded-xl bg-black/85" />
+          {/* 只有还没加载成功时才盖提示文字：加载成功后这里应该让位给真实网页 */}
+          {!loaded ? (
+            <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 text-[11px] text-faint">
+              {failed ? (
+                <>
+                  <span className="text-danger">✗ {vs?.error ?? '验证页加载失败'}</span>
+                  <span>验证窗口是真实网页，加载失败时这里会一直空着；点「重新加载」重试。</span>
+                </>
+              ) : (
+                <>
+                  <Spinner size={16} />
+                  <span>验证窗口正在这里打开…（外框是应用 UI，里面是站点真实页面）</span>
+                </>
+              )}
+            </div>
+          ) : null}
+        </div>
+
+        {/* ---------- 底部：说明 + 取消 / 重新加载 / 我已完成验证 ---------- */}
+        <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-2.5">
+          <span className="min-w-0 text-[11px] leading-relaxed text-faint">
+            验证过一次之后，本机再访问这条线路就不需要重复验证（Cookie 保存在应用的浏览器会话里）。
           </span>
           <div className="flex shrink-0 gap-2">
             <Button variant="outline" size="sm" onClick={onClose}>
               取消
             </Button>
-            <Button size="sm" icon={Play} onClick={onPassed}>
+            {failed ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  void api.ruleVerify.reload().then((r) => {
+                    if (!r.ok) toast.error(`重新加载失败：${r.error}`)
+                  })
+                }}
+              >
+                重新加载
+              </Button>
+            ) : null}
+            <Button size="sm" icon={Play} disabled={failed} onClick={onPassed}>
               我已完成验证
             </Button>
           </div>

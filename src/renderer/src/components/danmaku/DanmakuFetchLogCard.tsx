@@ -57,8 +57,8 @@ export function DanmakuFetchLogCard(): React.JSX.Element {
 
   return (
     <Card
-      title="获取记录"
-      desc="每次去弹幕数据源要弹幕的结果：用的哪个关键词、花多久、拿到多少条、为什么没拿到（排障用）"
+      title="显示弹幕获取器记录"
+      desc="每次去弹幕源要弹幕的结果：用的哪个关键词、花多久、拿到多少条、为什么没拿到（排障用）"
     >
       <div className="mb-2 flex items-center gap-2">
         <Button

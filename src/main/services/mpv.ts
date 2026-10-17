@@ -1,13 +1,16 @@
 import { app, BrowserWindow, screen } from 'electron'
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, cpSync } from 'node:fs'
 import { join } from 'node:path'
 import { CH } from '@shared/channels'
 import type { OverlayAction } from '@shared/api'
 import type { DanmakuSettings } from '@shared/types'
 import { anime4kChain } from '@shared/anime4k'
+import { themePalette, resolveThemeId } from '@shared/themePalette'
+import { buildUoscColorLine, renderUoscConf } from '@shared/uoscTheme'
 import { BROWSER_UA, getSettings } from '../net'
 import { danmakuApiBase } from './danmaku'
-import { beginStage, failStage, endFlow, flowDetail, flowRunning, pushStep, succeedStage } from './playFlow'
+import { beginStage, failStage, endFlow, flowDetail, flowRunning, pushStep, setMetrics, snapshot as flowSnapshot, succeedStage } from './playFlow'
+import { getStreamBoostStatus } from './streamBoost'
 import { noteControlAction, setOverlayPropReader } from './playerOverlay'
 import { log } from '../log'
 import { store } from '../store'
@@ -38,6 +41,12 @@ interface MpvState {
   eof: boolean
   volume: number
   mute: boolean
+  /**
+   * v1.1.4：uosc 桥接脚本的现场读数（版本/按钮清单/set-button 次数）。
+   * 挂在 `mpvGetState()` 上而不是另开 API：自检与排障拿到的永远是与播放状态同一刻的快照，
+   * 不会出现"状态是上一秒的、按钮清单是这一秒的"这种对不上的情况。
+   */
+  uosc?: UoscBridgeStats
 }
 
 interface MpvNative {
@@ -442,8 +451,85 @@ function trackAudioOnly(playing: boolean, hasPicture: boolean, t: number): void 
   }
 }
 
-function startTimePump(win: BrowserWindow): void {
-  stopTimePump()
+/*
+ * ───────── 内核侧网络采样（v1.1）─────────
+ *
+ * 修的是用户报的那条：「将播放地址交给播放器内核后经常出现没有加载速度的显示
+ * （多少 MB、多少 B 的数据流量显示），仅仅是将播放地址交给播放器内核后就没了，
+ * 也没有显示失败」。
+ *
+ * 原因有两层，这里两层都堵上：
+ *  ① `PlayFlowMetrics` 过去只有**交给内核之前**的可达性探测会写，内核开始拉流之后
+ *     没有任何代码再写 → 数字冻住/消失。现在挂在既有的 250ms 时间泵上采样，
+ *     以 1 秒节流写入（新增一条定时器是没有必要的，泵本来就在跑）。
+ *  ② 「没有失败」是因为内核拿不到数据时没有任何判据。这里补一条**保守**的判据：
+ *     内核已进入 playing、`time-pos` 仍是 0、累计字节也还是 0 —— 同时满足这三条的
+ *     20 秒才判失败（避免把"慢但在动"的源误判成失败；那种情况 rate 会 > 0）。
+ */
+let netBytes = 0
+let netLastSampleAt = 0
+let netLastRate = 0
+let netLastPushAt = 0
+let netHandedAt = 0
+let netStallConcluded = false
+
+/** 每次 loadfile（mpvPlay）重置采样基线：换集不能把上一集的流量算进这一集 */
+function resetNetSampling(): void {
+  netBytes = 0
+  netLastSampleAt = 0
+  netLastRate = 0
+  netLastPushAt = 0
+  netHandedAt = Date.now()
+  netStallConcluded = false
+}
+
+/**
+ * 采一次内核网络读数并写进播放流程的指标。
+ * @param playing 内核是否在播（pump 里算出来的那个判据）
+ * @param time    内核当前 time-pos（毫秒）
+ */
+function sampleNet(playing: boolean, time: number): void {
+  const now = Date.now()
+  const stats = mpvNetStats()
+  if (!stats) return
+  const dt = netLastSampleAt > 0 ? (now - netLastSampleAt) / 1000 : 0
+  netLastSampleAt = now
+  if (stats.forwardBytes > 0) {
+    // 内核自己报的已预读字节：直接用它（单调递增，不需要我们积分）
+    netBytes = Math.max(netBytes, stats.forwardBytes)
+  } else if (dt > 0 && stats.rateBps > 0) {
+    // 只有速率：按「速率 × 实际间隔」积分。标注清楚这是估算而不是内核计数
+    netBytes += stats.rateBps * dt
+  }
+  if (stats.rateBps > 0) netLastRate = stats.rateBps
+  if (!flowRunning()) return
+  if (now - netLastPushAt >= 1000) {
+    netLastPushAt = now
+    setMetrics({
+      bytes: Math.round(netBytes),
+      rateBps: Math.round(netLastRate),
+      source: 'engine'
+    })
+  }
+  /*
+   * 失败判据（保守）：已 playing + 时间不前进 + 一个字节都没读到，持续 20 秒。
+   * 只满足其中一两条时继续等 —— 慢源 rate>0 会走到上面那条分支，不会被这里误判。
+   */
+  if (!netStallConcluded && playing && time <= 0 && netBytes === 0 && netHandedAt > 0) {
+    const waited = now - netHandedAt
+    if (waited >= 20_000) {
+      netStallConcluded = true
+      failStage(
+        'inject',
+        `内核已接收地址，但 ${Math.round(waited / 1000)} 秒内没有读到任何数据（0 字节、进度 0 秒）：` +
+          '该地址很可能已失效、需要 Referer/Cookie，或源站拒绝了这个连接',
+        'site'
+      )
+    }
+  }
+}
+
+function startTimePump(win: BrowserWindow): void {  stopTimePump()
   timeTimer = setInterval(() => {
     if (!ready || !native || !attachedWin || attachedWin.isDestroyed()) return
     try {
@@ -536,6 +622,8 @@ function startTimePump(win: BrowserWindow): void {
        * 结论本身（summary）是对的，但详情面板上少了「有声无画 Ns」这个最关键的现场。
        */
       trackAudioOnly(playing, hasPicture, st.time ?? 0)
+      // 内核侧速度/流量/失败判据（v1.1，见 sampleNet 的说明）：挂在同一个泵上，1 秒节流写指标
+      sampleNet(playing, st.time ?? 0)
       if (hasPicture && !lastHadPicture) {
         lastHadPicture = true
         succeedStage('inject', `画面已就绪（首帧已解码，视频宽 ${picW}px）`)
@@ -577,6 +665,12 @@ function startTimePump(win: BrowserWindow): void {
        * 只有桥接脚本挂上了才读（见 pollUoscCtrl）。
        */
       pollUoscCtrl(win)
+      /*
+       * v1.1.4：控制栏「播放状态」菜单的数据源。
+       * 挂在同一个 250ms 泵上，但内部节流到 1 秒 —— 缓冲/速度/丢帧本来就是秒级变化；
+       * 只在 uosc 与桥接脚本都挂上时推，避免给不存在监听者的 script-message 白花钱。
+       */
+      if (uoscBarLoaded && uoscCtrlLoaded) mpvPushUoscStatus()
     } catch {
       /* ignore */
     }
@@ -754,27 +848,146 @@ export function uoscDanmakuRequested(): boolean {
 }
 
 /**
- * uosc 控制栏是否接管（v0.2.18 引入，**v0.3.3 起默认关闭**）。
+ * uosc 控制栏是否接管（**v1.1.4 起是唯一控制栏**）。
  *
- * 为什么默认关掉：用户明确要求「撤销 uosc，就用我们原来自建的控制栏」。
- * 现在回头看，当初迁到 uosc 是为了绕开「控制栏按钮失灵」，而那个毛病的真因后来查清了
- * （① 悬浮窗在鼠标移动时抢走交互、② uosc 的动作字符串被 mpv 加了引号导致全部匹配不上），
- * 两个都修好之后应用自己的悬浮窗控制栏是完全可用的，而且它的按钮、菜单、超分入口
- * 都在我们自己的 React 里，调试和扩展都比改 mpv 脚本直接。
+ * 为什么不再读 `settings.uoscControlBar`：
+ *   v1.1.4 把旧的自绘控制栏整体搬到了 `playerLegacy/PlayerOverlayBar.tsx` 并停止渲染。
+ *   如果这里仍然尊重 `uoscControlBar: false`（老用户或设置页手动关过），
+ *   结果会是「uosc 不画 + 旧栏也不画」= 一条控制栏都没有 —— 这正是历史上
+ *   反复出现过的"所有按钮失灵"的形态。所以现在只有两条路：
+ *     · 内置 uosc 可用 → 由它画；
+ *     · 安装目录不完整（uosc 缺失）→ 这里返回 false，日志里会写清楚为什么。
+ *   设置项保留只是为了旧 settings.json 不报错（见 shared/types.ts 的字段注释）。
  *
- * 仍保留 uosc 这条路（设置里可手动打开）：弹幕插件 uosc_danmaku 的菜单要用 uosc 渲染，
- * 所以 uosc 本身还会被加载，只是**不再让它画控制栏**（见 loadUoscPlugins 里的 disable-elements）。
- *
- * ⚠️ v0.3.6 补：**这个开关只决定"画不画控制栏"，不再决定 input.conf 生不生效**。
- * 老代码把 `config-dir` 也挂在这个条件上（不画控制栏就不给 config-dir），
- * 于是默认配置下 mpv 读不到 `input.conf`，ESC / q / f / l / c / x 等键位全部失效 ——
- * 用户报的「按 Esc 也退不出播放器」就是这么来的，而快捷键恰好只在 mpv 子窗口持焦时才是唯一出路
- * （应用侧那套快捷键要求 Electron 窗口有键盘焦点）。现在 `config-dir` 无条件给，
- * 见 `mpvAttach()` 里的说明。
+ * 仍然要注意：`config-dir` 与这个开关**无关**，它无条件给（v0.3.6 的教训：
+ * 不给 config-dir 时 input.conf 里的 ESC 等快捷键会全部失效，见 mpvAttach 的说明）。
  */
 export function uoscControlBarRequested(): boolean {
-  const s = getSettings() as unknown as { uoscControlBar?: boolean }
-  return s.uoscControlBar === true && uoscPluginAvailable()
+  return uoscPluginAvailable()
+}
+
+/* ─────────────── uosc 配色：按应用主题生成 script-opts/uosc.conf ─────────────── */
+
+/** 上一次生成时用的主题 id（同一主题重复进播放器不重复写盘、不重复刷日志） */
+let lastUoscConfTheme = ''
+/** 上一次实际生效的 config-dir（可能是安装目录，也可能是临时镜像目录） */
+let runtimeUoscConfDir = ''
+
+/** 从模板拼出完整的 uosc.conf 内容；模板读不到时返回 null（调用方保持现状） */
+function buildUoscConfContent(cfgDir: string, themeId: string): string | null {
+  const optsDir = join(cfgDir, 'script-opts')
+  let template = ''
+  try {
+    template = readFileSync(join(optsDir, 'uosc.conf.base'), 'utf8')
+  } catch {
+    try {
+      template = readFileSync(join(optsDir, 'uosc.conf'), 'utf8')
+    } catch (err) {
+      log.append(
+        'warn',
+        'mpv',
+        `[uosc] 找不到 uosc.conf.base / uosc.conf，控制栏配色无法生成，将使用 uosc 默认色：${String(
+          (err as Error)?.message ?? err
+        )}`
+      )
+      return null
+    }
+  }
+  /*
+   * 颜色算法在 @shared/uoscTheme（纯函数），主进程只负责读写文件。
+   * 这样自检脚本可以在 Node 里跑同一份映射，把生成后的 color= 行贴进报告，
+   * 不必为了验证颜色去启动整个 Electron。
+   */
+  return renderUoscConf(template, themeId)
+}
+
+/**
+ * 安装目录不可写时的退路：把 config-dir 需要的东西镜像到临时目录。
+ *
+ * 为什么只镜像 input.conf / fonts / script-opts：
+ *   uosc 本体的脚本是主进程用**绝对路径** `load-script` 挂的（见 loadUoscPlugins），
+ *   不需要躺在 config-dir 里；而 mpv 会从 config-dir 读 input.conf（快捷键）与
+ *   fonts（uosc 图标字体），这两样必须跟着走。
+ *
+ * 为什么值得做：打包安装到 Program Files 时安装目录**可能**只读。没有这个镜像，
+ * "按主题生成 uosc 配色"就只能放弃治疗；有了它，配色照样生效，只是换了个可写位置。
+ */
+function mirrorMpvConfig(cfgDir: string, confContent: string): string {
+  const root = join(app.getPath('temp'), 'sakana-mpv-config')
+  mkdirSync(join(root, 'script-opts'), { recursive: true })
+  try {
+    cpSync(join(cfgDir, 'input.conf'), join(root, 'input.conf'), { force: true })
+  } catch {
+    log.append('warn', 'mpv', '[uosc] 镜像 input.conf 失败：本次播放的键盘快捷键可能失效')
+  }
+  try {
+    cpSync(join(cfgDir, 'fonts'), join(root, 'fonts'), { recursive: true, force: true })
+  } catch {
+    log.append('warn', 'mpv', '[uosc] 镜像字体目录失败：uosc 的图标字体可能显示成方框')
+  }
+  writeFileSync(join(root, 'script-opts', 'uosc.conf'), confContent, 'utf8')
+  return root
+}
+
+/**
+ * 把 `uosc.conf.base` 当模板、按当前主题生成真正被 uosc 读的 `uosc.conf`，
+ * 并返回**本轮应该交给 mpv 的 config-dir**。
+ *
+ * 为什么必须生成而不能在启动参数里给颜色：
+ *   `--script-opts` 是逗号分隔的 key=value，而 uosc 的 color 本身就是一个逗号列表 ——
+ *   反斜杠转义也救不了（见 uosc.conf.base 头部的实测说明）。所以颜色只能落进配置文件。
+ *
+ * 三级退路（任何一级失败都不阻止播放）：
+ *   ① 直接写安装目录（开发态/可写安装目录，正常情况下走这里）；
+ *   ② 写不进去 → 镜像到系统临时目录，用镜像目录当 config-dir（Program Files 只读时走这里）；
+ *   ③ 连临时目录都写不了 → 保持现有 uosc.conf（仓库预置的是落日色兜底）并记 error。
+ */
+function prepareUoscConf(cfgDir: string): string {
+  const themeId = resolveThemeId(store.get<Record<string, unknown>>('settings', {}).theme)
+  if (themeId === lastUoscConfTheme && runtimeUoscConfDir) return runtimeUoscConfDir
+  const content = buildUoscConfContent(cfgDir, themeId)
+  if (!content) return cfgDir
+  const colorLine = `color=${buildUoscColorLine(themeId)}`
+  const bundledConf = join(cfgDir, 'script-opts', 'uosc.conf')
+  try {
+    writeFileSync(bundledConf, content, 'utf8')
+    lastUoscConfTheme = themeId
+    runtimeUoscConfDir = cfgDir
+    log.append('info', 'mpv', `[uosc] 控制栏配色已按主题「${themePalette(themeId).label}」生成：${colorLine}`)
+    return cfgDir
+  } catch (err) {
+    log.append(
+      'warn',
+      'mpv',
+      `[uosc] 安装目录不可写，尝试把 mpv 配置镜像到临时目录（原错误：${String((err as Error)?.message ?? err)}）`
+    )
+  }
+  try {
+    const mirrored = mirrorMpvConfig(cfgDir, content)
+    lastUoscConfTheme = themeId
+    runtimeUoscConfDir = mirrored
+    log.append(
+      'info',
+      'mpv',
+      `[uosc] 已改用临时配置目录（配色仍按主题「${themePalette(themeId).label}」生效）：${mirrored}`
+    )
+    return mirrored
+  } catch (err) {
+    /*
+     * 连临时目录都写不了：不改动现有 uosc.conf，uosc 读仓库预置的落日色。
+     * 把主题 id 留空，下次起播还会再试。
+     */
+    lastUoscConfTheme = ''
+    runtimeUoscConfDir = ''
+    log.append(
+      'error',
+      'mpv',
+      `[uosc] 生成 uosc.conf 失败（安装目录与临时目录都不可写），控制栏沿用文件里现有的落日色兜底：${String(
+        (err as Error)?.message ?? err
+      )}`
+    )
+    return cfgDir
+  }
 }
 
 /** uosc 本体（控制栏/进度条/菜单）是否真的挂上了 */
@@ -793,6 +1006,205 @@ export function uoscDanmakuActive(): boolean {
 let uoscCtrlLoaded = false
 export function uoscCtrlActive(): boolean {
   return uoscCtrlLoaded && ready
+}
+
+/* ───────────── uosc 控制栏自检：桥接脚本暴露的按钮清单 / 版本号 ───────────── */
+
+export interface UoscBridgeStats {
+  /** uosc 广播的版本（脚本收到 `script-message uosc-version` 后写入） */
+  version: string
+  /** 桥接脚本实际下发过的按钮名（排序后） */
+  buttons: string[]
+  /** `set-button` 被真正执行（不是命中内容缓存）的累计次数 */
+  setCalls: number
+  /** 桥接脚本存活标记（与 user-data/sakana-ctrl-ready 同值） */
+  ready: string
+}
+
+/** `user-data/*` 是节点属性，mpv 转字符串时可能带 JSON 引号；这里统一剥掉 */
+function readUserDataText(name: string): string {
+  if (!ready || !native) return ''
+  try {
+    const v = native.getProperty(name)
+    if (typeof v !== 'string') return ''
+    const t = v.trim()
+    if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) {
+      try {
+        const parsed = JSON.parse(t) as unknown
+        if (typeof parsed === 'string') return parsed
+      } catch {
+        return t.slice(1, -1)
+      }
+    }
+    return t
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 读取桥接脚本写出来的只读属性（`user-data/sakana-uosc-buttons` / `-stats`）。
+ *
+ * 为什么要暴露这两个属性：uosc 的按钮是 mpv 的 ASS 图层，Electron 侧看不到 DOM；
+ * "控制栏到底有没有按钮"只能由脚本自己说。这里是自检与排障的唯一硬证据
+ * （渲染层通过 `api.uosc.status()` 读它，日志里也会写一行）。
+ */
+export function uoscBridgeStats(): UoscBridgeStats {
+  const buttons = readUserDataText('user-data/sakana-uosc-buttons')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const stats = readUserDataText('user-data/sakana-uosc-stats')
+  const pick = (key: string): string => {
+    const m = new RegExp(`(?:^|\\s)${key}=([^\\s]+)`).exec(stats)
+    return m?.[1] ?? ''
+  }
+  const calls = Number(pick('sets'))
+  return {
+    version: pick('version'),
+    buttons,
+    setCalls: Number.isFinite(calls) && calls > 0 ? Math.trunc(calls) : 0,
+    ready: readUserDataText('user-data/sakana-ctrl-ready')
+  }
+}
+
+/* ───────────── uosc 播放状态：主进程把可读的实时读数推给菜单 ───────────── */
+
+/** 1 秒一次的状态推送（uosc 菜单打开时读的就是它；没有它菜单只能显示"暂不可用"） */
+let lastUoscStatusPushAt = 0
+
+function propNumber(name: string): number {
+  if (!native) return 0
+  try {
+    const v = Number(native.getProperty(name))
+    return Number.isFinite(v) ? v : 0
+  } catch {
+    return 0
+  }
+}
+
+function propText(name: string): string {
+  if (!native) return ''
+  try {
+    const v = native.getProperty(name)
+    return typeof v === 'string' ? v.trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 当前播放的"给用户看"的状态快照（不含任何推测值）。
+ *
+ * 分两类字段：
+ *   · 主进程自己知道的：线路/集、投屏、加速器、播放流程、时间；
+ *   · 从 mpv 标量属性读到的：分辨率、编码、码率、缓冲、丢帧、音画同步。
+ * `demuxer-cache-state` 是节点属性，原生插件只暴露 double/flag/string，
+ * 读不到就留空 —— lua 菜单会自己用 `mp.get_property_native` 补上累计流量等节点字段，
+ * 两边都拿不到时菜单显示"暂不可用"，**不编数字**。
+ */
+export interface UoscPlaybackStatus {
+  at: number
+  playing: boolean
+  paused: boolean
+  timeMs: number
+  lengthMs: number
+  width: number
+  height: number
+  videoCodec: string
+  audioCodec: string
+  videoBitrate: number
+  audioBitrate: number
+  cacheDurationSec: number
+  cacheSpeedBps: number
+  frameDropCount: number
+  decoderDropCount: number
+  avsync: number
+  fileSize: number
+  title: string
+  subtitle: string
+  statusText: string
+  line: number
+  lineName: string
+  ep: number
+  epName: string
+  cast: { active: boolean; deviceId: string; deviceName: string }
+  boost: { active: boolean; mode: string; kind: string; rateBps: number; bytes: number; parallel: number }
+  flow: { running: boolean; summary: string; reason: string }
+}
+
+export function uoscPlaybackStatus(): UoscPlaybackStatus {
+  const st = mpvGetState()
+  const p = (lastUoscPayload ?? {}) as Record<string, unknown>
+  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+  const lines = Array.isArray(p.lines) ? (p.lines as { name?: string; episodes?: string[] }[]) : []
+  const line = num(p.currentLine)
+  const ep = num(p.currentEp)
+  const lineName = str(lines[line]?.name)
+  const epName = str(lines[line]?.episodes?.[ep])
+  const cast = (p.cast ?? {}) as Record<string, unknown>
+  const status = (p.status ?? {}) as Record<string, unknown>
+  const boost = getStreamBoostStatus()
+  const flow = flowSnapshot()
+  return {
+    at: Date.now(),
+    playing: !!st?.ready && !st.idle && !st.eof && !st.paused,
+    paused: !!st?.paused,
+    timeMs: Math.round(st?.time ?? 0),
+    lengthMs: Math.round(st?.length ?? 0),
+    width: propNumber('width'),
+    height: propNumber('height'),
+    videoCodec: propText('video-codec'),
+    audioCodec: propText('audio-codec'),
+    videoBitrate: propNumber('video-bitrate'),
+    audioBitrate: propNumber('audio-bitrate'),
+    cacheDurationSec: propNumber('demuxer-cache-duration'),
+    cacheSpeedBps: propNumber('cache-speed'),
+    frameDropCount: propNumber('frame-drop-count'),
+    decoderDropCount: propNumber('decoder-frame-drop-count'),
+    avsync: propNumber('avsync'),
+    fileSize: propNumber('file-size'),
+    title: str(p.title),
+    subtitle: str(p.subtitle),
+    statusText: str(status.text),
+    line,
+    lineName,
+    ep,
+    epName,
+    cast: {
+      active: cast.active === true,
+      deviceId: str(cast.deviceId),
+      deviceName: str(cast.deviceName)
+    },
+    boost: {
+      active: boost.active,
+      mode: boost.mode,
+      kind: boost.kind,
+      rateBps: boost.rateBps,
+      bytes: boost.bytes,
+      parallel: boost.parallel
+    },
+    flow: { running: flow.running, summary: flow.summary, reason: flow.reason }
+  }
+}
+
+/**
+ * 把状态快照推给桥接脚本（lua 缓存它，`sakana-status` 菜单打开时直接读缓存，
+ * 不需要在点击那一刻再绕一圈 IPC —— 菜单必须**立刻**出现，不能等异步往返）。
+ *
+ * 每秒一次：菜单里的缓冲/速度/丢帧本来就是秒级变化，再快只会白耗 IPC。
+ */
+export function mpvPushUoscStatus(force = false): boolean {
+  if (!ready || !native || !uoscCtrlLoaded) return false
+  const now = Date.now()
+  if (!force && now - lastUoscStatusPushAt < 1000) return false
+  lastUoscStatusPushAt = now
+  try {
+    return native.command(['script-message', 'sakana-playback-status', JSON.stringify(uoscPlaybackStatus())])
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -889,6 +1301,26 @@ function clamp01(n: number): number {
 function loadUoscPlugins(mod: MpvNative, cfgDir: string, wantDanmaku: boolean, wantBar: boolean): boolean {
   const uoscDir = slashPath(join(cfgDir, 'scripts', 'uosc'))
   const danmakuDir = slashPath(join(cfgDir, 'scripts', 'uosc_danmaku'))
+
+  /*
+   * ⓪ thumbfast（进度条悬停缩略图，用户点名要的）
+   *
+   * 为什么必须**排在 uosc 之前**加载：uosc 在初始化时会问一遍 "有没有 thumbfast"，
+   * 之后靠 `thumbfast-info` 消息拿缩略图。先挂上它，uosc 第一次渲染进度条就知道能画预览；
+   * 反过来（uosc 先起）就要等它下一次探测，用户把鼠标压到进度条上可能还没有缩略图。
+   *
+   * 为什么它是一个 `load-script` 而不是 `<config-dir>/scripts/` 里的自动加载：
+   * libmpv 这边 `load-scripts=no`（否则 uosc 会被加载两份，见上面的注释），
+   * 所以每个脚本都得我们自己按绝对路径挂 —— 漏一个就等于没装。
+   */
+  const thumbfast = join(cfgDir, '..', 'mpv-scripts', 'thumbfast.lua')
+  try {
+    const p = slashPath(thumbfast)
+    const okT = mod.command(['load-script', p])
+    log.append(okT ? 'info' : 'warn', 'mpv', okT ? `thumbfast 已加载（进度条缩略图）: ${p}` : `thumbfast 加载失败: ${p}`)
+  } catch (err) {
+    log.append('warn', 'mpv', `加载 thumbfast 异常: ${String((err as Error)?.message ?? err)}`)
+  }
 
   // ① 控制栏桥接脚本
   const ctrlScript = bundledUoscCtrlScript()
@@ -996,6 +1428,22 @@ function loadUoscPlugins(mod: MpvNative, cfgDir: string, wantDanmaku: boolean, w
       }
       if (alive) {
         log.append('info', 'mpv', `控制栏桥接脚本已就绪（版本 ${alive}）`)
+        /*
+         * v1.1.4：把「uosc 真的收下了多少个 button」写进日志。
+         * 这是"控制栏有没有按钮"唯一不依赖截图的证据：uosc 的按钮是 ASS 图层，
+         * Electron 侧看不到 DOM；脚本把已下发的按钮名写进 user-data，这里读回来记一行。
+         * 同时把 1 秒后的状态快照强推一次，`sakana-status` 菜单在起播最开始就有数可看。
+         */
+        setTimeout(() => {
+          const stats = uoscBridgeStats()
+          log.append(
+            'info',
+            'mpv',
+            `[uosc] 控制栏就绪：uosc 版本=${stats.version || '未广播'} 按钮=${stats.buttons.length} 个` +
+              ` set-button 下发=${stats.setCalls} 次 [${stats.buttons.join(',')}]`
+          )
+          mpvPushUoscStatus(true)
+        }, 200)
         return
       }
       uoscCtrlLoaded = false
@@ -1063,6 +1511,14 @@ function uoscActionToOverlay(raw: string): OverlayAction | null {
       return { type: 'toggleDanmaku' }
     case 'toggle-info':
       return { type: 'toggleInfo' }
+    /*
+     * v1.1.5：uosc 右上角角标「播放流详情」。
+     * 动作名 `flow` 来自 `sakana-uosc-ctrl.lua` 的 sakana-flow 按钮；它打开的是**流详情面板**
+     * （StreamInfoModal：嗅探地址 / 带宽 / 线路读数 / 播放流程），
+     * 与「番剧详情」（toggle-info）是两件事，所以单独一条映射。
+     */
+    case 'flow':
+      return { type: 'toggleStreamInfo' }
     case 'snapshot':
       return { type: 'snapshot' }
     case 'toggle-fullscreen':
@@ -1077,6 +1533,24 @@ function uoscActionToOverlay(raw: string): OverlayAction | null {
       return { type: 'reloadDanmaku' }
     case 'detect-danmaku-alias':
       return { type: 'detectDanmakuAlias' }
+    /*
+     * v1.1.4：弹幕线约定的控制栏动作（参数是裸数字 / 关键词，不是 JSON）。
+     * 这些名字来自 `sakana-uosc-ctrl.lua` 的「弹幕」菜单；映射成 OverlayAction 后
+     * 与旧悬浮窗走**完全相同**的那套处理（updateDanmaku / loadDanmaku）。
+     */
+    case 'danmakuArea':
+    case 'danmakuFontSize':
+    case 'danmakuOffset': {
+      const v = Number(parts[0])
+      if (!Number.isFinite(v)) return null
+      const key = name === 'danmakuArea' ? 'area' : name === 'danmakuFontSize' ? 'fontSize' : 'offsetMs'
+      return { type: 'danmakuSetting', key, value: v }
+    }
+    case 'danmakuReload':
+      return { type: 'reloadDanmaku' }
+    case 'danmakuAliasSearch':
+      // 不带参数时 keyword 为空串，由播放页决定是弹输入框还是用当前剧名再搜
+      return { type: 'searchDanmakuAlias', keyword: rest }
     case 'uosc-menu': {
       const k = parts[0]
       if (k === 'search' || k === 'total' || k === 'style' || k === 'delay' || k === 'add') {
@@ -1860,8 +2334,18 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
    * 不给 uosc 也不会多出任何东西 —— `load-scripts=no` 已经保证 scripts/ 目录不会被自动扫描。
    */
   const cfgDir = bundledMpvConfigDir()
+  /** 真正交给 mpv 的 config-dir：安装目录可写时就是它，否则是临时镜像目录（见 prepareUoscConf） */
+  let runtimeCfgDir = cfgDir
   if (!cfgDir) {
     log.append('warn', 'mpv', '未找到内置 mpv 配置目录：播放器的键盘快捷键（含 ESC 退出）会全部失效')
+  } else {
+    /*
+     * uosc 只在**加载时**读一次 script-opts/uosc.conf（5.13 没有 set-option 消息），
+     * 所以必须在 mpv 初始化之前把配色写进去。放在 create 之前不是"顺手"：
+     * create 内部就会 mpv_initialize，uosc 的 read_options 发生在脚本加载时，但字体/配置
+     * 目录的解析从初始化就开始了；早写只有好处，晚写就可能这一轮还是旧颜色。
+     */
+    runtimeCfgDir = prepareUoscConf(cfgDir)
   }
   let hwnd: Buffer | undefined
   try {
@@ -1952,7 +2436,7 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
        * 所以即使这条选项在某个 libmpv 版本里不存在，也只会被忽略，不会导致初始化失败。
        */
       ...(process.env.SAKANA_MPV_CURSOR_PASSTHROUGH ? { 'input-cursor-passthrough': 'yes' } : {}),
-      ...(cfgDir ? { 'config-dir': slashPath(cfgDir), config: 'yes' } : {}),
+      ...(runtimeCfgDir ? { 'config-dir': slashPath(runtimeCfgDir), config: 'yes' } : {}),
       ...(scriptOptsParts.length > 0 ? { 'script-opts': scriptOptsParts.join(',') } : {})
     }
   })
@@ -2011,6 +2495,7 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
   lastLength = 0
   lastEof = false
   lastUoscBarJson = ''
+  lastUoscStatusPushAt = 0
   surfaceVisible = true
   startTimePump(win)
   startRaiseWatch(win)
@@ -2186,6 +2671,7 @@ export function mpvPlay(path: string, referer?: string, cookies?: string): void 
    */
   lastHadPicture = false
   resetAudioOnly()
+  resetNetSampling()
   beginStage('inject', '正在把播放资源交给播放内核（loadfile）')
   pushStep('inject', `交给内核：${path.slice(0, 100)}${referer ? `（带 Referer）` : ''}${cookies ? '（带 Cookie）' : ''}`)
   // 新媒体的视频输出窗口会在首帧时重建，届时需要再挂一次
@@ -2308,7 +2794,59 @@ export function mpvSetSpeed(speed: number): void {
 
 export function mpvGetState(): MpvState | null {
   if (!ready || !native) return null
-  return native.state()
+  /*
+   * v1.1.4：顺带带上 uosc 桥接脚本的按钮/版本读数（见 MpvState.uosc 的说明）。
+   * 三次属性读取，挂在本来就会调用的 800ms/250ms 状态泵上，开销可以忽略。
+   */
+  return { ...native.state(), uosc: uoscBridgeStats() }
+}
+
+/**
+ * 内核侧的网络读数（v1.1：修「地址交给内核后就没有速度/流量显示了」）。
+ *
+ * ## 为什么必须从 mpv 读，而不是继续用交给内核之前那次探测的数值
+ *
+ * 老实现里 `PlayFlowMetrics` 只在**交给内核之前**由可达性探测写一次
+ * （见 ipc.ts 的 playerDiagnose → setMetrics）。地址交给 mpv 之后没有任何代码再写它，
+ * 于是界面上那几个数字就**冻在探测结束时的那一刻**：
+ * 用户看到的正是「刚把地址交给播放器，速度/流量显示就没了，也没有失败原因」。
+ *
+ * ## 读的是哪些属性，为什么每个都有兜底
+ *
+ * - `cache-speed`：mpv 的"缓存与底层流之间的当前读取速率"（字节/秒），最直接；
+ * - `demuxer-cache-state/raw-input-rate`：老版本没有 cache-speed 时的等价读数；
+ * - `demuxer-cache-state/fw-bytes`：已预读的前向字节数（累计流量的下界）。
+ * 三者任一读不到就退到下一个，全都读不到时 `available=false` —— 界面显示「—」，
+ * 不用估算值凑数字（这是本项目一贯的"不许假状态"）。
+ * 注意：原生插件的 `getProperty` 只会按 double/flag/string 取值，**读不了 node**，
+ * 所以这里一律用带子路径的属性名（`demuxer-cache-state/xxx`），而不是直接读 node。
+ */
+export interface MpvNetStats {
+  /** 当前读取速率（字节/秒）；读不到是 0 */
+  rateBps: number
+  /** 已预读字节（fw-bytes）；读不到是 0 */
+  forwardBytes: number
+  /** 媒体总字节（file-size）；HLS 这类没有总长时是 0 */
+  fileSize: number
+  /** 是否至少读到了一个有效属性 */
+  available: boolean
+}
+
+export function mpvNetStats(): MpvNetStats | null {
+  const n = native
+  if (!n || !ready) return null
+  const num = (name: string): number => {
+    try {
+      const v = Number(n.getProperty(name))
+      return Number.isFinite(v) && v > 0 ? v : 0
+    } catch {
+      return 0
+    }
+  }
+  const rate = num('cache-speed') || num('demuxer-cache-state/raw-input-rate')
+  const fw = num('demuxer-cache-state/fw-bytes') || num('demuxer-cache-state/file-cache-bytes')
+  const size = num('file-size')
+  return { rateBps: rate, forwardBytes: fw, fileSize: size, available: rate > 0 || fw > 0 || size > 0 }
 }
 
 /** 诊断：输出窗口树（排查「有声音无画面」用） */
@@ -2532,6 +3070,7 @@ export function mpvDestroy(): void {
   uoscDanmakuLoaded = false
   uoscCtrlLoaded = false
   lastUoscBarJson = ''
+  lastUoscStatusPushAt = 0
   // 画质设置的指纹也要复位：实例没了，新实例必须被重新设置一次（哪怕设置值没变）
   lastEnhanceKey = ''
   lastVolume = -1

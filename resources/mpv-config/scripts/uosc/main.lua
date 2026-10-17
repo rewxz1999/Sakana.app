@@ -36,6 +36,7 @@ defaults = {
 	controls_margin = 8,
 	controls_spacing = 2,
 	controls_persistency = '',
+	corner_controls = '', -- 角标按钮（左上/右上），语法见 elements/CornerButtons.lua
 
 	volume = 'right',
 	volume_size = 40,
@@ -810,8 +811,11 @@ function bind_command(name, callback, flags)
 	end, flags)
 end
 
-bind_command('toggle-ui', function() Elements:toggle({'timeline', 'controls', 'volume', 'top_bar'}) end)
-bind_command('flash-ui', function() Elements:flash({'timeline', 'controls', 'volume', 'top_bar'}) end)
+-- Sakana 补丁：把 `corner_buttons`（左上退出 / 右上详情·截图·播放流详情）也纳入 Tab 隐藏与 flash-ui。
+-- 为什么要改这里：角标是我们新增的元素（见 elements/CornerButtons.lua），
+-- uosc 这两个命令里的元素清单是**写死**的，不加进来就会出现"按 Tab 隐藏了 UI，角标却还在"。
+bind_command('toggle-ui', function() Elements:toggle({'timeline', 'controls', 'volume', 'top_bar', 'corner_buttons'}) end)
+bind_command('flash-ui', function() Elements:flash({'timeline', 'controls', 'volume', 'top_bar', 'corner_buttons'}) end)
 bind_command('flash-timeline', function() Elements:flash({'timeline'}) end)
 bind_command('flash-top-bar', function() Elements:flash({'top_bar'}) end)
 bind_command('flash-volume', function() Elements:flash({'volume'}) end)
@@ -1162,6 +1166,8 @@ local constructors = {
 	top_bar = require('elements/TopBar'),
 	timeline = require('elements/Timeline'),
 	controls = options.controls and options.controls ~= 'never' and require('elements/Controls'),
+	-- 角标按钮（左上/右上）单独一个元素；不把这两个位置塞进 Controls，避免改动已验证的底部栏布局
+	corner_buttons = require('elements/CornerButtons'),
 	volume = itable_index_of({'left', 'right'}, options.volume) and require('elements/Volume'),
 }
 

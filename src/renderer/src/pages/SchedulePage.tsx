@@ -103,7 +103,14 @@ function SkeletonCard() {
 
 export function SchedulePage() {
   const navigate = useNavigate()
-  const { days, loading, error, fetchedAt, fromCache, stale, fallbackSource, selectedDay, weekOffset, ratings, ratingsAt, load, loadRatings, selectDay } = useSchedule()
+  const { days, loading, error, fetchedAt, fromCache, stale, refreshing, fallbackSource, selectedDay, weekOffset, ratings, ratingsAt, load, loadRatings, selectDay } = useSchedule()
+  /**
+   * 主进程把「后台刷新好的番剧表」推上来（v1.1.4）。
+   * 首屏用的是磁盘缓存；这里负责把新数据无缝换上，不需要用户手动刷新，
+   * 也不会出现「有缓存就永远不更新」。
+   */
+  const applyCalendar = useSchedule((s) => s.applyCalendar)
+  useEffect(() => api.bangumi.onCalendar((r) => applyCalendar(r)), [applyCalendar])
   const favorites = useLibrary((s) => s.favorites)
   const watchHistory = useLibrary((s) => s.watchHistory)
   const toggleFavorite = useLibrary((s) => s.toggleFavorite)
@@ -431,11 +438,16 @@ export function SchedulePage() {
              * v0.3.7：刷新要**连评分一起刷**。
              * 以前这里只 `load(true)`（放送数据绕缓存重取），评分仍旧是会话内存里那份旧值 ——
              * 用户点了刷新，卡片上的分数却一动不动，这就是「评分更新不及时」的观感来源。
+             *
+             * v1.1.4：只刷新**当前显示那一天**的评分，不再把整周 111 个 id 全部重拉。
+             * 原因：一条评分就是一次 `/v0/subjects/:id`（本次实测 30 秒级），
+             * 111 条放在 B 级队列里要跑几十分钟 —— 用户点一下「刷新」却把网络占满到明天，
+             * 这正是「应用对网络要求庞大」的典型来源。其它日子等切过去时按需补（6 小时缓存）。
              */
-            const ids = days.flatMap((d) => d.items).map((i) => i.id)
+            const ids = dayItems.map((i) => i.id)
             void load(true).then(() => {
               if (!error) toast.success('番剧表已刷新')
-              void loadRatings(ids, true)
+              if (ids.length > 0) void loadRatings(ids, true)
             })
           }}
         >
@@ -500,6 +512,17 @@ export function SchedulePage() {
                 <CloudOff size={13} /> 数据源不可达，当前显示缓存数据（{fmtDateTime(fetchedAt)}）
               </div>
             ) : null}
+            {/*
+              v1.1.4：首屏先用磁盘缓存秒开，联网刷新在后台做。
+              这里给一行「正在后台更新」，让用户知道看到的是缓存、并且正在变新，
+              而不是像以前那样盯着骨架屏以为卡死了。
+            */}
+            {refreshing && days.length > 0 ? (
+              <div className="mb-3 flex items-center gap-2 rounded-lg border border-border bg-elev2/60 px-3 py-2 text-xs text-dim">
+                <RefreshCw size={13} className="animate-spin text-accent" />
+                正在后台更新番剧表（当前先显示本地缓存，更新完会自动替换）
+              </div>
+            ) : null}
             {visibleItems.length > 0 ? (
               <div className="grid grid-cols-2 gap-3.5 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
                 {visibleItems.map((item: CalendarItem) => (
@@ -509,7 +532,12 @@ export function SchedulePage() {
                    * 内层卡片再跟着被拉伸（grid 的 auto 行/列默认 stretch），
                    * 效果与改动前「卡片自己就是网格项」完全一致；min-w-0 防止长标题把网格列撑宽。
                    */
-                  <div key={item.id} className="grid min-w-0" onContextMenu={(e) => openCardMenu(e, item)}>
+                  <div
+                    key={item.id}
+                    className="grid min-w-0"
+                    data-schedule-card={item.id}
+                    onContextMenu={(e) => openCardMenu(e, item)}
+                  >
                     <AnimeCard
                       item={{
                         id: item.id,

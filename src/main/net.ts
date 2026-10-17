@@ -2,8 +2,9 @@ import axios, { type AxiosRequestConfig } from 'axios'
 import { app, net } from 'electron'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import { SocksProxyAgent } from 'socks-proxy-agent'
-import type { AppSettings, ProxyConfig } from '@shared/types'
+import type { AppSettings, PlayRule, ProxyConfig } from '@shared/types'
 import { DEFAULT_SETTINGS } from '@shared/types'
+import { netQueue, type NetPriority } from './net-priority'
 import { store } from './store'
 
 /*
@@ -71,6 +72,139 @@ export function installCertFallback(): void {
 }
 
 installCertFallback()
+
+/*
+ * ───────── v1.1.4：全应用分级网络（S / A / B）─────────
+ *
+ * 为什么挂在 axios 拦截器上：本应用真正发网络请求的模块有十几个
+ * （bangumi / 规则 / 弹幕 / galgame / mikan / 更新…），逐个改调用点既容易漏，
+ * 也无法形成统一的并发上限。这里在所有 axios 请求进入 adapter 之前排队，
+ * 调用点只要**愿意**就可以写 `netPriority` 显式分级；没写的按 URL 自动归类：
+ *   · 本机服务（qbit / aria2 / 直播中转）→ 不排队（它们不是外网带宽，排队只会卡自己的 RPC）；
+ *   · 自建反代 / 公共镜像 / 规则站点 → S；其中搜索路径是 B（用户明确要求）；
+ *   · Jikan / AniList / 蜜柑 / 弹幕 / galgame 等其余外网 → A。
+ *
+ * 注意：这里只**限流**，不改任何请求的地址、超时、重试与响应处理 ——
+ * 出问题时可以单独关掉（删掉 installNetworkPriority() 调用）而不影响其余逻辑。
+ */
+const LOCAL_HOST = /^(127\.0\.0\.1|localhost|\[::1\])$/i
+
+/** 分类结果里带一个不含主机名的标签，日志/诊断只用它 */
+interface NetTag {
+  level: NetPriority
+  tag: string
+}
+
+/** 从 URL 取 hostname（相对地址返回空串） */
+function hostOf(url: string): string {
+  try {
+    return new URL(url, 'http://local').hostname.toLowerCase()
+  } catch {
+    return ''
+  }
+}
+
+/** 只保留 pathname 的日志标签：绝不把主机名写进日志（红线） */
+function pathLabel(url: string): string {
+  try {
+    const p = new URL(url, 'http://local').pathname.replace(/\/+$/, '') || '/'
+    return p.length > 72 ? `${p.slice(0, 68)}…` : p
+  } catch {
+    return '请求'
+  }
+}
+
+/** 设置里配置的数据源主机（自建反代 + 公共镜像）。缓存 5 秒，避免每个请求都深拷贝设置。 */
+let sourceHostCache: { at: number; hosts: Set<string> } | null = null
+function sourceHosts(): Set<string> {
+  if (sourceHostCache && Date.now() - sourceHostCache.at < 5000) return sourceHostCache.hosts
+  const s = getSettings()
+  const hosts = new Set<string>()
+  for (const m of [s.bangumiCustomApi, ...(s.bangumiMirrors ?? []), s.bangumiBase]) {
+    const h = hostOf(String(m ?? '').trim())
+    if (h) hosts.add(h)
+  }
+  sourceHostCache = { at: Date.now(), hosts }
+  return hosts
+}
+
+/** 用户启用的规则站点主机（规则取站点资源属于 S 级）。缓存 10 秒，规则不会秒变。 */
+let ruleHostCache: { at: number; hosts: Set<string> } | null = null
+function ruleHosts(): Set<string> {
+  if (ruleHostCache && Date.now() - ruleHostCache.at < 10000) return ruleHostCache.hosts
+  const hosts = new Set<string>()
+  try {
+    const rules = store.get<PlayRule[]>('rules', [])
+    for (const rule of Array.isArray(rules) ? rules : []) {
+      if (!rule?.enabled) continue
+      for (const raw of [rule.baseUrl, rule.search?.url]) {
+        const h = hostOf(String(raw ?? ''))
+        if (h) hosts.add(h)
+      }
+    }
+  } catch {
+    /* 规则读不出来时退化为默认 A 级，不影响请求本身 */
+  }
+  ruleHostCache = { at: Date.now(), hosts }
+  return ruleHostCache.hosts
+}
+
+function classifyRequest(config: AxiosRequestConfig): NetTag | null {
+  const url = String(config.url ?? '')
+  const host = hostOf(url)
+  // 本机服务不占用外网优先级额度（qbit/aria2 的轮询很频繁，混进来会把 A 级占满）
+  if (host && LOCAL_HOST.test(host)) return null
+  if (config.netPriority) return { level: config.netPriority, tag: config.netTag ?? pathLabel(url) }
+  if (!host) return { level: 'A', tag: config.netTag ?? '请求' }
+  if (sourceHosts().has(host)) {
+    // 搜索/建议：用户明确划为 B 级（可以等，不该挤占番剧数据与播放资源）
+    if (/\/search|subject_search/i.test(url)) return { level: 'B', tag: '搜索' }
+    return { level: 'S', tag: config.netTag ?? pathLabel(url) }
+  }
+  if (ruleHosts().has(host)) return { level: 'S', tag: config.netTag ?? '规则站点' }
+  return { level: 'A', tag: config.netTag ?? pathLabel(url) }
+}
+
+let priorityNetworkInstalled = false
+
+/** 安装全局分级队列（幂等）。在 net.ts 被 import 时装上，第一条请求前就生效。 */
+export function installNetworkPriority(): void {
+  if (priorityNetworkInstalled) return
+  priorityNetworkInstalled = true
+
+  /** 请求 config → 槽位释放函数。WeakMap 让失败/取消的请求也不会漏掉（config 被回收即消失） */
+  const held = new WeakMap<object, () => void>()
+  const release = (config: unknown): void => {
+    if (!config || typeof config !== 'object') return
+    const fn = held.get(config)
+    if (!fn) return
+    held.delete(config)
+    fn()
+  }
+
+  axios.interceptors.request.use(async (config) => {
+    const meta = classifyRequest(config)
+    if (!meta) return config
+    // 信号透传：请求被取消时把它从排队里摘掉，别占着位置等一个已经没人要的结果
+    const signal = (config.signal ?? undefined) as AbortSignal | undefined
+    const fn = await netQueue.acquire(meta.level, meta.tag, signal)
+    held.set(config, fn)
+    return config
+  })
+
+  axios.interceptors.response.use(
+    (res) => {
+      release(res.config)
+      return res
+    },
+    (err) => {
+      release((err as { config?: unknown })?.config)
+      return Promise.reject(err)
+    }
+  )
+}
+
+installNetworkPriority()
 
 /*
  * UA 里的版本号从 `app.getVersion()` 取（v0.3.9 体检 L5）。

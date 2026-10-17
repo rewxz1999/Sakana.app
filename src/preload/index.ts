@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type { SakanaApi, ApiResult } from '@shared/api'
+import type { CalendarResult } from '@shared/types'
 import { CH } from '@shared/channels'
 
 async function call<T>(channel: string, ...args: unknown[]): Promise<ApiResult<T>> {
@@ -55,12 +56,16 @@ const api: SakanaApi = {
   },
   bangumi: {
     calendar: (force) => call(CH.bgmCalendar, force),
-    subject: (id) => call(CH.bgmSubject, id),
+    onCalendar: (cb) => subscribe<[CalendarResult]>(CH.evBgmCalendar, cb),
+    subject: (id, priority) => call(CH.bgmSubject, id, priority),
+    // v1.1.4：详情页首屏（纯缓存）+ 评分板块（缓存优先、可后台刷新）
+    subjectCached: (id) => call(CH.bgmSubjectCached, id),
+    rating: (id, refresh) => call(CH.bgmRating, id, refresh),
     search: (keyword) => call(CH.bgmSearch, keyword),
     ratings: (ids, force) => call(CH.bgmRatings, ids, force),
-    season: (year, month, force) => call(CH.bgmSeason, year, month, force),
+    season: (year, month, force, priority) => call(CH.bgmSeason, year, month, force, priority),
     // v0.3.7：「更新到第几集」（番剧表详情页用；取不到返回 null）
-    episodeProgress: (id) => call(CH.bgmEpisodeProgress, id),
+    episodeProgress: (id, priority) => call(CH.bgmEpisodeProgress, id, priority),
     testMirrors: () => call(CH.bgmTestMirrors),
     // 「最XX的角色 9宫格」：角色列表（v0 优先 + 老接口兜底）与导出用的图片 data URL
     characters: (id) => call(CH.bgmCharacters, id),
@@ -101,7 +106,7 @@ const api: SakanaApi = {
     onChanged: (cb) => subscribe(CH.evDownloads, cb)
   },
   rules: {
-    search: (ruleId, keyword) => call(CH.rulesSearch, ruleId, keyword),
+    search: (ruleId, keyword, subjectId) => call(CH.rulesSearch, ruleId, keyword, subjectId),
     episodes: (ruleId, entry) => call(CH.rulesEpisodes, ruleId, entry),
     play: (ruleId, entry, lineIndex, episodeIndex, episodeLink, vars) =>
       call(CH.rulesPlay, ruleId, entry, lineIndex, episodeIndex, episodeLink, vars),
@@ -171,6 +176,8 @@ const api: SakanaApi = {
     delay: (offsetMs) => call(CH.playerUoscDelay, offsetMs),
     // v0.2.18：控制栏状态下行（uosc 按钮的图标/激活态/角标、各菜单的内容）
     bar: (payload) => call(CH.playerUoscBar, payload),
+    // v1.1.4：自检/排障用的按钮旁路（与按钮点击同一条 script-message，不参与业务）
+    ctrl: (action) => call(CH.playerUoscCtrl, action),
     // v0.3.3：让 uosc 立刻显示控制栏（播放页看到鼠标移动时调）
     reveal: () => call(CH.playerUoscReveal)
   },
@@ -255,7 +262,10 @@ const api: SakanaApi = {
   ruleVerify: {
     open: (ruleId, keyword, bounds) => call(CH.rulesVerifyOpen, ruleId, keyword, bounds),
     setBounds: (bounds) => call(CH.rulesVerifyBounds, bounds),
-    close: () => call(CH.rulesVerifyClose)
+    close: () => call(CH.rulesVerifyClose),
+    // v1.1：验证页的真实加载状态（外框用它显示进度/失败/重试）
+    onState: (cb) => subscribe(CH.evRuleVerifyState, cb),
+    reload: () => call(CH.rulesVerifyReload)
   },
   // v0.3.8：投屏（发现设备 / 投屏 / 遥控）
   cast: {
@@ -356,7 +366,11 @@ const api: SakanaApi = {
     libraryOpenDir: () => call(CH.danmakuLibOpenDir),
     // v1.1.2：数据源的「获取记录」（用户要求：设置里点开就能看每次去要弹幕的结果）
     fetchLog: () => call(CH.danmakuFetchLog),
-    fetchLogClear: () => call(CH.danmakuFetchLogClear)
+    fetchLogClear: () => call(CH.danmakuFetchLogClear),
+    // V1.2：获取进度（流详情面板轮询）与运行期统计（自检断言网络请求为 0）
+    progress: () => call(CH.danmakuProgress),
+    stats: () => call(CH.danmakuStats),
+    statsReset: () => call(CH.danmakuStatsReset)
   },
   cache: {
     info: () => call(CH.cacheInfo),

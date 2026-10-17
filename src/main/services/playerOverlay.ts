@@ -646,7 +646,11 @@ function describeRegionsDiag(d: RegionsDiag | null): string {
   const parts: string[] = []
   if (d.uosc) parts.push('uosc 接管控制栏')
   if (d.ready === false) parts.push('页面还没就绪')
-  if (d.hasTopBar === false && d.hasBottomBar === false) parts.push('DOM 里还没有控制栏')
+  /*
+   * v1.1.4：旧控制栏已剥离，uosc 模式下 DOM 里本来就没有顶栏/底栏。
+   * 这时再说「DOM 里还没有控制栏」会把正常的 uosc 隐藏误报成页面没加载完。
+   */
+  if (!d.uosc && d.hasTopBar === false && d.hasBottomBar === false) parts.push('DOM 里还没有控制栏')
   if (typeof d.hitCount === 'number') parts.push(`可点容器 ${d.hitCount} 个`)
   if (d.barVisible === false) parts.push('控制栏此刻处于自动收起')
   return parts.length > 0 ? parts.join('、') : '渲染层说当前没有任何可交互元素'

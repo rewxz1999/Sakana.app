@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import {
   existsSync,
   mkdirSync,
@@ -31,12 +30,16 @@ import { getSettings } from '../net'
  * 并且能在设置里列出、按番剧/来源筛选、删除、清空、打开目录。
  *
  * ## 目录与命名
- * 默认 `<缓存目录>/danmaku/library/`（缓存目录沿用 `settings.cacheDir`，没设就是
+ * 默认 `<缓存目录>/弹幕/`（缓存目录沿用 `settings.cacheDir`，没设就是
  * `<userData>/cache`），设置里可改（`settings.danmaku.libraryDir`）。
  * 每个「番剧 + 集 + 数据源」一个文件，路径稳定可预测：
- *   `<库根>/<番剧名>/第03集-巴哈姆特动画疯-<短哈希>.xml`
- * 稳定路径的好处：命中本地库时**不需要索引**也能直接算出来（索引只是为了给设置页列大小/条数，
- * 索引丢了也能从磁盘重建 → `rebuildIndex()`）。
+ *   `<库根>/<番剧名>/第03集-巴哈姆特动画疯.xml`
+ *
+ * **文件名里带来源名**（V1.2 用户明确要求）：同一个番剧同一集可能同时从巴哈与弹幕盒子
+ * 各存一份，不带来源名就会互相覆盖；带了之后"哪个源有这一集"看文件名就知道。
+ * 不额外加哈希：路径完全由「番剧 + 集 + 源」决定，命中本地缓存时**不需要索引**也能直接算出来
+ * （索引只是为了给设置页列大小/条数，索引丢了也能从磁盘重建 → `rebuildIndex()`）。
+ * 同一源对同一集重新下载会覆盖旧文件 —— 这正是我们想要的（旧数据本身就要更新）。
  *
  * ## 格式
  * 统一存成 **B 站 XML**（`<i><d p="时间,模式,字号,颜色,…">文本</d></i>`）：
@@ -48,9 +51,13 @@ import { getSettings } from '../net'
 export function libraryDir(): string {
   const custom = getSettings().danmaku?.libraryDir?.trim()
   if (custom) return custom
-  // 与 danmaku.ts 的 cacheDir() 同一套规则：自定义缓存目录优先，否则 userData/cache
+  /*
+   * V1.2 命名：默认 `<缓存目录>/弹幕`（用户给的例子就是 `<缓存根>/弹幕/<番剧名>/第01集-巴哈姆特动画疯.xml`）。
+   * 以前是 `<缓存目录>/danmaku/library`，多两层没有意义的英文目录；改短之后用户在设置里
+   * 「打开目录」能直接看到「弹幕 / 番剧名 / 第01集-源名.xml」，一眼认得出是什么。
+   */
   const base = getSettings().cacheDir?.trim() || join(app.getPath('userData'), 'cache')
-  return join(base, 'danmaku', 'library')
+  return join(base, '弹幕')
 }
 
 /** 库索引文件（列表用；损坏/丢失都能从磁盘重建） */
@@ -69,7 +76,7 @@ export function ensureLibraryDir(): string {
 }
 
 /** 番剧名 → 安全目录名（与播放器截图的命名规则同一套非法字符表） */
-function safeName(raw: string): string {
+export function safeName(raw: string): string {
   const s = String(raw ?? '')
     .replace(/[\\/:*?"<>|]/g, '_')
     .replace(/\s+/g, ' ')
@@ -78,18 +85,13 @@ function safeName(raw: string): string {
   return s || '未命名'
 }
 
-/** 短哈希：同名同集可能来自多个数据源，用它区分（避免互相覆盖） */
-function shortHash(s: string): string {
-  return createHash('sha1').update(s).digest('hex').slice(0, 8)
-}
-
 /**
- * 库内相对路径。
+ * 库内相对路径（V1.2：`第03集-巴哈姆特动画疯.xml`）。
  * `第03集` 用两位补零，按文件名排序时与集数顺序一致（用户翻目录时更直观）。
  */
 export function libraryRelPath(title: string, episode: number, sourceName: string): string {
   const ep = Number(episode) > 0 ? `第${String(Math.trunc(Number(episode))).padStart(2, '0')}集` : '合集'
-  const file = `${ep}-${safeName(sourceName)}-${shortHash(`${title}|${episode}|${sourceName}`)}.xml`
+  const file = `${ep}-${safeName(sourceName)}.xml`
   return join(safeName(title), file)
 }
 
@@ -116,7 +118,9 @@ function writeIndex(items: DanmakuLibraryItem[]): void {
 /**
  * 从磁盘重建索引（索引被用户删了、或从别处拷了目录进来时用）。
  *
- * 只认 `第NN集-来源-xxxxxxxx.xml` 这种我们自己写出来的命名，
+ * 只认我们自己写出来的两种命名：
+ *   · V1.2 `<第NN集>-<来源名>.xml`；
+ *   · V1.1 旧命名 `<第NN集>-<来源名>-<8位哈希>.xml`（老用户的库不该因为改名就整库消失）。
  * 别的文件（用户自己丢进来的）跳过并记一条日志 —— 不猜、不误删。
  */
 export function rebuildIndex(): DanmakuLibraryItem[] {
@@ -128,8 +132,10 @@ export function rebuildIndex(): DanmakuLibraryItem[] {
       const titlePath = join(dir, titleDir)
       if (!statSync(titlePath).isDirectory()) continue
       for (const file of readdirSync(titlePath)) {
-        const m = /^第(\d{2})集-(.+)-([0-9a-f]{8})\.xml$/.exec(file)
+        // 先认新命名（来源名里允许出现横线），再认旧的“来源-哈希”
+        const m = /^第(\d{2})集-(.+)\.xml$/.exec(file)
         if (!m) continue
+        const sourceName = m[2].replace(/-[0-9a-f]{8}$/i, '')
         const full = join(titlePath, file)
         const st = statSync(full)
         items.push({
@@ -137,7 +143,7 @@ export function rebuildIndex(): DanmakuLibraryItem[] {
           title: titleDir,
           episode: Number(m[1]),
           sourceId: 'unknown',
-          sourceName: m[2],
+          sourceName,
           file: join(titleDir, file),
           bytes: st.size,
           count: 0,
@@ -247,6 +253,35 @@ export function lookupLibrary(
     return i < 0 ? 999 : i
   }
   return [...loose].sort((a, b) => rank(a) - rank(b) || b.at - a.at)[0]
+}
+
+/**
+ * 按「番剧名 + 集数 + 来源名」精确找缓存（V1.2 的缓存命中入口）。
+ *
+ * 与 `lookupLibrary` 的差别：那个是"随便找一个能用的来源"，这个只认指定源 ——
+ * 集成器要分别判断"巴哈有没有缓存、弹幕盒子有没有缓存"，用错会出现
+ * "巴哈没缓存却拿了弹幕盒子的文件，于是巴哈这一路被跳过"。来源名按归一化比较，
+ * 允许用户在设置里给源改过显示名。
+ */
+export function lookupLibraryBySource(
+  title: string,
+  episode: number,
+  sourceName: string
+): DanmakuLibraryItem | null {
+  const norm = (s: string): string =>
+    String(s ?? '')
+      .toLowerCase()
+      .replace(/[\s_\-·・!！?？~～:：,，.。'"“”()（）[\]【】]/g, '')
+  const wantTitle = norm(title)
+  const wantSource = norm(sourceName)
+  if (!wantTitle || !wantSource) return null
+  const items = readIndex()
+  const hit = items.filter(
+    (it) => Math.trunc(it.episode) === Math.trunc(Number(episode) || 0) && norm(it.sourceName) === wantSource
+  )
+  const same = hit.filter((it) => norm(it.title) === wantTitle)
+  const loose = same.length > 0 ? same : hit.filter((it) => norm(it.title).includes(wantTitle) || wantTitle.includes(norm(it.title)))
+  return loose.sort((a, b) => b.at - a.at)[0] ?? null
 }
 
 /** 删除若干条（同时删文件；删不到文件也把索引项去掉） */

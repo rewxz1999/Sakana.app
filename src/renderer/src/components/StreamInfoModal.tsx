@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from 'react'
 import { RefreshCw, X } from 'lucide-react'
-import type { StreamInfo } from '@shared/types'
+import type { DanmakuProgressSnapshot, StreamInfo } from '@shared/types'
 import { api } from '@/lib/api'
 import { Spinner } from '@/components/ui'
-import { PlayFlowStages, metricsLine, reasonLabel } from '@/components/PlayFlowProgress'
+import { DanmakuProgressLine, PlayFlowStages, metricsLine, reasonLabel } from '@/components/PlayFlowProgress'
 
 /**
  * 播放状态栏点开后的「流详情」弹窗（v0.2.4）。
@@ -39,6 +39,11 @@ export function StreamInfoModal({
   onRetry?: () => void
 }) {
   const [info, setInfo] = useState<StreamInfo | null>(null)
+  /**
+   * V1.2：弹幕获取进度（用户要求显示在「播放流详情」里）。
+   * 主进程维护真实步骤，这里只按秒轮询 —— 不自己造进度，网络失败时也能看到卡在哪一步。
+   */
+  const [danmakuProgress, setDanmakuProgress] = useState<DanmakuProgressSnapshot | null>(null)
   const [loading, setLoading] = useState(false)
   /** 内核的实时状态（播放中/进度/倍速/音量）：这是「播放状态详情」里唯一每秒都在变的部分 */
   const [state, setState] = useState<{
@@ -73,16 +78,18 @@ export function StreamInfoModal({
    */
   const load = useCallback(async (silent = false): Promise<void> => {
     if (!silent) setLoading(true)
-    const [r, st, sd] = await Promise.all([
+    const [r, st, sd, dm] = await Promise.all([
       api.player.streamInfo(),
       api.player.getState(),
-      api.player.surfaceDebug().catch(() => null)
+      api.player.surfaceDebug().catch(() => null),
+      api.danmaku.progress().catch(() => null)
     ])
     if (!silent) setLoading(false)
     // 失败也把错误显示出来，方便用户反馈「为什么播不了」
     setInfo(r.ok ? r.data : { url: '', kind: '', message: r.error })
     if (st.ok) setState(st.data)
     if (sd && sd.ok) setSurface({ bounds: sd.data.bounds, hit: sd.data.hit })
+    if (dm && dm.ok) setDanmakuProgress(dm.data)
     setUpdatedAt(Date.now())
   }, [])
 
@@ -254,6 +261,39 @@ export function StreamInfoModal({
                   ))
                 )}
               </div>
+            </div>
+          ) : null}
+          {/*
+            V1.2：弹幕获取进度。与上面的「播放过程」并列 —— 弹幕是另一条链路，
+            它慢不代表视频卡住；但用户要能看到"正在从哪个源取、第几步"。
+          */}
+          {danmakuProgress?.current ? (
+            <div className="mb-2 rounded-lg bg-elev2 px-2 py-1.5">
+              <div className="mb-1 flex flex-wrap items-center gap-2 text-[11px] font-medium text-text">
+                <span>弹幕获取</span>
+                {danmakuProgress.current.active ? (
+                  <span className="text-warn">进行中</span>
+                ) : danmakuProgress.current.error ? (
+                  <span className="rounded-full bg-danger/15 px-1.5 py-0.5 text-[10px] text-danger">失败</span>
+                ) : (
+                  <span className="rounded-full bg-ok/15 px-1.5 py-0.5 text-[10px] text-ok">完成</span>
+                )}
+                <span className="text-[10px] font-normal text-faint">
+                  {danmakuProgress.current.sourceName} · 第 {danmakuProgress.current.step}/
+                  {danmakuProgress.current.total} 步
+                </span>
+              </div>
+              <DanmakuProgressLine progress={danmakuProgress} />
+              {danmakuProgress.steps.length > 1 ? (
+                <div className="mt-1 max-h-24 overflow-y-auto rounded bg-elev1 p-1.5 font-mono text-[10px] leading-relaxed text-faint">
+                  {danmakuProgress.steps.map((s, i) => (
+                    <div key={`${s.sourceId}-${s.updatedAt}-${i}`}>
+                      [{s.sourceName}] 第 {s.step}/{s.total} 步 {s.label}
+                      {s.error ? `（${s.error}）` : ''}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
             </div>
           ) : null}
           {/*

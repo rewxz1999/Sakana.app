@@ -1,0 +1,166 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sakana 播放器 · uosc 控制栏配置**模板**（v1.1.4）
+#
+# ⚠️ 真正被 uosc 读的是同目录的 `uosc.conf`，它由主进程在起播前按当前主题生成：
+#   模板本文件（.base）→ 替换下面那行 color= 占位符 → 写入 uosc.conf。
+#   改布局/按钮请改本文件；直接改 uosc.conf 会在下一次起播被覆盖。
+#   生成逻辑见 src/main/services/mpv.ts 的 prepareUoscConf()。
+#
+# 这份文件是**控制栏布局的唯一来源**。mpv 在启动时按下面两条路读取它：
+#   1. <config-dir>/script-opts/uosc.conf       ← 生成后的文件（应用把 config-dir 指到
+#      安装目录下的 resources/mpv-config，见 src/main/services/mpv.ts）
+#   2. --script-opts=uosc-<键>=<值>             ← 本文件**不用**这条路，原因见下
+#
+# 为什么必须走配置文件、不能走 --script-opts：
+#   `--script-opts` 是**逗号分隔**的 key=value 列表，而 uosc 的 controls / menu / color 等值
+#   本身就含逗号。实测（`node scripts/probe-uosc-opts.js`，无窗口 libmpv）反斜杠转义 `\,` 也救不了：
+#   mpv 内核把 `controls=A\,B\,C` 解析成了残缺的 key/value，所以含逗号的配置只能靠这份文件。
+#   探针还会顺带证明这份文件确实被读到了（uosc 启动日志会打印
+#   `[uosc] Opened config file script-opts/uosc.conf.`）。
+#
+# 为什么必须给 mpv 设 config=yes：
+#   libmpv 的默认值是 config=no（native/mpv/src/addon.cc 也显式设过），
+#   此时 mp.find_config_file('script-opts/uosc.conf') 直接返回 nil —— 实测结论，
+#   即这份文件**根本不会被读到**。mpv.ts 里现在显式设 config=yes 并保持 load-scripts=no
+#   （否则 <config-dir>/scripts/* 会被自动加载，uosc / uosc_danmaku 会各多出一份）。
+#
+# 语法：与 uosc 官方 script-opts/uosc.conf 完全一致（`键=值`，`#` 起注释，值不能跨行）。
+#       键名就是 uosc 的 options 名，等价于命令行 `--script-opts=uosc-<键>=<值>`。
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ── 颜色（由主进程按应用主题生成，勿手改这一行） ─────────────────────────────
+# uosc 的 color 语法是「逗号分隔的 key=hex」，hex **不带 #**，值只允许 [%w_.]
+# （见 scripts/uosc/lib/std.lua 的 serialize_key_value_list / serialize_rgba）。
+# 映射：accent→foreground/match、elev1→background、text→background_text、
+#       ok/danger→success/error、背景压暗→curtain（幕布必须深色，浅色主题不能直接用 bg）。
+color=@SAKANA_UOSC_COLOR@
+
+
+# ── 窗口边框 ──────────────────────────────────────────────────────────────────
+# 0 = 不画 uosc 的窗口描边。画面是嵌在 Electron 窗口里的原生子窗口，
+# 再套一圈描边只会看起来像“窗口里的窗口”，所以关掉。
+window_border_size=0
+
+
+# ── 进度条 / 时间显示 ─────────────────────────────────────────────────────────
+# line   = 细线样式（默认），与旧自绘控制栏那条细进度条观感一致
+timeline_style=line
+timeline_line_width=2
+# 进度条所在行的总高度（含鼠标交互热区；越大越好点）
+timeline_size=40
+# 左右方向键的跳转步长（秒）；键盘绑定见 input.conf
+timeline_step=5
+# 进度条悬停缩略图（用户点名要）——由 thumbfast 生成、uosc 负责画。
+# 依赖两件事，缺一不可：
+#   ① `resources/mpv-scripts/thumbfast.lua` 存在，且被 mpv.ts 用 load-script **显式挂上**
+#      （libmpv 这边 load-scripts=no，不显式挂就等于没装）；
+#   ② 这里的 timeline_cache 必须是 yes —— 它管的就是"缩略图/热度缓存"。
+timeline_cache=yes
+timeline_heatmap=overlay
+# 窗口模式下的顶部残余进度线（与 uosc 默认一致）
+progress=windowed
+progress_size=2
+# 右侧时间显示「总时长」（旧控制栏就是 当前 / 总时长）。
+# 其它可选值：playtime-remaining（预计播完时刻）、time-remaining、duration
+destination_time=total
+time_precision=0
+# 暂停时常显进度条（鼠标离开底部也不会缩回去，便于看清进度）
+timeline_persistency=paused
+
+
+# ── 底部控制栏（按钮顺序 = 界面从左到右） ─────────────────────────────────────
+# 语法取自 scripts/uosc/elements/Controls.lua 的 init_options：
+#   button:<名字>       受管按钮：图标 / 提示 / 是否可点 / 角标 / 是否隐藏 全部由
+#                       resources/mpv-scripts/sakana-uosc-ctrl.lua 用
+#                       `script-message-to uosc set-button <名字> <json>` 动态下发。
+#                       我们的业务按钮（选集、倍速、弹幕…）都走这一类。
+#   command:图标:命令   固定按钮：点一下执行一条 mpv 命令。
+#   cycle:...           绑定 mpv 属性的循环按钮；toggle:... 是它的简写。
+#   play-pause          uosc 内置简写 = cycle:pause:pause:no/yes
+#                       （直接绑 mpv 的 pause 属性，图标自动跟着播放状态变）
+#   gap                 弹性空隙（按比例分配）；space = 撑满剩余空间
+#
+# 用户点名的按钮必须在：退出、暂停/播放、上一集、下一集、弹幕、弹幕设置、画面比例、
+# 全屏/窗口、字幕、详情、播放状态、截图。v1.1.4 补上 sakana-status（播放状态菜单）；
+# sakana-prev/next 由脚本始终保留（不可用时置灰，不隐藏）。
+#
+# 分组（v1.1.5，按用户逐条指定的位置排版）：
+#   左（底部栏左侧）：播放控制        上一集 · -10s · 播放/暂停 · +10s · 下一集
+#   右（底部栏右侧）：应用相关，按用户给的顺序
+#        选集 · 弹幕 · 倍速 · 弹幕设置 · 画面比例 · 全屏(窗口) · 字幕 · 画质
+#        外加「播放状态」（用户最早点名要的读数，放在这组最前）
+#   右上角（corner_controls）：番剧详情 · 截图 · 播放流详情
+#   左上角（corner_controls）：退出
+#
+# 角标为什么不用 uosc 的顶栏（top_bar）画：
+#    uosc 的 `controls` 只能画在底部一条；顶栏（`top_bar`）只支持标题与三个窗口按钮，
+#    **没有“按钮列表”这种选项**（见 scripts/uosc/elements/TopBar.lua）。而且顶栏一启用就会画
+#    「最小化/最大化/关闭」，关闭键直接执行 quit → 会销毁嵌在 Electron 里的播放内核，
+#    所以顶栏继续关着（见下面 top_bar=no 的说明）。
+#    角标因此由我们自己的 Element 子类 scripts/uosc/elements/CornerButtons.lua 实现，
+#    在 main.lua 的 constructors 里注册。它只做“固定位置排按钮”，
+#    **复用同一批 managed button**（图标/提示/激活态/可点性/点击行为与底部栏完全一致），
+#    不改动 Controls / Timeline / Element 这些已验证的既有元素。
+#
+# 角标语法（CornerButtons.lua 的 parse_corner_controls；容错：写错只跳过、不报错退出）：
+#    top-left:按钮名;top-right:按钮名1,按钮名2        分号分隔角落，逗号分隔按钮
+#    按钮名就是 button:<名字> 里的 <名字>；写成 button:<名字> 也兼容。
+controls=button:sakana-prev,button:sakana-back10,play-pause,button:sakana-forward10,button:sakana-next,gap,button:sakana-episodes,button:sakana-status,button:sakana-danmaku,button:sakana-speed,button:sakana-danmaku-settings,button:sakana-aspect,button:sakana-fullscreen,button:sakana-subtitle,button:sakana-a4k
+# 角标按钮：左上=退出；右上=详情 · 截图 · 播放流详情（顺序按用户原话，flow 在最后）
+# 这四个已经从下面的 controls= 里移除，否则底部栏会出现第二份。
+corner_controls=top-left:sakana-exit;top-right:sakana-info,sakana-snapshot,sakana-flow
+# 按钮直径 / 左右边距 / 按钮间距（px，会再乘 UI 缩放）
+# V1.1.4：32→34、间距 2→5、边距 8→10。原来太挤，17 个按钮几乎连成一条线，
+# 用户分不清"哪几个是一组"，这也是他要求调整排版的原因之一。
+# 角标按钮同样复用这三个值（见 elements/CornerButtons.lua），所以两边尺寸天然一致。
+controls_size=34
+controls_margin=10
+controls_spacing=5
+# 暂停时常显控制栏
+controls_persistency=paused
+
+
+# ── 音量滑杆 ─────────────────────────────────────────────────────────────────
+# right/left = 贴右/左边框的**竖排**滑杆（鼠标移到边缘才浮现，滚轮也能调）。
+# 旧自绘控制栏是横排滑杆；uosc 只提供竖排，行为等价（值是 mpv 的 volume 属性）。
+volume=right
+volume_size=40
+# 滚轮/方向键每档步长（百分比）
+volume_step=1
+
+
+# ── 顶栏 ─────────────────────────────────────────────────────────────────────
+# 顶栏**保持关闭**。v1.1.4 已把悬浮窗里那条旧标题/状态栏整体剥离（见
+# renderer/src/components/playerLegacy/PlayerOverlayBar.tsx），标题、线路/集与播放状态
+# 改由控制栏的 `sakana-status`（播放状态）菜单展示 —— 它不依赖 uosc 顶栏，也不会引入下面这条暗雷。
+#
+#  1. uosc 5.13 的顶栏只要启用就会画「最小化 / 最大化 / 关闭」三个窗口按钮，
+#     而 `top_bar_controls` 是**字符串**选项：实测写 `no` 得到的是字符串 'no'，
+#     写空值得到的是空串 '' —— 在 Lua 里两者都是**真值**，按钮照样出现
+#     （TopBar.lua 用的是 `if options.top_bar_controls then`，只判断真假）。
+#     这三个按钮动的是 mpv 自己的窗口，而我们的画面是嵌进 Electron 窗口的子窗口：
+#     关闭键会直接执行 `quit` → 播放内核被销毁，属于必须避免的暗雷。
+#  2. 顶栏是否启用还挑值：TopBar.lua 只认 'no-border' 与 'always'
+#     （`self.enabled = options.top_bar == 'always'`），其它值一律不显示。
+# 综合下来「能显示标题」与「不出现危险按钮」无法同时满足，所以维持 top_bar=no。
+top_bar=no
+
+
+# ── 外观与交互 ───────────────────────────────────────────────────────────────
+# 鼠标进入按钮/进度条外扩多少像素开始浮现（越小越“跟手”）
+#
+# v0.3.3：从 40 放宽到 200。uosc 是「鼠标靠近某元素到 proximity_in 像素以内才显示它」的模型
+# （见 elements/Element.lua 的 get_visibility），40 太苛刻 —— 用户反馈「在播放器内移动鼠标时
+# 无法呼出控制栏」，因为在画面中间移动它按设计就不出来。现在画面下方约 200px 内移动即出现；
+# 另外应用侧每次鼠标移动还会主动执行 flash-ui（见 mpv.ts 的 mpvRevealUoscUi），两重保险。
+proximity_in=200
+# 鼠标离开多远之后完全隐藏（必须大于 in，否则会来回闪）
+proximity_out=260
+border_radius=4
+animation_duration=100
+# 切换播放/暂停时闪一个大图标（uosc 默认，观感与旧控制栏一致）
+pause_indicator=flash
+# 菜单项高度 / 最小宽度
+menu_item_height=36
+menu_min_width=260

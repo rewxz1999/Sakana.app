@@ -51,25 +51,85 @@ const SNIFF_GRACE_MS = 2_500
 const JOB_BUDGET_MS = 150_000
 
 /**
- * 结果缓存（v0.3.7，用户要求）。
+ * 「默认三规则」名单（AGE / aafun / sorani）。
  *
- * 「一次探测十几秒、每次进播放源列表都重跑」既慢又对站点不礼貌，
- * 所以同一部番剧 + 同一批规则的结果缓存 30 分钟：
- * 再进播放源列表时直接回放上次结果（`cached: true`），只有用户点「重新探测」才真的重跑。
- *
- * 为什么是内存缓存而不是落盘：站点可用性本来就是"这一会儿"的事，
- * 跨进程重启还拿几十分钟前的结论反而会误导用户；而且这份数据没有任何持久价值。
+ * 它们**同时开始**探测：用户进「选择数据源」就是要马上知道这三条常用线路有没有货，
+ * 让它们排在一个 3 并发的队列里等前一条跑完（每条十几秒）等于让用户白等。
+ * 判定用「规则名小写」而不是 id：内置规则的 id 是 `default-<小写名>`，
+ * 但从仓库导入/用户自建的规则可能是任意 id，名字才是用户眼里的"这条线路"。
  */
-const CACHE_TTL_MS = 30 * 60 * 1000
-const resultCache = new Map<string, { at: number; results: BatchProbeUpdate[] }>()
+const DEFAULT_THREE = ['age', 'aafun', 'sorani']
+function isDefaultThree(t: BatchProbeTarget): boolean {
+  return DEFAULT_THREE.includes(String(t.name ?? '').toLowerCase())
+}
 
-/** 缓存键：同一关键词 + 同一批规则才算同一件事（规则集变了就必须重探） */
-function cacheKey(keyword: string, rules: BatchProbeTarget[]): string {
-  return `${keyword.trim()}|${rules
-    .map((r) => r.id)
-    .slice()
-    .sort()
-    .join(',')}`
+/**
+ * 探测结果缓存（v1.1 重做：从「整批按关键词」改成「逐规则按番剧」+ LRU + 常驻）。
+ *
+ * ## 为什么键是「规则id + 番剧条目」而不是「关键词 + 这一批规则」
+ *
+ * 旧键（`keyword | 排序后的规则 id 列表`）有两个硬伤：
+ *  ① 只要规则集变一点（用户启用/停用一条规则），**整批缓存全部作废**，
+ *     明明其它规则的结论没变，用户还得再等一轮十几秒的探测；
+ *  ② 缓存只活 30 分钟 —— 用户看一集再回来、或者中途去看了别的番，回来又要重等。
+ * 用户这次的要求是「嗅探结果只要应用没关闭就一直保留」「重新进同一个番剧/同一集不应再等」，
+ * 所以改成逐规则条目：一条结果 = `规则id | 番剧（subjectId 或关键词）`，
+ * 规则集变化只影响新规则，其它条目的结论继续命中。
+ *
+ * ## 为什么是 LRU + 容量上限（而不是无限增长）
+ *
+ * 一条结果里带着搜索结果列表与整季剧集（几十~几百个对象，几 KB 到几十 KB）。
+ * 用户连看几十部番之后，不设上限就是几十 MB 的常驻内存 —— 这是个播放器，不是爬虫。
+ * 上限 400 条 ≈ 最多几 MB，够装「几十部番 × 全部规则」；超出时丢**最久没用过**的那条
+ * （用户刚看过的番永远还在，只有很久以前探过的才会被淘汰）。
+ *
+ * ## 为什么不过期
+ *
+ * 用户明确要求「只要应用没关闭就一直保留」。站点是否可用确实是"这一会儿"的事，
+ * 所以界面同时保留「重新探测」（force=true）作为唯一的手动刷新出口 ——
+ * 用"我们猜它可能过期了"去悄悄丢掉结果，反而会变成"刚探完又要点一次"。
+ */
+const PROBE_CACHE_MAX = 400
+interface ProbeCacheEntry {
+  at: number
+  update: BatchProbeUpdate
+}
+const probeCache = new Map<string, ProbeCacheEntry>()
+
+/** 番剧标识：优先条目 id（同一部番的中文名可能变），没有就用关键词 */
+function subjectKeyOf(job: ActiveJob): string {
+  return job.subjectId ? `s${job.subjectId}` : `k${job.keyword.trim().toLowerCase()}`
+}
+
+function cacheKeyOf(job: ActiveJob, ruleId: string): string {
+  return `${ruleId}|${subjectKeyOf(job)}`
+}
+
+/** 读缓存（命中即刷新 LRU 顺序：Map 的插入顺序就是"最近使用"顺序） */
+function cacheGet(job: ActiveJob, ruleId: string): BatchProbeUpdate | null {
+  const key = cacheKeyOf(job, ruleId)
+  const hit = probeCache.get(key)
+  if (!hit) return null
+  probeCache.delete(key)
+  probeCache.set(key, hit)
+  return hit.update
+}
+
+/** 写缓存 + 超容量淘汰最久未用的（Map 的第一个键就是它） */
+function cacheSet(job: ActiveJob, ruleId: string, update: BatchProbeUpdate): void {
+  const key = cacheKeyOf(job, ruleId)
+  probeCache.delete(key)
+  probeCache.set(key, { at: Date.now(), update })
+  while (probeCache.size > PROBE_CACHE_MAX) {
+    const oldest = probeCache.keys().next().value as string | undefined
+    if (!oldest) break
+    probeCache.delete(oldest)
+  }
+}
+
+/** 自检/设置页用：缓存条目数与命中情况 */
+export function probeCacheStats(): { size: number; capacity: number } {
+  return { size: probeCache.size, capacity: PROBE_CACHE_MAX }
 }
 
 export interface BatchProbeTarget {
@@ -81,12 +141,12 @@ export interface BatchProbeTarget {
 interface ActiveJob {
   id: string
   keyword: string
+  /** 番剧条目 id（库驱动规则要用它换日文原名；也是缓存键的一部分） */
+  subjectId?: number
   /** 结果往这个窗口发（就是发起探测的那个窗口） */
   win: BrowserWindow
   cancelled: boolean
   budgetTimer: NodeJS.Timeout | null
-  /** 本次任务对应的缓存键：每条规则出结果时逐条写进缓存 */
-  cacheKey: string
 }
 
 let job: ActiveJob | null = null
@@ -121,16 +181,9 @@ function update(
   /*
    * 出结果的那一条立刻写进缓存（不等整批跑完）：
    * 用户可能中途关掉播放源列表（那会 stopBatchProbe 取消剩下规则），
-   * 已经探到的结论不该跟着丢掉。
+   * 已经探到的结论不该跟着丢掉。缓存键是「规则 + 番剧」，与这一批跑了多少条无关。
    */
-  if (phase === 'done') {
-    const entry = resultCache.get(job.cacheKey) ?? { at: Date.now(), results: [] }
-    const idx = entry.results.findIndex((r) => r.ruleId === target.id)
-    if (idx >= 0) entry.results[idx] = payload
-    else entry.results.push(payload)
-    entry.at = Date.now()
-    resultCache.set(job.cacheKey, entry)
-  }
+  if (phase === 'done') cacheSet(job, target.id, payload)
   return payload
 }
 
@@ -245,11 +298,15 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
   const { ruleSearch, ruleEpisodes, rulePlay } = await import('./rules')
 
   update(current, target, 'search', t0)
-  const search = await withTimeout(ruleSearch(target.id, current.keyword), STEP_TIMEOUT_MS)
+  const search = await withTimeout(
+    ruleSearch(target.id, current.keyword, current.subjectId),
+    STEP_TIMEOUT_MS
+  )
   if (current.cancelled) return
   if (!search || !search.items?.length) {
     update(current, target, 'done', t0, {
       ok: true,
+      items: [],
       message: search?.error ? `搜索失败：${search.error}` : '这条规则里没有这部番剧'
     })
     return
@@ -259,10 +316,17 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
   if (current.cancelled) return
   const group = eps?.groups?.[0]
   const episodeCount = eps?.groups?.reduce((n, g) => n + (g.episodes?.length ?? 0), 0) ?? 0
+  /*
+   * 把搜索结果与剧集一起带出去（v1.1）。
+   * 「带哪一条的剧集」= 搜索结果的第一条：界面点开源时先列搜索结果，
+   * 用户点第一条是最常见的路径；其它条目仍按需拉取（但搜索结果本身已经是本地的了）。
+   */
+  const base = { items: search.items, groups: eps?.groups ?? [], vars: eps?.vars ?? {} }
   if (!group || !group.episodes?.length) {
     update(current, target, 'done', t0, {
       hit: true,
       ok: true,
+      ...base,
       message: eps?.error ? `剧集解析失败：${eps.error}` : '找到了这部番剧，但没有可用剧集'
     })
     return
@@ -274,7 +338,13 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
   )
   if (current.cancelled) return
   if (!play?.url) {
-    update(current, target, 'done', t0, { hit: true, episodes: episodeCount, ok: true, message: '拿不到播放页地址' })
+    update(current, target, 'done', t0, {
+      hit: true,
+      episodes: episodeCount,
+      ok: true,
+      ...base,
+      message: '拿不到播放页地址'
+    })
     return
   }
 
@@ -290,13 +360,14 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
       count: direct.length,
       url: playable?.url ?? direct[0],
       ok: true,
+      ...base,
       message: `播放页直出 ${direct.length} 个候选`
     })
     return
   }
 
   // 慢路：开窗口嗅探
-  update(current, target, 'sniff', t0, { hit: true, episodes: episodeCount })
+  update(current, target, 'sniff', t0, { hit: true, episodes: episodeCount, ...base })
   const sniffed = await sniffWindow(current, play.url, target.baseUrl)
   if (current.cancelled) return
   update(current, target, 'done', t0, {
@@ -305,6 +376,7 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
     count: sniffed.urls.length,
     url: sniffed.urls[0],
     ok: true,
+    ...base,
     message:
       sniffed.urls.length > 0
         ? `嗅探到 ${sniffed.urls.length} 个候选`
@@ -315,35 +387,72 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
 /**
  * 开始一批探测。同一时刻只允许一批（再开一批会取消上一批）：
  * 这是对第三方的礼貌 —— 用户来回切番剧时不该堆出几十个探测任务。
+ *
+ * ## 调度（v1.1 重做）
+ *
+ * 1. **缓存先回放**：逐条查「规则 + 番剧」的常驻缓存，命中的立刻推给界面（标 cached），
+ *    这些规则不再参与探测 —— 重新进同一部番时界面是"瞬间就有结果"的。
+ * 2. **默认三规则同时开始**：AGE / aafun / sorani 是用户最常用的三条，
+ *    它们同时跑（`Promise.all`，不排队），因为它们彼此独立、站点也不同。
+ * 3. **其余规则排队**：按 CONCURRENCY=3 的 worker 池依次探测。
+ *    为什么不给它们也开无限并发：每条慢路都会开一个真实浏览器窗口，
+ *    十几条规则一起开会同时弹出十几个离屏窗口、把内存与站点风控一起点着。
  */
 export function startBatchProbe(
   win: BrowserWindow,
-  req: { keyword: string; rules: BatchProbeTarget[]; force?: boolean }
+  req: { keyword: string; rules: BatchProbeTarget[]; force?: boolean; subjectId?: number }
 ): { jobId: string; total: number; cached: boolean; probedAt?: number } {
   stopBatchProbe()
   const id = `bp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
   const targets = req.rules.filter((r) => r && r.id)
-  const key = cacheKey(req.keyword, targets)
-  const hit = resultCache.get(key)
-  /*
-   * 缓存命中且用户没有要求重探：直接把上次结果回放给界面（标 cached + 探测时间），
-   * 一个窗口都不开。用户想更新时点「重新探测」即可（force=true）。
-   */
-  if (!req.force && hit && Date.now() - hit.at < CACHE_TTL_MS) {
-    const jobId = `${id}-cached`
-    for (const r of hit.results) {
-      const payload: BatchProbeUpdate = { ...r, jobId, cached: true, probedAt: hit.at }
-      if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
-        win.webContents.send(CH.evRuleBatchProbe, payload)
-      }
-    }
-    log.append('info', 'rule-batch', `批量预嗅探命中缓存（${hit.results.length} 条，探测于 ${new Date(hit.at).toLocaleTimeString()}）`)
-    return { jobId, total: targets.length, cached: true, probedAt: hit.at }
+  const current: ActiveJob = {
+    id,
+    keyword: req.keyword,
+    subjectId: req.subjectId,
+    win,
+    cancelled: false,
+    budgetTimer: null
   }
 
-  const current: ActiveJob = { id, keyword: req.keyword, win, cancelled: false, budgetTimer: null, cacheKey: key }
+  /*
+   * ① 逐条回放缓存。`force`（用户点「重新探测」）时一律跳过缓存重跑。
+   * 注意这里是**逐条**判断：一批里可能只有几条命中（其它是用户新启用的规则），
+   * 命中的直接出结果，没命中的继续探 —— 不会因为一条没缓存就把整批重跑。
+   */
+  const pending: BatchProbeTarget[] = []
+  let cachedCount = 0
+  let latestAt = 0
+  for (const t of targets) {
+    const hit = req.force ? null : cacheGet(current, t.id)
+    if (hit) {
+      cachedCount++
+      latestAt = Math.max(latestAt, hit.probedAt ?? 0)
+      send(current, { ...hit, jobId: id, cached: true })
+      continue
+    }
+    pending.push(t)
+  }
+  if (pending.length === 0) {
+    // 整批都命中缓存：一个窗口都不开，直接结束
+    log.append(
+      'info',
+      'rule-batch',
+      `批量预嗅探全部命中常驻缓存（${cachedCount} 条，最早探测于 ${latestAt ? new Date(latestAt).toLocaleTimeString() : '未知'}）`
+    )
+    job = null
+    return { jobId: `${id}-cached`, total: targets.length, cached: true, probedAt: latestAt || undefined }
+  }
+  if (cachedCount > 0) {
+    log.append('info', 'rule-batch', `批量预嗅探：${cachedCount} 条直接命中缓存，剩 ${pending.length} 条要探`)
+  }
+
   job = current
-  log.append('info', 'rule-batch', `开始批量预嗅探「${req.keyword}」，规则 ${targets.length} 条${req.force ? '（用户要求重新探测）' : ''}`)
+  log.append(
+    'info',
+    'rule-batch',
+    `开始批量预嗅探「${req.keyword}」：${pending.length} 条规则` +
+      `（默认三规则同时开始，其余排队）${req.force ? '（用户要求重新探测）' : ''}`
+  )
 
   current.budgetTimer = setTimeout(() => {
     if (job !== current) return
@@ -351,24 +460,40 @@ export function startBatchProbe(
     stopBatchProbe()
   }, JOB_BUDGET_MS)
 
-  let cursor = 0
-  const worker = async (): Promise<void> => {
-    while (cursor < targets.length) {
-      if (current.cancelled || job !== current) return
-      const target = targets[cursor++]
-      try {
-        await probeRule(current, target)
-      } catch (err) {
-        update(current, target, 'done', Date.now(), {
-          ok: false,
-          message: `探测异常：${String((err as Error)?.message ?? err).slice(0, 100)}`
-        })
-      }
+  /** 探一条；异常也要给出结论，否则界面永远停在「搜索中…」 */
+  const runOne = async (target: BatchProbeTarget): Promise<void> => {
+    if (current.cancelled || job !== current) return
+    try {
+      await probeRule(current, target)
+    } catch (err) {
+      update(current, target, 'done', Date.now(), {
+        ok: false,
+        message: `探测异常：${String((err as Error)?.message ?? err).slice(0, 100)}`
+      })
     }
   }
-  void Promise.all(Array.from({ length: Math.min(CONCURRENCY, targets.length) }, worker)).then(() => {
+
+  // ② 默认三规则：同时开始（只在 pending 里的那些，已命中缓存的不重复跑）
+  const priority = pending.filter(isDefaultThree)
+  const rest = pending.filter((t) => !isDefaultThree(t))
+  if (priority.length > 0) {
+    log.append('info', 'rule-batch', `默认规则并行开始：${priority.map((t) => t.name).join('、')}`)
+  }
+
+  let cursor = 0
+  const worker = async (): Promise<void> => {
+    while (cursor < rest.length) {
+      if (current.cancelled || job !== current) return
+      await runOne(rest[cursor++])
+    }
+  }
+
+  void Promise.all([
+    ...priority.map((t) => runOne(t)),
+    ...Array.from({ length: Math.min(CONCURRENCY, rest.length) }, worker)
+  ]).then(() => {
     if (job !== current) return
-    log.append('info', 'rule-batch', `批量预嗅探结束（${targets.length} 条规则）`)
+    log.append('info', 'rule-batch', `批量预嗅探结束（${targets.length} 条规则，其中 ${cachedCount} 条来自缓存）`)
     stopBatchProbe()
   })
 

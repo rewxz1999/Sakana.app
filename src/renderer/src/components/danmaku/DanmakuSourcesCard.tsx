@@ -128,8 +128,8 @@ export function DanmakuSourcesCard({ catalog }: { catalog: SourceCatalogState })
 
   return (
     <Card
-      title="弹幕数据源"
-      desc="可插拔的源集合：进播放器时按优先级依次尝试，拿到弹幕即停止；内置弹弹play 与本地弹幕库始终优先，不会被打乱"
+      title="弹幕获取规则"
+      desc="为弹幕获取器添加新的弹幕规则（自建巴哈反代 / 弹幕盒子 / 直链模板）：进播放器时按优先级并行取，结果由集成器合并；内置弹弹play 与本地缓存始终优先"
     >
       {/* ---------- 现有数据源 ---------- */}
       <div className="mb-3 flex items-center gap-2 text-[11px] text-faint">
@@ -147,9 +147,9 @@ export function DanmakuSourcesCard({ catalog }: { catalog: SourceCatalogState })
 
       {sources.length === 0 ? (
         <div className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-[11px] leading-relaxed text-faint">
-          还没有配置数据源 —— 播放时仍会用内置弹弹play 弹幕库。
+          还没有自定义规则 —— 这不影响使用：上面的「选择启用弹幕源」默认已启用巴哈姆特。
           <br />
-          点「新增数据源」把它打开：巴哈姆特动画疯（新番最全）、弹幕盒子（2019–2021 存档）、或自己贴直链模板。
+          需要自建反代 / 直链 / 老番存档时，点「新增数据源」加一条。
         </div>
       ) : (
         <div className="flex flex-col gap-2">
@@ -436,9 +436,9 @@ export function DanmakuSourcesCard({ catalog }: { catalog: SourceCatalogState })
       <div className="mt-3 flex items-start gap-1.5 border-t border-border pt-2.5 text-[11px] leading-relaxed text-faint">
         <Power size={12} className="mt-0.5 shrink-0" />
         <span>
-          只有<b>启用</b>的源会在播放时参与自动加载，顺序就是上面的优先级。
-          播放器会依次尝试：本地弹幕库 → 内置弹弹play → 这里的源（按 1、2、3…），
-          拿到第一条有内容的就停止，并在播放器状态区显示<b>这条弹幕来自哪个源</b>。
+          只有<b>启用</b>的规则会在播放时参与自动加载，顺序就是上面的优先级。
+          播放器会先查<b>本地缓存</b>，缓存没有才发起请求；多个源的结果按「时间 + 正文」去重合并，
+          并在播放器状态区显示<b>每个源各多少条、哪些来自缓存</b>。
         </span>
       </div>
     </Card>
