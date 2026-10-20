@@ -17,7 +17,21 @@ import { convertSubtitleToVtt, listVideos } from './services/media'
 import { initLiveServer, stopAllLive } from './services/transcode'
 import { maybeShowIntro } from './services/onboarding'
 import { applySessionProxy } from './net'
+import { logThumbfastMpv } from './services/mpv'
 import axios from 'axios'
+
+/*
+ * 启用 QUIC / HTTP3（V1.2.2）。
+ *
+ * 为什么：用户实测同一个反代地址**浏览器里不到 1 秒就打开**，而应用里两条栈（node 的 https、
+ * Electron 的 net.fetch）都出现 5~15 秒级等待甚至被中断。Edge/Chrome 对 Cloudflare 会走
+ * **HTTP/3（UDP 443）**，和 TCP+TLS 是两条完全不同的路径，被中间设备干扰的程度经常差一个数量级；
+ * 而 Electron 默认不带 QUIC。这里只打开开关，是否升级由服务端 `alt-svc` 决定 ——
+ * 不写死域名、不改任何证书校验行为；服务端不支持 h3 时会自动继续走 TCP，不会更差。
+ *
+ * 必须在 app ready 之前设置（Chromium 网络栈一初始化就定下来了）。
+ */
+app.commandLine.appendSwitch('enable-quic')
 
 /** 自检用：Node 侧抓取文本（与 Chromium 栈对比） */
 async function axiosGet(url: string): Promise<{ status: number; body: string }> {
@@ -208,6 +222,13 @@ if (!gotLock) {
       .then((m) => m.repairHistoryShape())
       .catch(() => 0)
     log.append('info', 'app', `Sakana v${app.getVersion()} 启动`)
+    /*
+     * thumbfast（进度条悬停缩略图）要 spawn 一个**独立的** mpv.exe，
+     * 而我们的播放器是内嵌 libmpv、进程里没有这个可执行文件。
+     * 启动时先把解析到的路径记一行：真机排查时直接看这条就知道 thumbfast 会用哪个 exe；
+     * 缺文件也会在这里 warn，进播放器后不会变成“莫名弹错”。
+     */
+    logThumbfastMpv()
     log.append('info', 'app', `数据根目录：${dataRootLabel()}${DATA_PATHS.fallback ? '（安装目录不可写）' : ''}`)
     bangumi.init()
     /*
@@ -221,6 +242,12 @@ if (!gotLock) {
       }
     })
     ensureDefaultRules()
+    /*
+     * V1.4：播种内置弹幕源（E站）。用户装完就有，不用自己去设置页手动添加。
+     * 用动态 import 是为了不在启动路径上引入弹幕模块的静态依赖（它比较重），
+     * 而播种本身只是一次 settings 读改，异步完成即可。
+     */
+    void import('./services/danmakuSources').then((m) => m.ensureDefaultDanmakuSources()).catch(() => {})
     registerMediaProtocols()
     registerIpc()
     createMainWindow()
@@ -228,6 +255,15 @@ if (!gotLock) {
     downloadManager.start()
     // 中转流用本机 HTTP 提供（libmpv / 渲染层 <video> 两方都能播）
     void initLiveServer()
+    /*
+     * v1.4 本地临时缓存（边下边播）：先把缓存根下的 tmp-media（默认数据根 cache/tmp-media）清一次。
+     * 上次被强杀/崩溃时临时文件会留在这里（用户看不见，但可能占几百 MB ~ 几 GB），
+     * 退出时还会再清一次；两次都做才能真正防崩溃残留。
+     * 清理失败只写日志：缓存服务不可用时播放会自动回退直连，不能拖住启动。
+     */
+    void import('./services/mediaCache')
+      .then((m) => m.initTempMediaCache())
+      .catch((err) => log.append('warn', 'cache', `启动清理本地临时缓存失败（不影响播放）：${String(err)}`))
     // 网页视图 / 嗅探窗口 / 图片协议同样走应用代理（否则部分站点只有 HTTP 能访问）
     applySessionProxy(session.defaultSession)
 
@@ -1398,6 +1434,29 @@ if (!gotLock) {
             await new Promise((r) => setTimeout(r, 1000))
             const st = mpv.mpvGetState()
             if (st?.ready && st.length > 0 && st.time > 0) break
+          }
+          /*
+           * v1.2.1：uosc 按钮能不能点，**前提**是 mpv 的 VO 子窗口已从 disabled 恢复。
+           * mpv 在 --wid 嵌入模式下会主动 `EnableWindow(..., 0)`，Windows 的命中测试跳过
+           * disabled 窗口，真实点击就落到外层 Static 容器上被吞掉 —— 这就是「控制栏画得出来、
+           * 所有按钮点了没反应」的根因（详见 services/mpv.ts 的 ensureMpvInputWindow）。
+           *
+           * 这里把「窗口是否已启用」写成一行硬证据：enabled=true 只代表前置条件成立，
+           * 真实点击是否被 uosc 接住仍需人工点一下（自检不伪造点击）。
+           */
+          {
+            const inp = mpv.mpvInputWindowState()
+            console.log(
+              `[uosc-test] mpv 画面窗口输入：hwnd=${inp.hwndHex || '(还没找到)'} enabled=${inp.enabled}` +
+                ` 后端=${inp.backend.available ? 'koffi+user32 可用' : inp.backend.reason}`
+            )
+            console.log(
+              `[uosc-test] 结论：${
+                inp.enabled
+                  ? '✓ mpv 画面窗口可接收鼠标（uosc 的按钮/进度条能收到真实点击）'
+                  : '✗ mpv 画面窗口仍是 disabled（点击会被外层 Static 吞掉，uosc 按钮点不动）'
+              }`
+            )
           }
 
           // 复刻播放页的行为：显示悬浮窗 + 持续推送「uosc 接管」状态
@@ -5383,6 +5442,16 @@ if (!gotLock) {
     await step('本机中转服务', async () => {
       const { closeLiveServer } = await import('./services/transcode')
       closeLiveServer()
+    })
+    /*
+     * ⑥.5 本地临时缓存（v1.4 边下边播）：用户要求「关闭应用后释放缓存的视频资源」。
+     *
+     * 放在本机中转服务之后：先关监听（不再有人来取字节），再把 tmp-media 整目录删掉。
+     * 启动时还会再清一次（防崩溃残留），两处都做才算真正释放。
+     */
+    await step('本地临时缓存', async () => {
+      const { releaseTempMediaCacheOnQuit } = await import('./services/mediaCache')
+      releaseTempMediaCacheOnQuit()
     })
     /*
      * ⑦ 投屏中转服务（v0.3.9 体检 M1）。

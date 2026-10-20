@@ -226,6 +226,12 @@ export async function probeStreamReachability(opts: ProbeOptions): Promise<Reach
       decompress: true,
       validateStatus: () => true,
       headers,
+      /*
+       * 绕过分级队列（v1.2.1）：这是与播放**并行**的取证请求，
+       * 一旦排到 A 级后面，排队超时会被 classifyError 当成 site（网站问题），
+       * 而它本来只是"我们自己的队列让路"。它有自己的 60s 首字节中止器，不需要队列兜底。
+       */
+      netBypass: true,
       ...buildProxyAgents(getSettings().proxy)
     })
   } catch (err) {

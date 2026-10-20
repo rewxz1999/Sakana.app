@@ -78,6 +78,12 @@ export function CoverImage({
       alt={alt}
       draggable={false}
       loading="lazy"
+      /*
+       * V1.4：加 `decoding="async"`。
+       * 番剧表一屏十几张封面同时解码会占住渲染线程，图片"一张张蹦出来"的观感里
+       * 有相当一部分是解码排队，而不是网络慢。异步解码让主线程先画出骨架。
+       */
+      decoding="async"
       onError={() => {
         if (attempt === 0) setAttempt(1)
         else setFailed(true)

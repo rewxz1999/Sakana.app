@@ -4,6 +4,8 @@
 
 import type { Anime4kMode, Anime4kTier } from './anime4k'
 import type { AudioSettings } from './audio'
+// 本地临时缓存（边下边播）的默认集数：设置页与主进程共用同一份口径
+import { TEMP_MEDIA_CACHE_EPISODES_DEFAULT } from './mediaCache'
 // 「导入工具」的容错解析产物（v0.3.9）：ToolMeta 会把它们存下来供界面复查
 import type { ToolImportNote, ToolRunMeta } from './toolImport'
 // 内置规则三件套（AGE / sorani / aafun）：规则内容在 resources/rules/*.json，这里只做汇总
@@ -86,7 +88,13 @@ export interface SourceError {
   tried: string[]
 }
 
-/** 分级网络优先级（v1.1.4，语义见 main/net-priority.ts 与 main/net.ts 的分类器） */
+/**
+ * 分级网络优先级。
+ *
+ * @deprecated **分级已废弃**：所有请求同等对待，只保留一个全局并发上限。
+ * 这个类型只为兼容 IPC / 调用签名而保留，传任何值行为都相同；
+ * 语义与实现见 `main/net-priority.ts` 与 `main/net.ts`。
+ */
 export type NetPriority = 'S' | 'A' | 'B'
 
 export interface CalendarResult {
@@ -974,7 +982,7 @@ export interface DanmakuMatch {
  * 拼错 id 会在 tsc 阶段被拦下，而不是运行时静默不生效。
  * `link` 不在界面上单独开关（它来自用户自己加的直链规则），保留在类型里是为了让老规则继续工作。
  */
-export type DanmakuFetcherId = 'bahamut' | 'danmubox' | 'link'
+export type DanmakuFetcherId = 'bahamut' | 'danmubox' | 'tucao' | 'ezdmw' | 'link'
 
 /** 一次加载里某个源的结果摘要（播放器状态区/详情面板据此显示「哪几个源、各多少条、是否缓存」） */
 export interface DanmakuSourceRunInfo {
@@ -1473,6 +1481,15 @@ export interface RuleSearchDef {
   itemNameJsonPath: string
   itemSourceJsonPath: string
   /**
+   * V1.3.8：搜索页必须用**真实浏览器会话**取（Chromium 网络栈 + 自动带 Cookie）。
+   *
+   * 为 Tucao 这类站加的：裸 axios 请求（哪怕带 UA/Referer）拿到的是 15KB 的残缺页，
+   * 里面连 `class="list"` 都没有 —— 站点按"有没有浏览器会话"分流；
+   * 而 Chromium 会话保存 Cookie，第二次请求就是"逛过这个站"的样子。
+   * 置为 true 时，搜索这一步改走 `chromiumGetText`（同一条网络栈，同样校验证书）。
+   */
+  useChromium?: boolean
+  /**
    * 可选（v0.3.9）：api 型搜索时，用条目的 `source` 字段拼**详情页地址**的模板，`@source` 占位。
    *
    * 为什么需要它：MacCMS 系站点的搜索补全接口（如 aafun 用的 `/index.php/ajax/suggest`）
@@ -1488,12 +1505,31 @@ export interface RuleEpisodesDef {
   type: 'xpath' | 'api'
   method: 'GET' | 'POST'
   url: string // @source 占位
+  /**
+   * V1.3.9：选集页也用真实浏览器会话取（同 `RuleSearchDef.useChromium`）。
+   *
+   * Tucao 的播放页对裸请求只给残缺页（连 `#player_code` 都没有），于是"搜索 1 条、选集 0 集"，
+   * 还要掉进 180 秒的网页视图兜底。开了这个开关后选集页走 Chromium 会话，
+   * 实测 5.5 秒解析出线路与直链。
+   */
+  useChromium?: boolean
   headers: string
   query: string
   bodyType: string
   responseFormat: string
   linesXPath: string
   episodesXPath: string
+  /**
+   * V1.3.6：**整段文本切分**（Tucao 这类老 PHP 站必需）。
+   *
+   * 它们把整部番的集数塞进**一个**元素的文本里、用分隔符拼接，例如：
+   * `<ul id="player_code"><li>type=video&file=…01.mp4|01**type=video&file=…02.mp4|02</li></ul>`
+   * 这时 `episodesXPath` 指向那个元素，`episodesSplit` 写分隔符（如 `**`），
+   * `episodesField` 写段内怎么取地址（`file` = 取 `file=` 之后到 `&`/结尾的值；`all` = 整段就是地址）。
+   * 集名一律取 `|` 后面的编号。两个字段都为空时行为与原来完全一致。
+   */
+  episodesSplit?: string
+  episodesField?: string
   /**
    * 可选：线路名 XPath（相对线路节点求值；以 @ 开头则读属性，如 '@alt'）。
    * 有些站点（MacCMS + sakura 模板）的线路名标签与剧集盒子是兄弟节点，
@@ -1566,6 +1602,17 @@ export interface PlayRule {
    * 所以这条限制必须由规则自己声明、界面如实显示，而不是让每个调用方各写一句。
    */
   playbackNote?: string
+  /**
+   * 可选：实测的**决定性耗时**（毫秒）——「点播放 → 资源地址进本地缓存 → 可以交给播放器」。
+   *
+   * 为什么把测量结果存进规则，而不是只在某一次排序里用一下：
+   *   · 规则页、播放源弹窗、预嗅探、投屏四处**必须共用同一套顺序**（用户要的是
+   *     「快的在前，嗅探也按这个顺序」，两处各排各的迟早会分叉）；
+   *   · 快慢会随站点改版变化，所以它是**数据**：重新量一次、改这个字段，四处同时生效，
+   *     不必改代码。
+   *   · 缺失（undefined）= 还没量过，排序时统一排到已测量的规则后面（不猜它快还是慢）。
+   */
+  speedMs?: number
 }
 
 export function emptyRule(): PlayRule {
@@ -1624,7 +1671,7 @@ export function emptyRule(): PlayRule {
  * 一并搬走会让这次改动的面变大，收益却只是"文件更整齐"。
  */
 export const DEFAULT_RULES: PlayRule[] = [
-  // 内置三条：AGE / sorani / aafun（顺序 = 列表展示顺序，且都在 PINNED_RULES 置顶名单里）
+  // 内置四条：AGE / sorani / aafun / Tucao（顺序只是存储顺序；界面与嗅探顺序由 sortRulesBySpeed 决定）
   ...BUILTIN_RULES,
   {
     id: 'default-tvtfun',
@@ -1914,15 +1961,31 @@ export interface AppSettings {
   /** 在线播放加速档位（v0.3.9）：auto=先直连测到慢再加速（默认）/ off=完全直连 / force=强制加速 */
   streamBoost?: StreamBoostMode
   /**
+   * 本地临时缓存（边下边播）最多保留的**集数**（v1.4）。
+   *
+   * 播放开始时把候选地址交给本机缓存服务：按顺序从上游拉字节、写进缓存根下的
+   * `tmp-media/`（默认 `<数据根>/cache/tmp-media/`），并把**已经落盘的部分**用本机 HTTP 喂给播放器。
+   * 于是播放器读的是磁盘，而不是一条随时会抖的上游连接；拖动进度/重播只读已缓存区。
+   *
+   * 为什么用「集数」而不是「GB」：用户对「留几集」有直觉，对「留多少 GB」没有；
+   * 一集的体积又随片源差异极大（200MB~1.5GB），按集数限制更贴近实际使用。
+   * 缺省 3，取值 1–10，实际使用前一律经 `resolveTempMediaCacheEpisodes` 收窄。
+   *
+   * 生命周期：关闭应用时整个 `tmp-media` 目录会被删除（启动时还会再清一次，
+   * 防止崩溃/强退留下半截文件）。旧设置文件没有这个键时取 DEFAULT_SETTINGS 的 3。
+   */
+  tempMediaCacheEpisodes?: number
+  /**
    * 自建反代（Cloudflare Worker，见 deploy/bangumi-proxy-README.md）。
    *
-   * bangumi.pro / bangumi.lol 已被墙、api.bgm.tv 直连也不稳，公共镜像随时可能全灭，
-   * 因此允许用户填自己的反代域名：
-   * - `bangumiCustomApi`：API 反代地址（Worker 的 API_HOST），会作为**最高优先级**镜像，
-   *   并强制按 v0 API 路径（`/v0/...`）请求，不再依赖域名里是否含 `api.`；
-   * - `bangumiCustomImg`：图片反代地址（Worker 的 IMG_HOST），
-   *   命中 `lain.bgm.tv` 等官方图床时按原路径改写过去。
-   * 两者留空则维持原有的公共镜像链。
+   * 现在默认使用**两套平级的自建反代**（内置在 `main/services/bangumiProxy.ts`，地址与 PSK 只做混淆、
+   * 不写进设置文件/日志/界面）。字段语义：
+   * - `bangumiCustomApi`：用户自定义 API 地址；**留空 = 使用内置双反代**。地址会被隐藏，
+   *   设置页只显示「已配置 / 未配置」，不会把地址摊开。填了自定义地址就只走用户填的地址，
+   *   支持用空格/逗号分隔多个（高级用法），此时不会把内置 PSK 发给第三方。
+   * - `bangumiCustomImg`：旧版图片反代字段，仅为兼容保留。现在图片 URL 由 API 响应自带
+   *   （新反代返回它自己的图片域名），默认留空；只有用户显式保留自定义图片反代时才使用。
+   * 两者留空则维持内置双反代 + API 返回的图片地址。
    */
   bangumiCustomApi?: string
   bangumiCustomImg?: string
@@ -2035,25 +2098,18 @@ export interface AppSettings {
 export const DEFAULT_SETTINGS: AppSettings = {
   theme: 'sakura',
   /*
-   * v0.2.7：默认改用自建反代（用户已部署 Cloudflare Worker）。
-   * 与官方 v0 的两处差异见 bangumi.ts 的注释：
-   * - 每日放送在 `/calendar`（不是 `/v0/calendar`），直接返回本应用需要的 7 天 JSON；
-   * - 搜索是 `POST /v0/search/subjects`（不是 GET）。
-   * 图片由反代自己改写成 `/img/...`，图片反代字段主要用于兜底。
+   * 数据源默认值。
+   *
+   * 自建反代的真实地址与 PSK **不放在这里**：`DEFAULT_SETTINGS` 会同时进入渲染层包，
+   * 放明文等于把用户要求隐藏的地址写进可读资源。内置双端点由主进程的
+   * `main/services/bangumiProxy.ts` 以混淆形式持有；这里只留公共镜像作为"反代全挂时"的备选，
+   * 并作为界面/设置里的安全兜底值。
    */
-  bangumiBase: 'https://sankana-bangumi.de5.net/api',
-  bangumiMirrors: [
-    'https://sankana-bangumi.de5.net/api',
-    'https://bangumi.vip',
-    'https://bangumi.lol'
-  ],
+  bangumiBase: 'https://bangumi.vip',
+  bangumiMirrors: ['https://bangumi.vip', 'https://bangumi.lol'],
   dataSources: {
-    main: 'https://sankana-bangumi.de5.net/api',
-    mirrors: [
-      'https://sankana-bangumi.de5.net/api',
-      'https://bangumi.vip',
-      'https://bangumi.lol'
-    ]
+    main: 'https://bangumi.vip',
+    mirrors: ['https://bangumi.vip', 'https://bangumi.lol']
   },
   proxy: { enabled: false, type: 'http', host: '127.0.0.1', port: 7890, username: '', password: '' },
   screenshotDir: '',
@@ -2097,9 +2153,15 @@ export const DEFAULT_SETTINGS: AppSettings = {
   hlsAdFilter: true,
   /** 在线播放加速：默认「自动」，与 `@shared/streamBoost` 的 BOOST_FAST_BPS 判定配套 */
   streamBoost: 'auto',
-  // 自建反代（默认启用，可在「设置 → 数据源配置」改回公共镜像）
-  bangumiCustomApi: 'https://sankana-bangumi.de5.net/api',
-  bangumiCustomImg: 'https://sankana-bangumi.de5.net/img',
+  /** 本地临时缓存（边下边播）：默认保留 3 集，退出应用时清空（见字段注释） */
+  tempMediaCacheEpisodes: TEMP_MEDIA_CACHE_EPISODES_DEFAULT,
+  /*
+   * 留空 = 使用内置双反代（地址与 PSK 在主进程里混淆持有，不进设置文件）。
+   * 用户要自定义时在「设置 → 数据源配置」里填地址，只影响 API 地址，不影响图片
+   * （图片 URL 由 API 响应自带）。
+   */
+  bangumiCustomApi: '',
+  bangumiCustomImg: '',
   // 番剧表「显示范围」筛选默认全关 = 全部显示
   scheduleFilters: { hideWatched: false, hideDropped: false, onlyWatching: false }
 }
@@ -2641,52 +2703,65 @@ export type GalEvent =
 // ---------------- 规则仓库（KazumiRules）自动更新元信息 ----------------
 
 /**
- * 产品指定的「推荐规则」名单（详情页搜索结果的「推荐」角标只用这份名单判定）。
+ * 产品指定的「推荐规则」名单（播放源弹窗与规则页的「推荐」角标只用这份名单判定）。
  *
- * 为什么单独抽成常量：推荐名单是**产品决策**，而判定代码落在详情页组件里，
+ * 为什么单独抽成常量：推荐名单是**产品决策**，而判定代码落在多个组件里，
  * 两处一旦分叉（组件里写死正则、文档里写另一个名单）就会出现「界面上标了推荐，
  * 但产品并没有推荐它」这种对不上的情况。名单只此一份，组件引用它即可。
  *
- * ⚠️ 注意：名单里的名字必须能在**本地规则库**里找到才有意义 ——
- * 内置 DEFAULT_RULES 现在包含 AGE / sorani / aafun / TvTFun / 樱之空 / 7sefun
- * （前三条来自 `resources/rules/*.json`，见 builtinRules.ts），
- * 所以这两个名字在全新安装上就已经存在，不需要先去规则仓库导入。
+ * 与"排序"的关系（v0.4.x 改动，用户要求）：
+ *   过去 AGE / sorani / aafun 还额外被 `PINNED_RULES` **置顶**（永远是列表前三条）。
+ *   用户明确要求「去掉置顶三条，但保留它们的推荐标签」—— 因为置顶会让"按实测速度排序"
+ *   永远对这三条失效：它们哪怕实测 20 秒也压在 1 秒的规则上面。
+ *   所以现在**顺序只由 speedMs 决定**（见 sortRulesBySpeed），这份名单只负责角标。
+ *
+ * ⚠️ 注意：名单里的名字必须能在**规则库**里找到才有意义 ——
+ * 内置 DEFAULT_RULES 包含 AGE / sorani / aafun / TvTFun / 樱之空 / 7sefun
+ * （前三条来自 `resources/rules/*.json`，见 builtinRules.ts）。
  */
-export const RECOMMENDED_RULES = ['aafun', 'sorani']
+export const RECOMMENDED_RULES = ['aafun', 'age', 'sorani']
 
 /**
- * 置顶规则（v0.3.7，用户要求：「将 aafun、AGE、sorani 规则置顶」）。
- *
- * 与 RECOMMENDED_RULES 的区别：
- *   · RECOMMENDED_RULES 决定**角标**（哪几条值得推荐）；
- *   · 这一份决定**顺序**（列表里排在最前面，用户不用往下翻就能点到）。
- * 为什么要有单独一份而不是复用推荐名单：推荐是「产品觉得好用」，
- * 置顶是「实测最快/最稳、优先试这几条」，两者的名单本来就可能不一样。
- *
- * 名单按**规则名**匹配（忽略大小写）。用户点名的是这三条，就只放这三条 ——
- * 不顺手把「樱之空」也塞进来：置顶是用户对顺序的明确要求，多放一条就等于替他做了决定。
+ * 这条规则是否属于推荐名单（按名字匹配，忽略大小写与首尾空格）。
+ * 只决定角标，不决定顺序 —— 顺序见 sortRulesBySpeed。
  */
-export const PINNED_RULES = ['aafun', 'age', 'sorani']
-
-/**
- * 这条规则是否属于置顶名单（按名字匹配，忽略大小写与首尾空格）。
- */
-export function isPinnedRule(name: string): boolean {
+export function isRecommendedRule(name: string): boolean {
   const n = (name ?? '').trim().toLowerCase()
   if (!n) return false
-  return PINNED_RULES.some((p) => p.toLowerCase() === n)
+  return RECOMMENDED_RULES.some((p) => p.toLowerCase() === n)
+}
+
+/** 未测量过的规则排到最后（不猜它比已测的快） */
+function speedRank(r: { speedMs?: number }): number {
+  const v = r?.speedMs
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : Number.MAX_SAFE_INTEGER
 }
 
 /**
- * 按置顶名单排序（置顶的排前面，各自保持原有相对顺序）。
+ * 按**实测的决定性耗时**排序：快的在前，没测过的排最后（同一档保持传入顺序）。
  *
- * 放在 shared 里而不是某个页面里：来源选择弹窗与规则管理页都要用同一套顺序，
- * 两处各写一份迟早会分叉（一处置顶了、另一处没置顶，用户会以为置顶失效了）。
+ * 放在 shared 里而不是某个页面里：规则管理页、详情页播放源、投屏、预嗅探四处
+ * 都要用同一套顺序 —— 用户的原话是「这样嗅探也按这个顺序」，两处各排一份必然分叉。
+ *
+ * 为什么用 `speedMs`（毫秒数）而不是给规则打「快/中/慢」标签：
+ *   排序要的是**可比的全序**，标签只能分三档；而且时间一改就要重新想标签怎么分。
  */
-export function sortRulesPinnedFirst<T extends { name: string }>(rules: T[]): T[] {
-  const pinned = rules.filter((r) => isPinnedRule(r.name))
-  const rest = rules.filter((r) => !isPinnedRule(r.name))
-  return [...pinned, ...rest]
+export function sortRulesBySpeed<T extends { name: string; speedMs?: number }>(rules: T[]): T[] {
+  return [...rules].sort((a, b) => speedRank(a) - speedRank(b))
+}
+
+/**
+ * **历史名字**：v0.4.x 之前这里按 `PINNED_RULES` 把 AGE/sorani/aafun 置顶。
+ *
+ * 用户要求去掉置顶后，行为已改成「按实测速度排序」，但名字保留：
+ * 调用点在详情页播放源（SubjectDetailPage）与投屏（castSync）里，那两处不在
+ * 这次改动的范围内（用户明确要求别碰详情页），改名只会扩大改动面。
+ * 新代码请直接用 `sortRulesBySpeed`。
+ *
+ * @deprecated 用 sortRulesBySpeed
+ */
+export function sortRulesPinnedFirst<T extends { name: string; speedMs?: number }>(rules: T[]): T[] {
+  return sortRulesBySpeed(rules)
 }
 
 /**

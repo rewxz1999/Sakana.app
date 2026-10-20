@@ -24,6 +24,7 @@ import { log } from '../log'
 import { getSettings, httpGetBuffer, httpGetText } from '../net'
 import { store } from '../store'
 import { episodeNumberFromTitle, seasonOfTitle } from './danmaku'
+import { ezdmwFetcher } from './danmaku/ezdmw'
 import { parseDanmakuText } from './danmakuLibrary'
 
 /**
@@ -418,6 +419,21 @@ export function fillTemplate(tpl: string, title: string, episode: number): strin
 /** 适配器自述（设置页「新增数据源」的下拉与说明都由它生成，实测结论写在这里） */
 export const DANMAKU_ADAPTERS: DanmakuAdapterInfo[] = [
   {
+    /*
+     * V1.4：E站（ezdmw）。这张表是**适配器的权威清单** —— `adapterOf()` 查不到就会把源判成
+     * "未知适配器，这条数据源不会生效"（真机踩过：只在设置页选项里加条目不够）。
+     */
+    id: 'ezdmw',
+    name: 'E站(ezdmw)',
+    kind: 'site',
+    defaultBase: 'https://www.ezdmw.org',
+    needTemplate: false,
+    desc:
+      'ezdmw.org：搜索 → 番剧页数集 → 播放页里的弹幕 iframe（player.ezdmw.com/danmuku）→ ' +
+      '截获它自己发出的 getData.html 请求（sign 由站点 JS 现算，必须截获）→ 拿回标准 B 站 XML。' +
+      '因为要起一个隐藏窗口等播放器发请求，单集约 5~15 秒。'
+  },
+  {
     id: 'danmubox',
     name: '弹幕盒子',
     kind: 'site',
@@ -453,6 +469,45 @@ export const DANMAKU_ADAPTERS: DanmakuAdapterInfo[] = [
       '适合站点检索不了、但有稳定直链的情况。'
   }
 ]
+
+/**
+ * 播种内置弹幕源（V1.4）：E站（ezdmw）。
+ *
+ * 为什么要内置：这条源的链路完全由我们自己实现（搜索 → 番剧页数集 → 播放页 →
+ * 隐藏窗口截获带 sign 的请求 → B 站 XML），用户不该为了用它去设置页手填一条源。
+ * 已存在同适配器的源（哪怕被用户停用）就不再播种 —— 尊重"我删了 / 我关了"的选择，
+ * 否则每次启动又冒出来，是很招人烦的行为。
+ */
+export function ensureDefaultDanmakuSources(): void {
+  try {
+    const settings = store.get<Record<string, unknown>>('settings', {})
+    const danmaku = { ...((settings.danmaku as Record<string, unknown>) ?? {}) }
+    const list = Array.isArray(danmaku.sources) ? (danmaku.sources as DanmakuSource[]) : []
+    if (list.some((s) => s && s.adapter === 'ezdmw')) return
+    const now = Date.now()
+    const seeded: DanmakuSource = {
+      id: `src-ezdmw-${now.toString(36)}`,
+      name: 'E站(ezdmw)',
+      kind: 'site',
+      adapter: 'ezdmw',
+      enabled: true,
+      priority: list.length + 1,
+      matchMode: 'title',
+      keyword: '',
+      base: 'https://www.ezdmw.org',
+      credential: '',
+      urlTemplate: '',
+      note: '内置：E站弹幕池（播放页弹幕 iframe 里的 B 站 XML）',
+      createdAt: now,
+      updatedAt: now
+    }
+    danmaku.sources = [...list, seeded]
+    store.set('settings', { ...settings, danmaku })
+    log.append('info', 'danmaku', '已播种内置弹幕源：E站(ezdmw)')
+  } catch (err) {
+    log.append('warn', 'danmaku', `播种内置弹幕源失败：${String((err as Error)?.message ?? err).slice(0, 60)}`)
+  }
+}
 
 export function adapterOf(id: string): DanmakuAdapterInfo | undefined {
   return DANMAKU_ADAPTERS.find((a) => a.id === id)
@@ -621,6 +676,52 @@ export async function testSource(source: DanmakuSource, keyword?: string): Promi
       return {
         ok: true,
         message: `可用：搜到 ${animes.length} 部，首选《${first.title}》，${eps.length} 集，已成功取到弹幕`,
+        steps,
+        samples
+      }
+    }
+
+    /*
+     * V1.4：E站（ezdmw）的"测试这条源"分支。
+     *
+     * 为什么必须单独写：`sourceTest` 原本是按适配器**硬编码**几条分支（danmubox / bahamut / link），
+     * 新加的适配器一律落到末尾的「未知适配器」—— 于是明明源能用，界面上点"测试"却报
+     * "未知适配器 ezdmw，这条数据源不会生效"。这里补上它的分支：
+     * 搜索 → 取第一部的集列表 → 取第 1 集弹幕（会起隐藏窗口截获 sign，最慢的一步放最后）。
+     */
+    if (source.adapter === 'ezdmw') {
+      const ctx = {
+        title: kw,
+        episode: 1,
+        aliases: [] as string[],
+        keyword: kw,
+        source
+      }
+      const found = await step(
+        '搜索',
+        async () => {
+          const r = await ezdmwFetcher.search(kw, ctx)
+          if (r.length === 0) throw new Error('没有搜到这部番（E站标题带季度/字幕组后缀时可换更短的关键词）')
+          return r
+        },
+        (r) => `搜到 ${r.length} 部，首选《${r[0].title}》`
+      )
+      for (const a of found.slice(0, 5)) samples.push({ title: a.title, extra: a.extra ?? '' })
+      const first = found[0]
+      const ep = first.episodes[0]
+      if (!ep) throw new Error('这部番没有解析到集')
+      await step(
+        `取弹幕（${ep.title}）`,
+        async () => {
+          const r = await ezdmwFetcher.fetchEpisode(first, ep.index, ctx)
+          samples.push({ title: first.title, episode: ep.index, count: r.comments.length, extra: r.detail })
+          return `${r.comments.length} 条`
+        },
+        (s) => s
+      )
+      return {
+        ok: true,
+        message: `可用：搜到 ${found.length} 部，首选《${first.title}》，${first.episodes.length} 集，已成功取到弹幕`,
         steps,
         samples
       }

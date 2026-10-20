@@ -603,7 +603,7 @@ export function SchedulePage() {
           <EmptyState
             icon={CloudOff}
             title="数据源连接失败"
-            desc={error.message + (error.tried.length ? `（尝试: ${error.tried.join('；')}）` : '')}
+            desc={error.message}
           >
             <div className="flex gap-2">
               <Button variant="outline" size="sm" onClick={() => navigate('/settings')}>
@@ -632,8 +632,8 @@ export function SchedulePage() {
           {fallbackSource === 'jikan'
             ? 'Jikan / AniList 备用源（主数据源不可用）'
             : settings.bangumiCustomApi
-              ? 'Bangumi'
-              : settings.bangumiBase || 'Bangumi'}
+              ? 'Bangumi（自定义反代）'
+              : 'Bangumi（内置双反代）'}
           {` · 本周 ${weekRange}`}
           {fetchedAt ? ` · 缓存于 ${fmtDateTime(fetchedAt)}${fromCache ? '（本地缓存）' : ''}` : ''}
         </span>
@@ -662,16 +662,16 @@ export function SchedulePage() {
         <div className="text-sm leading-relaxed text-dim">
           {settings.bangumiCustomApi ? (
             <>
-              自建反代不可用：<span className="break-all font-mono text-[12px]">{settings.bangumiCustomApi}</span>
+              自建反代不可用（地址已隐藏）。
               <br />
               <br />
-              应用默认只使用这个反代（避免在你不知情的情况下换源）。可以：
-              <br />· 到「设置 → 数据源配置」检查反代地址是否写对、Worker 是否还在运行；
-              <br />· 或把反代地址清空 / 改成其它镜像站，手动切换数据源。
+              应用默认只使用自建反代（避免在你不知情的情况下换源）。可以：
+              <br />· 到「设置 → 数据源配置」检查 API 地址是否写对、反代是否还在运行；
+              <br />· 或稍后重试（两套反代端点会自动切换）。
             </>
           ) : (
             <>
-              所有配置的 bangumi 镜像站均不可访问（{settings.bangumiMirrors.join('、')}）。
+              所有配置的 bangumi 数据源均不可访问（内置双反代与公共镜像）。
               <br />
               <br />
               是否开启 VPN 代理，或自行配置代理以连接 bangumi 主站？

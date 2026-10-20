@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023"],
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "types": ["node"],
+    "rootDir": "../..",
+    "outDir": "../../.tmp-play-speed/out",
+    "paths": {
+      "@shared/*": ["../../src/shared/*"],
+      "electron": ["./electron-stub.ts"]
+    }
+  },
+  "include": [
+    "../../src/main/services/xpath.d.ts",
+    "../../src/main/services/rules.ts",
+    "../../src/main/services/ruleProbe.ts",
+    "../../src/main/services/ruleWebview.ts",
+    "../../src/main/services/playerEngine.ts",
+    "../../src/main/services/transcode.ts",
+    "./electron-stub.ts"
+  ]
+}

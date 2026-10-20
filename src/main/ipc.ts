@@ -55,6 +55,7 @@ import {
   rulesRepoIndex
 } from './services/rules'
 import {
+  alternativesForStreamUrl,
   getCachedStreamOrWait,
   prefetchStream,
   rememberStream,
@@ -79,9 +80,12 @@ import {
 import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
 import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested, mpvApplyVideoEnhance, anime4kAvailable, anime4kShaderFiles, mpvRevealUoscUi, uoscBridgeStats, mpvSendScriptMessage } from './services/mpv'
 // v0.3.7：画面子窗口诊断（查「正在播放但没有画面」）
-import { mpvDiagnosticBounds, mpvDumpWindows, mpvHitTest, mpvRaiseStats, mpvSurfaceInfo } from './services/mpv'
+import { mpvDiagnosticBounds, mpvDumpWindows, mpvHitTest, mpvInputWindowState, mpvRaiseStats, mpvSurfaceInfo } from './services/mpv'
 import { buildStreamInfo } from './services/playerInfo'
-import { applyMark, failStage, flowDetail, noteSlow, setMetrics, snapshot as flowSnapshot } from './services/playFlow'
+import { applyMark, flowDetail, noteSlow, pushStep, setMetrics, snapshot as flowSnapshot } from './services/playFlow'
+// v1.3 提速工单：分段计时 + 乐观交接（见两个模块的注释）
+import { beginPlayTiming, markPlayTiming } from './services/playTiming'
+import { noteHandoffActive, offerHandoffCandidate } from './services/playHandoff'
 import { probeStreamReachability } from './services/streamDiag'
 import { hardResetPlayChain, runPlaySelfCheck, selfCheckSnapshotForInfo } from './services/playSelfCheck'
 import { isOneTimeStream } from './services/ruleProbe'
@@ -412,7 +416,9 @@ export function registerIpc(): void {
   })
 
   // ---------- bangumi 数据源 ----------
-  ipcMain.handle(CH.bgmCalendar, (_e, force?: boolean) => bangumi.calendar(!!force))
+  ipcMain.handle(CH.bgmCalendar, (_e, force?: boolean, opts?: { allowRefresh?: boolean }) =>
+    bangumi.calendar(!!force, { allowRefresh: opts?.allowRefresh === true })
+  )
   ipcMain.handle(CH.bgmSubject, (_e, id: number, priority?: string) =>
     bangumi.subject(Number(id), priority === 'A' || priority === 'B' ? priority : 'S')
   )
@@ -619,10 +625,34 @@ export function registerIpc(): void {
     ruleSearch(ruleId, keyword, subjectId)
   )
   ipcMain.handle(CH.rulesEpisodes, (_e, ruleId: string, entry) => ruleEpisodes(ruleId, entry))
+  /*
+   * 播放页解析 = 用户点下某一集的那一刻（v1.3 计时起点）。
+   *
+   * 两个提速点都在这里：
+   *   ① `beginPlayTiming` 记下点击时刻，后续 `rules.play → player.play → loadfile → 首帧`
+   *      四段耗时都相对它计算，最后在 playFlow.endFlow 打一行；
+   *   ② 播放页地址一确定就**在同一个 IPC 里直接发起预取**，不再等渲染层跳转后再发一次请求。
+   *      这样「页面抓取/候选解析」与「页面导航 + 播放页挂载」是并行的；
+   *      下一步 `cachedStream` 来查时，预取往往已经落地，可以完全跳过网页嗅探。
+   */
   ipcMain.handle(
     CH.rulesPlay,
-    (_e, ruleId: string, entry, lineIndex: number, episodeIndex: number, episodeLink: string, vars: Record<string, string>) =>
-      rulePlay(ruleId, entry, lineIndex, episodeIndex, episodeLink, vars)
+    async (
+      _e,
+      ruleId: string,
+      entry,
+      lineIndex: number,
+      episodeIndex: number,
+      episodeLink: string,
+      vars: Record<string, string>
+    ) => {
+      beginPlayTiming('规则播放')
+      const r = await rulePlay(ruleId, entry, lineIndex, episodeIndex, episodeLink, vars)
+      markPlayTiming('选源')
+      // handoff=true：这就是用户马上要播的那一集，候选可以进交接队列
+      if (r?.url) void prefetchStream(r.url, r.referer, { handoff: true })
+      return r
+    }
   )
   /*
    * v0.2.7 附加：直链会话缓存（加速进入播放与切集）。
@@ -643,14 +673,28 @@ export function registerIpc(): void {
       lineIndex: number,
       episodeIndex: number,
       episodeLink: string,
-      vars: Record<string, string>
+      vars: Record<string, string>,
+      /**
+       * v1.3：渲染层刚刚已经解析过播放页时把地址带过来，**不再重跑一次 rulePlay**。
+       * 这一步在过去是一次多余的主进程往返 + 一次重复解析（API 规则要拼模板、XPath 规则要读规则）。
+       */
+      knownPageUrl?: string,
+      /**
+       * v1.3：`true` = 这一集马上就要播（候选可以进交接队列）；
+       * 预取下一集时必须 false/省略，否则当前这集卡住 5 秒会被换到下一集的地址上。
+       */
+      forCurrentEpisode?: boolean
     ) => {
-      // 先解析出该集的播放页地址（与真实播放同一条路），再做「直出解析 + 校验」入缓存
-      const play = await rulePlay(ruleId, entry, lineIndex, episodeIndex, episodeLink, vars)
-      if (!play?.url) return null
-      const stream = await prefetchStream(play.url, play.referer)
-      // 连播放页地址一起返回：切集时可直接复用，省掉一次 play 解析
-      return { pageUrl: play.url, url: stream?.url ?? null, referer: stream?.referer ?? play.referer }
+      const pageUrl = knownPageUrl && /^https?:\/\//i.test(knownPageUrl)
+        ? knownPageUrl
+        : (await rulePlay(ruleId, entry, lineIndex, episodeIndex, episodeLink, vars))?.url
+      if (!pageUrl) return null
+      /*
+       * 预取的 Referer 交给 extractStreamCandidates 自己按播放页 origin 兜底：
+       * 这里只负责「尽快把播放页抓下来」，不再为了一个 Referer 再解析一次规则。
+       */
+      const stream = await prefetchStream(pageUrl, undefined, { handoff: forCurrentEpisode === true })
+      return { pageUrl, url: stream?.url ?? null, referer: stream?.referer }
     }
   )
   // 规则仓库导入（KazumiRules 镜像优先）
@@ -846,6 +890,14 @@ export function registerIpc(): void {
     return engineAttach(w, bounds)
   })
   ipcMain.handle(CH.playerPlay, (_e, path: string, referer?: string, cookies?: string) => {
+    /*
+     * v1.3：这条 IPC 就是「嗅探命中 → 交给内核」的交接点，因此计时打「命中」。
+     * 同时把同一次嗅探里发现的备选候选放进交接队列：
+     * 缓存/直出地址失效时，内核 5 秒零字节就能换下一条，不必重开一整轮嗅探。
+     */
+    markPlayTiming('命中')
+    noteHandoffActive(path)
+    for (const c of alternativesForStreamUrl(path)) offerHandoffCandidate(c)
     enginePlay(path, referer, cookies)
     return true
   })
@@ -911,7 +963,20 @@ export function registerIpc(): void {
     } catch {
       video = null
     }
-    return { bounds, state, video, hit, windows, raiseStats: mpvRaiseStats() }
+    /*
+     * v1.2.1：把「uosc 能不能收到鼠标」的前置条件一并交出去。
+     *
+     * `hit.hitClass` 只能说明那一刻窗口树里最上层是谁；真正决定按钮生死的是
+     * mpv 的 VO 子窗口有没有从 disabled 恢复（见 mpv.ts 的 ensureMpvInputWindow）。
+     * 两项并排返回，排障时能直接区分「窗口没启用」与「窗口启用但命中到别的东西」。
+     */
+    let input: unknown = null
+    try {
+      input = mpvInputWindowState()
+    } catch {
+      input = null
+    }
+    return { bounds, state, video, hit, windows, input, raiseStats: mpvRaiseStats() }
   })
   // v0.2.9 最后更新：播放倍速（0.25–4）
   ipcMain.handle(CH.playerSetSpeed, (_e, speed: number) => {
@@ -1478,7 +1543,18 @@ export function registerIpc(): void {
         // 「过慢」不结束播放，只归因（用户明确要求：还有数据在动就继续等）
         noteSlow(outcome.metrics.rateBps, outcome.verdict)
       } else {
-        failStage('inject', outcome.verdict, outcome.reason)
+        /*
+         * ⚠️ v1.2.1：可达性探测是**并行取证**，不是注入的裁判。
+         *
+         * 上一版在这里直接 `failStage('inject', …)`：探测只要拿不到数据（403/一次性令牌/
+         * 本应用网络队列排队超时）就把「注入播放器」判死，而 playFlow 的 settled 会
+         * **永久锁住**这个阶段 —— 内核稍后真的解出首帧，succeedStage 也被忽略。
+         * 用户看到的就是「所有规则都卡在最后一步」。
+         *
+         * 现在把证据原样写进阶段步骤：内核真没起来 → 由 playFlow 的 15s 注入看门狗
+         * 统一判失败（原因里同样带这些数据）；内核起来了 → 探测结论只作参考。
+         */
+        pushStep('inject', `资源可达性取证：${outcome.verdict}`)
       }
     }
     const report: StreamReachabilityReport = {

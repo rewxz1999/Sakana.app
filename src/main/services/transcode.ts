@@ -9,6 +9,7 @@ import type { LiveStartResult, MediaInspectResult } from '@shared/types'
 import { log } from '../log'
 import { getSettings } from '../net'
 import { handleAdProxyRequest, proxyHlsUrl, setAdProxyPort } from './adFilter'
+import { handleMediaCacheRequest, setMediaCachePort } from './mediaCache'
 import { handleBoostRequest } from './streamBoost'
 
 /**
@@ -57,6 +58,14 @@ export function initLiveServer(): Promise<number> {
       if (handleAdProxyRequest(req, res)) return
       // 在线播放加速中转（并发 Range / HLS 并发预读）同样复用这个端口（见 streamBoost.ts）
       if (handleBoostRequest(req, res)) return
+      /*
+       * 本地临时缓存（边下边播，v1.4）也挂在同一个监听上（见 mediaCache.ts）。
+       *
+       * 为什么不另起一个端口：这个 server 已经由应用统一启动/关闭，广告过滤与加速中转都在这上面；
+       * 多一个监听就多一份「退出没关、端口冲突、日志里多一个内部地址」的隐患。
+       * 这里只按 /cache/ 前缀接管请求，其它路径行为完全不变。
+       */
+      if (handleMediaCacheRequest(req, res)) return
       const id = /^\/live\/([A-Za-z0-9_-]+)/.exec(req.url ?? '')?.[1] ?? ''
       const s = sessions.get(id)
       if (!s) {
@@ -89,6 +98,8 @@ export function initLiveServer(): Promise<number> {
       livePort = (server.address() as AddressInfo).port
       // 把端口交给 HLS 改写代理：它复用这个监听端口提供改写后的播放列表
       setAdProxyPort(livePort)
+      // 本地临时缓存同样要这个端口来生成本机播放地址（见 mediaCache.ts）
+      setMediaCachePort(livePort)
       log.append('info', 'ffmpeg', `中转流服务已启动: http://127.0.0.1:${livePort}/live/<id>`)
       resolve(livePort)
     })
@@ -328,6 +339,8 @@ export function stopAllLive(): void {
  */
 export function closeLiveServer(): void {
   stopAllLive()
+  // 端口即将失效：本地缓存不能再生成/接受本机地址（会话与文件的清理由 mediaCache 自己在退出时做）
+  setMediaCachePort(0)
   const srv = liveServer
   liveServer = null
   livePort = 0

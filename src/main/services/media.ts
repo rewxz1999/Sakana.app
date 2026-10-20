@@ -18,6 +18,7 @@ import { log } from '../log'
 import { dataPaths } from './paths'
 import { BROWSER_UA, getSettings } from '../net'
 import { rewriteImageUrl, unresizedImageUrl } from './bangumi'
+import { builtInImgOrigin } from './bangumiProxy'
 import { liveStream } from './transcode'
 
 const VIDEO_EXTS = new Set([
@@ -481,6 +482,25 @@ export function convertSubtitleToVtt(path: string): string {
 function refererFor(target: string): string | undefined {
   try {
     const host = new URL(target).hostname.toLowerCase()
+    /*
+     * V1.4：内置图片反代**必须带 Referer**（这是"番剧表封面全空"的最后一环）。
+     *
+     * 实测同一张图（curl）：
+     *   Referer: https://bgm.tv/      → 200，15,361 字节
+     *   不带 Referer                   → code=000（连接被拒/超时）
+     *   Referer: https://lain.bgm.tv/ → code=000
+     * 数据里确实有封面地址，只是它指向已墙的 lain.bgm.tv；我们改写到了内置图片站，
+     * 如果不再补 Referer，改写后依然被挡 —— 于是"有数据也不显示"。
+     * 判定用内置图片站的 origin（不写死域名，符合"地址不外露"的红线）。
+     */
+    const imgOrigin = builtInImgOrigin()
+    if (imgOrigin) {
+      try {
+        if (new URL(target).origin === new URL(imgOrigin).origin) return 'https://bgm.tv/'
+      } catch {
+        /* ignore */
+      }
+    }
     // 镜像图床（lain.bangumi.vip 等）实测不带 Referer 也放行，带上更稳妥
     if (host.includes('bangumi.vip')) return 'https://bangumi.vip/'
     if (host.includes('bangumi.pro')) return 'https://bangumi.pro/'
@@ -502,7 +522,7 @@ function refererFor(target: string): string | undefined {
  * 表现就是「卡片经常加载不出来」。这里限制同时最多 4 张在取，其余排队 ——
  * 单张只要 0.6~1 秒，整体反而更快、更稳定。
  */
-const IMG_CONCURRENCY = 4
+const IMG_CONCURRENCY = 6
 let imgInFlight = 0
 const imgQueue: (() => void)[] = []
 
@@ -520,8 +540,16 @@ async function withImageSlot<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-/** 单次图片请求超时（毫秒）：卡住的图不能一直占着并发额度 */
-const IMG_TIMEOUT = 20000
+/**
+ * 单次图片请求超时（毫秒）：卡住的图不能一直占着并发额度。
+ *
+ * V1.4：20s → **8s**。真机日志证据：冷启动时出现
+ *   `图片加载失败 (http://…/pic/cover/…) TimeoutError: The operation was aborted due to timeout`
+ * 而缩略图本身只有 4~15KB —— 8 秒都下不来就是这条链路上那次请求废了，
+ * 继续等 20 秒只会白占一个并发槽（一屏十几张时会连锁拖慢）。
+ * 缩短之后失败会更快进入"改取原图/放弃"分支，整体感知更快。
+ */
+const IMG_TIMEOUT = 8000
 
 async function fetchImageOnce(target: string): Promise<Response> {
   const headers: Record<string, string> = { 'User-Agent': BROWSER_UA }
@@ -529,6 +557,34 @@ async function fetchImageOnce(target: string): Promise<Response> {
   if (referer) headers['Referer'] = referer
   const res = await fetch(target, { headers, signal: AbortSignal.timeout(IMG_TIMEOUT) })
   return res
+}
+
+/**
+ * 预取首屏封面（V1.4）。
+ *
+ * 为什么需要它：番剧表数据一到，渲染层才开始 `sakana-img://` 一张张取图 ——
+ * 冷缓存时每张 1~2 秒、并发 6，一屏十几张要好几秒，用户看到的就是"卡片图慢慢蹦出来"。
+ * 这里在**数据刚拿到**时就把前 N 张丢进同一条取图队列（同一套并发闸门 + 磁盘缓存），
+ * 等 React 真正渲染 `<img>` 时多数已经命中缓存，观感从"逐张加载"变成"一次性出现"。
+ *
+ * 只取前 18 张（一屏的量）：再多就是替用户预取他根本没滚动到的图，白费带宽。
+ * 失败一律忽略 —— 预取是锦上添花，不能因为它报错影响主流程。
+ */
+export async function prefetchImages(urls: string[], limit = 18): Promise<void> {
+  const list = urls.filter((u) => typeof u === 'string' && /^https?:\/\//i.test(u)).slice(0, limit)
+  if (list.length === 0) return
+  await Promise.allSettled(
+    list.map((u) =>
+      fetchImageWithCache(u).then(
+        (r) => {
+          // 只关心"取到没取到"，响应体不读会占着连接，这里主动释放
+          void r.arrayBuffer().catch(() => {})
+          return true
+        },
+        () => false
+      )
+    )
+  )
 }
 
 async function fetchImageWithCache(rawTarget: string): Promise<Response> {
@@ -562,7 +618,15 @@ async function fetchImageWithCache(rawTarget: string): Promise<Response> {
           if (res.status < 500 && res.status !== 429) return null // 4xx：重试也没意义
           await new Promise((r) => setTimeout(r, 500 + i * 700))
         } catch (err) {
-          log.append('warn', 'img', `取图失败（第 ${i + 1} 次）${url.slice(0, 90)}: ${String((err as Error)?.message ?? err)}`)
+          const msg = String((err as Error)?.message ?? err)
+          log.append('warn', 'img', `取图失败（第 ${i + 1} 次）${url.slice(0, 90)}: ${msg}`)
+          /*
+           * V1.4：**超时不重试**。
+           * 8 秒还没拿到一张 4~15KB 的缩略图，基本就是这条请求废了（反代冷启动 / 网络抖动），
+           * 立刻重试往往再等 8 秒 —— 用户看到的就是"图死活不出来还拖慢一屏"。
+           * 交给下层"改取原图"兜底一次即可；5xx/429 仍然重试（那类问题重试有效）。
+           */
+          if (/timeout|timed out|aborted/i.test(msg)) return null
           await new Promise((r) => setTimeout(r, 500 + i * 700))
         }
       }

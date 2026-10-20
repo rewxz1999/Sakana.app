@@ -25,8 +25,18 @@ import type {
 import { monthsOfSeason, seasonIndexOfMonth, seasonOfDate } from '@shared/season'
 import { log } from '../log'
 import { beginNetTrace, type NetPriority } from '../net-priority'
-import { BROWSER_UA, buildProxyAgents, getSettings } from '../net'
+import { BROWSER_UA, buildProxyAgents, chromiumGetText, getSettings, streamGetText } from '../net'
 import { store } from '../store'
+import {
+  authHeadersFor,
+  beginEndpointRequest,
+  builtInImgOrigin,
+  endpointLabelOf,
+  isBuiltInBangumiApi,
+  isBuiltInBangumiHost,
+  orderBangumiEndpoints,
+  resolveBangumiEndpoints
+} from './bangumiProxy'
 import { parseCalendar, parseRatingOnly, parseSearchPage, parseSubjectPage } from './bangumiHtml'
 import {
   anilistSearchAnime,
@@ -53,6 +63,47 @@ import {
 import { offscreenGet } from './offscreenFetch'
 
 const TTL_CALENDAR = 30 * 60 * 1000
+
+/**
+ * 端点隔离表（V1.5.1）：baseUrl → 解禁时间戳。
+ *
+ * 只用于**确定性错误**（例如某个 Worker 对所有路径返回 404 —— 配置问题），
+ * 不用来惩罚超时/抖动：那类问题靠"在途最少优先"的调度自动绕开，
+ * 一旦隔离反而会把好端点也误伤。
+ */
+const endpointQuarantine = new Map<string, number>()
+
+/**
+ * 预热番剧表首屏封面（V1.4）。
+ *
+ * 为什么放在这里：用户抱怨"图片加载很慢"，实测**图片本身并不慢**（热缓存 10 张 110ms），
+ * 慢的是"数据到了之后才一张张去取"这段。数据一拿到就先取前 18 张丢进取图队列，
+ * 渲染层再要时基本都命中磁盘缓存，观感从"逐张蹦"变成"一起出来"。
+ *
+ * 用动态 import 避免 bangumi ↔ media 的循环依赖（media.ts 静态引用本文件）。
+ * 失败静默：预取只是优化，不能因为它的异常影响番剧表返回。
+ */
+function prefetchCovers(days: CalendarDay[]): void {
+  void (async () => {
+    try {
+      const urls: string[] = []
+      for (const day of days) {
+        for (const item of day.items ?? []) {
+          const u = item.images?.common ?? item.images?.large ?? item.images?.medium
+          if (u) urls.push(u)
+          if (urls.length >= 18) break
+        }
+        if (urls.length >= 18) break
+      }
+      if (urls.length === 0) return
+      const { prefetchImages } = await import('./media')
+      await prefetchImages(urls, 18)
+    } catch {
+      /* 预取失败不影响主流程 */
+    }
+  })()
+}
+
 /*
  * 详情缓存（v0.2.7 附加：7 天 → 30 天）。
  *
@@ -108,20 +159,26 @@ const TTL_CHARACTERS = 30 * 24 * 3600 * 1000
  * 因此这里不做分页，只取一页（真出现时也只会少几条尾巴，不会报错）。
  */
 const SEASON_PAGE_LIMIT = 100
-const REQUEST_TIMEOUT = 12000
 /**
- * 分级超时（v1.1.4）。
+ * V1.4：12s → **22s**。
  *
- * 为什么 S 级要放宽到 45 秒：本次实测自建反代取一部番的 v0 详情
- * **成功时也要 31~36 秒**（`/calendar` 则是 25 秒后返回 522）。
- * 旧的 12 秒超时意味着「明明能成功的数据也一定失败」，而且会连着重试两次
- * （12s + 1.2s + 12s + 3s + 12s ≈ 40 秒）才报错 —— 用户感知就是「又慢又加载不出来」。
- * 放宽后由「必定失败」变成「一次成功」，失败重试也只在 45 秒内做一次。
- * 低优先级不享受这个宽限：B 级（随机推荐）卡 12 秒就该让路，不能长期占着带宽。
+ * 12 秒是按"反代首包 1~8 秒"定的，但换成**内置双反代**之后实测（子代理在同一台机器上各打 3 次
+ * `/v0/subjects/26803`）：api-1 = 13.1s / 12.2s / 超时，api-2 = 超时 / 38.0s / 1.2s。
+ * 也就是说 12 秒会把**一部分本来能成功的请求**判死 —— 真机日志里能直接看到
+ * `/calendar 失败 0.0KB 12022ms`、`/v0/subjects/… 失败 12010ms` 这种"刚好卡在 12 秒"的行。
+ * 22 秒覆盖到实测的 13~20 秒档；超过 22 秒基本就是端点挂了，交给上层的换端点重试。
  */
-function requestTimeoutFor(level: NetPriority): number {
-  return level === 'S' ? 40000 : level === 'A' ? 20000 : REQUEST_TIMEOUT
-}
+const REQUEST_TIMEOUT = 22000
+/**
+ * 统一请求超时（分级取消后）。
+ *
+ * 以前 S=8s / A=20s / B=12s，跟着"级别"走；现在分级已废弃，所有 bangumi 请求同一条 FIFO 队列，
+ * 超时也必须只有一套，否则等于换个地方继续分级。取 12 秒的理由：
+ *   · 详情/日历/季度检索都走反代，实测成功请求的首包在 1~8 秒，12 秒足够覆盖正常慢请求；
+ *   · 失败时尽快把错误交给上层（上层还有一次短退避重试），比"等 20 秒再失败"体验好；
+ *   · 与搜索/分集等接口原本的 REQUEST_TIMEOUT 一致，不再出现"同一反代两套超时"。
+ */
+const BANGUMI_TIMEOUT = REQUEST_TIMEOUT
 
 /**
  * Jikan 兜底的缓存（v0.3.2 新增）。
@@ -205,6 +262,20 @@ function makeSourceError(kind: SourceError['kind'], message: string, tried: stri
   return { kind, message, tried }
 }
 
+/**
+ * 把请求异常压成一句**不含地址**的原因（超时/HTTP 5xx/连接重置…）。
+ *
+ * 为什么单独写：错误信息会进日志、也会经 `SourceError.message` 显示在界面上。
+ * axios 的 message 偶尔会带 URL，直接拼出去等于把反代地址泄露到界面；
+ * 这里统一只保留可读原因，地址交给上层用 `api-1` / `api-2` 这类标签表示。
+ */
+function describeRequestError(err: unknown): string {
+  const e = err as { code?: string; message?: string } | undefined
+  if (e?.code === 'ECONNABORTED') return '超时'
+  const raw = String(e?.message ?? err ?? '请求失败')
+  return raw.replace(/https?:\/\/\S+/gi, '<地址已隐藏>').slice(0, 160)
+}
+
 function isApiHost(host: string): boolean {
   return host.startsWith('api.') || host.includes('api.bgm')
 }
@@ -213,18 +284,21 @@ function isApiHost(host: string): boolean {
 const DEAD_MIRRORS = ['bangumi.pro']
 
 /**
- * 单飞（single-flight）：完全相同的 URL 在同一时刻只发一次请求。
+ * 单飞（single-flight）：同一条逻辑请求在同一时刻只发一次。
  *
  * 实测最典型的重复请求：番剧详情页与播放器的「详情」面板会同时请求同一部番，
- * 以及切集时旧实例的收尾请求。合并后反代实际收到的请求数直接减半，而返回的数据一模一样
- * （不削减详情）。
+ * 以及切集时旧实例的收尾请求。合并后反代实际收到的请求数直接减半，而返回的数据一模一样。
+ *
+ * ⚠️ 改成双端点后，key 必须用**逻辑路径**而不是完整 URL：
+ * 如果按 URL 去重，同一部番的两个并发调用会分别选中 api-1 / api-2，
+ * 等于既没单飞、又把同一份数据向两套反代各要了一遍（正好抵消负载分担的收益）。
  */
-const jsonInflight = new Map<string, Promise<string>>()
+const jsonInflight = new Map<string, Promise<unknown>>()
 
-function singleFlight(key: string, fn: () => Promise<string>): Promise<string> {
-  const existing = jsonInflight.get(key)
+function singleFlight<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const existing = jsonInflight.get(key) as Promise<T> | undefined
   if (existing) return existing
-  const p: Promise<string> = fn().finally(() => {
+  const p = fn().finally(() => {
     jsonInflight.delete(key)
   })
   jsonInflight.set(key, p)
@@ -254,12 +328,16 @@ function looksLikeChallenge(text: string): boolean {
 }
 
 /**
- * 自建反代（Cloudflare Worker）：配置过的自定义 API 地址一律按 API 语义请求
- * （`/v0/...` 路径），不要求域名必须以 `api.` 开头 —— Workers 域名/自定义域名常常不是。
+ * 这个地址是否是「配好的 API 反代端点」（内置双反代或用户自定义）。
+ *
+ * 以前是拿设置里的单个 `bangumiCustomApi` 做字符串比较；现在端点池可能有两个内置端点，
+ * 所以统一问 `resolveBangumiEndpoints` —— 否则 `calendarPathFor` / `isApiMirror` 会把
+ * 内置端点当成网页镜像，拼出错的 `/v0/calendar` 或按 HTML 去解析 JSON。
  */
 function isCustomApiBase(mirror: string): boolean {
-  const custom = (getSettings().bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
-  return Boolean(custom) && mirror.replace(/\/+$/, '') === custom
+  const base = mirror.trim().replace(/\/+$/, '')
+  if (!base) return false
+  return resolveBangumiEndpoints(getSettings().bangumiCustomApi).some((ep) => ep.baseUrl === base)
 }
 
 /**
@@ -343,13 +421,45 @@ function isBangumiImageHost(host: string): boolean {
  * 反代本来就支持缩放，是我们没走。现在统一改写为缩放路径，卡片/详情页画质完全够用。
  */
 export function rewriteImageUrl(url: string, width = 400): string {
+  if (!url) return url
   const custom = (getSettings().bangumiCustomImg ?? '').trim().replace(/\/+$/, '')
-  if (!custom || !url) return url
+  /*
+   * V1.4 修「番剧表封面全空」：
+   *
+   * 上一版假设"新反代在 API 响应里直接返回它自己的图片域名"，于是没填自定义图片反代时**原样返回**。
+   * 真机抓包推翻了这条假设：日历/番剧表的封面仍然是 `http://lain.bgm.tv/pic/cover/…`，
+   * 而 lain.bgm.tv 在本机实测 **20 秒超时（code=000）** —— 封面一张都出不来。
+   * 同一路径走内置图片反代是 200（原图 177KB/1.66s，`/r/400/` 缩放后 4.4KB/1.08s）。
+   *
+   * 所以改成：**没有自定义图片反代（或填的是内置的）时，用内置图片站兜底改写**；
+   * 用户自己填了第三方图片反代就仍然优先用他的。
+   */
+  let base: URL | null = null
+  if (custom && !isBuiltInBangumiHost(custom)) {
+    try {
+      base = new URL(custom)
+    } catch {
+      base = null
+    }
+  }
+  if (!base) {
+    const builtIn = builtInImgOrigin()
+    if (!builtIn) return url
+    try {
+      base = new URL(builtIn)
+    } catch {
+      return url
+    }
+  }
   try {
     const u = new URL(url)
     // 只改 bgm 系图床（含镜像站图床），其它地址（含反代自己已带 /r/ 的地址）保持原样
     if (!isBangumiImageHost(u.hostname)) return url
-    const base = new URL(custom)
+    /*
+     * 注意：这里不能再写 `const base = new URL(custom)`（会遮蔽上面算好的 base）。
+     * custom 为空时 new URL('') 抛错，被 catch 吞掉后直接 return url，
+     * 于是改写永远不生效，日志里仍是那个已失效的原始图床地址。
+     */
     const prefix = base.pathname.replace(/\/+$/, '') // 例如 "/img"
     // 已经是缩放路径就不要重复加前缀
     const path = width <= 0 || /^\/r\/\d+\//.test(u.pathname) ? u.pathname : `/r/${width}${u.pathname}`
@@ -361,15 +471,32 @@ export function rewriteImageUrl(url: string, width = 400): string {
 
 /** 去掉缩放前缀（`/img/r/400/pic/…` → `/img/pic/…`）：缩放路径万一不可用时的兜底 */
 export function unresizedImageUrl(url: string): string {
+  if (!url) return url
+  /*
+   * 与 rewriteImageUrl 同一套基准：用户没填第三方图床时，用内置图片站判定。
+   * 过去这里在 custom 为空时直接原样返回 —— 于是"缩放路径失败 → 改取原图"这条兜底
+   * 在默认配置下等于没启用。
+   */
   const custom = (getSettings().bangumiCustomImg ?? '').trim().replace(/\/+$/, '')
-  if (!custom || !url) return url
-  try {
-    const base = new URL(custom)
-    if (!url.startsWith(base.origin)) return url
-    return url.replace(/\/r\/\d+\//, '/')
-  } catch {
-    return url
+  let origin = ''
+  if (custom && !isBuiltInBangumiHost(custom)) {
+    try {
+      origin = new URL(custom).origin
+    } catch {
+      origin = ''
+    }
   }
+  if (!origin) {
+    try {
+      const builtIn = builtInImgOrigin()
+      origin = builtIn ? new URL(builtIn).origin : ''
+    } catch {
+      origin = ''
+    }
+  }
+  if (!origin) return url
+  if (!url.startsWith(origin)) return url
+  return url.replace(/\/r\/\d+\//, '/')
 }
 
 /**
@@ -445,25 +572,37 @@ class BangumiService {
     mkdirSync(this.cacheDir, { recursive: true })
     this.migrateMirrors()
     /*
-     * 启动时把「实际会用哪个数据源」写进运行日志。
-     * 排查「明明配了反代却还在用镜像」这类问题时，一眼就能看出运行时读到的是什么。
+     * 启动时把「实际会用哪种数据源」写进运行日志。
+     * 只写类型与数量，**绝不写地址**：内置反代地址与 PSK 是用户要求隐藏的红线，
+     * 自定义地址也不该因为排障被复制进日志。
      */
     const custom = (getSettings().bangumiCustomApi ?? '').trim()
+    const usingCustom = Boolean(custom) && !isBuiltInBangumiApi(custom)
+    const endpointCount = resolveBangumiEndpoints(custom).length
     log.append(
       'info',
       'bangumi',
-      custom
-        ? `数据源：仅使用自建反代 ${custom}`
-        : `数据源：公共镜像 ${this.mirrors().join(', ') || '(空)'}`
+      usingCustom
+        ? '数据源：自定义 API 反代（地址已隐藏）'
+        : `数据源：内置双反代 ${endpointCount} 个端点（地址已隐藏，按在途请求数分担）`
     )
   }
 
   /**
-   * 一次性迁移：把 bangumi.vip 提到镜像列表首位。
+   * 数据源迁移（从旧版「单个反代地址写进设置」升级到「内置双端点 + 地址不落盘」）。
    *
-   * 老安装的 settings.json 里存着 `bangumi.pro`（已不可达），
-   * 如果只改 DEFAULT_SETTINGS，已装用户永远拿不到新镜像 —— 表现为「番剧表一直空白」。
-   * 用户自己填过的自建反代/自定义镜像保持不动，只是把可用镜像补到最前面。
+   * 为什么必须在启动时做：
+   *   · 老安装的 settings.json 里存着旧反代地址（现在属于内置端点之一）和旧图片反代地址；
+   *     不清理的话，用户升级后设置文件里仍有一份明文地址，与"地址隐藏"的目标直接冲突；
+   *   · 旧版还把反代地址写进了 `bangumiBase` / `dataSources.main`，界面会把它当主数据源显示；
+   *   · 这些字段一旦残留在磁盘上，用户复制一份 settings.json 就等于把地址带出去了。
+   *
+   * 迁移规则：
+   *   · `bangumiCustomApi` 若等于内置端点（旧默认值），清空 → 自动使用内置双端点；
+   *   · `bangumiCustomImg` 若属于内置反代主机（旧图片地址），清空 → 图片改由 API 响应自带；
+   *   · `bangumiBase` / `bangumiMirrors` / `dataSources` 里属于内置反代主机的条目全部剔除，
+   *     主数据源回落到公共镜像（只作为显示/测试用的安全兜底，不参与真实取数）。
+   * 只有实际发生变化时才写盘，避免每次启动都触发一次 settings 落盘。
    */
   private migrateMirrors(): void {
     try {
@@ -477,92 +616,88 @@ class BangumiService {
         proxyMigrated?: boolean
         proxyMainMigrated?: boolean
       }
-      /*
-       * v0.2.7：把自建反代设为默认主数据源（用户已部署 Cloudflare Worker）。
-       * 用户自己填过自定义反代就不覆盖，只补默认值。
-       */
-      const PROXY_API = 'https://sankana-bangumi.de5.net/api'
-      const PROXY_IMG = 'https://sankana-bangumi.de5.net/img'
-      if (!s.proxyMigrated && !(s.bangumiCustomApi ?? '').trim()) {
-        store.set('settings', {
-          ...(s as Record<string, unknown>),
-          bangumiCustomApi: PROXY_API,
-          bangumiCustomImg: PROXY_IMG,
-          proxyMigrated: true
-        })
-        log.append('info', 'bangumi', `已启用自建反代作为默认主数据源：${PROXY_API}`)
-        // 重新读一次：下面的镜像迁移基于最新设置
-        Object.assign(s, { bangumiCustomApi: PROXY_API, proxyMigrated: true })
-      }
-      /*
-       * v0.2.7：把「当前主数据源」的显示与实际取数对齐。
-       *
-       * 配了反代之后，日历/详情/搜索一律只走反代（`requestBest` 提前返回），
-       * 但 `dataSources.main` / `bangumiBase` 还停在 bangumi.vip，
-       * 于是「关于」「数据源配置」「番剧表底栏」都显示成公共镜像 ——
-       * 排查数据源问题时会被这行字直接带偏。
-       * 这里把主数据源改成反代地址，但**保留**镜像列表，用户清空反代即可切回。
-       * 单独一个标记位，已装用户也能补上这次迁移（上面的 proxyMigrated 不会再执行）。
-       */
-      const customNow = (s.bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
-      if (customNow && !s.proxyMainMigrated) {
-        store.set('settings', {
-          ...(s as Record<string, unknown>),
-          bangumiBase: customNow,
-          dataSources: {
-            main: customNow,
-            mirrors: s.dataSources?.mirrors ?? s.bangumiMirrors ?? []
-          },
-          proxyMainMigrated: true
-        })
-        Object.assign(s, { bangumiBase: customNow, proxyMainMigrated: true })
-        log.append('info', 'bangumi', `主数据源显示已改为自建反代：${customNow}`)
-      }
-      if (s.mirrorVipMigrated) return
+      const norm = (v: unknown): string => String(v ?? '').trim().replace(/\/+$/, '')
       const VIP = 'https://bangumi.vip'
-      const list = Array.isArray(s.bangumiMirrors) && s.bangumiMirrors.length > 0 ? s.bangumiMirrors : []
-      if (!list.includes(VIP)) {
-        const next = [VIP, ...list.filter((m) => m && m !== VIP)]
-        store.set('settings', {
-          ...(s as Record<string, unknown>),
-          bangumiMirrors: next,
-          bangumiBase: s.bangumiBase && s.bangumiBase.includes('bangumi.pro') ? VIP : s.bangumiBase || VIP,
-          dataSources: {
-            main:
-              s.dataSources?.main && s.dataSources.main.includes('bangumi.pro')
-                ? VIP
-                : s.dataSources?.main || VIP,
-            mirrors: next
-          },
-          mirrorVipMigrated: true
-        })
-        log.append('info', 'bangumi', `已把镜像 ${VIP} 加入数据源列表（原列表：${list.join(', ') || '空'}）`)
-      } else {
-        store.set('settings', { ...(s as Record<string, unknown>), mirrorVipMigrated: true })
+
+      const customRaw = norm(s.bangumiCustomApi)
+      // 旧默认地址就是内置端点之一：清空它，让 resolver 用内置双端点，而不是把它当"用户自定义"
+      const custom = isBuiltInBangumiApi(customRaw) ? '' : customRaw
+      const imgRaw = norm(s.bangumiCustomImg)
+      // 旧图片地址属于内置反代主机：清空，图片 URL 以后从 API 响应里取
+      const img = isBuiltInBangumiHost(imgRaw) ? '' : imgRaw
+
+      /** 清掉内置反代/已死镜像，并保证公共镜像列表至少有一个可用项 */
+      const cleanList = (list: unknown): string[] => {
+        const arr = Array.isArray(list) ? list : []
+        const out = arr
+          .map(norm)
+          .filter(Boolean)
+          .filter((m) => !isBuiltInBangumiApi(m) && !isBuiltInBangumiHost(m))
+          .filter((m) => !DEAD_MIRRORS.some((d) => m.includes(d)))
+        if (!out.includes(VIP)) out.unshift(VIP)
+        return [...new Set(out)]
       }
+      const mirrors = cleanList(s.bangumiMirrors)
+      const dsMirrors = cleanList(s.dataSources?.mirrors)
+      const safeMain = (v: unknown): string => {
+        const n = norm(v)
+        /*
+         * 主数据源只能落成**公共镜像列表里的一个**：
+         * 自定义 API 地址单独存 `bangumiCustomApi`，不再复制进 bangumiBase / dataSources.main。
+         * 否则设置文件与「当前主数据源」卡片会多出一份明文地址，违背"地址隐藏"的目标。
+         */
+        return n && mirrors.includes(n) ? n : mirrors[0] || VIP
+      }
+      const base = safeMain(s.bangumiBase)
+      const dsMain = safeMain(s.dataSources?.main)
+
+      const oldMirrors = (Array.isArray(s.bangumiMirrors) ? s.bangumiMirrors : []).map(norm)
+      const oldDsMirrors = (Array.isArray(s.dataSources?.mirrors) ? s.dataSources!.mirrors! : []).map(norm)
+      const changed =
+        custom !== customRaw ||
+        img !== imgRaw ||
+        base !== norm(s.bangumiBase) ||
+        dsMain !== norm(s.dataSources?.main) ||
+        JSON.stringify(mirrors) !== JSON.stringify(oldMirrors) ||
+        JSON.stringify(dsMirrors) !== JSON.stringify(oldDsMirrors)
+      if (!changed) return
+
+      store.set('settings', {
+        ...(s as Record<string, unknown>),
+        bangumiCustomApi: custom,
+        bangumiCustomImg: img,
+        bangumiBase: base,
+        bangumiMirrors: mirrors,
+        dataSources: { main: dsMain, mirrors: dsMirrors },
+        // 旧迁移标记一并置位：避免任何旧代码路径再把旧默认地址写回来
+        proxyMigrated: true,
+        proxyMainMigrated: true,
+        mirrorVipMigrated: true
+      })
+      log.append('info', 'bangumi', '数据源配置已迁移：内置反代地址与图片地址不再写入设置文件（地址已隐藏）')
     } catch (err) {
-      log.append('warn', 'bangumi', `镜像迁移失败（忽略）: ${String((err as Error)?.message ?? err)}`)
+      log.append('warn', 'bangumi', `数据源迁移失败（忽略）: ${String((err as Error)?.message ?? err)}`)
     }
   }
 
+  /** 公共镜像列表（**不含内置反代**：内置端点由 bangumiProxy 的端点池单独调度，地址不落设置） */
   private mirrors(): string[] {
     const s = getSettings()
-    const custom = (s.bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
     const list = Array.isArray(s.bangumiMirrors) && s.bangumiMirrors.length > 0
       ? s.bangumiMirrors
-      : [s.bangumiBase || 'https://bangumi.pro']
+      : [s.bangumiBase || 'https://bangumi.vip']
     const normalized = list.map((m) => m.replace(/\/+$/, ''))
     /*
-     * 自建反代排第一。
+     * 自建反代不再混进公共镜像列表。
      *
-     * ⚠️ v0.2.7 起这只影响「测试连接」时的展示顺序：`requestBest` 在配了反代时
-     * 会直接返回、根本不会走到这里的竞速，所以反代与公共镜像不再并存竞速
-     * （用户要求：只用自己的反代，加载不出来就提示手动切换）。
+     * 以前这里把 `bangumiCustomApi` 排第一，是为了"测试连接"时先展示反代；
+     * 现在反代地址既不进设置也不进界面，继续混进来只会让测试/回退逻辑把内置端点
+     * 当成普通镜像，从而绕过 PSK 与负载分担。
      */
-    const all = custom ? [custom, ...normalized] : normalized
+    const publicOnly = normalized.filter((m) => !isBuiltInBangumiApi(m) && !isBuiltInBangumiHost(m))
     // bangumi.pro 已确认不可达：无条件剔除。实测启动瞬间并发请求过多时，
     // 连带把可用镜像的连接也一起被中间设备重置，少发无用请求能显著提高成功率。
-    const alive = all.filter((m) => !DEAD_MIRRORS.some((d) => m.includes(d)))
+    const alive = publicOnly.filter((m) => !DEAD_MIRRORS.some((d) => m.includes(d)))
     return [...new Set(alive)]
   }
 
@@ -675,15 +810,35 @@ class BangumiService {
    * - 若拿到的是机器人校验页（bangumi.vip 用的 Anubis PoW 页只有 14KB 且标题是
    *   「正在确认你是不是机器人！」），改用**离屏真实浏览器**重新打开该地址 ——
    *   导航会自动完成校验并返回真正的服务端渲染 HTML。
+   *
+   * 自建反代改造：这里顺带做两件事 ——
+   *   1. 对内置反代注入 `X-API-Key`（通过 `authHeadersFor`，密钥不进日志/异常）；
+   *   2. 用 `beginEndpointRequest` 记录端点当前在途数，供 `orderBangumiEndpoints` 做负载分担。
+   *      包在整个 fetchMirror 外层（而不是单次 axios）是因为重试/Chromium 兜底期间
+   *      这个端点仍然是"忙"的，提前释放会让调度器误以为它空闲。
    */
   private async fetchMirror(
     url: string,
     isApi: boolean,
     meta: { priority?: NetPriority; tag?: string } = {}
   ): Promise<string> {
+    const release = beginEndpointRequest(url)
+    try {
+      return await this.fetchMirrorUnlocked(url, isApi, meta)
+    } finally {
+      release()
+    }
+  }
+
+  private async fetchMirrorUnlocked(
+    url: string,
+    isApi: boolean,
+    meta: { priority?: NetPriority; tag?: string } = {}
+  ): Promise<string> {
     /*
-     * 请求级计时（v1.1.4）：按优先级打标并记录「接口 / 状态 / 大小 / 耗时 / 同时并发数」。
+     * 请求级计时：记录「接口 / 状态 / 大小 / 耗时 / 总并发」。
      * 标签只取 pathname，不含主机名 —— 红线要求日志里不出现反代地址（log.append 还会再脱敏一次）。
+     * `level` 仅为了不改旧调用点保留，分级已废弃（见 net-priority）。
      */
     const level: NetPriority = meta.priority ?? 'A'
     const label = meta.tag ?? safePathLabel(url)
@@ -699,17 +854,30 @@ class BangumiService {
       }
     }
     const axiosOnce = async (): Promise<string> => {
-      const res = await axios.get(url, {
-        timeout: requestTimeoutFor(level),
-        responseType: 'text',
-        headers: { 'User-Agent': BROWSER_UA, Accept: '*/*' },
-        // 显式分级：全局队列据此排队（见 main/net.ts 的 installNetworkPriority）
-        netPriority: level,
+      /*
+       * V1.5：**空闲收尾**（这是"番剧表要等 50 秒"的真正原因）。
+       *
+       * 真机实测（curl -w 打两个反代，各 3 次）：
+       *   ttfb(首字节) = 3.6~9.9 秒      ← 数据其实很快就来了
+       *   total        = **恰好等于我设的超时上限**（40s），size 6.8KB/15KB/173KB 都有
+       * 也就是说：**响应体到齐后连接不结束**（和 Tucao 一模一样的老毛病）。
+       * 我们按"整响应结束"判定，于是每个请求都要耗满 BANGUMI_TIMEOUT（22s），
+       * 再叠加重试与排队（真机日志：在途 29、排队 21），一屏番剧表就能拖到几分钟。
+       *
+       * 修法：流式接收 + 收到首个数据块后 3 秒无新数据就当作响应完整。
+       * 只影响"响应不结束"的情形：正常结束的响应会走同一条 resolve 路径，行为不变。
+       */
+      return await streamGetText(url, {
+        // 不传 timeoutMs：用 streamGetText 的 35s 硬上限（季度响应能到 300KB+，22s 会误杀）
+        headers: { 'User-Agent': BROWSER_UA, Accept: '*/*', ...authHeadersFor(url) },
         netTag: label,
-        ...buildProxyAgents(getSettings().proxy)
+        agents: buildProxyAgents(getSettings().proxy),
+        /*
+         * bangumi 的接口全部是 JSON：空闲收尾前必须先确认能解析，
+         * 否则会把 80KB 的 `/calendar` 截断成半截 JSON（真机日志：Unterminated string / Bad Unicode escape）。
+         */
+        requireJson: true
       })
-      if (res.status !== 200) throw new Error(`HTTP ${res.status}`)
-      return res.data as string
     }
 
     let text: string | null = null
@@ -720,24 +888,20 @@ class BangumiService {
       directError = err
     }
     /*
-     * 重试两次（v0.2.7）：自建反代在并发下会瞬时返回 5xx / 429，
-     * 或者连接被中间设备重置。这些都是一过性的，隔一会儿再来通常就通了 ——
-     * 直接报错给用户会表现为「很多番剧详情加载不出来」。退避 1.2s → 3s。
+     * 重试两次：自建反代在并发下会瞬时返回 5xx / 429，或者连接被中间设备重置。
+     * 这些都是一过性的，隔一会儿再来通常就通了。退避 1.2s → 3s。
      *
-     * v1.1.4：加**总时限**。放宽 S 级超时后，如果每次都要等满 45 秒，
-     * 两次重试就是 90 秒以上（比旧版 40 秒还糟）。所以按级别给一个总预算，
-     * 预算用完就不再重试 —— 「一次成功」优先于「无限重试」。
+     * 总预算固定 30 秒（以前按 S/A/B 给 60/30/20 秒——分级取消后统一）。
+     * 预算用完就不再重试：「一次成功」优先于「无限重试」。
      */
-    const retryDeadline = Date.now() + (level === 'S' ? 60000 : level === 'A' ? 30000 : 20000)
+    const retryDeadline = Date.now() + 30_000
     for (const backoff of [1200, 3000]) {
       if (text) break
       if (Date.now() + backoff >= retryDeadline) break
       const msg = String((directError as { message?: string })?.message ?? directError ?? '')
       /*
-       * v1.1.4：**超时不重试**。
-       * 反代慢到 40 秒才超时，说明对端就是在慢慢排队；再重试只会让用户多等一个 40 秒
-       * （实测冷启动曾因此拖到 123 秒才成功）。超时直接失败、交给界面显示骨架/缓存；
-       * 连接被重置（10 秒内 ECONNRESET）这类一过性问题仍然重试，成本只有 1.2 秒。
+       * **超时不重试**：反代慢到超时说明对端就是在慢慢排队；再重试只会让用户多等一个超时。
+       * 超时直接失败、交给界面显示骨架/缓存；连接被重置这类一过性问题仍然重试。
        */
       const code = String((directError as { code?: string })?.code ?? '')
       const timedOut = code === 'ECONNABORTED' || /timeout of \d+ms exceeded/i.test(msg)
@@ -757,6 +921,31 @@ class BangumiService {
     // API 源在浏览器里打开只会看到 JSON 文本，没有校验问题也用不着绕；这里只救网页镜像
     if (isApi) {
       if (text) return text
+      /*
+       * V1.2.2：node 这条路失败时，**换 Chromium 的网络栈再试一次**。
+       *
+       * 依据是用户的原话与实测：「反代地址在浏览器里是可用的」，而 node 这边同一时刻
+       * 连续超时/被重置（curl 三次里两次失败）。差别在客户端：Chromium 走 HTTP/2、
+       * 有自己的 TLS 指纹与连接池，这类中间设备对它的处理不同。走同一条链路、同一个证书校验，
+       * 只是换一个 HTTP 实现 —— 不改服务端、不需要用户开代理。
+       * 注意这里也必须带 `X-API-Key`，否则内置反代会直接 403。
+       */
+      try {
+        const viaChromium = await traced(
+          () => chromiumGetText(url, 20_000, { 'User-Agent': BROWSER_UA, ...authHeadersFor(url) }),
+          (v) => Buffer.byteLength(v, 'utf-8')
+        )
+        if (viaChromium && !looksLikeChallenge(viaChromium)) {
+          log.append('info', 'bangumi', `node 请求失败，改用 Chromium 网络栈取到数据: ${label}`)
+          return viaChromium
+        }
+      } catch (err) {
+        log.append(
+          'warn',
+          'bangumi',
+          `Chromium 网络栈也失败（${String((err as Error)?.message ?? err).slice(0, 60)}）: ${label}`
+        )
+      }
       throw directError ?? new Error('请求失败')
     }
     // 网页镜像：交给离屏浏览器（会自动完成机器人校验，应用内实测约 14 秒）
@@ -781,37 +970,81 @@ class BangumiService {
     meta: { priority?: NetPriority; tag?: string } = {}
   ): Promise<{ text: string; mirror: string }> {
     /*
-     * v0.2.7：配了自建反代就**只用它**（用户要求：反代加载不出来时提示手动切换镜像，而不是自动回退）。
+     * 自建反代端点池（默认两个内置端点，**平级**）。
      *
-     * 之前把反代和公共镜像放在一起竞速，结果反代经常输给「已经预热好的网页镜像」
-     * （实测 bangumi.vip 命中缓存只要 26ms，反代首包要几百毫秒~3 秒），
-     * 于是「设为默认主数据源」形同虚设；后来改成优先-回退，但仍然会在用户不知情的情况下换源。
-     * 现在改为：有反代就用反代，失败直接把错误抛给界面（错误文案里写明去「设置 → 数据源配置」手动切换）。
+     * 调度策略：`orderBangumiEndpoints()` 按「当前在途请求数最少者优先」排序，负载相同则轮询。
+     * 为什么不是纯轮询：两套反代虽然共用上游，但各自的冷启动/限流状态不同；纯轮询会把
+     * 新请求继续送给正卡住的那一个，而"最少在途"会自然把请求推向空闲侧 ——
+     * 这就是用户要的"谁忙不过来就帮谁"。相同负载时轮询，避免空闲时永远先打 api-1、api-2 闲置。
+     *
+     * 失败自动切下一个端点：两套 API 平级，其中一个 5xx/超时不该让整页失败。
+     * 单飞的 key 用**逻辑路径**（不含端点）：同一部番的并发调用只发一次，
+     * 否则两个并发调用会分别选中两个端点，等于既没单飞、又把同一份数据要了两遍。
      */
-    const custom = (getSettings().bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
-    if (custom) {
-      const url = `${custom}${this.calendarPathFor(custom, paths)}`
+    const endpoints = resolveBangumiEndpoints(getSettings().bangumiCustomApi)
+    if (endpoints.length > 0) {
+      const logicalKey = `bgm:${paths.customApi ?? paths.api}`
       try {
-        /*
-         * 单飞：URL 相同的并发调用合并成一次（详情页与播放器详情面板会同时请求同一部番）。
-         * 并发上限交给全局分级队列（S=4）：这里不再单独压到 2 ——
-         * 那个 2 是 v0.2.7 在没有分级时的权宜之计，现在由 S 级闸门统一管理，
-         * 两处各压一次会让实际并发只剩 2，番剧表的三个月并行永远慢一拍。
-         */
-        const text = await singleFlight(url, () => this.fetchMirror(url, true, meta))
-        return { text, mirror: custom }
+        return await singleFlight(logicalKey, async () => {
+          const errors: string[] = []
+          for (const ep of orderBangumiEndpoints(getSettings().bangumiCustomApi)) {
+            /*
+             * V1.5.1：**404 端点临时隔离**。
+             *
+             * 真机现场：用户新部署的 Worker A 对**所有路径**都返回 404（`Not Found` 9 字节，
+             * curl `/calendar`、`/v0/subjects`、`/v0/subjects/390200` 全 404），
+             * 而 Worker B 正常。此时每个请求仍会先打 A、拿 404、再切 B ——
+             * 白白多一次往返，季度检索（3 个月 × 多次）就被这些往返拖到 60 秒以上。
+             * 404 是**确定性错误**（不是抖动），10 分钟内不再尝试它是安全的；
+             * 用户改好 Worker 后最多等 10 分钟自动恢复，或重启应用立即恢复。
+             */
+            const until = endpointQuarantine.get(ep.baseUrl) ?? 0
+            if (until > Date.now()) continue
+            const path = this.calendarPathFor(ep.baseUrl, paths)
+            const url = `${ep.baseUrl}${path}`
+            try {
+              const text = await this.fetchMirror(url, true, meta)
+              return { text, mirror: ep.baseUrl }
+            } catch (err) {
+              const reason = describeRequestError(err)
+              errors.push(`${ep.label}: ${reason}`)
+              if (/HTTP 404|status code 404/i.test(reason)) {
+                endpointQuarantine.set(ep.baseUrl, Date.now() + 10 * 60 * 1000)
+                log.append('warn', 'bangumi', `${ep.label} 返回 404（端点配置异常），已隔离 10 分钟不再尝试`)
+              }
+              log.append(
+                'warn',
+                'bangumi',
+                `${ep.label} 请求失败（${reason.slice(0, 80)}），按负载策略尝试下一个端点: ${meta.tag ?? safePathLabel(url)}`
+              )
+            }
+          }
+          throw makeSourceError(
+            'ALL_DOWN',
+            `所有自建反代端点均不可用（${errors.map((item) => item.split(':')[0]).join(' / ')}）。请稍后重试，或到「设置 → 数据源配置」检查 API 地址`,
+            errors
+          )
+        })
       } catch (err) {
-        const e = err as { code?: string; message?: string }
-        const reason = e?.code === 'ECONNABORTED' ? '超时' : (e?.message ?? String(err))
+        if (err && typeof err === 'object' && 'kind' in err) throw err
+        const reason = describeRequestError(err)
         log.append('error', 'bangumi', `自建反代不可用: ${reason}`)
         throw makeSourceError(
           'ALL_DOWN',
-          `自建反代不可用（${reason}）。请到「设置 → 数据源配置」检查反代地址，或手动切换到其它镜像站`,
-          [`${custom}: ${reason}`]
+          `自建反代不可用（${reason}）。请到「设置 → 数据源配置」检查 API 地址，或稍后重试`,
+          [`自定义反代: ${reason}`]
         )
       }
     }
-    const attempts = this.mirrors().map(async (mirror) => {
+    /*
+     * 兜底：只有内置端点常量损坏（正常构建不会发生）才会走到这里。
+     * 保留原来的公共镜像竞速，避免"一个常量坏了整个番剧模块不可用"。
+     */
+    const mirrors = this.mirrors()
+    if (mirrors.length === 0) {
+      throw makeSourceError('ALL_DOWN', '没有可用的 bangumi 数据源（内置端点与公共镜像均为空）', [])
+    }
+    const attempts = mirrors.map(async (mirror, index) => {
       let url: string
       let isApi = false
       try {
@@ -825,9 +1058,8 @@ class BangumiService {
       try {
         return { text: await this.fetchMirror(url, isApi, meta), mirror }
       } catch (err) {
-        const e = err as { code?: string; message?: string }
-        const reason = e?.code === 'ECONNABORTED' ? '超时' : (e?.message ?? String(err))
-        throw new Error(`${mirror}: ${reason}`)
+        // 错误只用序号标识镜像，不把地址拼进去（SourceError 最终会显示到界面）
+        throw new Error(`镜像站 ${index + 1}: ${describeRequestError(err)}`)
       }
     })
     /*
@@ -1200,7 +1432,18 @@ class BangumiService {
     })()
   }
 
-  async calendar(force = false): Promise<CalendarResult> {
+  /**
+   * 取番剧表。
+   *
+   * V1.2.3（用户要求）：**只在"打开番剧表"和"主动点刷新"时才联网**，其余调用一律吃缓存。
+   *
+   * 为什么要加 `allowRefresh`：原来只要缓存存在且本会话还没刷过，任何一次 `calendar()`
+   * （包括首页推荐、收藏页等并不需要最新番剧表的地方）都会在后台打一次 `/calendar` ——
+   * 实测这个请求在这台机器上要 **38 秒**，而它是反代上最贵的查询之一。
+   * 用户在搜索变慢时给出的判断就是"又在实时加载番剧表，占流量"。
+   * 现在默认**不刷新**（`allowRefresh` 缺省 false），只有番剧表页挂载与手动刷新会传 true。
+   */
+  async calendar(force = false, opts: { allowRefresh?: boolean } = {}): Promise<CalendarResult> {
     const readT0 = performance.now()
     const cache = this.readCache<CalendarDay[]>('calendar')
     const readMs = performance.now() - readT0
@@ -1221,14 +1464,32 @@ class BangumiService {
      * 手动刷新（force）仍然前台等网络 —— 用户点了「刷新」就是要看到新数据/失败提示。
      */
     if (!force && cache) {
-      const refreshing = !this.calendarSessionFresh
+      const refreshing = !this.calendarSessionFresh && opts.allowRefresh === true
       if (refreshing) this.refreshCalendarInBackground()
+      // V1.4：命中缓存也顺手预热首屏封面（多数时候缓存里已有图，这一步几乎零成本）
+      void prefetchCovers(cache.data)
       return { fromCache: true, refreshing, fetchedAt: cache.fetchedAt, days: cache.data }
+    }
+    /*
+     * V1.5：**手动刷新也走"先给缓存、后台更新"**。
+     *
+     * 真机实测：`/calendar` 即使 Worker 加了 KV，冷启动仍要 24~90 秒（上游要聚合 7 天）；
+     * 而客户端在这段时间里一直转圈，用户以为卡死。番剧表本来就有 30 分钟缓存，
+     * "先看到旧的、几秒后自动变成新的"远好于"干等一分半"。
+     * 新数据到了会通过 `emitCalendar` 推给界面（番剧表页已订阅），用户无需再点一次。
+     */
+    if (force && cache && opts.allowRefresh !== false) {
+      log.append('info', 'bangumi', '手动刷新：先返回缓存，后台更新完成后自动推送')
+      this.refreshCalendarInBackground()
+      void prefetchCovers(cache.data)
+      return { fromCache: true, refreshing: true, fetchedAt: cache.fetchedAt, days: cache.data }
     }
     try {
       const days = await this.fetchCalendarFromSource()
       this.writeCache('calendar', days)
       this.calendarSessionFresh = true
+      // V1.4：数据一到就开始预热首屏封面，等渲染层要图时多数已命中磁盘缓存
+      void prefetchCovers(days)
       return { fromCache: false, fetchedAt: Date.now(), days }
     } catch (err) {
       const error: SourceError =
@@ -1268,7 +1529,7 @@ class BangumiService {
    * 月份与季度的对应关系（1–3 月 冬 / 4–6 月 春 / 7–9 月 夏 / 10–12 月 秋）统一放在
    * `@shared/season` 里，主进程与渲染层共用，避免「文案说春季、实际查的是 1 月」。
    *
-   * 实测反代（sankana-bangumi.de5.net/api）：
+   * 实测自建反代：
    * - `?type=2&year=2026&month=4&sort=rank&limit=100` → 200，`total=75`，一页取全（4.4s，首次）
    * - 只给 `month` 不给 `year` → `total=3062`（历年所有 4 月番），所以 year 必传
    * - 返回体是 `{data, total, limit, offset}`，条目里放送日期字段是 `date`
@@ -1359,7 +1620,7 @@ class BangumiService {
   /**
    * 拉取一个季度的三个月份并合并去重（v1.1.4 改为返回「是否完整」）。
    *
-   * 三个月并行发（全局 S 级队列把并发上限放到 4，正好让三个月同时飞，
+   * 三个月并行发（全局并发上限 8，正好让三个月同时飞，
    * 不必再像旧实现那样排成两批）；**只要有一个月成功就返回该月的数据** ——
    * 某个月偶发 5xx 时用户看到的是「少了几条、但列表照常可用」，而不是整块不可用。
    * `complete = false` 时**不写整季缓存**（见 season() 的说明），月份级缓存各自已经写好。
@@ -1493,6 +1754,12 @@ class BangumiService {
   ): Promise<SeasonItem[]> {
     const path = `/v0/subjects?type=2&year=${year}&month=${month}&sort=${sort}&limit=${SEASON_PAGE_LIMIT}`
     /*
+     * 季度检索曾经被显式提到 S 级，原因是它排在 B 队列时会被后台评分请求挤到超时。
+     * 现在 S/A/B 已整体取消（所有请求同一条 FIFO，只受全局并发 8 限制），
+     * 这里不再需要"强行提级"；`priority` 参数保留只是为了不改调用方签名。
+     */
+
+    /*
      * 三个路径都给同一个地址：季度检索只有 v0 JSON 接口有（官方网页版的 /anime/browser
      * 是另一套 HTML，解析成本高且公共镜像已基本不可达）。
      * 配了自建反代时 requestBest 只会用反代；若用户把数据源切回纯网页镜像，
@@ -1504,7 +1771,7 @@ class BangumiService {
       { priority, tag: '/v0/subjects(季度)' }
     )
     if (!isApiMirror(mirror)) {
-      throw makeSourceError('PARSE', '当前数据源不支持季度接口（需要用 API 型数据源，如自建反代）', [mirror])
+      throw makeSourceError('PARSE', '当前数据源不支持季度接口（需要用 API 型数据源，如自建反代）', [endpointLabelOf(mirror)])
     }
     const parsed = JSON.parse(text) as { data?: Record<string, unknown>[] }
     const list = Array.isArray(parsed?.data) ? parsed.data : []
@@ -1812,8 +2079,12 @@ class BangumiService {
         const id = missing[i++]
         await new Promise((r) => setTimeout(r, 120))
         try {
-          // 批量补评分属于「后台补齐」：B 级，绝不能和番剧表/详情抢 S 级的槽
-          const data = await this.fetchRating(id, 'B')
+          /*
+           * 这里保留 2 并发 + 120ms 间隔，**不是分级**：分级已取消，所有请求同等排队。
+           * 这个限制是反代侧的自我保护 —— 一次几十上百个评分请求会把个人 Worker 打成 503，
+           * 而评分只是后台补齐，没必要占满全局并发额度。
+           */
+          const data = await this.fetchRating(id)
           this.writeCache(`rating-${id}`, data)
           out[id] = data
         } catch {
@@ -1881,36 +2152,46 @@ class BangumiService {
   }
 
   async testMirrors(): Promise<MirrorTestResult[]> {
+    /*
+     * 测试连接要覆盖**真实会用的端点**：内置双反代排前面，公共镜像排后面。
+     * 返回给渲染层的 `url` 字段故意只放安全标签（`内置反代 api-1` / `镜像站 1`），
+     * 不放真实地址 —— 设置页会把结果直接显示出来，红线要求地址不能出现在界面。
+     */
+    const endpoints = resolveBangumiEndpoints(getSettings().bangumiCustomApi)
+    const targets: { label: string; base: string; isApi: boolean }[] = endpoints.map((ep) => ({
+      label: ep.id.startsWith('custom-') ? ep.label : `内置反代 ${ep.label}`,
+      base: ep.baseUrl,
+      isApi: true
+    }))
+    this.mirrors().forEach((mirror, index) => {
+      targets.push({ label: `镜像站 ${index + 1}`, base: mirror, isApi: isApiMirror(mirror) })
+    })
     return await Promise.all(
-      this.mirrors().map(async (mirror): Promise<MirrorTestResult> => {
+      targets.map(async (target): Promise<MirrorTestResult> => {
         const start = Date.now()
-        let url: string
-        let isApi = false
-        try {
-          const u = new URL(mirror)
-          isApi = isApiHost(u.hostname) || isCustomApiBase(mirror)
-          /*
-           * v0.2.7 修：自建反代的日历在 `/calendar`（`/v0/calendar` 是 404）。
-           * 过去这里对 API 型地址一律拼 `/v0/calendar`，于是「测试连接」把
-           * 明明能用的自建反代报成失败。改走与真实取数一致的 calendarPathFor。
-           */
-          url = isApi
-            ? `${mirror}${this.calendarPathFor(mirror, { api: '/v0/calendar', web: '/calendar', customApi: '/calendar' })}`
-            : `${mirror}/calendar`
-        } catch {
-          url = `${mirror}/calendar`
-        }
+        /*
+         * 自建反代的日历在 `/calendar`（`/v0/calendar` 是 404）；公共 API 镜像走 `/v0/calendar`，
+         * 网页镜像走 `/calendar`。与真实取数共用 calendarPathFor，避免测试与实际两套口径。
+         */
+        const path = target.isApi
+          ? this.calendarPathFor(target.base, { api: '/v0/calendar', web: '/calendar', customApi: '/calendar' })
+          : '/calendar'
+        const url = `${target.base}${path}`
         try {
           /*
            * 走与真实取数完全相同的路径（含「被机器人校验时改用离屏浏览器」），
            * 否则 bangumi.vip 这类站点在测试里会被判失败 —— 明明应用能正常用它。
            */
-          const text = await this.fetchMirror(url, isApi)
-          const ok = isApi ? text.trim().startsWith('[') : text.includes('coverList')
-          return { url: mirror, ok, ms: Date.now() - start, error: ok ? undefined : '响应格式不符（可能需要校验或该地址不是番组计划镜像）' }
+          const text = await this.fetchMirror(url, target.isApi)
+          const ok = target.isApi ? text.trim().startsWith('[') : text.includes('coverList')
+          return {
+            url: target.label,
+            ok,
+            ms: Date.now() - start,
+            error: ok ? undefined : '响应格式不符（可能需要校验或该地址不是番组计划镜像）'
+          }
         } catch (err) {
-          const e = err as { message?: string }
-          return { url: mirror, ok: false, ms: Date.now() - start, error: e?.message ?? String(err) }
+          return { url: target.label, ok: false, ms: Date.now() - start, error: describeRequestError(err) }
         }
       })
     )
@@ -1938,7 +2219,12 @@ class BangumiService {
       const text = await this.fetchMirror(
         `${mirror}/subject_search/${encodeURIComponent(kw)}?cat=2`,
         false,
-        { priority: 'B', tag: '搜索(网页)' }
+        /*
+         * 搜索曾经从 B 提到 S，因为排队会让"敲下回车"变成超时失败。
+         * 现在分级已整体取消：搜索与其他请求同一条 FIFO，只受全局并发 8 限制，
+         * 不再需要"提级"这个动作；`priority` 参数仅为兼容保留。
+         */
+        { priority: 'S', tag: '搜索(网页)' }
       )
       return parseSearchPage(text)
     }
@@ -1946,52 +2232,70 @@ class BangumiService {
     /**
      * 一个数据源上的完整尝试链：v0 → 老接口，每个接口再按关键词变体各试一次。
      * 只有「全部接口都抛错」才算失败；「接口通了但没结果」返回空数组（由上层继续试别的源）。
+     *
+     * 日志里只写 `api-1` / `api-2` 这类**安全标签**，不写 base 地址（红线）。
      */
     const viaBase = async (base: string, isApi: boolean, kw: string): Promise<SearchResultItem[]> => {
+      const label = isBuiltInBangumiApi(base) ? endpointLabelOf(base) : '镜像站'
       if (!isApi) return await viaMirror(base, kw)
       let firstError: unknown = null
       for (const variant of searchKeywordVariants(kw)) {
         try {
           const items = await this.searchViaV0(base, variant)
           if (items.length > 0) {
-            log.append('info', 'bangumi', `搜索命中：v0「${variant}」→ ${items.length} 条（${base}）`)
+            log.append('info', 'bangumi', `搜索命中：v0「${variant}」→ ${items.length} 条（${label}）`)
             return items
           }
         } catch (err) {
           firstError = firstError ?? err
-          log.append('warn', 'bangumi', `v0 搜索失败「${variant}」（${base}）：${String((err as Error)?.message ?? err)}`)
+          log.append('warn', 'bangumi', `v0 搜索失败「${variant}」（${label}）：${describeRequestError(err)}`)
         }
         try {
           const items = await this.searchViaLegacy(base, variant)
           if (items.length > 0) {
-            log.append('info', 'bangumi', `搜索命中：老接口「${variant}」→ ${items.length} 条（${base}）`)
+            log.append('info', 'bangumi', `搜索命中：老接口「${variant}」→ ${items.length} 条（${label}）`)
             return items
           }
         } catch (err) {
           firstError = firstError ?? err
-          log.append('warn', 'bangumi', `老接口搜索失败「${variant}」（${base}）：${String((err as Error)?.message ?? err)}`)
+          log.append('warn', 'bangumi', `老接口搜索失败「${variant}」（${label}）：${describeRequestError(err)}`)
         }
       }
       if (firstError) throw firstError
       return []
     }
 
-    // 与 requestBest 一致：配了自建反代就只用它，失败直接提示用户手动切换镜像（不再自动回退）
-    const custom = (getSettings().bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
-    if (custom) {
-      try {
-        return await viaBase(custom, true, keyword)
-      } catch (err) {
-        const reason = String((err as Error)?.message ?? err)
-        log.append('error', 'bangumi', `自建反代搜索失败: ${reason}`)
-        throw makeSourceError(
-          'ALL_DOWN',
-          `自建反代搜索不可用（${reason}）。请到「设置 → 数据源配置」检查反代地址，或手动切换到其它镜像站`,
-          [`${custom}: ${reason}`]
-        )
+    /*
+     * 与 requestBest 同一套端点池与调度：按在途数排序，失败自动切另一个。
+     * 搜索是用户敲下回车就在等的交互，单端点失败时直接换边，不把错误立刻抛给界面。
+     */
+    const endpoints = resolveBangumiEndpoints(getSettings().bangumiCustomApi)
+    if (endpoints.length > 0) {
+      const errors: string[] = []
+      for (const ep of orderBangumiEndpoints(getSettings().bangumiCustomApi)) {
+        try {
+          const items = await viaBase(ep.baseUrl, true, keyword)
+          // 接口通了但确实没结果：这是真实结果，不再拿同一关键词去另一套反代重复问一遍
+          return items
+        } catch (err) {
+          const reason = describeRequestError(err)
+          errors.push(`${ep.label}: ${reason}`)
+          log.append('warn', 'bangumi', `自建反代搜索失败（${ep.label}）：${reason.slice(0, 80)}，尝试下一个端点`)
+        }
       }
+      const summary = errors.map((item) => item.split(':')[0]).join(' / ')
+      log.append('error', 'bangumi', `所有自建反代端点搜索均失败: ${summary}`)
+      throw makeSourceError(
+        'ALL_DOWN',
+        `自建反代搜索不可用（${summary}）。请稍后重试，或到「设置 → 数据源配置」检查 API 地址`,
+        errors
+      )
     }
-    const attempts = this.mirrors().map(async (mirror) => await viaBase(mirror, isApiMirror(mirror), keyword))
+    const mirrors = this.mirrors()
+    if (mirrors.length === 0) {
+      throw makeSourceError('ALL_DOWN', '没有可用的 bangumi 数据源搜索端点', [])
+    }
+    const attempts = mirrors.map(async (mirror) => await viaBase(mirror, isApiMirror(mirror), keyword))
     return await new Promise<SearchResultItem[]>((resolve, reject) => {
       let pending = attempts.length
       const errors: string[] = []
@@ -2009,16 +2313,23 @@ class BangumiService {
 
   /** v0 搜索：POST + JSON body（带 type=2 过滤，免得把游戏/书籍也搜出来） */
   private async searchViaV0(base: string, keyword: string): Promise<SearchResultItem[]> {
-    const done = beginNetTrace('B', '搜索(v0)')
+    const url = `${base}/v0/search/subjects?limit=24&responseGroup=small`
+    const done = beginNetTrace('A', '搜索(v0)')
+    const release = beginEndpointRequest(url)
     let res
     try {
       res = await axios.post(
-        `${base}/v0/search/subjects?limit=24&responseGroup=small`,
+        url,
         { keyword, filter: { type: [2] } },
         {
           timeout: REQUEST_TIMEOUT,
-          headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json', Accept: 'application/json' },
-          netPriority: 'B',
+          headers: {
+            'User-Agent': BROWSER_UA,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            ...authHeadersFor(url)
+          },
+          // netTag 仅用于日志；netPriority 已废弃，不再传
           netTag: '搜索(v0)',
           ...buildProxyAgents(getSettings().proxy)
         }
@@ -2027,8 +2338,10 @@ class BangumiService {
     } catch (err) {
       done('error')
       throw err
+    } finally {
+      release()
     }
-    if (res.status !== 200) throw new Error(`${base}: HTTP ${res.status}`)
+    if (res.status !== 200) throw new Error(`HTTP ${res.status}`)
     const list = (res.data as { data?: Record<string, unknown>[] })?.data ?? []
     return list.map((raw) => this.normalizeItem(raw))
   }
@@ -2041,25 +2354,26 @@ class BangumiService {
    * 交给 `rewriteImageUrl` 在取图时改写到自建图片反代即可（`media.ts` 已统一处理）。
    */
   private async searchViaLegacy(base: string, keyword: string): Promise<SearchResultItem[]> {
-    const done = beginNetTrace('B', '搜索(老接口)')
+    const url = `${base}/search/subject/${encodeURIComponent(keyword)}?type=2&responseGroup=large`
+    const done = beginNetTrace('A', '搜索(老接口)')
+    const release = beginEndpointRequest(url)
     let res
     try {
-      res = await axios.get(
-        `${base}/search/subject/${encodeURIComponent(keyword)}?type=2&responseGroup=large`,
-        {
-          timeout: REQUEST_TIMEOUT,
-          headers: { 'User-Agent': BROWSER_UA, Accept: 'application/json' },
-          netPriority: 'B',
-          netTag: '搜索(老接口)',
-          ...buildProxyAgents(getSettings().proxy)
-        }
-      )
+      res = await axios.get(url, {
+        timeout: REQUEST_TIMEOUT,
+        headers: { 'User-Agent': BROWSER_UA, Accept: 'application/json', ...authHeadersFor(url) },
+        // netTag 仅用于日志；netPriority 已废弃，不再传
+        netTag: '搜索(老接口)',
+        ...buildProxyAgents(getSettings().proxy)
+      })
       done(res.status, JSON.stringify(res.data ?? null).length)
     } catch (err) {
       done('error')
       throw err
+    } finally {
+      release()
     }
-    if (res.status !== 200) throw new Error(`${base}: HTTP ${res.status}`)
+    if (res.status !== 200) throw new Error(`HTTP ${res.status}`)
     const body = res.data as { list?: Record<string, unknown>[] } | Record<string, unknown>[]
     const list = Array.isArray(body) ? body : (body?.list ?? [])
     return list
@@ -2188,7 +2502,7 @@ class BangumiService {
         },
         { priority: 'S', tag: `/v0/subjects/${id}/characters` }
       )
-      if (!isApiMirror(mirror)) throw new Error(`${mirror}: 网页镜像不提供 v0 角色接口`)
+      if (!isApiMirror(mirror)) throw new Error(`${endpointLabelOf(mirror)}: 网页镜像不提供 v0 角色接口`)
       const items = this.normalizeCharactersV0(JSON.parse(text) as unknown)
       if (items.length > 0) return { items, source: 'v0' }
       firstError = new Error('v0 角色接口返回为空')
@@ -2216,19 +2530,34 @@ class BangumiService {
   /**
    * 老接口角色兜底：`GET {base}/subject/{id}?responseGroup=large` 的 `crt` 数组。
    *
-   * 竞速/兜底写法复用 `requestBest` 的策略：
-   * - 配了自建反代就**只用反代**（失败把错误抛给界面，由用户去「设置 → 数据源配置」切换，
-   *   不在用户不知情的情况下偷偷换源）；
-   * - 没配反代时所有 API 型镜像并行发，第一个成功就立刻返回，不等其余。
+   * 写法与 `requestBest` 一致：内置双端点按在途数排序，失败自动切另一个；
+   * 没配端点（只可能是常量损坏）才退回公共 API 镜像竞速。
    * 只对 API 型数据源发起：网页镜像的同一个地址返回的是 HTML 页面，里面没有结构化角色列表。
    */
   private async charactersLegacy(id: number): Promise<CharacterItem[]> {
-    const custom = (getSettings().bangumiCustomApi ?? '').trim().replace(/\/+$/, '')
-    const bases = (custom ? [custom] : this.mirrors()).filter((m) => isApiMirror(m))
+    const endpoints = resolveBangumiEndpoints(getSettings().bangumiCustomApi)
+    if (endpoints.length > 0) {
+      const errors: string[] = []
+      for (const ep of orderBangumiEndpoints(getSettings().bangumiCustomApi)) {
+        const url = `${ep.baseUrl}/subject/${id}?responseGroup=large`
+        try {
+          const text = await this.fetchMirror(url, true)
+          const items = this.normalizeCharactersLegacy(JSON.parse(text) as unknown)
+          if (items.length === 0) throw new Error('响应里没有 crt 角色数组')
+          return items
+        } catch (err) {
+          const reason = describeRequestError(err)
+          errors.push(`${ep.label}: ${reason}`)
+          log.append('warn', 'bangumi', `老接口角色失败（${ep.label}）：${reason.slice(0, 80)}，尝试下一个端点`)
+        }
+      }
+      throw makeSourceError('ALL_DOWN', '所有自建反代端点都没有取到角色列表', errors)
+    }
+    const bases = this.mirrors().filter((m) => isApiMirror(m))
     if (bases.length === 0) {
       throw makeSourceError('PARSE', '当前数据源不支持角色接口（需要用 API 型数据源，如自建反代）', [])
     }
-    const attempts = bases.map(async (base): Promise<CharacterItem[]> => {
+    const attempts = bases.map(async (base, index): Promise<CharacterItem[]> => {
       const url = `${base}/subject/${id}?responseGroup=large`
       try {
         const text = await this.fetchMirror(url, true)
@@ -2236,7 +2565,7 @@ class BangumiService {
         if (items.length === 0) throw new Error('响应里没有 crt 角色数组')
         return items
       } catch (err) {
-        throw new Error(`${base}: ${String((err as Error)?.message ?? err)}`)
+        throw new Error(`镜像站 ${index + 1}: ${describeRequestError(err)}`)
       }
     })
     return await new Promise<CharacterItem[]>((resolve, reject) => {

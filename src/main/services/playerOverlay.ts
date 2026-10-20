@@ -101,6 +101,11 @@ import { log } from '../log'
 
 let overlayWin: BrowserWindow | null = null
 /**
+ * 重同步日志的节流表（V1.4）：key → 上次记录时间。
+ * 只用来压掉"同一状态反复刷"的噪声，状态真的变化时仍然照常记（键里带了状态）。
+ */
+const overlayLogMarks = new Map<string, number>()
+/**
  * 弹幕窗口（v0.3.9 第三轮）。
  *
  * 为什么要把弹幕单独拆一个窗口：UI 窗口用 `setShape` 限定可点区域，而 `setShape` 同时**裁剪绘制** ——
@@ -386,7 +391,18 @@ function createOverlayWindow(owner: BrowserWindow, kind: OverlayKind): BrowserWi
      * （见 applyRegions）—— 没有形状的"整窗接收鼠标"窗口会把画面上的点击全吃掉。
      * 弹幕窗口直接显示（它永久穿透，显示出来也不吃鼠标）。
      */
-    if (kind === 'danmaku') win.showInactive()
+    if (kind === 'danmaku') {
+      /*
+       * v1.2.1：显示**之前再确认一次穿透**。
+       *
+       * 为什么不能只信构造时那一次 setIgnoreMouseEvents：弹幕窗口铺满整个播放器窗口、
+       * 又位于 mpv 的原生子窗口之上 —— 它一旦不是穿透态，视频区域上的**所有**鼠标事件
+       * （包括 uosc 控制栏的按钮）都会被它吃掉，现象与「按钮全部失灵」一模一样，却极难定位。
+       * 这里幂等重申一次，代价是一次系统调用，换掉一整类静默故障。
+       */
+      win.setIgnoreMouseEvents(true, { forward: true })
+      win.showInactive()
+    }
     raiseAboveOwner()
   })
   return win
@@ -440,7 +456,27 @@ export function showOverlay(owner: BrowserWindow): number {
    * 够用且永远不会「抢占最前面的位置」；理由详见文件头注释。
    */
   raiseAboveOwner()
-  log.append('info', 'overlay', `悬浮窗已创建（第 ${myGen} 代，UI 形状模式=${shapeSupported() ? '开' : '关'}，不置顶）`)
+  /*
+   * v1.2.1：把两块悬浮窗与主窗口的 HWND 一起写进日志。
+   *
+   * 为什么值得占一行：真机排查「点击到底落在谁身上」用的是 WindowFromPoint ——
+   * 它返回的类名/句柄必须能和我们对上号（主窗口 / 弹幕窗 / UI 窗 / mpv 子窗口）。
+   * 没有这行，现场只能靠猜；有了它，一条命中结果就能直接归因。
+   */
+  const hwndHex = (w: BrowserWindow | null): string => {
+    try {
+      if (!w || w.isDestroyed()) return '0x0'
+      return `0x${w.getNativeWindowHandle().readUInt32LE(0).toString(16)}`
+    } catch {
+      return 'n/a'
+    }
+  }
+  log.append(
+    'info',
+    'overlay',
+    `悬浮窗已创建（第 ${myGen} 代，UI 形状模式=${shapeSupported() ? '开' : '关'}，不置顶；` +
+      `主窗口=${hwndHex(owner)} 弹幕窗=${hwndHex(danmakuWin)} UI窗=${hwndHex(overlayWin)}）`
+  )
   logOverlayOwner('control bar owner')
   return myGen
 }
@@ -811,7 +847,31 @@ export function resyncOverlay(reason: string): void {
   const canShow = mayShowOverlay()
   const minimized = !!ownerWin && !ownerWin.isDestroyed() && ownerWin.isMinimized()
   syncBounds()
-  if (danmakuWin && !danmakuWin.isDestroyed() && !minimized && canShow) danmakuWin.showInactive()
+  /*
+   * 日志节流（V1.4）：同一类状态在短时间内重复出现时只记一条。
+   *
+   * 真机日志里这两行能刷满整屏 —— 主窗口焦点每变化一次就重同步一次，而 uosc 接管模式下
+   * 结果永远是"按设计隐藏、区域 0 块"：
+   *   [overlay] 悬浮窗重同步（再次进入播放页 / 悬浮窗已存在）：…
+   *   [overlay] 悬浮窗已重同步（…）：可见=false 区域=0 块 退化=false
+   * 对排障没有任何新信息，却把真正有用的行（规则/播放/错误）挤掉了。
+   * 现在同样的 (reason, 可见, 区域数) 组合 30 秒内只记一次；状态真变了立刻记。
+   */
+  const logOnce = (msg: string, key: string): void => {
+    const now = Date.now()
+    const last = overlayLogMarks.get(key)
+    if (last && now - last < 30_000) return
+    overlayLogMarks.set(key, now)
+    log.append('info', 'overlay', msg)
+  }
+  if (danmakuWin && !danmakuWin.isDestroyed() && !minimized && canShow) {
+    /*
+     * v1.2.1：每次重新显示都重申穿透（理由见 createOverlayWindow 的 ready-to-show）。
+     * 弹幕窗口在 z 序上高于主窗口与 mpv 子窗口，穿透态一旦丢失，uosc 的点击就全没了。
+     */
+    danmakuWin.setIgnoreMouseEvents(true, { forward: true })
+    danmakuWin.showInactive()
+  }
   if (canShow) {
     /*
      * 先按"当前已知区域"重下发一次（立刻可用的那份），再异步拉一次最新的。
@@ -820,7 +880,7 @@ export function resyncOverlay(reason: string): void {
      * 只让下面的 refreshRegions 去按最新区域重新判定一次。
      */
     if (hiddenByDesign && appliedRegions.length === 0) {
-      log.append('info', 'overlay', `悬浮窗重同步（${reason}）：当前是"按设计隐藏"（uosc 接管控制栏），只刷新区域`)
+      logOnce(`悬浮窗重同步（${reason}）：按设计隐藏（uosc 接管控制栏），只刷新区域（同状态 30s 内不重复）`, 'resync-hidden')
     } else {
       const known = appliedRegions.length > 0 ? appliedRegions : lastNonEmptyRegions
       if (known.length > 0) applyRegions(known, { allowHide: false })
@@ -831,7 +891,14 @@ export function resyncOverlay(reason: string): void {
   applyInteractive()
   void refreshRegions(true)
   pokeHitCheck()
-  log.append('info', 'overlay', `悬浮窗已重同步（${reason}）：可见=${win.isVisible()} 区域=${appliedRegions.length} 块 退化=${regionsDegraded}`)
+  /*
+   * 第二行日志同样节流：键里带"可见/区域数/是否退化"，**状态真的变了立刻记**，
+   * 只是重复刷同样的状态才压掉。这样排障时不会丢关键变化。
+   */
+  logOnce(
+    `悬浮窗已重同步（${reason}）：可见=${win.isVisible()} 区域=${appliedRegions.length} 块 退化=${regionsDegraded}`,
+    `resync-done|${win.isVisible()}|${appliedRegions.length}|${regionsDegraded}`
+  )
 }
 
 /**

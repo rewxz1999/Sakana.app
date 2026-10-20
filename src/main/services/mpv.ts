@@ -1,5 +1,7 @@
 import { app, BrowserWindow, screen } from 'electron'
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, cpSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, cpSync, watchFile, unwatchFile } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import type { Stats } from 'node:fs'
 import { join } from 'node:path'
 import { CH } from '@shared/channels'
 import type { OverlayAction } from '@shared/api'
@@ -9,9 +11,12 @@ import { themePalette, resolveThemeId } from '@shared/themePalette'
 import { buildUoscColorLine, renderUoscConf } from '@shared/uoscTheme'
 import { BROWSER_UA, getSettings } from '../net'
 import { danmakuApiBase } from './danmaku'
-import { beginStage, failStage, endFlow, flowDetail, flowRunning, pushStep, setMetrics, snapshot as flowSnapshot, succeedStage } from './playFlow'
+import { beginStage, failStageAndEnd, endFlow, flowDetail, flowRunning, pushStep, setMetrics, snapshot as flowSnapshot, succeedStage } from './playFlow'
+import { HANDOFF_NO_BYTES_MS, handoffSnapshot, resetHandoff, shouldSwitchCandidate, takeNextCandidate } from './playHandoff'
+import { markPlayTiming } from './playTiming'
 import { getStreamBoostStatus } from './streamBoost'
 import { noteControlAction, setOverlayPropReader } from './playerOverlay'
+import { enableWindowInput, isWindowAlive, isWindowInputEnabled, winInputStatus } from './winInput'
 import { log } from '../log'
 import { store } from '../store'
 
@@ -41,6 +46,15 @@ interface MpvState {
   eof: boolean
   volume: number
   mute: boolean
+  /**
+   * v1.5：本轮媒体**是否已经真的出过画面**（由 mpvGetState 补上，不是原生插件的字段）。
+   *
+   * 原生插件的 `state()` 不读 `width`，而"有没有画面"必须由 `videoWidth()` 这**一个来源**
+   * 统一判定（见 mpvHasPicture 的说明）。所以这个字段在 mpvGetState 里合并进来，
+   * 渲染层调 `player.getState()` 拿到的就是与弹幕/控制栏门控完全一致的读数，
+   * 不会出现"状态里说在播、画面上什么都没有"两套说法。
+   */
+  hasPicture?: boolean
   /**
    * v1.1.4：uosc 桥接脚本的现场读数（版本/按钮清单/set-button 次数）。
    * 挂在 `mpvGetState()` 上而不是另开 API：自检与排障拿到的永远是与播放状态同一刻的快照，
@@ -172,6 +186,180 @@ function startRaiseWatch(win: BrowserWindow): void {
   raiseTimer = setInterval(raiseSurface, 400)
 }
 
+/* ─────────────── mpv 画面窗口的鼠标输入（v1.2.1 的致命回归修复） ─────────────── */
+
+/**
+ * mpv 用 `--wid` 嵌入时创建的 VO 子窗口的类名（见 mpv 源码 `video/out/w32_common.c`）。
+ * 它是我们交给 mpv 的那个 `Static` 容器的子窗口；真实画面与 uosc 的 OSD 都画在它里面。
+ */
+const MPV_VO_WINDOW_CLASS = 'mpv'
+
+/** mpv 的 VO 子窗口 HWND（0 = 还没创建/还没找到） */
+let inputHwnd = 0
+/** 这个 HWND 是否已经确认「可接收鼠标」（false 时每秒重试一次） */
+let inputHwndEnabled = false
+/** 上一次检查的时刻（内部节流；已启用后 5 秒复核一次，防窗口被重建） */
+let inputCheckAt = 0
+/** 上一次失败原因（同一条原因只写一次日志，避免 250ms 刷屏） */
+let inputLastFailure = ''
+
+/**
+ * 从窗口树里找 mpv 的 VO 子窗口 HWND。
+ *
+ * 为什么复用 `native.windows()` 而不是再绑一个 `FindWindowExW`：
+ * 这个诊断接口本来就在每次起播后由自检/排障调用，返回的信息里已经带了 `hwnd` 与 `class`
+ * （见 native/mpv/src/addon.cc 的 EnumChildProc）。直接解析它，既不用扩大 koffi 的 API 白名单，
+ * 也不会多一条「两边找窗口逻辑不一致」的分叉。
+ *
+ * ⚠️ 注意这些字符串**不是合法 JSON**：addon.cc 里是手写 `snprintf` 拼的，
+ * `style`/`ex` 写成 `0x%llx`（十六进制字面量，JSON 不支持）——拿 `JSON.parse` 会整体抛错。
+ * 所以这里只用正则取 `hwnd`（十进制）与 `class` 两个字段，别改成 JSON.parse。
+ *
+ * 找不到是**正常**的：mpv 的 VO 窗口要到真正开始出画时才创建（`force-window=no`），
+ * 所以调用方必须允许「这一轮没找到、下一秒再找」。
+ */
+function findMpvVoWindowHwnd(): number {
+  const n = native
+  if (!n) return 0
+  try {
+    const dump = n.windows()
+    for (const list of [dump.childChildren, dump.parentChildren]) {
+      for (const raw of list ?? []) {
+        const cls = /"class":"([^"]*)"/.exec(raw)?.[1]
+        if (cls !== MPV_VO_WINDOW_CLASS) continue
+        const h = Number(/"hwnd":(\d+)/.exec(raw)?.[1])
+        if (Number.isFinite(h) && h > 0) return h
+      }
+    }
+  } catch {
+    /* 内核还没就绪/正在销毁：下一轮再试 */
+  }
+  return 0
+}
+
+/**
+ * 保证 mpv 的 VO 子窗口处于「可接收鼠标」状态。
+ *
+ * ═══ 为什么必须做这件事（这一轮的根因）═══
+ * mpv 在 `--wid` 嵌入模式下会**主动禁用**自己的 VO 窗口（`w32_common.c` 里
+ * `if (w32->parent) EnableWindow(w32->window, 0);`），设计上是要宿主App负责输入。
+ * 于是这个窗口带上了 `WS_DISABLED`（实测其样式为 0x58000000 = WS_CHILD|WS_VISIBLE|WS_DISABLED），
+ * 而 Windows 的命中测试**会跳过 disabled 窗口**：视频区域上的真实鼠标全部落到我们创建的
+ * 外层 `Static` 容器上（那个容器没有任何输入处理），点击就被它吞掉 ——
+ * uosc 永远等不到 mouse-pos 与 MBTN_LEFT，表现就是「控制栏画得出来、每个按钮都没反应」。
+ *
+ * 以前按钮是应用自绘的 React 控件（在 Electron 悬浮窗里），点击根本不经过 mpv，
+ * 所以这个断点一直存在却不显形；这一轮控制栏整体交给 uosc，它立刻变成致命问题。
+ *
+ * 反过来只要把窗口重新启用，Windows 就会把鼠标消息直接投递给 mpv 自己的 WndProc：
+ *   · WM_MOUSEMOVE → mouse-pos → uosc 的 hover / 附近浮现
+ *   · WM_LBUTTONDOWN/UP → MBTN_LEFT → 按钮、进度条拖动
+ *   · WM_MOUSEWHEEL → WHEEL_UP/DOWN → 音量/快进
+ *   · WM_MOUSELEAVE → hover=false → 控制栏自动隐藏
+ * 全部走 mpv 原生路径，应用不需要转发任何鼠标事件，也不会引入 IPC 延迟。
+ *
+ * ⚠️ 配套改动：`mpvAttach` 里给 mpv 加了 `window-dragging=no`。窗口一旦可命中，
+ * mpv 自带的「左键点画面拖动窗口」分支（`SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)`）也会被激活，
+ * 对嵌在 Electron 里的子窗口就是「点一下画面，视频子窗口被拖走」；关掉它之后该分支不执行，
+ * 点击照常交给 uosc / input.conf。
+ *
+ * 失败时只记日志、绝不阻断播放：最坏情况回到修复前的状态（按钮点不动），不会更糟。
+ */
+function ensureMpvInputWindow(force = false): void {
+  if (!ready || !native) return
+  const now = Date.now()
+  // 已启用：5 秒复核一次（VO 窗口可能被自愈逻辑重建）；未启用：每秒重试（等 VO 窗口出现）
+  if (!force && now - inputCheckAt < (inputHwndEnabled ? 5000 : 1000)) return
+  inputCheckAt = now
+
+  /*
+   * ═══ v1.5 需求 ④：没有画面时**不让 mpv 的画面窗口接收鼠标** ═══
+   *
+   * 这是"控制栏不能在没有画面时被呼出"这条在**主进程侧**的那一半，而且是最硬的一半：
+   * uosc 的控制栏画在 mpv 的 VO 子窗口里，它之所以会"鼠标移到边缘就出现"，
+   * 全靠 mpv 能收到 `mouse-pos`。而 mpv 用 `--wid` 嵌入时默认把这个子窗口设成 disabled
+   * （见上面那一大段说明），是**我们**在起播后把它 EnableWindow 恢复成可命中的。
+   * 所以只要在首帧出现前不恢复，Windows 的命中测试就跳过这个窗口，uosc 既收不到移动
+   * 也收不到点击 —— 用户把鼠标怼到屏幕边缘也不会冒出控制栏。
+   *
+   * 为什么用 `mpvHasPicture()` 而不是 `playing`：见 mpvHasPicture 的说明 ——
+   * playing 只代表"内核在拉流"，那时多半还是一片黑；这种状态下露出控制栏正是用户报的问题。
+   *
+   * 不碰 uosc 的任何配置/元素：这里改的是**我们自己的**「什么时候把鼠标还给 mpv」。
+   * 首帧出现时会 `inputCheckAt = 0` 立刻走一遍本函数，把窗口恢复正常（见 startTimePump），
+   * 之后的复核/自愈逻辑完全不变。
+   *
+   * 注意两点：
+   *  · 一旦启用过（同一内核实例播过一集），换集加载阶段不会**重新禁用**旧窗口 ——
+   *    koffi 只绑了 EnableWindow(TRUE)，没有反向调用，这是刻意的：
+   *    宁可多一秒可点击，也不引入新的窗口状态（失败方向是"能点"而不是"点不动"）；
+   *  · 但 mpv 每换一次媒体都会重建 VO 子窗口（见上面 findMpvVoWindowHwnd 的说明），
+   *    新窗口默认又是 disabled，而这里在首帧前不会去恢复它 ——
+   *    所以绝大多数换集场景仍然被门控。真机若看到换集加载段冒出控制栏，说明这版 mpv
+   *    复用了同一个 VO 窗口，届时需要补一个"禁用窗口"的绑定（不能只靠 enable）。
+   */
+  if (!lastHadPicture) {
+    return
+  }
+
+  if (inputHwnd > 0 && !isWindowAlive(inputHwnd)) {
+    // 视频子窗口被重建：旧句柄作废，重新找（新窗口默认又是 disabled）
+    inputHwnd = 0
+    inputHwndEnabled = false
+  }
+  if (inputHwnd === 0) inputHwnd = findMpvVoWindowHwnd()
+  if (inputHwnd === 0) return
+
+  if (isWindowInputEnabled(inputHwnd)) {
+    if (!inputHwndEnabled) {
+      inputHwndEnabled = true
+      inputLastFailure = ''
+      log.append('info', 'mpv', `mpv 画面窗口已可接收鼠标（hwnd=0x${inputHwnd.toString(16)}）`)
+    }
+    return
+  }
+
+  const r = enableWindowInput(inputHwnd)
+  if (r.enabled) {
+    inputHwndEnabled = true
+    inputLastFailure = ''
+    log.append(
+      'info',
+      'mpv',
+      `已启用 mpv 画面窗口的鼠标输入（hwnd=0x${inputHwnd.toString(16)}）：` +
+        'uosc 的底部栏/角标按钮、进度条拖动与滚轮都依赖它；不启用时点击会落到外层 Static 容器被吞掉'
+    )
+    return
+  }
+
+  inputHwndEnabled = false
+  if (r.reason !== inputLastFailure) {
+    inputLastFailure = r.reason
+    log.append('warn', 'mpv', `启用 mpv 画面窗口鼠标输入失败：${r.reason}（uosc 按钮会点不动）`)
+  }
+}
+
+/**
+ * 诊断/自检：mpv 画面窗口的输入状态（验证「uosc 能收到鼠标」的硬证据之一）。
+ *
+ * `enabled=true` 只说明窗口可命中；最终仍要以真实点击是否让 uosc 响应为准
+ * （用户真机验证步骤见本次修复的报告）。
+ */
+export function mpvInputWindowState(): {
+  hwnd: number
+  hwndHex: string
+  enabled: boolean
+  backend: { available: boolean; reason: string }
+} {
+  return {
+    hwnd: inputHwnd,
+    hwndHex: inputHwnd > 0 ? `0x${inputHwnd.toString(16)}` : '',
+    enabled: inputHwndEnabled,
+    backend: winInputStatus()
+  }
+}
+
+
 /**
  * 光标监听：与 libVLC 同理，画面渲染在独立原生子窗口里，
  * 鼠标在视频区域移动时渲染层收不到 mousemove（控制栏唤不出来）；
@@ -283,7 +471,7 @@ function sendEvent(win: BrowserWindow | null | undefined, payload: Record<string
 }
 
 /** 自检用：各类事件发出次数（用于验证「换集后必须重新发 playing」） */
-const eventCounts = { playing: 0, paused: 0, time: 0, length: 0, ended: 0 }
+const eventCounts = { playing: 0, paused: 0, time: 0, length: 0, ended: 0, picture: 0 }
 
 export function mpvEventCounts(): typeof eventCounts {
   return { ...eventCounts }
@@ -295,6 +483,8 @@ export function mpvResetEventCounts(): void {
   eventCounts.time = 0
   eventCounts.length = 0
   eventCounts.ended = 0
+  // v1.5：画面出现事件也一起计数/清零 —— 真机排查时"到底有没有发过 hasPicture=true"看它
+  eventCounts.picture = 0
 }
 
 /** CSS 像素 → 物理像素（子窗口用物理像素定位） */
@@ -329,6 +519,25 @@ function videoWidth(): number {
   } catch {
     return 0
   }
+}
+
+/**
+ * 「画面是否真的出来了」的**唯一判据**（v1.5 需求 ①）。
+ *
+ * 为什么要单独一个函数、并强调"唯一来源"：
+ * 渲染层过去用 `time > 0` / `engineState === 'active'` 推断"有画面"，但那两个都不是画面 —
+ * attach 成功只说明窗口挂上了，`playing` 只说明内核开始拉流；地址失效、CDN 卡住、
+ * 解出音频却没解出画时，它们**全是 true**，屏幕上却什么都没有。
+ * 这里复用一个已经在用的真实信号：mpv 的 `width`（= `video-params/w`），
+ * 只有解码器真的产出视频帧之后它才 > 0（见 `videoWidth()` 与 startTimePump 里的成功判据）。
+ *
+ * 语义是**本轮媒体的 sticky 值**：一旦为 true，暂停 / 缓冲 / seek 都不会变回 false
+ * （否则「一暂停控制栏和弹幕就消失」），只有下一次 loadfile（`loadSource` 里）
+ * 或销毁内核时才复位。渲染层与主进程的所有门控都只读这一个值，
+ * 不再各自用别的字段二次推断 —— 多来源最终一定会互相打架。
+ */
+export function mpvHasPicture(): boolean {
+  return lastHadPicture
 }
 
 /** 读一个 mpv 字符串属性（容错：内核未就绪 / 属性不存在时返回空串） */
@@ -446,32 +655,48 @@ function trackAudioOnly(playing: boolean, hasPicture: boolean, t: number): void 
     /*
      * 归因：没有视频轨 = 站点给的地址不对（该换源）；有视频轨但解不出来 = 编码/解码器问题。
      * 两者都不是「网络慢，再等等」，所以用 failStage 给结论，而不是让它一直转圈。
+     *
+     * v1.2.1：改成 failStageAndEnd —— 15 秒有声无画是**已经查清**的失败，
+     * 只标红不收尾会让整轮一直 running，界面就停在「注入播放器」。
      */
-    failStage('inject', why, audioOnly.videoTrack ? 'format' : 'site')
+    failStageAndEnd('inject', why, audioOnly.videoTrack ? 'format' : 'site')
   }
 }
 
 /*
- * ───────── 内核侧网络采样（v1.1）─────────
+ * ───────── 内核侧网络采样（v1.1，v1.2.1 收窄职责）─────────
  *
  * 修的是用户报的那条：「将播放地址交给播放器内核后经常出现没有加载速度的显示
  * （多少 MB、多少 B 的数据流量显示），仅仅是将播放地址交给播放器内核后就没了，
  * 也没有显示失败」。
  *
- * 原因有两层，这里两层都堵上：
- *  ① `PlayFlowMetrics` 过去只有**交给内核之前**的可达性探测会写，内核开始拉流之后
- *     没有任何代码再写 → 数字冻住/消失。现在挂在既有的 250ms 时间泵上采样，
- *     以 1 秒节流写入（新增一条定时器是没有必要的，泵本来就在跑）。
- *  ② 「没有失败」是因为内核拿不到数据时没有任何判据。这里补一条**保守**的判据：
- *     内核已进入 playing、`time-pos` 仍是 0、累计字节也还是 0 —— 同时满足这三条的
- *     20 秒才判失败（避免把"慢但在动"的源误判成失败；那种情况 rate 会 > 0）。
+ * v1.2.1 起这里**只负责采样**，不再自己判失败：
+ * 上一版在「playing + time=0 + 0 字节」持续 20s 时直接 failStage('inject')，
+ * 而它和「有声无画 15s」「可达性探测」「注入超时」是四个各自独立的判据 ——
+ * 谁先到点谁把阶段锁死（playFlow 的 settled），后到的真实首帧再也改不回来：
+ * 用户看到的就是「所有规则都卡在最后一步：将资源注入播放器」。
+ *
+ * 现在唯一的注入判据是 playFlow 里 15s 的注入看门狗（beginStage('inject') 时武装），
+ * 它拿的正是这里写进去的 `metrics`（已收字节/速率），所以失败文案仍然有真实证据，
+ * 只是**只有一个主人**。这里保留采样是为了让面板上的速度/流量在内核接管后继续跳。
  */
 let netBytes = 0
 let netLastSampleAt = 0
 let netLastRate = 0
 let netLastPushAt = 0
-let netHandedAt = 0
-let netStallConcluded = false
+
+/**
+ * 「当前这个候选」的计量基线（v1.3 乐观交接）。
+ *
+ * `sampleNet` 采到的 `netBytes` 是**当前文件**的已预读字节（每次 loadfile 都要
+ * `resetNetSampling`，否则换源后会停在旧值上，见 loadSource 里的说明）。
+ * 这里保留一个显式基线，是为了让「这个候选收到多少字节」这件事有一个统一读数，
+ * 将来如果改成多连接累计也不会把语义搞混。
+ */
+let candidateLoadedAt = 0
+let candidateBytesBase = 0
+/** 本轮是否已经把「加速中转」换上去过（同一轮只换一次，避免来回切流） */
+let boostSwapped = false
 
 /** 每次 loadfile（mpvPlay）重置采样基线：换集不能把上一集的流量算进这一集 */
 function resetNetSampling(): void {
@@ -479,8 +704,11 @@ function resetNetSampling(): void {
   netLastSampleAt = 0
   netLastRate = 0
   netLastPushAt = 0
-  netHandedAt = Date.now()
-  netStallConcluded = false
+}
+
+/** 当前候选从装载到现在收到的字节数（内核自己报的流字节，不含响应头） */
+function bytesSinceCandidate(): number {
+  return Math.max(0, netBytes - candidateBytesBase)
 }
 
 /**
@@ -512,20 +740,15 @@ function sampleNet(playing: boolean, time: number): void {
     })
   }
   /*
-   * 失败判据（保守）：已 playing + 时间不前进 + 一个字节都没读到，持续 20 秒。
-   * 只满足其中一两条时继续等 —— 慢源 rate>0 会走到上面那条分支，不会被这里误判。
+   * 只是在**注入超时之前**把现场如实写进阶段说明（不是失败判定）：
+   * 用户能在进度面板上看到「已收 X KB / 进度 0s」，而不是一句干巴巴的「等待首帧」。
+   * 失败（以及失败原因）由 playFlow 的 15s 看门狗统一给出。
    */
-  if (!netStallConcluded && playing && time <= 0 && netBytes === 0 && netHandedAt > 0) {
-    const waited = now - netHandedAt
-    if (waited >= 20_000) {
-      netStallConcluded = true
-      failStage(
-        'inject',
-        `内核已接收地址，但 ${Math.round(waited / 1000)} 秒内没有读到任何数据（0 字节、进度 0 秒）：` +
-          '该地址很可能已失效、需要 Referer/Cookie，或源站拒绝了这个连接',
-        'site'
-      )
-    }
+  if (playing && time <= 0) {
+    flowDetail(
+      'inject',
+      `内核已接收地址，正在等数据（已收 ${Math.round(netBytes / 1024)} KB，进度 0s）`
+    )
   }
 }
 
@@ -553,8 +776,26 @@ function startTimePump(win: BrowserWindow): void {  stopTimePump()
         injectAttempts = 0
       }
       if (curPath && latestPluginDanmakuFile && injectedForPath !== curPath) {
-        // 失败时不要每 250ms 刷一次日志：同一文件最多重试 3 次、每次间隔 2 秒
-        if (injectAttempts < 3 && Date.now() - lastInjectAttemptAt > 2000) {
+        /*
+         * v1.5 需求 ②：**画面还没出现时先不把弹幕交给插件**。
+         *
+         * 判据是 `mpvHasPicture()`（唯一来源：内核 `width`>0 的首帧判据，见 videoWidth 的说明）。
+         * 为什么必须门控在这里而不是渲染层：弹幕是由 mpv 内部的 uosc_danmaku 画在视频画面上的，
+         * 渲染层根本管不到它 —— 唯一能拦住它的地方就是「不向它注入弹幕」。
+         * 首帧出现后这一支自然成立，排队中的那份弹幕会在同一秒内补发，
+         * 所以用户看到的仍然是「画面出来就有弹幕」，不会丢。
+         */
+        if (!mpvHasPicture()) {
+          if (danmakuWaitLoggedPath !== curPath) {
+            danmakuWaitLoggedPath = curPath
+            log.append(
+              'info',
+              'mpv',
+              '画面还没出现（hasPicture=false）：弹幕先不注入 uosc_danmaku，等内核解出首帧后自动补发'
+            )
+          }
+        } else if (injectAttempts < 3 && Date.now() - lastInjectAttemptAt > 2000) {
+          // 失败时不要每 250ms 刷一次日志：同一文件最多重试 3 次、每次间隔 2 秒
           lastInjectAttemptAt = Date.now()
           injectAttempts += 1
           injectPluginDanmaku(latestPluginDanmakuFile)
@@ -593,6 +834,12 @@ function startTimePump(win: BrowserWindow): void {  stopTimePump()
         setTimeout(settle, 300)
         setTimeout(settle, 1500)
       }
+      /*
+       * v1.2.1：uosc 的按钮要能点，前提是 mpv 的 VO 子窗口可命中。
+       * 挂在同一个 250ms 泵上（内部按「未启用 1s / 已启用 5s」节流），不新增定时器；
+       * VO 窗口要等起播才创建，所以这里必须允许「这轮没找到、下轮再找」。
+       */
+      ensureMpvInputWindow()
       if (st.length > 0 && Math.abs(st.length - lastLength) > 500) {
         lastLength = st.length
         sendEvent(win, { type: 'length', length: st.length })
@@ -624,8 +871,48 @@ function startTimePump(win: BrowserWindow): void {  stopTimePump()
       trackAudioOnly(playing, hasPicture, st.time ?? 0)
       // 内核侧速度/流量/失败判据（v1.1，见 sampleNet 的说明）：挂在同一个泵上，1 秒节流写指标
       sampleNet(playing, st.time ?? 0)
+      /*
+       * v1.3 乐观交接的执行端：当前候选 5 秒一个字节都没收到 → 换交接队列里的下一个。
+       *
+       * 为什么挂在 250ms 的状态泵上而不是另开定时器：`sampleNet` 刚把内核真实流量读出来，
+       * 这一刻的 `netBytes` 才是做判据的最新值；另开定时器会多一层相位差，
+       * 而且退出播放器时还得再管一个定时器的生命周期（历史上就是这类定时器漏清理）。
+       * 已经出首帧（`hasPicture` / `lastHadPicture`）时绝不换：不能让正在看的画面回 0。
+       */
+      if (!hasPicture && !lastHadPicture && candidateLoadedAt > 0 && flowRunning()) {
+        if (
+          shouldSwitchCandidate({
+            elapsedMs: Date.now() - candidateLoadedAt,
+            bytesSinceCandidate: bytesSinceCandidate()
+          })
+        ) {
+          const switched = mpvSwitchToNextCandidate()
+          if (switched) sendEvent(win, { type: 'source', url: switched.url })
+        }
+      }
       if (hasPicture && !lastHadPicture) {
         lastHadPicture = true
+        /*
+         * v1.5 需求 ①：**画面出现的唯一通知**。
+         *
+         * 渲染层靠这一条解除弹幕层与控制栏的门控；这里只发 `hasPicture` 一个字段，
+         * 不再让渲染层用 time/playing 自行推断（那些在"有声音没画面"时同样是 true）。
+         * 反向（true→false）由 loadSource 在换媒体时发，见那里的说明。
+         */
+        sendEvent(win, { type: 'picture', hasPicture: true })
+        /*
+         * 首帧也是「mpv 画面窗口该恢复鼠标」的时刻（见 ensureMpvInputWindow 的门控）：
+         * 把节流时间清零，让下一次 250ms 泵立刻找窗口并启用，尽量缩短
+         * 「画面已经出来、但点了没反应」的那一段。
+         */
+        inputCheckAt = 0
+        log.append(
+          'info',
+          'mpv',
+          `画面已出现（hasPicture=true，视频宽 ${picW}px）：现在才恢复弹幕注入与控制栏鼠标输入`
+        )
+        // 计时：loadfile → 首帧（真实解码出第一帧的时刻，不是 loadfile 返回）
+        markPlayTiming('首帧')
         succeedStage('inject', `画面已就绪（首帧已解码，视频宽 ${picW}px）`)
         /*
          * 首帧出现 = 整轮播放流程达成（v0.3.9）。
@@ -779,6 +1066,195 @@ function bundledScript(name: string): string {
     }
   }
   return ''
+}
+
+/**
+ * thumbfast 用的**独立 mpv 可执行文件**路径（不存在时返回空串）。
+ *
+ * 为什么必须单独带一个 mpv.exe：
+ *   我们的播放器是**内嵌 libmpv**（native/mpv + resources/libmpv/libmpv-2.dll），
+ *   整个进程里没有独立的 mpv 可执行文件；而 thumbfast 生成缩略图的方式就是
+ *   `spawn` 一个新的 mpv 进程去截帧（见 resources/mpv-scripts/thumbfast.lua 的 spawn()）。
+ *   PATH 上没有 mpv 时它只会打印 "mpv subprocess create failed"，
+ *   进度条悬停就永远没有缩略图 —— 修法只能是给它一个真实的 exe。
+ *
+ * 为什么按这两条路径找、不硬编码：
+ *   与 bundledScript / bundledMpvConfigDir 同一条思路 —— 打包后资源在
+ *   `<process.resourcesPath>`，开发态在仓库的 `resources/`：
+ *   · 打包态：`<安装目录>/resources/mpv-bin/mpv.exe`
+ *     （package.json 的 `build.extraResources` 把 resources/mpv-bin 复制成 mpv-bin）
+ *   · 开发态：`<仓库>/resources/mpv-bin/mpv.exe`
+ *   这样换机器、换安装目录都不用改代码。
+ */
+export function bundledMpvExe(): string {
+  /*
+   * V1.2.6：优先用 **纯 ASCII 路径下的副本**。
+   *
+   * 为什么（真机证据）：开发环境 `E:/sakana.app/resources/mpv-bin/mpv.exe` 能出图
+   * （实测生成 141,000 字节的缩略图），而安装到 `D:/动画应用/…` 之后 thumbfast
+   * **一次都没启动过子进程**（连它自己的 `thumbfast-status.json` 都没写出来，日志里一行都没有）。
+   * 两者最大的差别就是路径里有中文：`thumbfast.lua` 把 `mpv_path` 当字节串读出来再交给
+   * Windows 的进程创建 API，非 UTF-8 代码页下会被错误解码，spawn 失败且**不抛错**。
+   *
+   * 所以启动时把 exe 复制到 `%LOCALAPPDATA%/Sakana/mpv-bin/mpv.exe`（纯 ASCII、无空格、无中文），
+   * 让 thumbfast 永远拿到一条安全的路径 —— 不管用户把应用装到哪。
+   */
+  const safe = asciiMpvExe();
+  if (safe) return safe
+  const candidates = [
+    process.resourcesPath ? join(process.resourcesPath, 'mpv-bin', 'mpv.exe') : '',
+    join(app.getAppPath(), 'resources', 'mpv-bin', 'mpv.exe')
+  ]
+  for (const p of candidates) {
+    try {
+      if (p && existsSync(p)) return p
+    } catch {
+      /* ignore */
+    }
+  }
+  return ''
+}
+
+/** 本次进程内缓存的安全副本路径（避免每次调用都 stat） */
+let asciiMpvExeCache: string | null = null
+
+/**
+ * 把随包的 mpv.exe 复制到 `%LOCALAPPDATA%/Sakana/mpv-bin/` 并返回那条路径。
+ *
+ * 失败（磁盘满 / 权限不足）时返回空串，调用方自动退回随包路径 —— 宁可维持现状，
+ * 也不能因为"复制失败"让 thumbfast 完全不可用。
+ * 复制是同步的（121MB 约 1~2 秒），只在**文件不存在或大小不一致**时做一次，
+ * 之后每次启动都只是两次 stat。
+ */
+function asciiMpvExe(): string {
+  if (asciiMpvExeCache !== null) return asciiMpvExeCache
+  const src = [process.resourcesPath ? join(process.resourcesPath, 'mpv-bin', 'mpv.exe') : '', join(app.getAppPath(), 'resources', 'mpv-bin', 'mpv.exe')]
+    .find((p) => p && existsSync(p)) ?? ''
+  if (!src) {
+    asciiMpvExeCache = ''
+    return ''
+  }
+  try {
+    /*
+     * ⚠️ 目标目录必须是**纯 ASCII**，否则这次复制毫无意义。
+     * 一开始我用了 `app.getPath('userData')`，但本机它是 `D:/动画应用/sakana/sakana.data/Sakana`
+     * —— 还是有中文；而 `%LOCALAPPDATA%` 在本机是 `C:/Users/RE妄想症/...`，用户名也带中文。
+     * 所以优先放 `C:/ProgramData/Sakana/mpv-bin`（系统级目录，路径天然 ASCII）；
+     * 写不进去（权限受限）再退回 userData —— 那种情况下至少不比改之前更差。
+     */
+    const dirs = [join(process.env.ProgramData || 'C:\\ProgramData', 'Sakana', 'mpv-bin'), join(app.getPath('userData'), 'mpv-bin')]
+    let dir = dirs[0]
+    let dst = join(dir, 'mpv.exe')
+    const usable = (d: string): boolean => {
+      try {
+        mkdirSync(d, { recursive: true })
+        return true
+      } catch {
+        return false
+      }
+    }
+    if (!usable(dir) && dirs[1]) {
+      dir = dirs[1]
+      dst = join(dir, 'mpv.exe')
+      if (!usable(dir)) throw new Error('ProgramData 与 userData 都不可写')
+    }
+    // 已经存在且大小一致 → 直接用（换版本时大小几乎一定不同，足够当校验）
+    if (existsSync(dst) && statSync(dst).size === statSync(src).size) {
+      asciiMpvExeCache = dst
+      return dst
+    }
+    mkdirSync(dir, { recursive: true })
+    cpSync(src, dst, { force: true })
+    log.append('info', 'mpv', `已把 mpv.exe 复制到纯 ASCII 路径供 thumbfast 使用：${slashPath(dst)}`)
+    asciiMpvExeCache = dst
+    return dst
+  } catch (err) {
+    log.append(
+      'warn',
+      'mpv',
+      `复制 mpv.exe 失败，thumbfast 退回随包路径（中文路径可能导致它起不来）：${String((err as Error)?.message ?? err).slice(0, 80)}`
+    )
+    asciiMpvExeCache = ''
+    return ''
+  }
+}
+
+/** 上一次已经写进日志的路径（同一条路径只写一次；文件后来出现/消失时会重新记一行） */
+let thumbfastMpvLoggedPath: string | null = null
+
+/**
+ * 缩略图输出前缀（纯 ASCII）。
+ *
+ * 见 thumbfast.conf 里 `thumbnail=` 的注释：真机上默认落在 `%TEMP%`，而本机
+ * `%TEMP%` 里带中文用户名，thumbfast 把它交给子进程当 `--of` 时被写坏，
+ * 结果就是"有请求、无内容"的白窗。这里固定成 `C:/ProgramData/Sakana/thumb/t`
+ * （与 mpv.exe 副本同目录树），确保整条链路只有 ASCII。
+ */
+function thumbOutputBase(): string {
+  const base = join(process.env.ProgramData || 'C:\\ProgramData', 'Sakana', 'thumb')
+  try {
+    mkdirSync(base, { recursive: true })
+  } catch {
+    /* 建不了目录就让 thumbfast 用默认路径，至少不比现在更差 */
+    return join(app.getPath('temp'), 'thumbfast.out')
+  }
+  return join(base, 't')
+}
+
+/**
+ * 主进程启动时确认「thumbfast 到底会 spawn 哪个 mpv」，并把结果写进日志。
+ *
+ * 为什么要单独一行、且由启动流程调用：
+ *   真机排查 thumbfast 时，唯一能区分「没带 exe / 带错路径 / 路径对但文件坏了」的证据
+ *   就是它实际拿到的路径。放在启动时而不是第一次悬停进度条时，是因为失败发生在
+ *   thumbfast 的异步子进程回调里（只会打印 "subprocess create failed"），
+ *   到那时再回头找「它想用哪个 exe」已经被埋掉了。
+ *
+ * 为什么找不到时不加载 thumbfast（见 loadUoscPlugins）：
+ *   thumbfast 自己会在 mpv 画面里 show-text 一条 "ERROR! cannot create mpv subprocess"，
+ *   对用户来说就是“播放器莫名弹错”。缺文件时我们宁可不要缩略图，也不弹这条错误。
+ */
+export function logThumbfastMpv(): string {
+  const exe = bundledMpvExe()
+  if (thumbfastMpvLoggedPath === exe) return exe
+  thumbfastMpvLoggedPath = exe
+  if (exe) {
+    /*
+     * 正斜杠：这个值最终会原样进 thumbfast.conf 的 mpv_path（mpv 在 Windows 上也接受正斜杠，
+     * 且不会被当成转义），日志用同一种写法便于直接对照配置文件。
+     */
+    log.append('info', 'mpv', `thumbfast 使用的 mpv：${slashPath(exe)}`)
+    /*
+     * V1.2.6：**启动自检** —— 真的把这个 exe 跑一次，把退出码写进日志。
+     *
+     * 为什么必须做：中文路径那条假设已经被证伪（改成 C:/ProgramData 纯 ASCII 之后
+     * 仍然没有 `[thumbfast] 缩略图已生成`）。现在需要一刀切开两种可能：
+     *   · 自检失败 → 是我们的 exe 起不来（权限 / 杀软拦截 / 依赖缺失）；
+     *   · 自检成功 → exe 没问题，问题在 thumbfast.lua 与 uosc 之间（它俩都不写我们的日志）。
+     * 自检只跑 `--version`，几百毫秒，且只在路径变化时跑一次。
+     */
+    try {
+      const r = spawnSync(exe, ['--version'], { timeout: 8000, windowsHide: true, encoding: 'utf-8' })
+      const ok = r.status === 0
+      log.append(
+        ok ? 'info' : 'warn',
+        'mpv',
+        ok
+          ? `thumbfast 自检通过（mpv.exe 可执行，退出码 0）：${slashPath(exe)}`
+          : `thumbfast 自检失败：退出码 ${String(r.status)}，错误 ${String(r.error?.message ?? r.stderr ?? '').slice(0, 80)}`
+      )
+    } catch (err) {
+      log.append('warn', 'mpv', `thumbfast 自检异常：${String((err as Error)?.message ?? err).slice(0, 80)}`)
+    }
+  } else {
+    log.append(
+      'warn',
+      'mpv',
+      'thumbfast 使用的 mpv 不存在（应为 resources/mpv-bin/mpv.exe）：' +
+        '进度条悬停缩略图不可用；本次跳过 thumbfast，避免它在画面里弹出 “cannot create mpv subprocess”'
+    )
+  }
+  return exe
 }
 
 /** B 站弹幕脚本的默认临时目录（用户没填时用它；biliass 必须有一个可写 tmpdir） */
@@ -987,6 +1463,147 @@ function prepareUoscConf(cfgDir: string): string {
       )}`
     )
     return cfgDir
+  }
+}
+
+/**
+ * 给 thumbfast 写 `script-opts/thumbfast.conf`，返回「这份配置是否已可用」。
+ *
+ * thumbfast 的开头用 `mp.options.read_options(options, "thumbfast")` 读配置，
+ * 它的选项名就是 `mpv_path`（不是 mpv-path / mpv_exe）——见 thumbfast.lua 第 13~55 行的 options 表。
+ * 这里写 `mpv_path`，并按我们的播放形态额外打开 `network`；其余选项保持 thumbfast 的默认值。
+ *
+ * 为什么必须**运行时生成**、不能放一个静态文件进仓库：
+ *   `mpv_path` 在开发态是 `<仓库>/resources/mpv-bin/mpv.exe`，打包态是
+ *   `<安装目录>/resources/mpv-bin/mpv.exe`。静态文件只能写死其中一种，
+ *   换一台机器 / 换安装目录就失效；这里复用 bundledMpvExe() 的同一条解析链，
+ *   路径永远与当前运行环境一致。
+ *
+ * 为什么写到传进来的 cfgDir（而不是固定的 resources/mpv-config）：
+ *   打包安装到 Program Files 时安装目录可能只读，prepareUoscConf 会把 config-dir
+ *   镜像到临时目录；thumbfast 必须从**真正交给 mpv 的那个 config-dir** 读配置，
+ *   否则 mpv 读不到这份文件。
+ *
+ * 失败时返回 false，调用方会**跳过加载 thumbfast**：这样最多是没有缩略图，
+ * 不会出现 thumbfast 在自己 spawn 失败后往画面里 show-text 错误提示的情况。
+ */
+function prepareThumbfastConf(cfgDir: string, mpvExe: string): boolean {
+  if (!cfgDir || !mpvExe) return false
+  const optsDir = join(cfgDir, 'script-opts')
+  const conf = join(optsDir, 'thumbfast.conf')
+  /*
+   * 第三方脚本的配置文件用 `#` 注释、`key=value` 一行一个。
+   * 路径用正斜杠：mpv 在 Windows 上等价接受，且不会被配置解析当成转义序列。
+   */
+  const content = [
+    '# 由 Sakana 在启动播放器时生成，下一次播放会覆盖，请勿手改。',
+    '# thumbfast 通过 mp.options.read_options(options, "thumbfast") 读取本文件。',
+    '# 内嵌 libmpv 进程里没有 mpv 可执行文件，thumbfast 必须 spawn 这个独立 exe 去截帧。',
+    `mpv_path=${slashPath(mpvExe)}`,
+    /*
+     * 我们的播放地址全是网络流（直链/HLS）。thumbfast 的 `network` 默认是 false，
+     * 而它在 info() 里用 `demuxer-via-network and not options.network` 直接判定 disabled ——
+     * 也就是说：只给对 mpv_path、不开这一项，仍然一辈子不会生成缩略图。
+     */
+    'network=yes',
+    /*
+     * V1.2.9：把**缩略图输出路径**钉到纯 ASCII 目录。
+     *
+     * 真机证据：thumbfast 写出的状态文件里，缩略图路径长这样 ——
+     *   `C:\Users\RE濡勬兂鐥嘰\AppData\Local\Temp\thumbfast.out19916.bgra`
+     * 用户名 `RE妄想症` 已经变成了乱码（`RE濡勬兂鐥嘰`）。thumbfast 会把这个路径拼成
+     * `--of=<path>` 交给子进程 mpv 去写 —— 路径坏了，子进程就写不出文件，
+     * uosc 拿到的是"有请求、无内容"，于是画出一个**白色空窗**。
+     * 这与用户观察完全一致：**连本地播放也没有缩略图**（跟网络流、跟临时缓存都无关）。
+     *
+     * 现在显式指定一个纯 ASCII 前缀（与 mpv.exe 副本同一个 ProgramData 目录），
+     * 让这条链路上不再有任何非 ASCII 字符。
+     */
+    `thumbnail=${slashPath(thumbOutputBase())}`,
+    ''
+  ].join('\n')
+  try {
+    mkdirSync(optsDir, { recursive: true })
+    let same = false
+    try {
+      same = readFileSync(conf, 'utf8') === content
+    } catch {
+      /* 第一次运行/文件被删：照常写 */
+    }
+    if (!same) {
+      writeFileSync(conf, content, 'utf8')
+      log.append('info', 'mpv', `thumbfast 配置已生成：${slashPath(conf)}（mpv_path=${slashPath(mpvExe)}）`)
+    }
+    return existsSync(conf)
+  } catch (err) {
+    log.append(
+      'warn',
+      'mpv',
+      `thumbfast 配置生成失败，本次不加载 thumbfast（进度条缩略图不可用）：${String(
+        (err as Error)?.message ?? err
+      )}`
+    )
+    return false
+  }
+}
+
+/**
+ * 监听 thumbfast 写的缩略图状态文件（`<config-dir>/script-opts/thumbfast-status.json`）。
+ *
+ * 为什么要这条桥：libmpv 跑在我们主进程里，thumbfast 的 `mp.msg` 日志进不了应用日志；
+ * 而「缩略图生成成功没有、失败原因是什么」是排查白块时唯一需要的证据。
+ * Lua 侧只写缩略图临时路径 / 尺寸 / 错误码，**不写流地址**（日志红线）。
+ *
+ * 为什么用 watchFile 轮询而不是 fs.watch：Windows 上 fs.watch 对“文件先不存在、
+ * 之后被创建”的监听并不可靠；这个文件一局只写几次，500ms 轮询足够且不会漏。
+ */
+let stopThumbfastStatusWatch: (() => void) | null = null
+let lastThumbfastStatusKey = ''
+
+interface ThumbfastStatus {
+  ok?: boolean
+  error?: string
+  path?: string
+  bytes?: number
+  width?: number
+  height?: number
+}
+
+function watchThumbfastStatus(cfgDir: string): void {
+  stopThumbfastStatusWatch?.()
+  lastThumbfastStatusKey = ''
+  const file = join(cfgDir, 'script-opts', 'thumbfast-status.json')
+  const onChange = (cur: Stats, prev: Stats): void => {
+    if (cur.mtimeMs === prev.mtimeMs && cur.size === prev.size) return
+    let st: ThumbfastStatus
+    try {
+      st = JSON.parse(readFileSync(file, 'utf8')) as ThumbfastStatus
+    } catch {
+      /* Lua 不是原子写：读到半截 JSON 就等下一次 stat 变化再读 */
+      return
+    }
+    if (!st || typeof st.ok !== 'boolean') return
+    if (st.ok) {
+      /*
+       * 按「尺寸 + 字节数」去重：悬停会在同一张图上反复 seek，每次都写状态文件，
+       * 但用户只需要一行「生成了」；尺寸变了（换集/换分辨率）才再记。
+       */
+      const key = `ok:${st.width ?? 0}x${st.height ?? 0}:${st.bytes ?? 0}`
+      if (key === lastThumbfastStatusKey) return
+      lastThumbfastStatusKey = key
+      log.append('info', 'mpv', `[thumbfast] 缩略图已生成 ${slashPath(st.path ?? '')} ${st.bytes ?? 0} bytes`)
+    } else {
+      const reason = st.error && st.error.length > 0 ? st.error : '未知原因'
+      const key = `fail:${reason}`
+      if (key === lastThumbfastStatusKey) return
+      lastThumbfastStatusKey = key
+      log.append('warn', 'mpv', `[thumbfast] 缩略图生成失败：${reason}`)
+    }
+  }
+  watchFile(file, { interval: 500 }, onChange)
+  stopThumbfastStatusWatch = () => {
+    unwatchFile(file, onChange)
+    stopThumbfastStatusWatch = null
   }
 }
 
@@ -1222,6 +1839,14 @@ let lastMpvPath = ''
 /** 当前文件的注入尝试次数与上次尝试时间（失败时限流重试，避免每 250ms 刷日志） */
 let injectAttempts = 0
 let lastInjectAttemptAt = 0
+/**
+ * 「因为还没有画面、暂时不注入」这条日志已经为哪个 path 记过。
+ *
+ * 为什么要有它：画面没出来时 250ms 的泵会一直走到那个分支，
+ * 不记的话同一句话每 250ms 刷一行（历史上正是这样把日志刷满的）。
+ * 只在换文件（path 变化）时重新允许记一次。
+ */
+let danmakuWaitLoggedPath = ''
 
 /**
  * uosc + uosc_danmaku 的 script-opts。
@@ -1297,8 +1922,15 @@ function clamp01(n: number): number {
  *
  * @param wantDanmaku 是否加载 uosc_danmaku（弹幕渲染方式 = uosc 时才加载）
  * @param wantBar 控制栏是否交给 uosc（设置项 uoscControlBar，默认 true）
+ * @param thumbfastScript thumbfast.lua 的绝对路径；空串 = 这一轮不加载（缺 exe / 配置写不进去）
  */
-function loadUoscPlugins(mod: MpvNative, cfgDir: string, wantDanmaku: boolean, wantBar: boolean): boolean {
+function loadUoscPlugins(
+  mod: MpvNative,
+  cfgDir: string,
+  wantDanmaku: boolean,
+  wantBar: boolean,
+  thumbfastScript: string
+): boolean {
   const uoscDir = slashPath(join(cfgDir, 'scripts', 'uosc'))
   const danmakuDir = slashPath(join(cfgDir, 'scripts', 'uosc_danmaku'))
 
@@ -1312,14 +1944,20 @@ function loadUoscPlugins(mod: MpvNative, cfgDir: string, wantDanmaku: boolean, w
    * 为什么它是一个 `load-script` 而不是 `<config-dir>/scripts/` 里的自动加载：
    * libmpv 这边 `load-scripts=no`（否则 uosc 会被加载两份，见上面的注释），
    * 所以每个脚本都得我们自己按绝对路径挂 —— 漏一个就等于没装。
+   *
+   * `thumbfastScript` 为空 = 这一轮不加载（缺 mpv.exe / 配置写不进去，原因已在 mpvAttach 记过）。
+   * 为什么缺东西时宁可不挂：thumbfast 的 spawn 失败回调会自己 `show-text`
+   * "ERROR! cannot create mpv subprocess" —— 那会变成用户眼里的“播放器莫名弹错”。
+   * 不加载最多是没有悬停缩略图，uosc 不会报错。
    */
-  const thumbfast = join(cfgDir, '..', 'mpv-scripts', 'thumbfast.lua')
-  try {
-    const p = slashPath(thumbfast)
-    const okT = mod.command(['load-script', p])
-    log.append(okT ? 'info' : 'warn', 'mpv', okT ? `thumbfast 已加载（进度条缩略图）: ${p}` : `thumbfast 加载失败: ${p}`)
-  } catch (err) {
-    log.append('warn', 'mpv', `加载 thumbfast 异常: ${String((err as Error)?.message ?? err)}`)
+  if (thumbfastScript) {
+    try {
+      const p = slashPath(thumbfastScript)
+      const okT = mod.command(['load-script', p])
+      log.append(okT ? 'info' : 'warn', 'mpv', okT ? `thumbfast 已加载（进度条缩略图）: ${p}` : `thumbfast 加载失败: ${p}`)
+    } catch (err) {
+      log.append('warn', 'mpv', `加载 thumbfast 异常: ${String((err as Error)?.message ?? err)}`)
+    }
   }
 
   // ① 控制栏桥接脚本
@@ -1509,6 +2147,33 @@ function uoscActionToOverlay(raw: string): OverlayAction | null {
       return { type: 'forward10' }
     case 'toggle-danmaku':
       return { type: 'toggleDanmaku' }
+    /*
+     * 音量菜单里的「静音 / 恢复声音」项。
+     * v1.1.6 之前这是 sakana-volume 按钮点一下的唯一下场；现在按钮改为弹菜单，
+     * 这一条只由菜单项发出（见 sakana-uosc-ctrl.lua 的 menu_volume）。
+     * 语义与旧控制栏的音量键一致：只切 mpv 的 mute 标记，不改 volume 数值。
+     */
+    case 'toggle-mute':
+      return { type: 'toggleMute' }
+    /*
+     * v1.1.6：音量菜单（sakana-volume 点开）的"调大小"动作。
+     *
+     * 用户反馈旧按钮只发 toggle-mute，点了只能静音/恢复；Lua 侧现在发这两条，
+     * 由播放页调 api.player.setVolume 写入。这里只做范围收敛，不直接碰内核 ——
+     * 音量真源始终是主进程/内核，Lua 只发动作（见 sakana-uosc-ctrl.lua 的 menu_volume）。
+     * 上限 100 与菜单快捷档一致；增量在播放页按应用现有上限（VOLUME_MAX=200）计算，
+     * 不能在这里夹到 100，否则用户已经在 150% 时点 −10% 会突然掉到 100%。
+     */
+    case 'volume-set': {
+      const v = Number(parts[0])
+      if (!Number.isFinite(v)) return null
+      return { type: 'volumeSet', value: Math.max(0, Math.min(100, Math.round(v))) }
+    }
+    case 'volume-delta': {
+      const d = Number(parts[0])
+      if (!Number.isFinite(d)) return null
+      return { type: 'volumeDelta', delta: Math.max(-200, Math.min(200, Math.round(d))) }
+    }
     case 'toggle-info':
       return { type: 'toggleInfo' }
     /*
@@ -1635,6 +2300,16 @@ function pollUoscCtrl(win: BrowserWindow): void {
   lastDispatchedAction = raw
   dispatchedCount += 1
   /*
+   * v1.1.6：音量菜单的动作单独记一行。
+   *
+   * 音量是这次用户反馈的核心，而「点了菜单项到底有没有到主进程」在界面上只能靠 toast；
+   * 把动作名与参数原样留下，真机验证时搜 `uosc 音量菜单动作` 就能确认链路真的通了
+   * （没这一行而只看到 unknown-action 警告，就说明映射表没接住）。
+   */
+  if (action.type === 'volumeSet' || action.type === 'volumeDelta') {
+    log.append('info', 'mpv', `uosc 音量菜单动作：${raw}（已交给播放页执行）`)
+  }
+  /*
    * V1.1：uosc 控制栏（mpv 自己画的那条）的点击**不经过悬浮窗**，只有这里看得到。
    * 用户要的是"点播放器按钮没反应就提示 Esc/F"，而很多用户用的正是 uosc 这条，
    * 所以这条路上的动作也要交给同一套侦测（判据与悬浮窗那条完全相同：客观读数）。
@@ -1743,6 +2418,18 @@ export function mpvPushUoscBar(payload: unknown): boolean {
 export function mpvPushDanmakuFile(file: string): boolean {
   if (!ready || !native || !uoscDanmakuLoaded || !file) return false
   latestPluginDanmakuFile = file
+  /*
+   * v1.5 需求 ②：画面还没出现时**只排队、不注入**。
+   *
+   * 为什么必须在这里拦一道（哪怕 250ms 泵里也有一道）：弹幕通常在播放开始后几百毫秒
+   * 就加载完了，而首帧往往要等好几秒（慢 CDN / 长片冷启动）。如果这里照旧立刻注入，
+   * 插件会马上开画 —— 屏幕上就是"黑底 + 上一集的帧 + 一堆弹幕"，正是用户要修的那一幕。
+   * 返回值仍然给 true：对调用方来说"已经收下、会负责送达"，不是失败。
+   */
+  if (!mpvHasPicture()) {
+    log.append('info', 'mpv', `画面还没出现（hasPicture=false）：弹幕先排队，等首帧后交给 uosc_danmaku: ${file}`)
+    return true
+  }
   const curPath = mpvCurrentPath()
   if (curPath && injectedForPath !== curPath) return injectPluginDanmaku(file)
   // 文件还没载入：留给 250ms 的轮询在 path 就绪后补发（理由见 startTimePump 注释）
@@ -1768,7 +2455,13 @@ function injectPluginDanmaku(file: string): boolean {
   }
 }
 
-/** 是否还有弹幕在等当前文件就绪（渲染层据此决定「再等等」还是「回落到画布」） */
+/**
+ * 是否还有弹幕在等当前文件就绪（渲染层据此决定「再等等」还是「回落到画布」）。
+ *
+ * v1.5：**"等首帧"也会返回 true**（注入被 hasPicture 门控住了，见 mpvPushDanmakuFile）。
+ * 所以渲染层不能把它一律当成"插件没挂上"去回落 —— 那会在画面出现后又叠一层内置画布弹幕。
+ * 渲染层的正确做法是：`hasPicture=false` 期间继续等，画面出现后再按这个值判断。
+ */
 export function mpvPluginDanmakuPending(): boolean {
   if (!latestPluginDanmakuFile) return false
   const curPath = mpvCurrentPath()
@@ -1776,7 +2469,7 @@ export function mpvPluginDanmakuPending(): boolean {
 }
 
 /** mpv 当前载入的文件/地址（未载入时为 ''） */
-function mpvCurrentPath(): string {
+export function mpvCurrentPath(): string {
   if (!ready || !native) return ''
   try {
     const v = native.getProperty('path')
@@ -2133,6 +2826,15 @@ function dispatchOverlayAction(action: Record<string, unknown>): void {
  */
 export function mpvRevealUoscUi(): boolean {
   if (!ready || !native || !uoscBarLoaded) return false
+  /*
+   * v1.5 需求 ④：**画面没出来就不唤出控制栏**。
+   *
+   * 渲染层那一侧已经拦了（PlayerOverlayPage 的 poke 直接 return，不再调这个接口），
+   * 这里再拦一道是「唯一入口」层面的保证：只要还没有画面，无论谁调这个接口都不会
+   * 让 uosc 把控制栏闪出来。判据与弹幕门控同源（mpvHasPicture = 首帧 width>0）。
+   * 不涉及 uosc 的任何配置/元素 —— 被拒绝的是**我们的**唤出请求。
+   */
+  if (!mpvHasPicture()) return false
   const now = Date.now()
   if (now - lastRevealAt < 900) return true
   lastRevealAt = now
@@ -2347,6 +3049,22 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
      */
     runtimeCfgDir = prepareUoscConf(cfgDir)
   }
+  /*
+   * thumbfast 的独立 mpv 必须在 mpv 初始化之前就位：
+   *   · exe 路径要写进 `<config-dir>/script-opts/thumbfast.conf` 的 mpv_path；
+   *   · thumbfast 在 `load-script` 时立刻 read_options，晚写这一轮就还是默认的 "mpv"。
+   *
+   * 缺 exe 时 logThumbfastMpv() 已经 warn 过；这里把 thumbfastScript 置空，
+   * loadUoscPlugins 会**跳过** thumbfast —— 不让它在画面上弹 spawn 失败的错误。
+   * 缺 thumbfast.lua 是另一种原因（安装目录不完整），单独 warn 一句便于区分。
+   */
+  const thumbfastExe = logThumbfastMpv()
+  const thumbfastLua = thumbfastExe ? bundledScript('thumbfast.lua') : ''
+  if (thumbfastExe && !thumbfastLua) {
+    log.append('warn', 'mpv', '找不到 resources/mpv-scripts/thumbfast.lua：进度条悬停缩略图不可用')
+  }
+  const thumbfastReady = !!thumbfastLua && prepareThumbfastConf(runtimeCfgDir, thumbfastExe)
+  const thumbfastScript = thumbfastReady ? thumbfastLua : ''
   let hwnd: Buffer | undefined
   try {
     hwnd = win.getNativeWindowHandle()
@@ -2436,6 +3154,21 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
        * 所以即使这条选项在某个 libmpv 版本里不存在，也只会被忽略，不会导致初始化失败。
        */
       ...(process.env.SAKANA_MPV_CURSOR_PASSTHROUGH ? { 'input-cursor-passthrough': 'yes' } : {}),
+      /*
+       * ── v1.2.1：关掉 mpv 自带的「左键拖窗口」──
+       *
+       * 这一版把 mpv 的 VO 子窗口重新设成可接收鼠标（见 ensureMpvInputWindow），
+       * uosc 的按钮/进度条才能真正收到点击。但 mpv 的 WndProc 里还有一条默认行为：
+       * 左键按在画面上且不在任何控件上时，它执行
+       * `SendMessage(hWnd, WM_NCLBUTTONDOWN, HTCAPTION)` 来拖动窗口。
+       * 对独立 mpv 窗口这是正常功能，对我们这个**嵌在 Electron 里的子窗口**则是灾难：
+       * 拖一下画面就会把视频子窗口从父窗口里拖走，画面与上报的 videoRect 永久错位。
+       *
+       * `window-dragging=no` 让 `mp_input_test_dragging()` 恒为 true，那条分支就不执行；
+       * uosc 与 input.conf 的鼠标绑定不受影响（它们走的是 input 层的按键绑定）。
+       * 窗口拖动本来就该由 Electron 自己的标题栏负责，mpv 不需要也不应该插手。
+       */
+      'window-dragging': 'no',
       ...(runtimeCfgDir ? { 'config-dir': slashPath(runtimeCfgDir), config: 'yes' } : {}),
       ...(scriptOptsParts.length > 0 ? { 'script-opts': scriptOptsParts.join(',') } : {})
     }
@@ -2470,7 +3203,16 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
    * 否则默认关闭 uosc 的机器上会被塞进一套用不上的控制栏（还会抢走鼠标）。
    */
   if (cfgDir && !uoscBarLoaded && (wantUoscBar || wantUoscDanmaku)) {
-    loadUoscPlugins(mod, cfgDir, wantUoscDanmaku, wantUoscBar)
+    loadUoscPlugins(mod, cfgDir, wantUoscDanmaku, wantUoscBar, thumbfastScript)
+  }
+  /*
+   * thumbfast 状态监听放在 create() 成功之后：它写的是 `<config-dir>/script-opts/thumbfast-status.json`，
+   * 只有 uosc 真的会加载 thumbfast 时才有意义。放在这里也避免「初始化失败但 watcher 还在轮询」的泄漏。
+   * 监听目录必须是 runtimeCfgDir —— prepareThumbfastConf 写配置的同一个目录，
+   * thumbfast.lua 里 `~~/script-opts/thumbfast-status.json` 展开到的就是这里。
+   */
+  if (thumbfastReady && (wantUoscBar || wantUoscDanmaku)) {
+    watchThumbfastStatus(runtimeCfgDir)
   }
   /*
    * Anime4K 着色器（v0.3.1）：实例就绪后按设置的链挂上。
@@ -2497,6 +3239,14 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
   lastUoscBarJson = ''
   lastUoscStatusPushAt = 0
   surfaceVisible = true
+  /*
+   * v1.2.1：新实例/新窗口，mpv 的 VO 子窗口会重新创建（而且默认又是 disabled），
+   * 输入窗口的缓存必须清零，由 250ms 泵重新找并重新启用。
+   */
+  inputHwnd = 0
+  inputHwndEnabled = false
+  inputCheckAt = 0
+  inputLastFailure = ''
   startTimePump(win)
   startRaiseWatch(win)
   startCursorWatch(win)
@@ -2592,7 +3342,14 @@ export function mpvDiagnostics(): {
   surfaceVisible: boolean
   hasPicture: boolean
   timePumpRunning: boolean
+  /**
+   * v1.2.1：uosc 能不能收到鼠标的**前提**（mpv 的 VO 子窗口是否已从 disabled 恢复）。
+   * 自检与排障要能把「按钮没反应」分成两类：窗口根本没启用（本字段 false） versus
+   * 窗口已启用但 uosc/动作链还有别的问题。只报事实，不下结论。
+   */
+  inputWindow: { hwnd: number; hwndHex: string; enabled: boolean; backendAvailable: boolean }
 } {
+  const inputWindow = mpvInputWindowState()
   return {
     nativeLoaded: native !== null,
     ready,
@@ -2606,7 +3363,13 @@ export function mpvDiagnostics(): {
     hasBounds: currentBounds !== null,
     surfaceVisible,
     hasPicture: lastHadPicture,
-    timePumpRunning: timeTimer !== null
+    timePumpRunning: timeTimer !== null,
+    inputWindow: {
+      hwnd: inputWindow.hwnd,
+      hwndHex: inputWindow.hwndHex,
+      enabled: inputWindow.enabled,
+      backendAvailable: inputWindow.backend.available
+    }
   }
 }
 
@@ -2650,7 +3413,48 @@ export function mpvSurfaceInfo(): {
   }
 }
 
-export function mpvPlay(path: string, referer?: string, cookies?: string): void {
+/**
+ * 把地址真正交给内核（loadfile）。
+ *
+ * `swap=true` 是 v1.3 新增的「换候选/接加速」路径，与首次装载的区别只有两点，
+ * 但两点都不能少：
+ *   · **不调用 `beginStage('inject')`** —— 那会重新武装 15 秒注入看门狗。
+ *     换候选只是同一轮里的重试，必须让总兜底仍然是「首次装载后 15 秒」，
+ *     否则三个候选就能把用户拖到 45 秒；
+ *   · **不重置累计流量**，只把「当前候选」的字节基线挪到此刻。
+ */
+/**
+ * 日志/界面上显示「交给内核的地址」时的脱敏（v1.4）。
+ *
+ * 本地临时缓存交给内核的是**本机地址**（127.0.0.1 上的 /cache/<id>）。
+ * 红线是不许在日志与界面出现内部接口地址，所以这里只显示「会话号」，
+ * 其它地址保持原样（上游地址本来就会被 log.append 的脱敏规则打码）。
+ * 注意只做展示，不改变真正 loadfile 的 path。
+ */
+function displaySource(path: string): string {
+  const m = /^https?:\/\/127\.0\.0\.1:\d+\/cache\/([A-Za-z0-9_-]+)/.exec(path)
+  return m ? `本机临时缓存（会话 ${m[1].slice(0, 8)}）` : path.slice(0, 130)
+}
+
+/**
+ * 把请求头序列化成 mpv 的 `http-header-fields` 值。
+ *
+ * 为什么不能直接 `join(',')`：这是 mpv 的**字符串列表**选项，逗号是列表分隔符；
+ * BROWSER_UA 里的 "(KHTML, like Gecko)" 带逗号，直接拼会被 mpv 拆成两个头
+ * （第二个没有冒号，等于 UA 被截断），Referer/Cookie 也会跟着错位。
+ * 按 mpv 的规则把值里的反斜杠、逗号转义，读回来（包括 thumbfast 子进程）
+ * 才是同一组头。thumbfast.lua 里也照这个规则反向读取。
+ */
+function joinMpvHeaderFields(headers: string[]): string {
+  return headers.map((h) => h.replace(/\\/g, '\\\\').replace(/,/g, '\\,')).join(',')
+}
+
+function loadSource(
+  path: string,
+  referer: string | undefined,
+  cookies: string | undefined,
+  opts: { swap?: boolean; reason?: string } = {}
+): boolean {
   if (!ready || !native) throw new Error('libmpv 尚未就绪')
   const headers: string[] = []
   // 必须带浏览器 UA：libVLC 路径（:http-user-agent）与 FFmpeg 中转（-user_agent）都发浏览器 UA，
@@ -2659,23 +3463,55 @@ export function mpvPlay(path: string, referer?: string, cookies?: string): void 
   headers.push(`User-Agent: ${BROWSER_UA}`)
   if (referer) headers.push(`Referer: ${referer}`)
   if (cookies) headers.push(`Cookie: ${cookies}`)
-  native.setProperty('http-header-fields', headers.join(','))
+  native.setProperty('http-header-fields', joinMpvHeaderFields(headers))
   // 新一次载入：重置状态基线，确保开播时一定会重新发出 playing 事件
   lastPlaying = false
   lastEof = false
   lastLength = 0
-  /*
-   * v0.3.9：「注入播放器」阶段从这里开始计时 ——
-   * 这才是真正「把播放资源交给播放器」的那一刻（loadfile），
-   * 之前的嗅探/校验都属于「获取播放资源」。阶段完成要等 startTimePump 看到首帧。
-   */
   lastHadPicture = false
   resetAudioOnly()
-  resetNetSampling()
-  beginStage('inject', '正在把播放资源交给播放内核（loadfile）')
-  pushStep('inject', `交给内核：${path.slice(0, 100)}${referer ? `（带 Referer）` : ''}${cookies ? '（带 Cookie）' : ''}`)
+  /*
+   * v1.5 需求 ①：换媒体 = 画面回到"还没有"。
+   *
+   * 必须在这里显式发一次 false（而不是等渲染层自己发现）：渲染层要立刻收起弹幕层、
+   * 收起控制栏、把加载进度重新显示出来；等它按 800ms 轮询察觉就晚了 ——
+   * 那一段时间里屏幕上会出现"上一集的最后一帧 + 上一集的弹幕 + 控制栏"。
+   * 与 startTimePump 里的 true 是同一个字段、同一个来源（lastHadPicture）。
+   */
+  sendEvent(attachedWin, { type: 'picture', hasPicture: false })
   // 新媒体的视频输出窗口会在首帧时重建，届时需要再挂一次
   pendingReparent = true
+  if (!opts.swap) {
+    resetNetSampling()
+    candidateBytesBase = 0
+    boostSwapped = false
+    /*
+     * 新一集：清掉 thumbfast 状态去重键，让「缩略图已生成/失败」至少再记一行。
+     * 只在新装载（不是换候选）时清 —— 换候选不换集，重复记同一条会刷日志。
+     */
+    lastThumbfastStatusKey = ''
+    markPlayTiming('loadfile')
+    /*
+     * v0.3.9：「注入播放器」阶段从这里开始计时 ——
+     * 这才是真正「把播放资源交给播放器」的那一刻（loadfile），
+     * 之前的嗅探/校验都属于「获取播放资源」。阶段完成要等 startTimePump 看到首帧。
+     */
+    beginStage('inject', '正在把播放资源交给播放内核（loadfile）')
+    pushStep('inject', `交给内核：${displaySource(path)}${referer ? `（带 Referer）` : ''}${cookies ? '（带 Cookie）' : ''}`)
+  } else {
+    /*
+     * 换候选也必须**重置网络采样**。
+     *
+     * 为什么（v1.3 实测踩到的）：`netBytes` 是「已预读字节」的单调值，
+     * 换源后内核从头开始报，`Math.max(旧值, 新值)` 会永远停在旧值上 ——
+     * 于是「这个候选收到多少字节」恒为 0，5 秒零字节规则会把一条**正常的新地址**
+     * 每 5 秒换掉一次。现在每次 loadfile 都从 0 起算，判据只属于当前候选。
+     */
+    resetNetSampling()
+    candidateBytesBase = 0
+    pushStep('inject', `切换播放源（${opts.reason ?? '换候选'}）：${path.slice(0, 90)}`)
+  }
+  candidateLoadedAt = Date.now()
   const loaded = native.command(['loadfile', path, 'replace'])
   /*
    * ⚠️ v0.2.7 附加 修「抓到了视频流却一直不播 / 连播与选集之后再也播不出来」。
@@ -2698,9 +3534,138 @@ export function mpvPlay(path: string, referer?: string, cookies?: string): void 
     'info',
     'mpv',
     loaded
-      ? `libmpv 取流: ${path.slice(0, 130)} | Referer=${referer ? referer.slice(0, 60) : '(不带)'} Cookie=${cookies ? `${cookies.length} 字符` : '(无)'}`
-      : `libmpv 取流失败: ${path.slice(0, 130)} → ${native.lastError()}`
+      ? `libmpv 取流${opts.swap ? `（切换：${opts.reason ?? '换候选'}）` : ''}: ${displaySource(path)} | Referer=${referer ? referer.slice(0, 60) : '(不带)'} Cookie=${cookies ? `${cookies.length} 字符` : '(无)'}`
+      : `libmpv 取流失败${opts.swap ? `（切换：${opts.reason ?? '换候选'}）` : ''}: ${displaySource(path)} → ${native.lastError()}`
   )
+  /*
+   * 首次装载被内核当场拒绝：这是**确定性的失败**，不用等 15s 看门狗。
+   * 立刻结束本轮并给出原因（用户看到的必须是一句「注入失败：…」而不是一直转圈）。
+   * 换候选失败则只记日志：还有下一个候选 / 15 秒兜底，不能在这里把整轮判死。
+   */
+  if (!loaded && !opts.swap) {
+    failStageAndEnd(
+      'inject',
+      `注入失败：播放内核拒绝了该地址（loadfile 返回失败：${native.lastError() || '未知原因'}）`,
+      'site'
+    )
+  }
+  return loaded
+}
+
+/** 本轮是否已经把加速中转换上去过（调用方据此决定「后台会话还要不要留」） */
+export function mpvBoostSwapped(): boolean {
+  return boostSwapped
+}
+
+/**
+ * 当前这一路的播放进度读数（v1.3）。
+ *
+ * 用途：`enginePlay` 在「要不要启动加速测速」那一刻必须知道直连是不是已经有数据 ——
+ * 有数据就说明不需要再开一条连接去测速（省带宽，也避免慢 CDN 上两条连接互相排队）。
+ * 只读三个内存变量，不碰内核、不发请求。
+ */
+export function mpvPlaybackProgress(): { bytes: number; hasPicture: boolean; sinceLoadMs: number } {
+  return {
+    bytes: bytesSinceCandidate(),
+    hasPicture: lastHadPicture,
+    sinceLoadMs: candidateLoadedAt > 0 ? Date.now() - candidateLoadedAt : 0
+  }
+}
+
+export function mpvPlay(path: string, referer?: string, cookies?: string): void {
+  loadSource(path, referer, cookies, {})
+}
+
+/**
+ * 本地临时缓存失败 → 把内核切回**直连原地址**（v1.4 边下边播的兜底）。
+ *
+ * 为什么单独一个函数，而不是复用 `mpvApplyBoost`：
+ *   · 加速中转有自己的「2 秒 / 零字节」门槛，而这里失败已经由缓存会话**确定**了，
+ *     再等 2 秒只会让用户多黑屏两秒；
+ *   · 加速中转会设置 `boostSwapped`，回退直连并不是「加速已切换」，那个标记不能动
+ *     （否则后台加速决策会误以为已经切过流）。
+ *
+ * 与加速切换相同的一条硬规则：**已经出画面就绝不切**。
+ * 缓存可能是在播放中途才失败（上游断了），这时切源会把正在看的画面打回 0 秒；
+ * 已经缓存的区间足够继续播，真播到断点再让内核自己报错/换候选更合理。
+ */
+export function mpvFallbackDirect(
+  url: string,
+  referer?: string,
+  cookies?: string,
+  reason = '缓存不可用'
+): boolean {
+  if (!ready || !native || !attachedWin || attachedWin.isDestroyed()) return false
+  if (lastHadPicture) return false
+  try {
+    return loadSource(url, referer, cookies, { swap: true, reason: `本地缓存回退：${reason}` })
+  } catch {
+    return false
+  }
+}
+
+/** 内核是否已经挂载好、可以 loadfile（播放页刚打开时地址可能比 attach 先到） */
+export function mpvReady(): boolean {
+  return ready && !!native && !!attachedWin && !attachedWin.isDestroyed()
+}
+
+/**
+ * 换到交接队列里的下一个候选（v1.3 乐观交接的执行端）。
+ *
+ * 调用方是 250ms 状态泵：只有「当前候选 5 秒零字节」才会被调用。
+ * 这里再复核一次判据（不信任调用方），因为泵的采样是异步的：
+ * 万一这一帧刚好收到字节，就不能把一条已经通了的地址换掉。
+ */
+export function mpvSwitchToNextCandidate(reason = '5 秒零字节'): { url: string } | null {
+  if (!ready || !native || !attachedWin || attachedWin.isDestroyed()) return null
+  if (lastHadPicture) return null
+  if (bytesSinceCandidate() > 0) return null
+  const next = takeNextCandidate()
+  if (!next) return null
+  log.append(
+    'warn',
+    'mpv',
+    `${HANDOFF_NO_BYTES_MS / 1000} 秒内内核一个字节都没收到，换下一个候选（${reason}；队列还剩 ${handoffSnapshot().queued} 个）`
+  )
+  try {
+    if (!loadSource(next.url, next.referer, next.cookies, { swap: true, reason })) return null
+  } catch {
+    return null
+  }
+  return { url: next.url }
+}
+
+/**
+ * 把「加速中转」地址接到内核上（v1.3：加速决策不再挡在起播前面）。
+ *
+ * 旧的顺序是「测速/预热（0.3~8 秒）→ 启用中转 → loadfile」，
+ * 用户必须先等完测速才可能看到画面。现在直连地址**先交给内核**，
+ * 测速在后台跑；只有「还没出画面」时才把内核切到中转地址（中转里已经缓存了头部分片，
+ * 切过去通常立刻就能出画面），已经出画面则**绝不打断**。
+ */
+export function mpvApplyBoost(url: string, referer?: string, cookies?: string): boolean {
+  if (!ready || !native || !attachedWin || attachedWin.isDestroyed()) return false
+  if (lastHadPicture || boostSwapped) return false
+  /*
+   * 只有「还一个字节都没收到」才切加速。
+   *
+   * 为什么字节在动就不切：换流是 `loadfile replace`，进度必然回 0 ——
+   * 一条慢但通的直连已经拉了几百 KB，切到中转反而把这段进度扔掉（实测慢源上更慢）。
+   * 慢但通的源交给用户看即时进度（状态区有速率），或者由 5 秒零字节那条规则去换候选。
+   *
+   * 为什么还要等 2 秒：单连接慢≠死。正常慢 CDN 的首字节约 1~2 秒，
+   * 抢在它前面切流会把正要出画面的那一路打断（脚本里实测：1.9 秒切流后首帧反而慢了 2 秒）。
+   * 2 秒还没一个字节，才说明这一条连接确实卡住了，此时中转里通常已经有头部分片，切过去立刻出画。
+   */
+  if (bytesSinceCandidate() > 0) return false
+  if (Date.now() - candidateLoadedAt < 2000) return false
+  boostSwapped = true
+  log.append('info', 'mpv', '把加速中转接到内核（直连这段时间还没出画面）')
+  try {
+    return loadSource(url, referer, cookies, { swap: true, reason: '加速中转' })
+  } catch {
+    return false
+  }
 }
 
 /** 播放列表：第一个 replace，其余 append（供本地多集播放使用） */
@@ -2797,8 +3762,11 @@ export function mpvGetState(): MpvState | null {
   /*
    * v1.1.4：顺带带上 uosc 桥接脚本的按钮/版本读数（见 MpvState.uosc 的说明）。
    * 三次属性读取，挂在本来就会调用的 800ms/250ms 状态泵上，开销可以忽略。
+   *
+   * v1.5：再把 `hasPicture` 并进来 —— 它是渲染层弹幕门控（需求 ②）与加载进度（需求 ③）
+   * 的唯一判据，必须和播放状态同一刻、同一来源（详见 mpvHasPicture 与 MpvState.hasPicture）。
    */
-  return { ...native.state(), uosc: uoscBridgeStats() }
+  return { ...native.state(), hasPicture: mpvHasPicture(), uosc: uoscBridgeStats() }
 }
 
 /**
@@ -3059,11 +4027,30 @@ export function mpvNotifyLayout(): void {
 }
 
 export function mpvDestroy(): void {
+  /*
+   * V1.3.1：退出链路插桩（真机 AppHang，Event 1002，1.2.5 / 1.2.9 / 1.3.0 都中招）。
+   *
+   * 为什么必须在**每一步之间**打点：Windows 判定"无响应"的依据是主线程 5 秒没处理窗口消息，
+   * 而这里连续做了「停计时器 → 停各种 watch → destroy 内核 → 清状态」几件同步事，
+   * 任何一件卡住，外部都只看到"整个窗口卡死"，看不出是哪一件。
+   * 每一行都带相对开始时的毫秒数；下次卡住时，**最后一行就是卡住的那一步**。
+   */
+  const t0 = Date.now()
+  const mark = (step: string): void => log.append('info', 'exit', `+${Date.now() - t0}ms ${step}`)
+  mark('开始销毁播放器')
   stopTimePump()
+  mark('已停时间泵')
   stopRaiseWatch()
   stopCursorWatch()
+  stopThumbfastStatusWatch?.()
+  mark('已停各种 watch（raise/cursor/thumbfast）')
   surfaceVisible = true
   biliScriptLoaded = false
+  /* v1.2.1：实例销毁后 VO 窗口随之消失，输入窗口缓存作废（新实例会重新找/重新启用） */
+  inputHwnd = 0
+  inputHwndEnabled = false
+  inputCheckAt = 0
+  inputLastFailure = ''
   // 三个 uosc 相关的标记都要复位：实例销毁后脚本也随之消失，
   // 保留为 true 会让「动作回传」「弹幕插件渲染」在下一个实例上误判成可用。
   uoscBarLoaded = false
@@ -3092,16 +4079,50 @@ export function mpvDestroy(): void {
     } catch {
       /* ignore */
     }
-    try {
-      native.destroy()
-    } catch {
-      /* ignore */
-    }
-    log.append('info', 'mpv', 'libmpv 已销毁')
+    mark('已发 stop')
+    /*
+     * V1.3.2：内核销毁**挪到下一轮事件循环**。
+     *
+     * 真机日志（用户贴的）：
+     *   [exit] +0ms 开始销毁播放器
+     *   [exit] +0ms 已停时间泵
+     *   [exit] +0ms 已停各种 watch（raise/cursor/thumbfast）
+     *   ← 到这里就断了，`内核 destroy 完成` 再也没出现
+     * 也就是**卡在 native.destroy() 这一句**（libmpv 释放时在等网络/解码线程收尾），
+     * 而它是同步调用，主线程被它按住的这几秒里窗口消息没人处理 → Windows 判 AppHang 直接杀掉。
+     *
+     * 现在把销毁放到 setTimeout(0)：先把退出流程（关窗口、清状态）交给下一轮事件循环跑完，
+     * 重建时窗口已经收起来了，再让 libmpv 在自己那一下里慢慢收尾。
+     * **这不是把问题藏起来**：日志里仍然会打 `内核 destroy 完成 +Nms`，N 就是它真实的耗时，
+     * 下一次要是还卡，这个数字会告诉我们它到底卡多久。
+     */
+    const inst = native
+    native = null
+    setTimeout(() => {
+      const tDestroy = Date.now()
+      try {
+        inst.destroy()
+      } catch {
+        /* ignore */
+      }
+      log.append('info', 'mpv', 'libmpv 已销毁')
+      log.append('info', 'exit', `+${Date.now() - tDestroy}ms 内核 destroy 完成（异步执行）`)
+    }, 0)
   }
   ready = false
   attachedWin = null
   lastPlaying = false
   lastLength = 0
   lastEof = false
+  /*
+   * v1.5：销毁后「有没有画面」必须是 false。
+   * 以前这里没复位（它只在 loadSource 里被清），销毁后如果还有人读这份状态
+   * （自检、旧渲染层的迟到轮询），会得到"有画面"的假读数，弹幕/控制栏门控跟着失效。
+   */
+  lastHadPicture = false
+  // v1.3：内核销毁后「当前候选」的计量与交接队列都不再有意义
+  candidateLoadedAt = 0
+  candidateBytesBase = 0
+  boostSwapped = false
+  resetHandoff()
 }

@@ -1,5 +1,7 @@
-import axios from 'axios'
+import axios, { type AxiosRequestConfig } from 'axios'
 import { createHash } from 'node:crypto'
+import http from 'node:http'
+import https from 'node:https'
 import { JSONPath } from 'jsonpath-plus'
 import xhtml from 'xpath-html'
 import type {
@@ -18,9 +20,16 @@ import type {
   RulesRepoMeta
 } from '@shared/types'
 import { DEFAULT_RULES, emptyRule } from '@shared/types'
-import { BAHAMUT_RULE_ID, bahamutRule } from '@shared/bahamutRule'
+import {
+  REMOVED_RULE_IDS,
+  RETIRED_RULES,
+  RULE_LIBRARY_REVISION,
+  RULE_LIBRARY_SEEDS,
+  RULE_NOTES,
+  RULE_SPEED_MS
+} from '@shared/builtinRules'
 import { log } from '../log'
-import { BROWSER_UA, buildProxyAgents, getSettings } from '../net'
+import { BROWSER_UA, buildProxyAgents, chromiumGetText, getSettings } from '../net'
 import { store } from '../store'
 import { bahamutEpisodes, bahamutPlay, bahamutSearch } from './bahamut'
 import { normalizeEpisodeGroups } from './episodeNormalize'
@@ -154,8 +163,37 @@ interface HNode {
   getAttribute?: (name: string) => string | null
 }
 
+const toDocCache = new WeakMap<object, XDocWrapper>()
+
+/**
+ * HTML → 可查 XPath 的文档对象。
+ *
+ * V1.3.8：**整页解析出空树时，退到 `<body` 之后重新解析**。
+ *
+ * 真机证据（Tucao 的搜索页，32KB、含 `class="list"`、5 个 `/play/` 链接）：
+ *   · `xpath-html.fromPageSource(整页)` → `//div` 都是 **0**，等于整棵树是空的；
+ *   · 把 `<head>` 之前的部分切掉、从 `<body` 开始解析 → `//div` 有 54 个，`//a[@class="t"]` 命中 2 个。
+ * 也就是说这个站的头部（XHTML DOCTYPE + 一堆内联脚本）会让解析器产出空树，
+ * 表现为「搜索 0 条」，而数据其实就在 HTML 里。这里是通用兜底：只在**整页解析出 0 个元素**时才重试，
+ * 正常站点完全不受影响。
+ */
 function toDoc(text: string): XDocWrapper {
-  return xhtml.fromPageSource(text) as unknown as XDocWrapper
+  const first = xhtml.fromPageSource(text) as unknown as XDocWrapper & {
+    findElements: (expr: string) => unknown[]
+  }
+  try {
+    if (first.findElements('//*').length > 0) return first
+  } catch {
+    /* 查询失败也走兜底 */
+  }
+  const bodyAt = text.search(/<body[\s>]/i)
+  if (bodyAt <= 0) return first
+  try {
+    const second = xhtml.fromPageSource(text.slice(bodyAt)) as unknown as XDocWrapper
+    return second
+  } catch {
+    return first
+  }
 }
 
 /** 给 XPath 的每个标签名加 x: 命名空间前缀（与 xpath-html 内部一致；跳过 @ 属性与已带前缀的节点） */
@@ -320,6 +358,268 @@ function beforeRedirectFor(url: string): (options: Record<string, unknown>) => v
   }
 }
 
+/**
+ * 上面那个跳转钩子的对外别名。
+ * 播放页直出解析（ruleProbe）也要同一套「同站 http→https」口径，
+ * 但它是另一个模块，直接 import 这个别名即可（避免两处各写一份、口径漂移）。
+ */
+export const sameSiteRedirectUpgrade = beforeRedirectFor
+
+/**
+ * 把「同站的 http 绝对地址」升级成 https（v1.7）。
+ *
+ * 和 resolveUrl 的区别：这个只做协议升级、**不改解析基准**，给「已经拿到绝对地址、
+ * 但那条地址可能是 http」的调用点用（播放页直出解析、候选探测）。
+ * AGE 的搜索页里给出的详情/播放链接本身就是 `http://www.agedm.io/...`，
+ * 而它的 :80 是**黑洞**（实测直连 ETIMEDOUT，21 秒都不回），60 秒超时就是这么来的；
+ * 所以只要「原地址是同站 https」，就一定要在发请求前把协议换掉，而不是等 301 再补救
+ * （301 也可能指向 http，见 upgradeRedirectProtocol）。
+ */
+export function upgradeSameSite(url: string, base?: string): string {
+  try {
+    const u = new URL(url)
+    if (u.protocol !== 'http:') return url
+    let b: URL | null = null
+    try {
+      b = new URL(base || url)
+    } catch {
+      b = null
+    }
+    if (!b || b.protocol !== 'https:') return url
+    if (!sameSite(u.hostname, b.hostname)) return url
+    u.protocol = 'https:'
+    if (u.port === '80') u.port = ''
+    return u.toString()
+  } catch {
+    return url
+  }
+}
+
+/**
+ * 哪些错误值得「换一条连接重发」（v1.7）。
+ *
+ * 只认**连接级**故障：TCP 被重置/被掐、连接超时、DNS 临时失败。
+ * 4xx/5xx、验证页、解析失败一律不算 —— 那些重发也没用，只会把站点的限流打得更狠
+ * （AGE 这类站点的速率限制本来就紧，多余请求会让它把整台机器拉黑更久）。
+ */
+export function isTransientNetError(err: unknown): boolean {
+  const e = err as { code?: string; message?: string }
+  const code = String(e?.code ?? '')
+  const msg = String(e?.message ?? '')
+  if (
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    code === 'ECONNABORTED' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNREFUSED' ||
+    code === 'EAI_AGAIN' ||
+    code === 'ENETUNREACH' ||
+    code === 'EHOSTUNREACH'
+  ) {
+    return true
+  }
+  return /socket hang up|timeout of \d+ms exceeded|aborted|network error|connection (?:reset|aborted|closed)/i.test(
+    msg
+  )
+}
+
+/** 重试用的「一次性连接」：不复用 keep-alive 池（被掐掉的死 socket 还在池里，复用等于白重试） */
+const freshHttpsAgent = new https.Agent({ keepAlive: false })
+const freshHttpAgent = new http.Agent({ keepAlive: false })
+
+/**
+ * 「换一条新连接」的 axios 片段（重试用，也给播放页直出解析复用）。
+ *
+ * 走代理时连接由代理持有，换不换 agent 由代理决定，这里保持与原请求一致。
+ */
+export function freshConnectionAgents(): Partial<AxiosRequestConfig> {
+  const proxy = getSettings().proxy
+  if (proxy?.enabled && proxy.host) return buildProxyAgents(proxy)
+  return { httpAgent: freshHttpAgent, httpsAgent: freshHttpsAgent }
+}
+
+/**
+ * 像浏览器一样的请求头（v1.7）。
+ *
+ * 为什么需要：规则引擎过去的请求头只有 `User-Agent`，没有 `Referer` / `Accept` / `Accept-Language`。
+ * 真实浏览器访问一个站点的每个子页面都会带这三样，而 AGE 这类带 WAF 的站点对
+ * 「裸请求」明显更严（实测同一时刻带/不带 Referer 的被重置概率不同）。
+ * 这里只补**站点自己的 origin** 作 Referer —— 不外泄任何其它地址，也不会把规则里
+ * 显式写死的 headers 覆盖掉（调用方后写的优先）。
+ */
+export function browserLikeHeaders(url: string): Record<string, string> {
+  let origin = ''
+  try {
+    origin = new URL(url).origin + '/'
+  } catch {
+    origin = ''
+  }
+  return {
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    ...(origin ? { Referer: origin } : {})
+  }
+}
+
+/** 重试间隔（第 n 次重发前等多久）：第一次很快就试，第二次给站点一点喘息 */
+const RETRY_DELAYS_MS = [350, 900]
+/** 重试总预算：超过就认失败。与「单请求 30s + 三次」相称，又不至于让一次搜索挂两分钟 */
+const RETRY_BUDGET_MS = 40_000
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * 对连接级故障重发（语义见文件上方 isTransientNetError / 常量处的说明）。
+ *
+ * `send(fresh)` 的入参表示「这次要不要换新连接」：第一次 false（沿用应用统一的
+ * keep-alive/代理配置），重试一律 true。
+ * 日志只记站点名与错误类型，**不记 URL**（内部接口地址不进日志是红线）。
+ */
+/**
+ * 日志里只写"主机 + 路径"（不写 query）：红线是**不要在日志/界面里出现内部接口地址**，
+ * 而规则站点的 url 带 keyword 之类的查询串也没必要留。
+ */
+function shortUrlForLog(u: string): string {
+  try {
+    const p = new URL(u)
+    return `${p.host}${p.pathname}`.slice(0, 120)
+  } catch {
+    return '(无法解析的地址)'
+  }
+}
+
+export async function withNetRetry<T>(
+  label: string,
+  send: (fresh: boolean) => Promise<T>
+): Promise<T> {
+  const started = Date.now()
+  let lastErr: unknown
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      return await send(attempt > 0)
+    } catch (err) {
+      lastErr = err
+      const left = RETRY_BUDGET_MS - (Date.now() - started)
+      const wait = RETRY_DELAYS_MS[attempt]
+      if (!isTransientNetError(err) || wait === undefined || left < wait + 1_000) break
+      const short = String((err as { message?: string })?.message ?? err).slice(0, 60)
+      log.append(
+        'warn',
+        'rules',
+        `${label} 连接被重置/超时（${short}），${wait}ms 后换新连接重发（第 ${attempt + 1} 次重试）`
+      )
+      await sleep(wait)
+    }
+  }
+  throw lastErr
+}
+
+/*
+ * ───────── 站点冷却（v1.7）─────────
+ *
+ * 真机 + 实测：AGE 被短时间连打之后会**直接掐连接**（ECONNRESET，0.7~1 秒就失败），
+ * 而且这个状态是「打一次续一次」——实测冷却期里每 45 秒打一次，要 2~3 分钟才恢复；
+ * 一旦继续连发（批量预嗅探、网页视图兜底、用户连点），整段就一直是失败（实测 27/30）。
+ *
+ * 所以这里做一个**很窄**的熔断：同一主机连续 2 次连接级失败 → 该主机静默 20 秒，
+ * 期间不再发请求，而是立刻返回一句可读的错误。它换不回"站点没被限流"，
+ * 但能保证：① 不再给它加码（加压只会延长冷却）；② 用户看到的是「稍后再试」而不是
+ * 「这条规则里没有这部番剧」；③ 其它站点完全不受影响（按主机隔离）。
+ */
+const hostStrikes = new Map<string, { strikes: number; until: number }>()
+const COOL_DOWN_MS = 20_000
+const COOL_DOWN_STRIKES = 2
+
+/** 冷却中的错误码：调用方据此区分「站点限流」与「真的没结果」 */
+export const COOL_DOWN_CODE = 'SAKANA_SITE_COOL_DOWN'
+
+function hostKey(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase()
+  } catch {
+    return ''
+  }
+}
+
+/** 冷却中就直接失败（不产生任何网络请求） */
+function assertNotCoolingDown(url: string): void {
+  const host = hostKey(url)
+  if (!host) return
+  const st = hostStrikes.get(host)
+  if (!st || st.until <= Date.now()) return
+  const left = Math.ceil((st.until - Date.now()) / 1000)
+  const err = new Error(`站点连接被连续重置（疑似限流），已暂停对该站点的请求 ${left} 秒后再试`)
+  ;(err as { code?: string }).code = COOL_DOWN_CODE
+  throw err
+}
+
+/** 记录一次请求结果：连续失败达阈值就对该主机开冷却；成功则清零 */
+function noteNetResult(url: string, ok: boolean): void {
+  const host = hostKey(url)
+  if (!host) return
+  if (ok) {
+    hostStrikes.delete(host)
+    return
+  }
+  const st = hostStrikes.get(host) ?? { strikes: 0, until: 0 }
+  st.strikes += 1
+  if (st.strikes >= COOL_DOWN_STRIKES && st.until <= Date.now()) {
+    st.until = Date.now() + COOL_DOWN_MS
+    st.strikes = 0
+    log.append(
+      'warn',
+      'rules',
+      `站点连续 ${COOL_DOWN_STRIKES} 次连接被重置，暂停请求 ${COOL_DOWN_MS / 1000} 秒（避免把站点限流打成更长的封禁）`
+    )
+  }
+  hostStrikes.set(host, st)
+}
+
+/**
+ * 规则页面的**短缓存**（v1.7，只缓存 GET）。
+ *
+ * 为什么需要：同一次「点开一部番」会**重复抓同一张页面**——
+ *   ① 批量预嗅探（ruleProbeBatch）对每条规则各跑一遍 搜索→详情→播放页；
+ *   ② 用户自己点进播放页时，规则引擎又跑一遍同样的搜索与详情；
+ *   ③ 选集失败重试 / 用户重开一次，再来一遍。
+ * 对 AGE 这种**按请求速率掐连接**的站点，重复抓同一张页面是纯粹的加压：
+ * 实测几秒内连打 3~4 次就会开始 ECONNRESET，而整轮播放因此失败。
+ * 缓存 20 秒足够覆盖"预嗅探 + 用户点击"这段重叠窗口，又短到不会把
+ * 站点刚改版这种变化藏起来（选集列表在 20 秒内不可能变）。
+ */
+const HTML_CACHE_TTL_MS = 20_000
+const HTML_CACHE_MAX = 40
+const htmlCache = new Map<string, { at: number; text: string }>()
+
+function cacheKey(url: string, method: string): string {
+  return `${method} ${url}`
+}
+
+function readHtmlCache(key: string): string | null {
+  const hit = htmlCache.get(key)
+  if (!hit) return null
+  if (Date.now() - hit.at > HTML_CACHE_TTL_MS) {
+    htmlCache.delete(key)
+    return null
+  }
+  return hit.text
+}
+
+function writeHtmlCache(key: string, text: string): void {
+  htmlCache.delete(key)
+  htmlCache.set(key, { at: Date.now(), text })
+  while (htmlCache.size > HTML_CACHE_MAX) {
+    const oldest = htmlCache.keys().next().value as string | undefined
+    if (!oldest) break
+    htmlCache.delete(oldest)
+  }
+}
+
+/** 清掉规则页面缓存（测试/改规则后重跑用） */
+export function clearRuleHtmlCache(): void {
+  htmlCache.clear()
+}
+
 async function httpRequest(
   url: string,
   method: 'GET' | 'POST',
@@ -327,15 +627,88 @@ async function httpRequest(
   queryJson: string,
   bodyType: string
 ): Promise<string> {
-  const headers = parseJsonObject(headersJson) as Record<string, string>
+  const headers = {
+    ...browserLikeHeaders(url),
+    ...(parseJsonObject(headersJson) as Record<string, string>)
+  }
   const query = parseJsonObject(queryJson)
+  const send = async (fresh: boolean): Promise<string> => {
+    assertNotCoolingDown(url)
+    try {
+      const text = await sendOnce(url, method, headers, query, bodyType, fresh)
+      noteNetResult(url, true)
+      return text
+    } catch (err) {
+      // 冷却错误本身不算「一次失败」，否则会自己延长自己的冷却
+      if ((err as { code?: string })?.code !== COOL_DOWN_CODE) noteNetResult(url, false)
+      throw err
+    }
+  }
+  /*
+   * 只对「无查询参数拼装」的 GET 做缓存：POST/带 query 的请求语义上更接近"查询"，
+   * 缓存它们容易在改关键词后拿到上一条结果。
+   */
+  const key = Object.keys(query).length === 0 && method === 'GET' ? cacheKey(url, method) : ''
+  if (key) {
+    const hit = readHtmlCache(key)
+    if (hit !== null) return hit
+  }
+  /*
+   * 为什么在 httpRequest 这一层重试而不是在 ruleSearch/ruleEpisodes 里：
+   * 规则站点的每一次抓取（搜索页、详情页、API）都是同一条网络路径，
+   * 口径放在最底层，所有规则、所有步骤自动一致，不会漏掉某一处。
+   */
+  /*
+   * V1.3.6：node 这条路彻底失败时，**换 Chromium 网络栈再取一次**。
+   *
+   * 真机证据：Tucao 的搜索页在应用里 20 秒超时，而它的 HTML 我用 curl 是能拿到的
+   * （浏览器头 + Referer）——说明不是页面不存在，而是 node 的请求在这类老站/反爬前面
+   * 更容易被拖死或直接不给响应。同样的兜底我们已经在 bangumi 上验证过（把 8 秒超时的
+   * `/calendar` 救回来过），这里把它复用到规则页面上：**只在 node 失败后才走**，
+   * 正常路径的耗时不受影响。
+   */
+  let text: string
+  try {
+    text = await withNetRetry(`规则站点请求`, send)
+  } catch (err) {
+    const short = String((err as { message?: string })?.message ?? err).slice(0, 60)
+    try {
+      const viaChromium = await chromiumGetText(url, 20_000, headers)
+      if (viaChromium && viaChromium.length > 0) {
+        log.append('info', 'rules', `node 取页失败（${short}），改用 Chromium 网络栈成功：${shortUrlForLog(url)}`)
+        noteNetResult(url, true)
+        if (key) writeHtmlCache(key, viaChromium)
+        return viaChromium
+      }
+    } catch (err2) {
+      log.append(
+        'warn',
+        'rules',
+        `node 与 Chromium 都没取到页面（${short} / ${String((err2 as { message?: string })?.message ?? err2).slice(0, 50)}）：${shortUrlForLog(url)}`
+      )
+    }
+    throw err
+  }
+  if (key) writeHtmlCache(key, text)
+  return text
+}
+
+/** 真正发一次请求（拆出来只为了让上面那层能统一记成功/失败） */
+async function sendOnce(
+  url: string,
+  method: 'GET' | 'POST',
+  headers: Record<string, string>,
+  query: Record<string, unknown>,
+  bodyType: string,
+  fresh: boolean
+): Promise<string> {
   const common = {
     timeout: 30000,
     responseType: 'text' as const,
     headers: { 'User-Agent': BROWSER_UA, ...headers },
     // AGE 偶发的 301→http:80 会 ETIMEDOUT（见 upgradeRedirectProtocol）
     beforeRedirect: beforeRedirectFor(url),
-    ...buildProxyAgents(getSettings().proxy)
+    ...(fresh ? freshConnectionAgents() : buildProxyAgents(getSettings().proxy))
   }
   if (method === 'POST') {
     if (bodyType === 'json') {
@@ -365,8 +738,105 @@ async function httpRequest(
     for (const [k, v] of Object.entries(query)) u.searchParams.set(k, String(v))
     finalUrl = u.toString()
   }
+  /*
+   * V1.3.7：**空闲收尾**，但**只对白名单主机生效**。
+   *
+   * 真机实测：Tucao 的搜索页首字节 2.2~10.5 秒就到了、正文 32KB 也齐了，
+   * 但 `curl -w` 的 `total` 永远等于超时上限 —— 服务器把连接挂着**不结束响应**
+   * （keep-alive 且不带 Content-Length）。我们按"响应结束"判定，于是一直等到超时。
+   *
+   * ⚠️ 第一版做成了全局 GET 生效，结果日志里刷出一堆
+   *   `流式接收失败，退回整响应模式：Request failed with status code 404 / read ECONNRESET / socket hang up`
+   * 那些是**请求本身失败**（对方 404 / 掐连接），流式根本轮不到生效，还污染了其它规则的日志。
+   * 所以现在收窄成按主机白名单：只有明确知道"响应不结束"的站点才走这条路，其它规则行为完全不变。
+   */
+  let idleCutoff = false
+  try {
+    idleCutoff = IDLE_CUTOFF_HOSTS.has(new URL(finalUrl).hostname.toLowerCase())
+  } catch {
+    idleCutoff = false
+  }
+  if (idleCutoff) {
+    try {
+      /*
+       * ⚠️ 必须显式 `Accept-Encoding: identity`。
+       *
+       * axios 只在 responseType 为 text/json 时自动解压；**stream 模式不会**。
+       * 默认请求头带 `Accept-Encoding: gzip`，服务器就回 gzip，于是我们拿到的是**压缩后的字节流**，
+       * 转成字符串就是乱码，XPath 一条也匹配不到 —— 表现为"HTTP 成功但 0 条"，
+       * 然后退回网页视图兜底（那一步要 100 多秒），用户看到的就是"搜不到"。
+       * 这是本流程里唯一一处"拿到数据却解析不出"的坑，写在这里免得以后再踩。
+       */
+      return await getWithIdleCutoff(finalUrl, {
+        ...common,
+        responseType: 'stream',
+        headers: { ...common.headers, 'Accept-Encoding': 'identity' }
+      })
+    } catch (err) {
+      log.append('warn', 'rules', `流式接收失败，退回整响应模式：${String((err as Error)?.message ?? err).slice(0, 60)}`)
+    }
+  }
   const res = await axios.get(finalUrl, common)
   return String(res.data ?? '')
+}
+
+/**
+ * 「响应不结束」的站点白名单（V1.3.7）。
+ * 只有实测确认过"正文到齐但连接不收尾"的站才放进来，避免全局改变所有规则的请求行为。
+ */
+const IDLE_CUTOFF_HOSTS = new Set(['www.tucao.my', 'tucao.my'])
+
+/** 首字节后多久没有新数据就认为响应完整（毫秒）。见 sendOnce 里的说明。 */
+const STREAM_IDLE_MS = 3000
+/** 流式接收的硬上限：再慢也不能让一次搜索挂满整轮（毫秒） */
+const STREAM_HARD_MS = 25_000
+
+/**
+ * 流式 GET：**内容完整就收尾**，不依赖连接关闭。
+ *
+ * 这是为了 Tucao 这类"body 到齐但连接不结束"的老站。两个判定条件一起用：
+ *   ① 已收到 `</html>`（整页 HTML 齐了）→ 再等 STREAM_IDLE_MS 无新数据就返回；
+ *   ② 没等到 `</html>` 就只能靠空闲判定 —— 所以空闲窗口取 **3 秒**（1.5 秒太激进：
+ *      服务端两次 flush 之间常有 2 秒空档，过早收尾会把结果区截掉，表现为"搜索 0 条"）。
+ *
+ * 真机教训：最初写 1.5 秒空闲，结果 HTTP 这条路"成功但 0 条"，
+ * 于是又退到网页视图兜底，整个搜索花了 **155 秒**才出 1 条 —— 用户感知就是"搜不到"。
+ */
+async function getWithIdleCutoff(
+  url: string,
+  config: Record<string, unknown>
+): Promise<string> {
+  const res = await axios.get(url, config as never)
+  const stream = res.data as NodeJS.ReadableStream & { destroy?: () => void }
+  return await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let idle: NodeJS.Timeout | null = null
+    let done = false
+    const finish = (err?: Error): void => {
+      if (done) return
+      done = true
+      if (idle) clearTimeout(idle)
+      clearTimeout(hard)
+      try {
+        stream.destroy?.()
+      } catch {
+        /* ignore */
+      }
+      if (err) reject(err)
+      else resolve(Buffer.concat(chunks).toString('utf-8'))
+    }
+    const hard = setTimeout(() => finish(new Error(`流式接收超过 ${STREAM_HARD_MS / 1000}s`)), STREAM_HARD_MS)
+    const bumpIdle = (): void => {
+      if (idle) clearTimeout(idle)
+      idle = setTimeout(() => finish(), STREAM_IDLE_MS)
+    }
+    stream.on('data', (c: Buffer) => {
+      chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c))
+      bumpIdle()
+    })
+    stream.on('end', () => finish())
+    stream.on('error', (e: Error) => finish(e))
+  })
 }
 
 // ---------------- 搜索 ----------------
@@ -418,6 +888,16 @@ export function looksLikeVerificationWall(text: string): boolean {
 /** 验证墙的统一说法：界面据此显示「需人机验证」并给出验证入口 */
 export const VERIFY_WALL_MESSAGE = '需要人机验证：站点要求先通过验证（在播放源列表里点这条线路即可弹窗验证）'
 
+/**
+ * 连接级失败（被站点掐连接 / 站点冷却中）的统一说法（v1.7）。
+ *
+ * 为什么必须和「没有这部番」「解析失败」区分开：
+ * 这三种情况的用户动作完全不同 —— 前者是「等一会儿再点」，中间是「换别的线路」，
+ * 而 AGE 的间歇性 RST 过去只会显示一句 `socket hang up`，
+ * 用户既不知道是站点的问题，也不知道再点一次有没有用。
+ */
+export const NET_FAIL_MESSAGE = '与站点的连接被重置（站点限流/网络中断），稍等再试一次'
+
 
 export async function ruleSearch(
   ruleId: string,
@@ -449,11 +929,53 @@ export async function ruleSearch(
     // 查询参数 / 请求头中的 @keyword 占位同样需要替换
     const query = fillTemplate(def.query, { keyword })
     const headers = fillTemplate(def.headers, { keyword })
-    const text = await httpRequest(url, def.method, headers, query, def.bodyType)
+    /*
+     * V1.3.8：`useChromium` 的规则走真实浏览器会话取搜索页。
+     *
+     * Tucao 对"没有浏览器会话"的请求返回 15KB 残缺页（实测同一时刻 curl 带 UA/Referer
+     * 能拿到 32KB 结果页，应用里却经常拿到残缺页）。Chromium 会话会保存 Cookie，
+     * 路径与用户手动打开浏览器一致。失败仍退回 httpRequest，不会让搜索彻底不可用。
+     */
+    let text: string
+    if (def.useChromium) {
+      try {
+        text = await chromiumGetText(url, 25_000, {
+          'User-Agent': BROWSER_UA,
+          Referer: rule.baseUrl ?? '',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        })
+        log.append('info', 'rules', `搜索页走 Chromium 会话（${rule.name}）：${shortUrlForLog(url)} → ${text.length} 字节`)
+      } catch (err) {
+        log.append(
+          'warn',
+          'rules',
+          `Chromium 会话取搜索页失败（${rule.name}），退回 HTTP：${String((err as Error)?.message ?? err).slice(0, 60)}`
+        )
+        text = await httpRequest(url, def.method, headers, query, def.bodyType)
+      }
+    } else {
+      text = await httpRequest(url, def.method, headers, query, def.bodyType)
+    }
+    /*
+     * V1.3.8：0 条时把"拿到的到底是什么"写进日志。
+     *
+     * 真机排查 Tucao 时最耗时的一步就是分不清「没拿到 HTML」「拿到了是乱码」「XPath 不匹配」——
+     * 三者在界面上都表现为"搜索不到"。这里在三者之间给出一个可判读的证据：
+     * 字节数 = 0 → 没拿到；含 `class="list"` = false → 拿到的不是结果页（拦截页/空壳）；
+     * 都正常但条数 0 → XPath 不匹配。
+     */
     const items: RuleSearchEntry[] = []
     if (def.type === 'xpath') {
       const doc = toDoc(text)
       const nodes = evalNodes(doc, def.listXPath)
+      if (nodes.length === 0) {
+        log.append(
+          'warn',
+          'rules',
+          `搜索解析 0 条（${rule.name}）：HTML ${text.length} 字节，含 class="list"=${text.includes('class="list"')}，` +
+            `/play/ 链接 ${(text.match(/\/play\/[a-z0-9]+\//g) || []).length} 个，listXPath=${def.listXPath}`
+        )
+      }
       for (const node of nodes) {
         const name = extractName(doc, itemXPath(def.itemNameXPath || def.itemLinkXPath), node)
         const link = evalHref(doc, itemXPath(def.itemLinkXPath), node)
@@ -516,9 +1038,33 @@ export async function ruleSearch(
     }
     return { items }
   } catch (err) {
-    const e = err as { message?: string }
+    const e = err as { message?: string; code?: string }
     const msg = `搜索失败 (${rule.name}): ${e?.message ?? String(err)}`
     log.append('warn', 'rules', msg)
+    /*
+     * ★ 连接级失败（连接被重置 / 站点冷却中）**不**开网页视图兜底（v1.7）★
+     *
+     * 为什么：网页内搜索会真的开一个浏览器窗口去加载同一个站点的同一个页面 ——
+     * 对「站点正在掐连接」这种状态来说，这等于在冷却期里再补 1~3 次请求，
+     * 实测只会把限流窗口拖得更长（每打一次续一次）。
+     * 这类失败的正确处置是「停手 + 如实告诉用户稍后再试」，而不是换个方式继续打。
+     * 真正的「内容级拦截」（403 / 验证页 / 纯 JS 渲染）仍然走下面的网页视图兜底。
+     */
+    if (
+      e?.code === COOL_DOWN_CODE ||
+      (isTransientNetError(err) && !/timeout|timed out|超时/i.test(String(e?.message ?? err)))
+    ) {
+      log.append('warn', 'rules', `连接级失败，跳过网页视图兜底（${rule.name}），避免加压延长站点限流`)
+      return { items: [], error: `${NET_FAIL_MESSAGE}（${rule.name}）` }
+    }
+    /*
+     * V1.3.6：**超时不再跳过网页视图兜底**。
+     *
+     * 真机证据：Tucao 的搜索在 axios 里 20 秒超时，日志写「搜索超时（20s 内站点没有响应）」，
+     * 而它的搜索页我用浏览器能打开 —— 这类站把"非浏览器请求"拖着不回，而不是掐连接。
+     * 上面的"跳过兜底"是为了不给**正在限流的站点**加压（连接被重置那种），
+     * 而"超时"恰恰是最该换真实浏览器再试一次的情形：真实窗口有 Cookie/JS，页面正常渲染。
+     */
     /*
      * ★ 纯 HTTP 被站点挡下（403 / 人机验证页）时，仍然用真实浏览器窗口再试一次（v0.3.7）★
      *
@@ -579,14 +1125,74 @@ async function ruleEpisodesRaw(
     let vars: Record<string, string> = {}
     if (def.type === 'xpath') {
       const url = resolveUrl(rule.baseUrl, entry.link || entry.source)
-      const text = await httpRequest(url, 'GET', '{}', '{}', '')
+      /*
+       * V1.3.9：**选集页也要能用浏览器会话取**。
+       *
+       * 真机证据（Tucao）：搜索已经靠 `useChromium` 修好了（32KB 完整页），
+       * 但选集这一步仍走 axios —— 播放页对裸请求同样只给残缺页（连 `#player_code` 都没有），
+       * 于是"搜索 1 条、选集 0 集"，再掉进网页视图兜底，一次要 180 秒。
+       * 规则里开了 `useChromium` 时，播放页也走 Chromium 会话；失败再退回 HTTP。
+       */
+      let text: string
+      if (def.useChromium) {
+        try {
+          text = await chromiumGetText(url, 25_000, {
+            'User-Agent': BROWSER_UA,
+            Referer: rule.baseUrl ?? '',
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+          })
+          log.append('info', 'rules', `选集页走 Chromium 会话（${rule.name}）：${shortUrlForLog(url)} → ${text.length} 字节`)
+        } catch (err) {
+          log.append(
+            'warn',
+            'rules',
+            `Chromium 会话取选集页失败（${rule.name}），退回 HTTP：${String((err as Error)?.message ?? err).slice(0, 60)}`
+          )
+          text = await httpRequest(url, 'GET', '{}', '{}', '')
+        }
+      } else {
+        text = await httpRequest(url, 'GET', '{}', '{}', '')
+      }
       const doc = toDoc(text)
       const linesXPath = def.linesXPath.trim()
       const mkEp = (a: HNode): RuleEpisode => ({
         name: nodeText(a),
         link: nodeAttr(a, 'href')
       })
-      if (!linesXPath || linesXPath === '//') {
+      /*
+       * V1.3.6：**整段文本切分**（Tucao 这类老 PHP 站必需）。
+       *
+       * 这类站把整部番的集数塞进**一个**元素的文本里，用分隔符拼接，例如 Tucao：
+       *   <ul id="player_code"><li>type=video&file=https://…01.mp4|01**type=video&file=…02.mp4|02</li></ul>
+       * 它们不是"一个元素一集"，XPath 数元素的方法只能得到 1 集（实际有 12 集）。
+       * 规则里用两个新字段描述这种结构：
+       *   episodesSplit  = 段间分隔符（如 `**`）
+       *   episodesField  = 段内取值模板（`file` = 取 `file=` 之后到 `|` 之前；`all` = 整段当地址）
+       * 集名取 `|` 后面的编号。
+       */
+      const splitDelim = String((def as { episodesSplit?: string }).episodesSplit ?? '').trim()
+      if (splitDelim) {
+        const srcNodes = evalNodes(doc, def.episodesXPath)
+        const blob = srcNodes.map((n) => nodeText(n)).join(splitDelim)
+        const field = String((def as { episodesField?: string }).episodesField ?? 'file').trim()
+        const eps: RuleEpisode[] = []
+        for (const part of blob.split(splitDelim)) {
+          const seg = part.trim()
+          if (!seg) continue
+          const bar = seg.lastIndexOf('|')
+          const label = bar >= 0 ? seg.slice(bar + 1).trim() : ''
+          const body = bar >= 0 ? seg.slice(0, bar) : seg
+          let link = ''
+          if (field === 'all') link = body
+          else {
+            const m = body.match(new RegExp(`(?:^|[&?])${field}=([^&]+)`))
+            link = m ? m[1] : ''
+          }
+          if (!link) continue
+          eps.push({ name: label || `第 ${eps.length + 1} 集`, link })
+        }
+        if (eps.length > 0) groups.push({ lineName: null, episodes: eps })
+      } else if (!linesXPath || linesXPath === '//') {
         const eps = evalNodes(doc, def.episodesXPath)
         groups.push({ lineName: null, episodes: eps.map(mkEp) })
       } else {
@@ -685,9 +1291,18 @@ async function ruleEpisodesRaw(
     }
     return { groups, vars }
   } catch (err) {
-    const e = err as { message?: string }
+    const e = err as { message?: string; code?: string }
     const msg = `选集解析失败 (${rule.name}): ${e?.message ?? String(err)}`
     log.append('warn', 'rules', msg)
+    /*
+     * 连接级失败给一句用户能照做的说法（v1.7）：
+     * 「选集解析失败 (AGE): socket hang up」过去会被界面当成"这条线路坏了"，
+     * 而实际上详情页一秒后重试就能打开（站点限流）。网页视图兜底在这里同样不加了 ——
+     * 理由与 ruleSearch 里那段相同：冷却期里换浏览器窗口去打开同一个站点只会延长限流。
+     */
+    if (e?.code === COOL_DOWN_CODE || isTransientNetError(err)) {
+      return { groups: [], vars: {}, error: `${NET_FAIL_MESSAGE}（${rule.name}）` }
+    }
     return { groups: [], vars: {}, error: msg }
   }
 }
@@ -888,27 +1503,29 @@ export function ensureDefaultRules(): void {
   const rules = store.get<PlayRule[]>('rules', [])
   /*
    * 内置规则（default- 前缀）由应用托管：每次启动都按内置定义刷新，保证
-   * ① 用户点名要内置的 AGE / sorani / aafun 一定存在且**启用**；
+   * ① 用户点名要内置的 AGE / sorani / aafun 一定存在；
    * ② 内置内容随应用升级而更新（用户不用手动"恢复默认"）。
    * 用户自己加的、以及从仓库导入的规则（repo- / 其它 id）一律原样保留、顺序不动。
+   *
+   * ⚠️ RETIRED_RULES 里的内置规则**每次启动都保持停用**：它们四部番全败（见 shared 的说明），
+   * 如果这里统一强制 enabled:true，用户下次启动就会看到一条"看起来能播、其实播不出"的线路。
+   * 用户仍可在规则页手动打开（只是下次启动会回到停用，直到我们发布修复版）。
    */
-  const builtin = DEFAULT_RULES.map((r) => ({ ...r, enabled: true }))
+  const builtin = DEFAULT_RULES.map((r) => ({ ...r, enabled: RETIRED_RULES[r.id] ? false : true }))
   const custom = rules.filter((r) => !r.id.startsWith('default-'))
   /*
-   * 巴哈姆特（v1.1）：**只播种一次**的普通规则。
+   * 巴哈姆特规则已按用户要求**删除**（原话：「巴哈姆特用于弹幕源就够了」）。
    *
-   * 为什么不放进 DEFAULT_RULES：那张表的语义是「应用托管、每次启动强制启用并整体覆盖」，
-   * 而用户要求巴哈姆特**能被启用/停用** —— 放进内置表的话用户关掉它、下次启动又会被打开。
-   * 所以它用一个普通 id（`local-bahamut`），首次启动时播种，之后启用状态归用户。
-   * `bahamutRuleSeeded` 是"已经播过种"的标记：用户主动删掉它之后不该每次启动又冒出来。
+   * 为什么连"播种"代码一起删掉：v1.1 时它是「只播种一次」的普通规则（local-bahamut），
+   * 靠 `bahamutRuleSeeded` 保证用户删掉后不再出现。但那一层保险只防"用户手动删"，
+   * 防不了"应用又给装回来"—— 只要播种逻辑还在，新装/换机/清数据后它就会重新出现在
+   * 播放源列表里，而它只对台湾网络开放、播放链路也天然不完整，用户已经不想要这条线路了。
+   * 现在改为：**应用不再播这条种**，历史数据里的 local-bahamut 也一并从 store 与本地库清掉
+   * （弹幕侧的 bahamut 模块不受影响：那条链路走 danmakuSources，与播放规则无关）。
    */
-  const seeded = store.get<boolean>('bahamutRuleSeeded', false)
-  const hasBahamut = rules.some((r) => r.id === BAHAMUT_RULE_ID)
-  const bahamutSeed = !hasBahamut && !seeded ? [bahamutRule()] : []
-  if (bahamutSeed.length > 0) store.set('bahamutRuleSeeded', true)
-  // 内置排最前：列表与搜索结果里这三条先出现（PINNED_RULES 也把它们置顶，两处一致）；
-  // 巴哈姆特排在内置之后、用户规则之前（它是"应用带来的可选线路"，但不是托管规则）
-  const next = [...builtin, ...bahamutSeed, ...custom]
+  // 内置排最前（ensureDefaultRules 的合并顺序，不是界面顺序）：
+  // 界面与嗅探顺序一律由 shared 的 sortRulesBySpeed 按实测耗时决定，与存储顺序无关。
+  const next = [...builtin, ...custom]
   if (JSON.stringify(next) !== JSON.stringify(rules)) {
     // 被覆盖掉的旧内容先留档到本地库，再写新的（"任何修改都留一份"）；
     // 内置规则标记成 'builtin'：它在本地库里就是"随应用分发、最可靠的那一版"
@@ -925,6 +1542,126 @@ export function ensureDefaultRules(): void {
   }
   seedLocalLibraryFromRules()
   repairStoredRules()
+  migrateRuleLibrary()
+}
+
+/**
+ * 规则库整理（v1.4.0，用户要求）—— **一次性迁移 + 每次校正测速值**。
+ *
+ * 用户原话（整理诉求）：
+ *   · 删掉本地库里重复的 sorani；
+ *   · 删除巴哈姆特规则（「巴哈姆特用于弹幕源就够了」）；
+ *   · 其余规则去重整理（同一 ruleId 只留最新一条）；
+ *   · 新增 E站（ezdmw）与 AniWatch，并在四部番上实测，可用才留、全败就标"暂不可用"并停用；
+ *   · 去掉"置顶三条"、按实测的决定性耗时排序（嗅探顺序也跟着这个）。
+ *
+ * 为什么做成**启动迁移**而不是改一次 JSON 文件：
+ *   ① 规则数据在 `<安装目录>/data/userData/data/`，不在构建产物里 —— 改代码不会自动生效，
+ *      而用户升级/换机/清数据后最需要的恰恰是"自动整理一遍"；
+ *   ② 本地库条目的 id 是 `规则id#内容哈希`（见 ruleContentHash），手改 JSON 极容易写错哈希，
+ *      写错之后界面永远判定"当前规则不是这份快照"，替换按钮就废了；
+ *   ③ 迁移带版本号（RULE_LIBRARY_REVISION），只跑一次，重复启动不会反复改动用户数据。
+ *
+ * 为什么测速值**每次启动都写**：
+ *   它只是排序键，而且会被"仓库自动更新"整条覆盖（rulesRepoImport 会用远端内容重建规则对象）。
+ *   每次启动补一次，成本是几十次对象赋值，换来的是排序永远与 shared 里的实测值一致。
+ */
+function migrateRuleLibrary(): void {
+  const rules = store.get<PlayRule[]>('rules', [])
+  const rev = store.get<number>('rulesLibraryRevision', 0)
+  let next = rules
+
+  if (rev < RULE_LIBRARY_REVISION) {
+    const ids = new Set(REMOVED_RULE_IDS)
+    const beforeIds = new Set(next.map((r) => r.id))
+    next = next.filter((r) => !ids.has(r.id))
+    const removedCount = beforeIds.size - new Set(next.map((r) => r.id)).size
+    /*
+     * 同 ruleId 只留最新一条：'rules' 里本来不该有重复 id，但历史导入/手改产生过，
+     * 这里按"内容哈希最新"兜底（保存顺序即最近写入顺序）。
+     */
+    const seen = new Set<string>()
+    const deduped: PlayRule[] = []
+    for (const r of [...next].reverse()) {
+      if (seen.has(r.id)) continue
+      seen.add(r.id)
+      deduped.push(r)
+    }
+    next = deduped.reverse()
+    // 两条新规则：按 id upsert（存在则**保留用户的启用状态/创建时间**，只换内容）
+    for (const seed of RULE_LIBRARY_SEEDS) {
+      const i = next.findIndex((r) => r.id === seed.id)
+      if (i >= 0) {
+        next[i] = { ...seed, enabled: next[i].enabled, createdAt: next[i].createdAt || seed.createdAt }
+      } else {
+        next.push({ ...seed })
+      }
+    }
+    // 全败规则一次性停用；"需人机验证"的只写说明，保持启用
+    next = next.map((r) => {
+      const retired = RETIRED_RULES[r.id]
+      const note = RULE_NOTES[r.id]
+      if (!retired && !note) return r
+      return {
+        ...r,
+        ...(retired ? { enabled: false, playbackNote: retired } : {}),
+        ...(note ? { playbackNote: note } : {})
+      }
+    })
+    const addedCount = next.filter((r) => !beforeIds.has(r.id)).length
+    log.append(
+      'info',
+      'rules',
+      `规则库整理：删除 ${removedCount} 条（${REMOVED_RULE_IDS.join('、')}）、新增 ${addedCount} 条、` +
+        `停用 ${Object.keys(RETIRED_RULES).length} 条四部番全败的线路`
+    )
+  }
+
+  // 每次启动校正测速值（见上面的说明）：只影响排序，不碰内容/启用状态
+  let speedChanged = false
+  next = next.map((r) => {
+    const ms = RULE_SPEED_MS[r.id]
+    if (ms === undefined || r.speedMs === ms) return r
+    speedChanged = true
+    return { ...r, speedMs: ms }
+  })
+  if (speedChanged || JSON.stringify(next) !== JSON.stringify(rules)) store.set('rules', next)
+
+  if (rev < RULE_LIBRARY_REVISION) {
+    dedupeLocalLibrary()
+    store.set('rulesLibraryRevision', RULE_LIBRARY_REVISION)
+  }
+}
+
+/**
+ * 本地库整理：同一 ruleId 只留**最新一条**快照（用户要求），并清掉已删除规则的历史。
+ *
+ * 为什么"只留最新"而不是继续保留 8 版：
+ *   本地库的意义是"仓库版跑不通时有一份能用的替换版本"。规则刚跑通的那一版就是最新的，
+ *   更老的版本在站点改版后几乎不会再能播，留着只会让本地库列表变成一长串同名条目
+ *   （用户看到的就是"重复的 sorani"这类问题本身）。
+ *   代价是失去"退回上上版"的能力 —— 这一点已在报告里写明，需要时再手工导出。
+ */
+function dedupeLocalLibrary(): void {
+  const local = listLocalRules()
+  const gone = new Set(REMOVED_RULE_IDS)
+  const newest = new Map<string, LocalRuleEntry>()
+  for (const e of local) {
+    if (gone.has(e.ruleId)) continue
+    const cur = newest.get(e.ruleId)
+    if (!cur || e.savedAt > cur.savedAt) newest.set(e.ruleId, e)
+  }
+  const kept = [...newest.values()].sort((a, b) => a.savedAt - b.savedAt)
+  store.set(LOCAL_NS, trimLocalRules(kept))
+  log.append(
+    'info',
+    'rules',
+    `本地库已整理：${local.length} 条 → ${kept.length} 条（同一规则只留最新版，已删除规则的历史一并清掉）`
+  )
+  // 两条新规则各留一份快照，保证"仓库版跑不通时能替换回这一版"
+  for (const seed of RULE_LIBRARY_SEEDS) {
+    archiveRuleSnapshot(seed, 'first-seen', seed.origin)
+  }
 }
 
 /**
@@ -966,12 +1703,22 @@ const RULE_FIXES: {
     }
   },
   {
-    // 萌甸 EZDMW（m.ezdmw.org）：线路 XPath 里的 `//section[@class='anthology'][1]`
-    // 在 XPath 1.0 里是「父节点下的第一个 section」而非「结果集第一个」，
-    // 命中的是另一处 section → 线路恒为 0 条。改按线路按钮类名直取。
-    // 剧集表达式是行内 `self::/following-sibling::` 轴写法，由 itemXPath/enhance 负责转义。
+    /*
+     * 萌甸 EZDMW（www.ezdmw.org / m.ezdmw.org）。
+     *
+     * 历史问题（v0.3.9）：线路 XPath 里的 `//section[@class='anthology'][1]`
+     * 在 XPath 1.0 里是「父节点下的第一个 section」而非「结果集第一个」，
+     * 命中的是另一处 section → 线路恒为 0 条。改按线路按钮类名直取。
+     * 剧集表达式是行内 `self::/following-sibling::` 轴写法，由 itemXPath/enhance 负责转义。
+     *
+     * v1.4 起规则本体重写（见 data 里的 repo-ezdmw：站点根换成桌面版 www，
+     * 搜索/选集 XPath 全部实测过），这条修正仍然保留 —— 因为从仓库重新导入时
+     * 拿到的还是 1.2 的旧定义，修正表要能把它拉回可用状态。
+     * 版本号跟着规则一起抬到 1.4：不抬的话 applyRuleFix 会把新规则**改回 1.3-fix**，
+     * 启动自动更新就会误判「仓库版 1.2 比本地新」而反复覆盖。
+     */
     match: /ezdmw\.org/i,
-    version: '1.3-fix',
+    version: '1.4',
     episodes: {
       linesXPath: '//div[contains(@class,"line_button")]'
     }
@@ -1314,6 +2061,11 @@ export async function rulesRepoImport(names: string[]): Promise<{ imported: numb
             origin: 'repo'
           }
         : { ...rule, id: `repo-${rule.name.toLowerCase()}`, createdAt: Date.now(), origin: 'repo' }
+      /*
+       * 刚导入的规则也要带测速值，否则它在本会话里会一直排到最后
+       * （迁移只在启动时补；用户点"从仓库导入"之后就会看到顺序突然变了）。
+       */
+      finalRule.speedMs = RULE_SPEED_MS[finalRule.id] ?? RULE_SPEED_MS[finalRule.name.toLowerCase()]
       if (existing) {
         /*
          * 覆盖前先把**被覆盖的那一版**留档到本地库（v0.3.9）：

@@ -6,7 +6,15 @@ import { CH } from '@shared/channels'
 import { ONLINE_PLAY_TIMEOUT_MS } from '@shared/onlinePlay'
 import { log } from '../log'
 import { BROWSER_UA, httpGetText } from '../net'
+import {
+  browserLikeHeaders,
+  freshConnectionAgents,
+  sameSiteRedirectUpgrade,
+  upgradeSameSite,
+  withNetRetry
+} from './rules'
 import { beginStage, flowDetail, pushStep, succeedStage } from './playFlow'
+import { offerHandoffCandidate } from './playHandoff'
 
 /**
  * 播放页流嗅探（Kazumi 同思路）：隐藏窗口加载播放页，
@@ -74,9 +82,89 @@ export function isDevServerAsset(rawUrl: string): boolean {
   return /\.(ts|tsx|js|mjs|mts|cts|jsx|css|map)$/i.test(path)
 }
 
+/**
+ * 是否是「看起来像媒体、但扩展名被伪装过」的地址（V1.4）。
+ *
+ * 真机证据（E站/ezdmw）：视频播放列表的真实地址是
+ *   `https://player.ezdmw.com/index/listres/resource_name/<nk>/key/…/sign/<hash>.webp?…`
+ * 扩展名写的是 **.webp**（图片），内容其实是 **HLS 播放列表（#EXTM3U）**。
+ * 只看扩展名的嗅探器永远抓不到它 —— 这就是 ezdmw 四部番"0 候选"的真正原因。
+ * 这里只负责"值得进一步验证"的猜测，真正的判定交给 `verifyM3u8ByContent`。
+ */
+export function looksLikeDisguisedPlaylist(rawUrl: string): boolean {
+  try {
+    const u = new URL(String(rawUrl ?? ''))
+    const p = u.pathname.toLowerCase()
+    if (/\.(m3u8|mpd)$/.test(p)) return true
+    // 站点常用的伪装形态：listres/、hls/、playlist/ 路径，或图片扩展名 + 签名查询串
+    if (/\/(listres|hls|playlist|m3u8)\//.test(p)) return true
+    if (/\.(webp|jpg|jpeg|png|gif)$/.test(p) && /(sign|key|token|expire)=/i.test(u.search)) return true
+    return false
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 用**内容**判断是否播放列表（取前 64 字节看 `#EXTM3U` / `<MPD`）。
+ *
+ * 为什么不看 Content-Type：这类站点常常把 m3u8 以 `image/webp` 返回，头不可信，只有正文可信。
+ * 失败一律返回 null（"判断不了"），调用方据此决定要不要继续等，不会误杀。
+ */
+export async function verifyM3u8ByContent(rawUrl: string): Promise<'m3u8' | 'dash' | null> {
+  try {
+    const res = await axios.get(String(rawUrl), {
+      timeout: 6000,
+      responseType: 'text',
+      headers: { Range: 'bytes=0-63' },
+      validateStatus: () => true
+    })
+    const head = String(res.data ?? '').slice(0, 200)
+    if (head.includes('#EXTM3U')) return 'm3u8'
+    if (head.includes('<MPD')) return 'dash'
+    return null
+  } catch {
+    return null
+  }
+}
+
 /** 媒体流候选的统一过滤器：调用方在任何上报点都先过这一层 */
 export function isStreamCandidate(rawUrl: string): boolean {
   return !isDevServerAsset(rawUrl)
+}
+
+/**
+ * 媒体扩展名必须出现在**路径**里，而不是查询串里（V1.4 修）。
+ *
+ * 真机踩到的坑：E站（ezdmw）的弹幕 iframe 地址是
+ *   `https://player.ezdmw.com/danmuku/?nk=…&type=1&owner_qid=0&name=…&…=.ts…`
+ * 扩展名藏在 query 里，于是 `MEDIA_EXT_RE`（正则不区分路径/查询）把它当成视频候选上报，
+ * 界面上就会出现「1 个资源」，点进去必然失败 —— 假阳性比没有更糟。
+ * 判定只看 `pathname`：真正媒体流的 `.m3u8/.mp4/.ts` 永远在路径上。
+ */
+export function hasMediaExtensionInPath(rawUrl: string): boolean {
+  try {
+    const p = new URL(String(rawUrl ?? '')).pathname
+    return MEDIA_EXT_RE.test(p)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 是否是「播放器/弹幕页」而不是媒体流（V1.4）。
+ *
+ * E站的播放窗口是外站 iframe（`player.ezdmw.com/danmuku/`），它本身是个 HTML 页面；
+ * 只要路径里带这些片段且**路径里没有媒体扩展名**，就一律不算候选。
+ */
+export function isPlayerOrDanmakuPage(rawUrl: string): boolean {
+  if (hasMediaExtensionInPath(rawUrl)) return false
+  try {
+    const p = new URL(String(rawUrl ?? '')).pathname.toLowerCase()
+    return /\/(danmuku|danmaku)(\/|$)/.test(p) || /\/danmu[^/]*\//.test(p)
+  } catch {
+    return false
+  }
 }
 
 /** 只解码外层混淆（解码到成为 http(s) 地址为止），保留路径内的百分号编码 */
@@ -191,39 +279,57 @@ export function findMediaUrl(html: string): string | null {
   return findMediaUrls(html)[0] ?? null
 }
 
+/**
+ * 播放页直出解析的**单次尝试**超时（v1.7）。
+ *
+ * 总预算仍是 @shared/onlinePlay 的 60 秒，但把它切成「最多 3 次 × 20 秒」，理由是真机日志：
+ * 失败几乎全是 `timeout of 60000ms exceeded`，而 AGE 这类站点的播放页正常 **0.5~2 秒**就回来。
+ * 20 秒还没回只有两种可能 ——
+ *   ① 连接被中间设备掐住（黑洞）：等满 60 秒也是白等，换条连接重发才有用；
+ *   ② 站点限流：直接 RST，几十毫秒就失败。
+ * 所以 60 秒不再是一次干等，而是三次机会；单次失败的成本也从 60 秒降到 20 秒，
+ * 后面的窗口嗅探不用再陪着一起等。
+ */
+const DIRECT_ATTEMPT_TIMEOUT_MS = 20_000
+
 /** 抓取播放页 HTML 并提取**全部**候选媒体地址（空数组则交给窗口嗅探兜底） */
 export async function extractStreamCandidates(url: string, referer?: string): Promise<string[]> {
+  /*
+   * 同站 http→https（v1.7）。
+   * AGE 的搜索/详情页里给的播放链接本身就是 `http://www.agedm.io/play/...`，
+   * 而它的 :80 是黑洞（实测直连 21 秒都不回，足够把 60 秒预算耗光）。
+   * 这一步在**发请求之前**就把协议换掉，比等 301 再补救可靠（301 也可能指向 http）。
+   */
+  const target = upgradeSameSite(url, referer)
   try {
     let origin = ''
     try {
-      origin = new URL(url).origin + '/'
+      origin = new URL(target).origin + '/'
     } catch {
-      origin = url
+      origin = target
     }
-    const res = await axios.get<string>(url, {
-      /*
-       * v0.3.9：超时从 8 秒统一到 60 秒（@shared/onlinePlay）。
-       *
-       * 老注释说「直出解析是快路，超时给短一点，卡住就交给窗口嗅探」——
-       * 但实测（`.e2e/online-test-v037.log`）不少站点的播放页 HTML 在冷启动 + 慢 CDN 下
-       * 要 10–30 秒才吐出来，8 秒放弃的结果是：**明明能直出拿到地址，却退化成整轮窗口嗅探**，
-       * 而窗口嗅探又要再等几十秒 —— 用户看到的就是「一直在捕捉视频流中」。
-       * 现在给足 60 秒；同时窗口嗅探本来就是并行跑的（见 startRuleProbe），
-       * 所以就算这一路真的慢，也不会把总时长叠加成两倍。
-       */
-      timeout: ONLINE_PLAY_TIMEOUT_MS,
-      maxRedirects: 5,
-      responseType: 'text',
-      headers: {
-        'User-Agent': BROWSER_UA,
-        Referer: referer || origin,
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-      }
+    const html = await withNetRetry('播放页直出解析', async (fresh) => {
+      const res = await axios.get<string>(target, {
+        timeout: DIRECT_ATTEMPT_TIMEOUT_MS,
+        maxRedirects: 5,
+        // 跳转目标同样可能是 http:80 → 同站时升级（与规则引擎同一个钩子）
+        beforeRedirect: sameSiteRedirectUpgrade(target),
+        responseType: 'text',
+        headers: {
+          ...browserLikeHeaders(target),
+          'User-Agent': BROWSER_UA,
+          Referer: referer || origin,
+          // 重试时不要复用可能已被站点掐掉的 keep-alive 连接
+          ...(fresh ? { Connection: 'close' } : {})
+        },
+        ...(fresh ? freshConnectionAgents() : {})
+      })
+      return String(res.data ?? '')
     })
-    const list = findMediaUrls(String(res.data ?? ''))
+    const list = findMediaUrls(html)
     if (list.length > 0) {
       log.append('info', 'rule-probe', `播放页直出候选 ${list.length} 个，首选: ${list[0].slice(0, 110)}`)
-      flowDetail(STAGE, `播放页直出候选 ${list.length} 个，正在并行校验`)
+      flowDetail(STAGE, `播放页直出候选 ${list.length} 个，第一个直接交给播放器`)
       pushStep(STAGE, `播放页直出候选 ${list.length} 个`)
     } else {
       flowDetail(STAGE, '播放页里没有直出地址，继续等页面播放器发请求')
@@ -238,9 +344,79 @@ export async function extractStreamCandidates(url: string, referer?: string): Pr
   }
 }
 
+/**
+ * 播放页直出解析的**短缓存 + 同页去重**（v1.3 提速）。
+ *
+ * 为什么需要：同一次点击会先后有两处去抓同一个播放页 ——
+ *   ① 预取（`prefetchStream`，为了让「选源」那一刻就可能直接命中）；
+ *   ② 网页嗅探窗口自己的直出解析（它和页面加载并行跑）。
+ * 两处各发一次 GET，等于把站点打两遍；预取已经拿到「没有直出地址」的结论时，
+ * 第二遍纯属白拉一个几十 KB 的 HTML。缓存 8 秒足够覆盖这一轮，
+ * 又短到不会把「站点刚改版」这种变化藏起来。
+ */
+const EXTRACT_CACHE_TTL_MS = 8_000
+const EXTRACT_CACHE_MAX = 60
+const extractCache = new Map<string, { at: number; list: string[] }>()
+/** 同一个播放页正在解析时，后来者等它（避免并发抓两次） */
+const inflightExtract = new Map<string, Promise<string[]>>()
+
+export async function extractStreamCandidatesCached(url: string, referer?: string): Promise<string[]> {
+  const hit = extractCache.get(url)
+  if (hit && Date.now() - hit.at < EXTRACT_CACHE_TTL_MS) return [...hit.list]
+  const running = inflightExtract.get(url)
+  if (running) return await running
+  const task = extractStreamCandidates(url, referer)
+    .then((list) => {
+      extractCache.delete(url)
+      extractCache.set(url, { at: Date.now(), list })
+      while (extractCache.size > EXTRACT_CACHE_MAX) {
+        const oldest = extractCache.keys().next().value as string | undefined
+        if (!oldest) break
+        extractCache.delete(oldest)
+      }
+      return list
+    })
+    .finally(() => {
+      inflightExtract.delete(url)
+    })
+  inflightExtract.set(url, task)
+  return await task
+}
+
+/** 清空直出解析缓存（自检/计时脚本用） */
+export function clearExtractCache(): void {
+  extractCache.clear()
+  inflightExtract.clear()
+}
+
+/**
+ * 给候选挑一个 Referer（v1.3 乐观交接的配套判定）。
+ *
+ * 为什么不再发 HEAD 去「试探哪种 Referer 能用」：那一次探测正是要省掉的等待。
+ * 这里用一条实测足够可靠的启发式：
+ *   · 候选与播放页**同站**（或子域）→ 带播放页地址（站点自己的播放器就是这么请求的）；
+ *   · 候选在**另一个域**（典型是 CDN）→ **不带** Referer。
+ *     历史日志里大量 CDN 会因跨域 Referer 直接 400（`rule-probe` 的旧注释也记着这一条），
+ *     而不带 Referer 的请求它们都接受。
+ * 判错的代价被「5 秒零字节换候选」兜住，不会像过去那样卡住整轮。
+ */
+export function refererForCandidate(candidate: string, pageUrl?: string): string | undefined {
+  if (!pageUrl) return undefined
+  try {
+    const c = new URL(candidate)
+    const p = new URL(pageUrl)
+    const sameHost =
+      c.hostname === p.hostname || c.hostname.endsWith(`.${p.hostname}`) || p.hostname.endsWith(`.${c.hostname}`)
+    // 空串 = 「经判定不能带 Referer」，与播放页侧的既有语义一致
+    return sameHost ? pageUrl : ''
+  } catch {
+    return undefined
+  }
+}
+
 /** 兼容旧调用：只取第一个候选 */
 export async function extractStreamFromHtml(url: string, referer?: string): Promise<string | null> {
-  return (await extractStreamCandidates(url, referer))[0] ?? null
+  return (await extractStreamCandidatesCached(url, referer))[0] ?? null
 }
 
 const PLAYABLE_MIME_RE = /^(video\/|audio\/|application\/(octet-stream|vnd\.apple\.mpegurl|mp2t|x-mpegurl|dash\+xml))/i
@@ -440,7 +616,7 @@ export function isOneTimeStream(url: string): boolean {
 }
 
 /**
- * 会话内的「播放页地址 → 已验证媒体地址」缓存。
+ * 会话内的「播放页地址 → 媒体地址」缓存。
  *
  * 为什么有用：进入播放器、以及播放器里切集，最慢的一环都是「重新嗅探」。
  * 同一个播放页在短时间内（同一集来回切、A/B 比较、退出再进）拿到的地址通常仍然可用，
@@ -448,15 +624,30 @@ export function isOneTimeStream(url: string): boolean {
  * 反代/CDN 的直链有时效（有的是**一次性令牌**），所以：
  * - TTL 只给 6 分钟；
  * - 播放器侧仍保留「N 秒没开播就重新嗅探」的看门狗 —— 缓存过期不会变成卡死，只是白等几秒。
+ *
+ * v1.3：条目里额外保存**同一播放页的其它候选**。命中缓存时把它们交给交接队列，
+ * 于是缓存里那条地址万一失效，5 秒零字节就能换到下一条 —— 不必重开一整轮嗅探。
  */
-const streamCache = new Map<string, { url: string; referer?: string; at: number }>()
+interface StreamCacheEntry {
+  url: string
+  referer?: string
+  at: number
+  alternatives: { url: string; referer?: string }[]
+}
+const streamCache = new Map<string, StreamCacheEntry>()
 const STREAM_CACHE_TTL = 6 * 60 * 1000
 
-export function rememberStream(pageUrl: string, url: string, referer?: string): void {
+export function rememberStream(
+  pageUrl: string,
+  url: string,
+  referer?: string,
+  alternatives: { url: string; referer?: string }[] = []
+): void {
   if (!pageUrl || !url) return
   // 一次性令牌类直链不缓存（缓存下来也已经失效，只会让下次切集白等一轮看门狗）
   if (isOneTimeStream(url)) return
-  streamCache.set(pageUrl, { url, referer, at: Date.now() })
+  const rest = alternatives.filter((a) => a && a.url && a.url !== url).slice(0, 6)
+  streamCache.set(pageUrl, { url, referer, at: Date.now(), alternatives: rest })
 }
 
 export function getCachedStream(pageUrl: string): { url: string; referer?: string } | null {
@@ -467,6 +658,23 @@ export function getCachedStream(pageUrl: string): { url: string; referer?: strin
     return null
   }
   return { url: hit.url, referer: hit.referer }
+}
+
+/**
+ * 「当前要播的这条地址」在缓存里还带着哪些备选候选。
+ *
+ * 用途：播放页命中缓存直接开播时，把备选也放进交接队列 ——
+ * 缓存地址过期/被限流时，内核 5 秒零字节就能切到下一条，而不是让用户等重嗅探。
+ */
+export function alternativesForStreamUrl(url: string): { url: string; referer?: string }[] {
+  if (!url) return []
+  for (const entry of streamCache.values()) {
+    if (entry.url === url) return entry.alternatives.map((a) => ({ ...a }))
+    if (entry.alternatives.some((a) => a.url === url)) {
+      return [{ url: entry.url, referer: entry.referer }, ...entry.alternatives.filter((a) => a.url !== url)]
+    }
+  }
+  return []
 }
 
 export function clearStreamCache(): void {
@@ -500,43 +708,57 @@ export async function getCachedStreamOrWait(
 }
 
 /**
- * 预取某个播放页的直链（v0.2.7 附加：让切集更快）。
+ * 预取某个播放页的直链（v0.2.7 附加：让切集更快；v1.3 改成**乐观交接**）。
  *
- * 只走**直出解析**这一条路（纯 HTTP，不创建浏览器窗口），
- * 命中就写进上面的缓存 —— 切到该集时播放器直接命中缓存、跳过整轮嗅探。
- * 拿不到也没关系（很多站点必须靠网页渲染），只是那一集仍需正常嗅探。
+ * 只走**直出解析**这一条路（纯 HTTP，不创建浏览器窗口）。
+ *
+ * v1.3 的关键改动：**不再发 HEAD/Range 预校验**。
+ * 过去的顺序是「解析出候选 → 并行 HEAD → 按优先级完整校验 → 才写缓存」，
+ * 正常站点要多花 0.3~6 秒，慢 CDN 上更久，而它换来的只是「第一个候选可能是坏的」。
+ * 现在第一个候选**立刻**写进缓存并交给播放器，坏候选由内核的「5 秒零字节换候选」兜住
+ * （见 playHandoff 的说明）。全部候选都会进交接队列，所以换的时候不需要重新嗅探。
  */
 export async function prefetchStream(
   pageUrl: string,
-  referer?: string
+  referer?: string,
+  /**
+   * `handoff=true`：这次的候选就是**用户马上要播的那一集**，可以进交接队列
+   * （5 秒零字节时才用得到）。预取下一集时必须传 false —— 否则当前这一集卡住 5 秒时，
+   * 内核会被换到「下一集」的地址上（真实会发生的串台）。
+   */
+  opts: { handoff?: boolean } = {}
 ): Promise<{ url: string; referer?: string } | null> {
   const cached = getCachedStream(pageUrl)
   if (cached) return cached
   const running = inflightPrefetch.get(pageUrl)
   if (running) return await running
   const task = (async (): Promise<{ url: string; referer?: string } | null> => {
-    const candidates = await extractStreamCandidates(pageUrl, referer)
+    const candidates = await extractStreamCandidatesCached(pageUrl, referer)
     if (candidates.length === 0) return null
     /*
-     * 一次性令牌类站点（如 aafun 的 pan.wo.cn 下载接口）**最终不入缓存**：
-     * 这类地址（多数是**经重定向**才拿到的最终地址）校验或延迟使用后即失效，
-     * 缓存下来只会让下次切集白等一轮看门狗 —— 实测反而比不预取更慢。
-     * 注意仍然要**并行探测全部候选**：像 aafun 这样「第一个候选 400、重定向后才拿到可用地址」的站点，
-     * 并行 HEAD 能几百毫秒定出可用地址。
+     * 候选的 Referer 用启发式判定（同站带、跨域 CDN 不带），不再发 HEAD 试探 ——
+     * 判错的代价被「5 秒零字节换候选」兜住（见 refererForCandidate 的说明）。
      */
-    if (candidates.every((u) => isOneTimeStream(u))) {
-      log.append('info', 'rule-probe', '该站点为一次性直链，跳过预取（切集时现解析更快）')
-      return null
+    const alts = candidates.slice(0, 6).map((u) => ({ url: u, referer: refererForCandidate(u, pageUrl) }))
+    if (opts.handoff === true) for (const a of alts) offerHandoffCandidate(a)
+    const reusable = alts.filter((a) => !isOneTimeStream(a.url))
+    if (reusable.length === 0) {
+      /*
+       * 一次性令牌类站点（如 pan.wo.cn 下载接口）不入缓存，但**首个候选照样直接交给播放器**：
+       * 预取本身已经不再发任何试探请求，不存在「把令牌提前烧掉」的问题；
+       * 不入缓存只是为了避免下次切集命中一条必然失效的地址。
+       */
+      log.append('info', 'rule-probe', '该站点为一次性直链：不入缓存，首个候选仍直接交给播放器')
+      return { url: alts[0].url, referer: alts[0].referer }
     }
-    const ok = await resolveFirstPlayable(candidates, referer)
-    if (!ok) return null
-    if (isOneTimeStream(ok.url)) {
-      log.append('info', 'rule-probe', '解析结果是时效性直链，跳过预取（不做无效缓存）')
-      return null
-    }
-    rememberStream(pageUrl, ok.url, ok.referer ?? referer)
-    log.append('info', 'rule-probe', `已预取直链（切集可秒开）: ${ok.url.slice(0, 110)}`)
-    return ok
+    const first = reusable[0]
+    rememberStream(pageUrl, first.url, first.referer, reusable.slice(1))
+    log.append(
+      'info',
+      'rule-probe',
+      `预取完成（不做预校验，${alts.length} 个候选已入交接队列，首个直接交给播放器）: ${first.url.slice(0, 110)}`
+    )
+    return { url: first.url, referer: first.referer }
   })().finally(() => {
     inflightPrefetch.delete(pageUrl)
   })
@@ -634,13 +856,61 @@ function emit(win: BrowserWindow | null | undefined, payload: Record<string, unk
   }
 }
 
-function pickBest(urls: string[]): string | null {
+/**
+ * 「占位/广告命名」的媒体地址（v1.7）。
+ *
+ * 只认**路径里的独立词**，不碰正常文件名：
+ *   命中：`/Play/adposter.mp4`、`/ads/pre.mp4`、`/ad/intro.mp4`、`/placeholder.mp4`
+ *   不命中：`/video/adam.mp4`（adam 不是独立词）、`/player/movie.mp4`
+ *
+ * 为什么值得单独认：AGE 这类站的播放页交给第三方解析器，解析器初始化会先请求一段
+ * `adposter.mp4` 当占位，而那个地址由解析器自己的机器提供，实测会 ECONNREFUSED。
+ * 它一旦被乐观交接给内核，就是「15 秒零字节 → 注入失败」，整轮白等。
+ */
+const AD_PLACEHOLDER_RE = /(?:^|[\/_.-])(?:ad|ads|adv|adposter|advert|advertisement|placeholder|blank|spacer)(?:[\/_.-]|$)/i
+
+function isAdPlaceholder(rawUrl: string): boolean {
+  try {
+    return AD_PLACEHOLDER_RE.test(new URL(rawUrl).pathname)
+  } catch {
+    return false
+  }
+}
+
+/** 占位地址能不能打开（只对上面那类地址调用，所以超时给得短） */
+const PLACEHOLDER_PROBE_TIMEOUT_MS = 2_500
+
+async function adPlaceholderReachable(u: string): Promise<boolean> {
+  try {
+    const r = await axios.head(u, {
+      timeout: PLACEHOLDER_PROBE_TIMEOUT_MS,
+      maxRedirects: 4,
+      validateStatus: () => true,
+      headers: { 'User-Agent': BROWSER_UA, Accept: '*/*' }
+    })
+    // 2xx/3xx 视为「真能取到」；405/403 这类站点可能不支持 HEAD，保守地当作可用（交给内核去试）
+    if (r.status >= 400 && r.status !== 405 && r.status !== 403) return false
+    return r.status < 500
+  } catch {
+    // 连接被拒/超时 → 明确不可用
+    return false
+  }
+}
+
+function pickBest(urls: string[], adClips?: Set<string>): string | null {
+  /*
+   * 收尾兜底：先把「已确认是占位/广告」的地址排到最后，再按类型挑。
+   * 过去只要页面上先出现的是广告 mp4，收尾的 `pickBest` 就把它当选交出去 ——
+   * 那正是「播放页卡在广告 src 上、永远不切真流」的一条成因。
+   */
+  const clean = adClips ? urls.filter((u) => !adClips.has(u)) : urls
+  const pool = clean.length > 0 ? clean : urls
   // 优先 m3u8（HLS 主列表），其次 mp4/flv
-  const m3u8 = urls.find((u) => /\.m3u8(\?|$)/i.test(u))
+  const m3u8 = pool.find((u) => /\.m3u8(\?|$)/i.test(u))
   if (m3u8) return m3u8
-  const master = urls.find((u) => /master|index\.m3u8/i.test(u))
+  const master = pool.find((u) => /master|index\.m3u8/i.test(u))
   if (master) return master
-  return urls.find((u) => /\.(mp4|flv)(\?|$)/i.test(u)) ?? urls[0] ?? null
+  return pool.find((u) => /\.(mp4|flv)(\?|$)/i.test(u)) ?? pool[0] ?? null
 }
 
 export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: string): boolean {
@@ -723,34 +993,69 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
     }
   }
 
-  /** 捕获到一个候选：先过疑似广告判定，再决定是立刻上报还是留作兜底 */
-  const captureCandidate = (u: string, channel: string): void => {
-    if (!probeActive || foundUrls.includes(u)) return
-    foundUrls.push(u)
+  /**
+   * 捕获到一个候选 → 交给播放器（v1.3 乐观交接；v1.7 只对「占位/广告命名」的地址先验一次）。
+   *
+   * v1.3 的理由仍然成立：广告判定要「拉一遍 m3u8 / HEAD 一次 mp4」，最多 8 秒，
+   * 挡在「抓到第一个媒体请求 → 交给内核」这条最短路上不划算，所以默认**不等**、
+   * 先交给播放器，真流后到时由播放页的"后到候选顶掉前一个"逻辑兜住。
+   *
+   * v1.7 补的那一刀（AGE 真机链路的最后一环）：
+   *   AGE 的播放页由第三方解析器接管，它初始化时先请求一段 `adposter.mp4` 当占位，
+   *   而这个地址由解析器自己的服务器提供，实测会直接 ECONNREFUSED。
+   *   乐观交接把它交给内核 → 内核 15 秒一个字节都收不到 → 整轮被判「注入失败」，
+   *   真流即使随后到达也只能等下一轮。用户看到的就是「AGE 老是播放失败」。
+   *   所以**只对**「路径里带 ad/ads/adposter/placeholder 这类命名」的候选先发一次 HEAD：
+   *   真能打开就照旧先交给播放器（有画面总比没有强），打不开就不交，继续等真流。
+   *   普通站点（URL 里没有这些词）一次额外请求都不会发，没有任何延迟代价。
+   */
+  const deliverCandidate = (u: string, channel: string): void => {
     log.append('info', 'rule-probe', `捕获媒体流: ${u.slice(0, 120)}`)
     pushStep(STAGE, `捕获媒体流（${channel}）：${u.slice(0, 70)}`)
-    flowDetail(STAGE, `已捕获 ${foundUrls.length} 个候选，正在筛查是否为广告短片`)
+    flowDetail(STAGE, `已捕获 ${foundUrls.length} 个候选，已直接交给播放器（1 字节未到时才换下一个）`)
+    offerHandoffCandidate({ url: u })
+    noteCapturedStream({
+      url: u,
+      kind: /\.m3u8(\?|$)/i.test(u) ? 'm3u8' : 'media',
+      channel,
+      capturedAt: Date.now()
+    })
+    // 拿到可用候选 = 「获取播放资源」阶段达成（后面交给播放器是 inject 阶段的事）
+    succeedStage(STAGE, `已获取播放资源（${channel}）`)
+    emit(mainWin, { type: 'found', url: u, kind: /\.m3u8(\?|$)/i.test(u) ? 'm3u8' : 'media' })
     void looksLikeAdClip(u).then((suspect) => {
+      if (!probeActive || !suspect) return
+      adClipUrls.add(u)
+      log.append(
+        'warn',
+        'rule-probe',
+        `疑似广告短片（已先交给播放器；真流到达后会自动顶掉）: ${u.slice(0, 110)}`
+      )
+      pushStep(STAGE, `疑似广告短片（已先播，等真流顶掉）：${u.slice(0, 60)}`)
+    })
+  }
+
+  const captureCandidate = (u: string, channel: string): void => {
+    if (!probeActive || foundUrls.includes(u)) return
+    // 先进列表：收尾时 `pickBest` 才有兜底可交（收到 adClipUrls 里，兜底时会被排到后面）
+    foundUrls.push(u)
+    if (!isAdPlaceholder(u)) {
+      deliverCandidate(u, channel)
+      return
+    }
+    adClipUrls.add(u)
+    void adPlaceholderReachable(u).then((ok) => {
       if (!probeActive) return
-      if (suspect) {
-        adClipUrls.add(u)
-        log.append(
-          'warn',
-          'rule-probe',
-          `疑似广告短片（先不交给播放器，继续等正片）: ${u.slice(0, 110)}`
-        )
-        pushStep(STAGE, `疑似广告短片，继续等正片：${u.slice(0, 60)}`)
+      if (ok) {
+        deliverCandidate(u, channel)
         return
       }
-      noteCapturedStream({
-        url: u,
-        kind: /\.m3u8(\?|$)/i.test(u) ? 'm3u8' : 'media',
-        channel,
-        capturedAt: Date.now()
-      })
-      // 拿到可用候选 = 「获取播放资源」阶段达成（后面交给播放器是 inject 阶段的事）
-      succeedStage(STAGE, `已获取播放资源（${channel}）`)
-      emit(mainWin, { type: 'found', url: u, kind: /\.m3u8(\?|$)/i.test(u) ? 'm3u8' : 'media' })
+      log.append(
+        'warn',
+        'rule-probe',
+        `占位/广告地址打不开（连接被拒/超时），先不交给播放器，继续等真流: ${u.slice(0, 110)}`
+      )
+      pushStep(STAGE, `占位/广告地址不可达，继续等真流：${u.slice(0, 60)}`)
     })
   }
 
@@ -758,9 +1063,31 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
   const onBeforeRequest = (details: { url: string; resourceType: string }): void => {
     if (!probeActive) return
     const u = details.url
+    /*
+     * 诊断开关（V1.4）：`SAKANA_PROBE_LOG_ALL=1` 时把探针窗口发出的所有请求打到日志。
+     *
+     * 用途：有些站点的媒体/弹幕接口藏在 JS 里（E站的弹幕池是
+     * `player.ezdmw.com/danmuku/` 这个 iframe 内部的 XHR），抓包工具又会被站点的
+     * 反调试挡住（devtools 一开就 about:blank）。我们自己的探针窗口没有 devtools 附加，
+     * 站点不会自我清空，于是可以借它"代理一次 devtools"。
+     */
+    if (process.env.SAKANA_PROBE_LOG_ALL === '1') {
+      log.append('info', 'probe', `REQ[${details.resourceType}] ${u.slice(0, 180)}`)
+    }
     if (!isStreamCandidate(u)) return
     if (details.resourceType === 'media' || MEDIA_EXT_RE.test(u)) {
       captureCandidate(u, 'webRequest')
+      return
+    }
+    /*
+     * V1.4：扩展名被伪装成图片的播放列表（E站用 `.webp` 装 m3u8）。
+     * 这里只做"可疑"的预判，真正判定要看到 `#EXTM3U` 才收 —— 避免把普通图片当成视频。
+     */
+    if (looksLikeDisguisedPlaylist(u)) {
+      void verifyM3u8ByContent(u).then((kind) => {
+        if (!probeActive) return
+        if (kind) captureCandidate(u, kind === 'm3u8' ? 'm3u8(伪装扩展名)' : 'dash(伪装扩展名)')
+      })
     }
   }
   const onCompleted = (details: { url: string; statusCode: number }): void => {
@@ -774,36 +1101,38 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
   if (disposeListeners) disposeListeners()
   disposeListeners = addProbeListeners({ onBeforeRequest, onCompleted })
 
-  // 先尝试直接从播放页 HTML 提取真实地址（MacCMS 等）：多候选并行探测，窗口仅作兜底
-  void extractStreamCandidates(url, referer).then(async (candidates) => {
+  // 先尝试直接从播放页 HTML 提取真实地址（MacCMS 等）：**首个候选立即交给播放器**，窗口仅作兜底
+  void extractStreamCandidatesCached(url, referer).then((candidates) => {
     if (!probeActive || candidates.length === 0) return
-    const ok = await resolveFirstPlayable(candidates, referer)
-    if (!probeActive || !ok) return
-    if (foundUrls.includes(ok.url)) return
-    foundUrls.push(ok.url)
-    log.append('info', 'rule-probe', `直出地址命中: ${ok.url.slice(0, 120)}`)
+    const alts = candidates.slice(0, 6).map((u) => ({ url: u, referer: refererForCandidate(u, url) }))
+    for (const a of alts) offerHandoffCandidate(a)
+    const first = alts[0]
+    if (foundUrls.includes(first.url)) return
+    foundUrls.push(first.url)
+    log.append('info', 'rule-probe', `直出地址命中（不做预校验，直接交给播放器）: ${first.url.slice(0, 120)}`)
     /*
-     * 直出地址也过一遍"疑似广告短片"判定（v0.3.7）。
-     * 为什么连直出也要查：MacCMS 系的播放页里 `player_aaaa.url` 指向的**就是**播放器第一个要放的媒体，
-     * 而有些站点把它填成了前置广告 —— 这一条进了 6 分钟直链缓存，用户下次进来还会再看一遍广告。
+     * 直出地址也过一遍"疑似广告短片"判定（v0.3.7）—— 但**不再等它**：
+     * MacCMS 系的 `player_aaaa.url` 有时被站点填成前置广告，先交给播放器最多多看几秒广告，
+     * 而等它（最长 8 秒）是每一集都要付的时间。判定结论只记日志与阶段步骤。
      */
-    if (await looksLikeAdClip(ok.url)) {
-      adClipUrls.add(ok.url)
-      log.append('warn', 'rule-probe', `直出地址疑似广告短片（不缓存、先不交播放器）: ${ok.url.slice(0, 110)}`)
-      return
-    }
-    // 记进会话直链缓存（同一集来回切 / 退出再进可直接命中）
-    rememberStream(url, ok.url, ok.referer ?? referer)
+    void looksLikeAdClip(first.url).then((suspect) => {
+      if (!probeActive || !suspect) return
+      adClipUrls.add(first.url)
+      log.append('warn', 'rule-probe', `直出地址疑似广告短片（已先播，等真流顶掉）: ${first.url.slice(0, 110)}`)
+      pushStep(STAGE, '直出地址疑似广告短片（已先播，等真流顶掉）')
+    })
+    // 记进会话直链缓存（同一集来回切 / 退出再进可直接命中）；备选一起存，缓存失效时 5 秒内可换
+    rememberStream(url, first.url, first.referer, alts.slice(1))
     noteCapturedStream({
-      url: ok.url,
-      kind: /\.m3u8(\?|$)/i.test(ok.url) ? 'm3u8' : 'direct',
-      referer: ok.referer,
+      url: first.url,
+      kind: /\.m3u8(\?|$)/i.test(first.url) ? 'm3u8' : 'direct',
+      referer: first.referer,
       channel: 'html 直出',
       capturedAt: Date.now()
     })
     succeedStage(STAGE, '已获取播放资源（播放页直出）')
-    // referer 用空串表示「经校验确定不能带 Referer」（很多 CDN 会因 Referer 直接 400）
-    emit(mainWin, { type: 'found', url: ok.url, referer: ok.referer ?? '', kind: 'direct' })
+    // Referer 语义：undefined=未判定（回退规则站点）；''=判定不能带（跨域 CDN）
+    emit(mainWin, { type: 'found', url: first.url, referer: first.referer ?? '', kind: 'direct' })
   })
 
   /**
@@ -917,7 +1246,8 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
    * 界面回退到网页播放 —— 用户看到的就是「有些源偶尔能播、偶尔播不了」。
    */
   timeoutTimer = setTimeout(() => {
-    const best = pickBest(foundUrls)
+    // 收尾时别再优先选已知的占位/广告地址（理由见 pickBest）
+    const best = pickBest(foundUrls, adClipUrls)
     if (!doneSent) {
       doneSent = true
       /*

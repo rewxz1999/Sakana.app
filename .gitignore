@@ -109,3 +109,11 @@ streamBoostLog.json
 
 # npm ����ʱ����Ŀ¼�����ý��ֿ⣩
 tmp-npmcache/
+
+# ---- thumbfast 独立 mpv 可执行文件（官方构建，约 40-60MB，绝不入 git） ----
+# 由 package.json 的 build.extraResources 复制为 mpv-bin；体积大且可从官方 release 重新获取。
+resources/mpv-bin/
+# 运行时按当前环境写入的绝对路径（开发态/打包态不同），不入库。
+resources/mpv-config/script-opts/thumbfast.conf
+# thumbfast 运行时写的缩略图状态（供主进程日志读取，不入 git）
+resources/mpv-config/script-opts/thumbfast-status.json

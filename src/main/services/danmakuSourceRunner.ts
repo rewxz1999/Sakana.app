@@ -144,7 +144,19 @@ async function fetchOne(binding: EnabledFetcher, input: SourceRunInput, keywords
  * 每个源自己的失败只影响它自己（`Promise.allSettled`），一个源挂了另一个仍能出弹幕。
  */
 export async function runEnabledSources(input: SourceRunInput): Promise<SourceRunOutput> {
-  const wanted = input.missingSourceNames ? new Set(input.missingSourceNames) : null
+  /*
+   * V1.4 修「弹幕源永远不跑」：
+   *
+   * 原来写的是 `input.missingSourceNames ? new Set(...) : null` —— 传入**空数组**时
+   * `new Set([])` 是**真值**，于是下一行的过滤条件 `wanted.has(b.name)` 对所有源都是 false，
+   * 所有源被静默过滤掉。表现为：`sourceTest` 单条源测试能拿到 990 条弹幕，
+   * 但播放时自动加载永远是 0 条、日志里连一条源相关记录都没有。
+   * 语义应该是：**只有明确点名了"缺哪些源"时才过滤**（用于补漏），否则跑全部启用源。
+   */
+  const wanted =
+    input.missingSourceNames && input.missingSourceNames.length > 0
+      ? new Set(input.missingSourceNames)
+      : null
   const bindings = enabledFetchers().filter((b) => !wanted || wanted.has(b.name))
   const out: SourceRunOutput = { batches: [], errors: [], cacheHits: 0 }
   if (bindings.length === 0 && !wanted) {

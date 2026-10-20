@@ -1,17 +1,25 @@
 import type { BrowserWindow } from 'electron'
 import { getSettings } from '../net'
 import { log } from '../log'
-import { failStage, flowRunning } from './playFlow'
+import { failStageAndEnd, flowRunning } from './playFlow'
 import { proxyHlsUrl } from './adFilter'
+import { onTempMediaCacheFailure, pauseTempMediaCache, startTempMediaCache } from './mediaCache'
 import { planStreamBoost, stopAllBoost } from './streamBoost'
 import {
   mpvAddSubtitleFile,
+  mpvApplyBoost,
   mpvAttach,
   mpvAvailable,
+  mpvBoostSwapped,
+  mpvCurrentPath,
   mpvDestroy,
+  mpvFallbackDirect,
   mpvGetState,
+  mpvHasPicture,
   mpvNotifyLayout,
   mpvPlay,
+  mpvPlaybackProgress,
+  mpvReady,
   mpvSeekSec,
   mpvSetAspect,
   mpvSetBounds,
@@ -68,7 +76,117 @@ export function engineAttach(
    * 不清的话，「切集/换源后又回到同一个地址」会被当成重复请求挡掉，什么都不播。
    */
   resetPlayDedupe()
-  return Promise.resolve(mpvAttach(win, b))
+  const r = mpvAttach(win, b)
+  /*
+   * v1.3：地址可能比内核先到（缓存命中时播放页几乎立刻就有直链，而 attach 还在建子窗口）。
+   * 过去这种情况只能由渲染层「内核还没 attach」重试，每次间隔 900ms —— 白白多等近一秒。
+   * 现在主进程把地址排队，attach 一成功就立刻 loadfile。
+   */
+  if (r.ok && pendingPlay) {
+    const p = pendingPlay
+    pendingPlay = null
+    try {
+      mpvPlay(p.path, p.referer, p.cookies)
+      log.append('info', 'player', '内核挂载完成，立刻装载排队中的播放地址（不再等渲染层重试）')
+    } catch (err) {
+      log.append('warn', 'player', `挂载后装载排队地址失败：${String((err as Error)?.message ?? err).slice(0, 120)}`)
+    }
+  }
+  return Promise.resolve(r)
+}
+
+/**
+ * 内核还没挂载时先排队的播放地址（v1.3）。
+ * 只保留最后一次：用户在这期间换了集，旧地址不该再被装载。
+ */
+let pendingPlay: { path: string; referer?: string; cookies?: string } | null = null
+
+/* ─────────────────── 本地临时缓存（边下边播，v1.4） ─────────────────── */
+
+/**
+ * 当前交给内核的本地缓存会话。
+ *
+ * 为什么要在这里留一份、而不是全交给 mediaCache：
+ * 缓存失败时是**主进程后台**知道的（上游 403/写盘失败），而「原始地址 + Referer/Cookie」
+ * 只有播放层有；回退直连就是把这三样再交给内核。会话 id 用来过滤「上一集迟到的失败通知」。
+ */
+let activeCache: {
+  sessionId: string
+  localUrl: string
+  directUrl: string
+  referer?: string
+  cookies?: string
+  gen: number
+} | null = null
+let cacheFailureHooked = false
+
+/**
+ * 缓存失败 → 回退直连（「不许因为它播不了」的兜底，v1.4）。
+ *
+ * 只在三个条件同时成立时才切源，避免把一次后台失败变成用户可感知的中断：
+ *   ① 失败的是**当前**这一路（不是上一集迟到的通知）；
+ *   ② 内核还没出画面（已出画面时切源会把进度打回 0，已缓存区间足够继续播）；
+ *   ③ 内核当前载入的确实是这个本机地址（用户已经换候选/切加速时不要把它拉回来）。
+ * 任何一步不满足都只写日志、不动内核 —— 播放优先。
+ */
+function ensureCacheFailureHandler(): void {
+  if (cacheFailureHooked) return
+  cacheFailureHooked = true
+  onTempMediaCacheFailure((f) => {
+    const cur = activeCache
+    if (!cur || cur.sessionId !== f.sessionId) return
+    /*
+     * 这个会话已经失败，不再代表「当前正在走缓存」：
+     * 清掉它，2.5 秒的加速决策才能把已经回退过去的直连当作普通直连来救援
+     * （否则会误以为缓存还在接管取流而跳过测速）。
+     */
+    activeCache = null
+    if (mpvPlaybackProgress().hasPicture) {
+      log.append('warn', 'cache', `本地临时缓存失败（${f.reason}），但画面已经在播，保持当前播放不回退`)
+      return
+    }
+    const kernelPath = mpvCurrentPath()
+    if (kernelPath && kernelPath !== cur.localUrl) {
+      // 内核已经被换候选/加速中转带到别处：这次失败与当前播放无关，顺手把后台拉取停掉
+      log.append('info', 'cache', '本地临时缓存失败，但内核已切到其它地址，不再回退')
+      pauseTempMediaCache(cur.sessionId)
+      return
+    }
+    if (!mpvReady()) {
+      // 内核还没挂载、地址还在排队：把排队地址换成直连原地址，attach 后直接播它
+      if (pendingPlay && pendingPlay.path === cur.localUrl) {
+        pendingPlay = { path: cur.directUrl, referer: cur.referer, cookies: cur.cookies }
+        log.append('warn', 'cache', `本地临时缓存失败（${f.reason}），排队中的播放地址已换成直连原地址`)
+      }
+      return
+    }
+    const ok = mpvFallbackDirect(cur.directUrl, cur.referer, cur.cookies, f.reason)
+    log.append(
+      ok ? 'warn' : 'error',
+      'cache',
+      ok
+        ? `本地临时缓存失败（${f.reason}），已自动回退直连原地址，不影响本次播放`
+        : `本地临时缓存失败（${f.reason}），回退直连也未成功（内核不可用）`
+    )
+  })
+}
+
+/**
+ * 「要不要测速/加速」的延迟决策（v1.3）。
+ *
+ * 为什么不在 loadfile 之后立刻测速（脚本里实测到的真问题）：
+ * 测速/预热会**再开一条连接去拉同一个地址**。对「同一 IP 只给一条连接」的慢 CDN，
+ * 它和内核的取流互相排队 —— 实测同一路 11 秒首字节的地址，改后立刻测速会让首帧等到 10.6 秒，
+ * 而让内核独占连接只要 3 秒。所以先给直连 2.5 秒：
+ *   · 已经收到字节/已经出画面 → 这一轮**根本不测速**（省一条连接，也省 0.3~3 秒后台开销）；
+ *   · 一个字节都没有 → 才启动测速/预热，作为「直连卡死」的救援（成功就切到中转，失败就交给 5 秒/15 秒兜底）。
+ */
+const BOOST_PLAN_DELAY_MS = 2_500
+let boostTimer: NodeJS.Timeout | null = null
+
+function clearBoostTimer(): void {
+  if (boostTimer) clearTimeout(boostTimer)
+  boostTimer = null
 }
 
 export function engineSetBounds(bounds: PlayerBounds): void {
@@ -116,6 +234,23 @@ export function engineSetBounds(bounds: PlayerBounds): void {
  * 这里在交给内核之前**再看一眼列表内容**（HLS 才看，整段文件不看）：
  * 既没有变体（不是主列表）也没有任何一个时长 > 0 的分片时，说明这不是可用播放列表，
  * 直接如实失败并写清证据（字节数 / 分片数 / 判据），不再让用户白等一轮。
+ *
+ * ## v1.3：上面这件事**不再挡在起播前面**
+ *
+ * 工单实测（`scripts/play-speed`）里最刺眼的一段就是这里：
+ * 命中一个直链之后，`enginePlay` 会先 `await planStreamBoost(...)`（测速 + 预热，
+ * 快源 ~0.3s、慢源 1~8s），再 `await checkPlaylistUsable(...)`（必要时再拉一次列表，最多 8s），
+ * 全都结束才 `loadfile`。用户点完一集，内核其实**还没拿到地址** ——
+ * 这正是「命中→loadfile」这一段，Kazumi 那里几乎是 0。
+ *
+ * 现在顺序反过来：
+ *   ① 直连地址**立刻** loadfile（这是唯一能出画面的动作）；
+ *   ② 测速/预热/列表校验在后台并行跑；
+ *   ③ 只有「还没出画面」时才把内核切到加速中转（中转里已经缓存了头部分片，切过去通常立刻出画）；
+ *      已经出画面则**绝不打断**，把后台中转停掉省带宽。
+ *
+ * 去重闸与「占位播放列表」两道闸都保留 —— 它们防的是真实踩过的坑，
+ * 只是从「先判后播」改成「先播后判」，判失败仍然会结束本轮并给出原因。
  */
 export function enginePlay(path: string, referer?: string, cookies?: string): void {
   const filtered = proxyHlsUrl(path, { referer, cookies })
@@ -136,51 +271,157 @@ export function enginePlay(path: string, referer?: string, cookies?: string): vo
   lastPlayKey = key
   lastPlayAt = now
   const gen = ++playGen
-  void planStreamBoost(filtered, { referer, cookies })
-    .then(async (plan) => {
-      // 期间用户又点了别的集/退出了播放器：这次的结果作废，别再动内核
-      if (gen !== playGen) return
-      const target = plan.boosted && plan.url ? plan.url : filtered
-      if (plan.boosted) {
-        log.append('info', 'player', `在线播放加速生效：${plan.reason}`)
-      }
-      // 闸 ②：交给内核前确认这确实是一张能播的播放列表（只查 HLS）
-      /*
-       * 什么时候可以省掉这一查：测速/预热阶段已经从这路流里**真的取到一个分片**了
-       * （≥1KB，见 streamBoost 的 sample）。那时再发一次 GET 纯属白等 ——
-       * 而白等的这几百毫秒，恰好在用户最在意的"起播"路径上。
-       * 只有当样本小到说明不了问题（例如真实日志里那个 0KB 的样本）时才去查列表内容。
-       */
-      const sample = plan.sample
-      const alreadyProven = !!sample && sample.ok && sample.bytes >= 1024
-      const usable = alreadyProven
-        ? { ok: true, reason: '' }
-        : await checkPlaylistUsable(filtered, referer, cookies)
-      if (gen !== playGen) return
-      if (!usable.ok) {
-        log.append('error', 'player', `不把不可用的播放列表交给内核：${usable.reason}`)
-        if (flowRunning()) {
-          /*
-           * 归因用 'site'：拿到的地址内容本身不可用（占位列表/需要会话），
-           * 处置方式与「网络慢要再等等」完全不同 —— 用户该做的是换线路/换源。
-           */
-          failStage('inject', usable.reason, 'site')
+
+  /*
+   * ① 本地临时缓存（边下边播，v1.4）：
+   * 先把候选地址交给本机缓存服务，拿到**本机播放地址**再 loadfile。
+   * 缓存服务按顺序拉上游字节并写盘，播放器只读「已经落盘」的部分 ——
+   * 起播不再受上游抖动影响，后续拖动/重播也只读磁盘。
+   * 拿不到本机地址（HLS / 服务未就绪 / 目录不可写）就原样直连：这一步绝不能挡住播放。
+   */
+  if (activeCache && activeCache.directUrl !== filtered) {
+    // 切集：上一集不必继续在后台把整集拉完，暂停但保留已落盘字节（LRU 里拖回来还能续）
+    pauseTempMediaCache(activeCache.sessionId)
+  }
+  const cacheStart = startTempMediaCache({ url: filtered, referer, cookies })
+  let playUrl = filtered
+  let playReferer = referer
+  let playCookies = cookies
+  if (cacheStart.ok) {
+    playUrl = cacheStart.url
+    // 上游需要的 Referer/Cookie 由本机缓存服务带：内核不必、也不该把 Cookie 发给本机端口
+    playReferer = undefined
+    playCookies = undefined
+    /*
+     * 切到缓存链路 = 以后这路字节由缓存服务提供，上一集可能还挂着的加速中转没有用了：
+     * 不收掉它会继续并发拉上游，和缓存抢带宽（慢源上尤其明显）。
+     */
+    stopAllBoost()
+    activeCache = {
+      sessionId: cacheStart.sessionId,
+      localUrl: cacheStart.url,
+      directUrl: filtered,
+      referer,
+      cookies,
+      gen
+    }
+    ensureCacheFailureHandler()
+    log.append(
+      'info',
+      'cache',
+      cacheStart.reused
+        ? '本次播放走本地临时缓存（复用已有缓存，播放器只读本地文件）'
+        : '本次播放走本地临时缓存：先落盘再喂给播放器，未缓存到的位置边下边播'
+    )
+  } else {
+    activeCache = null
+    log.append('info', 'cache', `本地临时缓存未启用（${cacheStart.reason}），本次直连原地址播放`)
+  }
+
+  // ② 先交给内核：不等测速、不等列表校验、不等任何预检查
+  if (mpvReady()) {    try {
+      mpvPlay(playUrl, playReferer, playCookies)
+    } catch (err) {
+      pendingPlay = { path: playUrl, referer: playReferer, cookies: playCookies }
+      log.append(
+        'warn',
+        'player',
+        `内核暂时不可用，地址先排队（attach 完成立刻 loadfile）：${String((err as Error)?.message ?? err).slice(0, 100)}`
+      )
+    }
+  } else {
+    pendingPlay = { path: playUrl, referer: playReferer, cookies: playCookies }
+    log.append('info', 'player', '内核还没挂载，地址先排队；attach 完成立刻 loadfile（不再让渲染层等 900ms 重试）')
+  }
+
+  // ③ 延迟决策：先让直连独占连接 2.5 秒；没数据才测速/预热（见 BOOST_PLAN_DELAY_MS 的说明）
+  clearBoostTimer()
+  boostTimer = setTimeout(() => {
+    boostTimer = null
+    // 期间用户又点了别的集/退出了播放器：这次的结果作废，别再动内核
+    if (gen !== playGen) return
+    /*
+     * 这一轮已经结束（首帧已到 / 已判失败）就不再测速：
+     * 首帧到了说明直连没问题，失败则已经由 15 秒看门狗收尾 —— 两种情况都不需要再开一条连接。
+     */
+    if (!flowRunning()) return
+    /*
+     * 本地临时缓存已经接管取流：不再做加速测速。
+     *
+     * 两个原因：
+     *   · 测速/预热会**再开一条连接**去拉同一个地址，和缓存服务抢上游带宽（慢源上尤其明显）；
+     *   · 加速中转的地址会绕开本地缓存，等于把刚缓存的字节作废、还要重新拉一遍。
+     */
+    if (activeCache && activeCache.gen === gen) {
+      log.append('info', 'player', '本地临时缓存已接管取流：跳过加速测速/中转（避免与缓存拉取抢上游带宽）')
+      return
+    }
+    if (!mpvReady()) {
+      log.append('info', 'player', '内核还没挂载，跳过这一轮加速测速（地址已在排队，挂载后直接取流）')
+      return
+    }
+    const progress = mpvPlaybackProgress()
+    if (progress.hasPicture || progress.bytes > 0) {
+      log.append(
+        'info',
+        'player',
+        `直连已经在出数据（${Math.round(progress.bytes / 1024)} KB${progress.hasPicture ? '，已出画面' : ''}），跳过加速测速`
+      )
+      return
+    }
+    void planStreamBoost(filtered, { referer, cookies })
+      .then(async (plan) => {
+        // 期间用户又点了别的集/退出了播放器：这次的结果作废，别再动内核
+        if (gen !== playGen) return
+        /*
+         * 什么时候可以省掉列表校验：测速/预热阶段已经从这路流里**真的取到一个分片**了
+         * （≥1KB，见 streamBoost 的 sample）。那时再发一次 GET 纯属白拉。
+         */
+        const sample = plan.sample
+        const alreadyProven = !!sample && sample.ok && sample.bytes >= 1024
+        const usable = alreadyProven
+          ? { ok: true, reason: '' }
+          : await checkPlaylistUsable(filtered, referer, cookies)
+        if (gen !== playGen) return
+        if (!usable.ok) {
+          log.append('error', 'player', `不把不可用的播放列表交给内核：${usable.reason}`)
+          if (flowRunning()) {
+            /*
+             * 归因用 'site'：拿到的地址内容本身不可用（占位列表/需要会话），
+             * 处置方式与「网络慢要再等等」完全不同 —— 用户该做的是换线路/换源。
+             *
+             * 用 failStageAndEnd 而不是 failStage —— 这是**确定性的失败**，
+             * 必须结束整轮，否则 running 一直是 true、状态药丸停在「注入播放器」不动。
+             */
+            failStageAndEnd('inject', `注入失败：${usable.reason}`, 'site')
+          }
+          // 这次没播成：把去重记忆清掉，用户马上点重试/换回同一路时不能再被挡
+          resetPlayDedupe()
+          return
         }
-        // 这次没播成：把去重记忆清掉，用户马上点重试/换回同一路时不能再被挡
-        resetPlayDedupe()
-        return
-      }
-      mpvPlay(target, referer, cookies)
-    })
-    .catch((err) => {
-      if (gen !== playGen) return
-      log.append('warn', 'player', `加速决策异常，按直连播放: ${String((err as Error)?.message ?? err).slice(0, 120)}`)
-      try {
-        mpvPlay(filtered, referer, cookies)
-      } catch (e) {
-        log.append('error', 'player', `直连播放也失败: ${String((e as Error)?.message ?? e).slice(0, 120)}`)
-      }
-    })
+        if (plan.boosted && plan.url) {
+          const applied = mpvApplyBoost(plan.url, referer, cookies)
+          if (applied) {
+            log.append('info', 'player', `在线播放加速已接入内核：${plan.reason}`)
+          } else if (!mpvBoostSwapped()) {
+            /*
+             * 没切过去，而且本轮也还没切过加速：说明直连在这段时间里已经出画面/开始拉流。
+             * 这时把后台中转停掉 —— 它已经在并发拉分片，继续跑只会和内核抢带宽。
+             */
+            stopAllBoost()
+            log.append('info', 'player', `直连已经起播，放弃加速中转（不再切流）：${plan.reason}`)
+          }
+        }
+      })
+      .catch((err) => {
+        // 后台链路出任何问题都不该影响已经交给内核的直连播放
+        log.append(
+          'warn',
+          'player',
+          `后台加速决策异常（直连已在播）: ${String((err as Error)?.message ?? err).slice(0, 120)}`
+        )
+      })
+  }, BOOST_PLAN_DELAY_MS)
 }
 
 /** 同一路流在该时间窗内重复到达时只播一次（见 enginePlay 的说明） */
@@ -287,10 +528,26 @@ export function engineGetState(): {
   playing: boolean
   volume: number
   muted: boolean
+  /**
+   * v1.5：本轮媒体是否真的出过画面（**不是** `playing`）。
+   *
+   * 渲染层用它做三件事：弹幕层门控、加载进度显示、控制栏门控。
+   * 判据只有 `mpvHasPicture()` 一个来源（内核 `width`>0 的首帧判据），
+   * 这里只做透传，绝不在这层再按 time/playing 二次推断 ——
+   * 那样会出现"状态说有画面、屏幕上却一片黑"的两套说法。
+   */
+  hasPicture: boolean
 } | null {
   const st = mpvGetState()
   if (!st || !st.ready) return null
-  return { time: st.time, length: st.length, playing: !st.paused, volume: st.volume, muted: st.mute }
+  return {
+    time: st.time,
+    length: st.length,
+    playing: !st.paused,
+    volume: st.volume,
+    muted: st.mute,
+    hasPicture: mpvHasPicture()
+  }
 }
 
 export function engineSubtitleTracks(): { id: number; label: string }[] {
@@ -322,7 +579,19 @@ export function engineSetAspect(mode: 'fit' | 'cover' | 'stretch'): void {
 export function engineDetach(): void {
   // 退出播放器：连同加速会话一起收掉，别让 4 条并发连接在后台继续拉流
   stopAllBoost()
+  /*
+   * 本地临时缓存同样要停：文件保留（LRU 里最多 N 集，拖回来还能继续），
+   * 但后台不该在用户已经离开这一集之后继续拉整集 —— 那是在白烧带宽。
+   */
+  if (activeCache) {
+    pauseTempMediaCache(activeCache.sessionId)
+    activeCache = null
+  }
   resetPlayDedupe()
+  // 延迟决策的定时器也要撤：内核已经销毁，2.5 秒后不该再发测速请求
+  clearBoostTimer()
+  // 排队中的地址也要丢掉：内核已经销毁，再装载只会在下一次 attach 时播一集旧内容
+  pendingPlay = null
   mpvDestroy()
 }
 

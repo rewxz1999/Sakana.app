@@ -124,7 +124,8 @@ export function AboutPage() {
    * 没配反代就显示当前镜像站地址 —— 那时用户确实需要知道自己在用哪面镜像。
    */
   const customApi = (settings.bangumiCustomApi ?? '').trim()
-  const mainSource = customApi ? 'Bangumi' : settings.dataSources?.main || settings.bangumiBase || 'Bangumi'
+  // 只显示「内置 / 自定义」，不显示地址：内置双反代的地址与 PSK 是主进程隐藏项
+  const mainSource = customApi ? 'Bangumi（自定义反代 · 地址已隐藏）' : 'Bangumi（内置双反代 · 地址已隐藏）'
   const mirrorCount = settings.dataSources?.mirrors?.length ?? settings.bangumiMirrors.length
 
   return (
@@ -162,7 +163,7 @@ export function AboutPage() {
       <Card title="数据来源" desc="番剧数据与 galgame 数据来源">
         <Row label="当前数据源">
           {mainSource}
-          {customApi ? '（默认数据源 · 最高优先级）' : ''}
+          {customApi ? '（默认数据源）' : '（默认数据源 · 双端点分担）'}
         </Row>
         <div className="border-t border-border" />
         <Row label="镜像站数量">{mirrorCount} 个{customApi ? '（反代取不到数据时可手动切换）' : ''}</Row>

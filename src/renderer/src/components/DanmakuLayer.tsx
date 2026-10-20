@@ -62,6 +62,18 @@ interface Props {
   rect: { x: number; y: number; width: number; height: number }
   /** 分辨率缩放（devicePixelRatio） */
   scale?: number
+  /**
+   * 画面是否真的出来了（v1.5 门控）。
+   *
+   * 为什么这一层还要再判一次（调用方已经在 hasPicture=false 时**不渲染**本组件了）：
+   * 弹幕画在铺满主窗口的透明窗口上，一旦在没有画面的黑屏上出现，用户看到的就是
+   * "还没开播就有一堆弹幕在飞"——正是这次要修的那一幕。把判据放进组件内部，
+   * 任何将来新增的调用路径都绕不过这条规则，不必依赖每个调用方都记得传条件。
+   * 判据与播放页/主进程同源：`state.hasPicture`（内核首帧 width>0），不是 playing/time。
+   *
+   * false 时只清空画布，不生成、不绘制任何一条弹幕（见 draw 内部）。
+   */
+  active?: boolean
 }
 
 /** 每秒最多新出现的弹幕条数（防止瞬间糊屏） */
@@ -73,7 +85,7 @@ const RAF_SLOW_MS = 40
 /** 定时器驱动的间隔（≈60fps） */
 const TIMER_FRAME_MS = 16
 
-export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 1 }: Props): React.ReactElement {
+export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 1, active = true }: Props): React.ReactElement {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const itemsRef = useRef<ActiveItem[]>([])
   const cursorRef = useRef(0)
@@ -87,8 +99,8 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
   /** 文本宽度缓存：key = `${bold?'b':''}${fontSize}|${text}` */
   const measureRef = useRef<Map<string, number>>(new Map())
   /** 每次 e 变化都要重建的常量放到 ref，避免闭包过期 */
-  const cfgRef = useRef({ settings, comments, rect, playing })
-  cfgRef.current = { settings, comments, rect, playing }
+  const cfgRef = useRef({ settings, comments, rect, playing, active })
+  cfgRef.current = { settings, comments, rect, playing, active }
   /**
    * 渲染窗口（V1.2「切时间轴要快」）。
    *
@@ -182,7 +194,7 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
     const draw = (): void => {
       lastFrameAt = performance.now()
       probe.__sakanaDanmakuFrames = (Number(probe.__sakanaDanmakuFrames) || 0) + 1
-      const { settings: cfg, comments: list, rect: r, playing: isPlaying } = cfgRef.current
+      const { settings: cfg, comments: list, rect: r, playing: isPlaying, active: isActive } = cfgRef.current
       const w = Math.max(1, Math.round(r.width))
       const h = Math.max(1, Math.round(r.height))
       if (canvas.width !== Math.round(w * scale) || canvas.height !== Math.round(h * scale)) {
@@ -193,6 +205,19 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
       }
       ctx.setTransform(scale, 0, 0, scale, 0, 0)
       ctx.clearRect(0, 0, w, h)
+
+      /*
+       * v1.5 门控：画面还没出来（active=false）→ 只清空，不生成、不绘制。
+       *
+       * 放在 clearRect 之后：这样"画面刚消失"的那一帧会把上一轮留下的弹幕一起擦掉，
+       * 不会出现"黑屏上还停着上一集的弹幕"（用户报的正是这个）。
+       * 也顺手把车道状态清空 —— 否则画面再次出现时会按旧的车道占用情况排道，前几条会莫名错位。
+       */
+      if (!isActive) {
+        itemsRef.current = []
+        laneLastRef.current = []
+        return
+      }
 
       // 未开启 / 无弹幕：清空并停在这里
       if (!cfg.enabled || list.length === 0) {
@@ -370,14 +395,24 @@ export function DanmakuLayer({ comments, settings, time, playing, rect, scale = 
         const age = t - it.start
         let x = 0
         let y = 0
+        /*
+         * V1.3.3（用户反馈"弹幕区域在顶部被遮住了一些"）：
+         * 顶部留一条**安全边**再开始排道。
+         *
+         * 为什么需要：滚动/顶部弹幕原来从 y=0 起排，最上面那道紧贴画面顶边 ——
+         * 播放器顶部还有 uosc 的角标按钮热区（鼠标靠近才会浮现，但浮现时正好压在最上面那道弹幕上），
+         * 视觉上就是"顶部被挡住一条"。
+         * 取 `min(画面高度 3%, 一行字高)`：小窗时不至于浪费太多区域，大窗时约等于让开一行。
+         */
+        const topInset = Math.min(Math.round(h * 0.03), lineH)
         if (it.mode === 1) {
           const travel = w + it.width + 24
           x = w - (age / it.duration) * travel
           if (x + it.width < -8) continue // 已出画
-          y = it.lane * lineH
+          y = topInset + it.lane * lineH
         } else if (it.mode === 5) {
           if (age > it.duration) continue
-          y = it.lane * lineH
+          y = topInset + it.lane * lineH
           x = Math.round((w - it.width) / 2)
         } else {
           if (age > it.duration) continue

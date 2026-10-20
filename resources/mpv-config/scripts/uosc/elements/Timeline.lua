@@ -60,9 +60,12 @@ function Timeline:update_dimensions()
 	self.font_size = math.floor(math.min((self.size + 60 * state.scale) * 0.2, self.size * 0.96) * options.font_scale)
 	local window_border_size = Elements:v('window_border', 'size', 0)
 	self.ax = window_border_size
-	self.ay = display.height - window_border_size - self.size - self.top_border
 	self.bx = display.width - window_border_size
+	-- 用户最终决定：**进度条回到最底部、控制按钮在它上面**（与 uosc 原版一致）。
+	-- 之前"按钮贴底、进度条在上"的方案被否掉了，所以这里恢复成贴屏幕底边；
+	-- Controls.lua 那边同步恢复成"坐在进度条上方"，两处必须一起改。
 	self.by = display.height - window_border_size
+	self.ay = self.by - self.size - self.top_border
 	self.width = self.bx - self.ax
 	self.chapter_size = math.max((self.by - self.ay) / 10, 3)
 	self.chapter_size_hover = self.chapter_size * 2

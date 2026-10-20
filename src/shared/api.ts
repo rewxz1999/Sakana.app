@@ -180,6 +180,16 @@ export interface OverlayState {
    * 那时再盖一层「加载中」就是误报。所以由播放页给出这个更准确的判据。
    */
   startedOnce?: boolean
+  /**
+   * v1.5：**画面是否真的出来了**（= `player.getState().hasPicture`，同一条来源）。
+   *
+   * 悬浮窗必须知道它，才能做三件用户要求的事：
+   *   ① 没有画面 → 不画弹幕（内置画布这一条路；插件那条路由主进程拦住注入）；
+   *   ② 没有画面 → 显示"加载中/加载失败"的明确提示，而不是一片空白；
+   *   ③ 没有画面 → 控制栏既不显示、也不能被鼠标呼出（含 uosc 的 reveal）。
+   * `startedOnce` 的语义是"曾经 playing"，它比"有画面"早，不能用它替代。
+   */
+  hasPicture?: boolean
 }
 
 /**
@@ -277,6 +287,16 @@ export type OverlayAction =
   | { type: 'volumeDown' }
   /** v0.2.9：控制栏音量滑杆（0-100），取代原来的静音按钮 */
   | { type: 'setVolume'; value: number }
+  /**
+   * v1.1.6：uosc 音量菜单（`sakana-volume` 点开的那个）。
+   *
+   * `volumeSet` 是"直接设到某一档"（0/25/50/75/100%），`volumeDelta` 是"在当前值上 ±10%"。
+   * 这两条不复用上面的 `setVolume`：滑杆是高频拖动、只改音量；而菜单是一次明确的点选，
+   * 语义上要顺手解除静音（否则静音状态下点 +10% 仍然没声音，用户会以为按钮还是坏的）。
+   * 真正的写入仍由播放页调 `api.player.setVolume` 完成 —— Lua 侧只发动作、不碰 mpv 属性。
+   */
+  | { type: 'volumeSet'; value: number }
+  | { type: 'volumeDelta'; delta: number }
   /** v0.2.9 最后更新：设置播放倍速（0.25–4） */
   | { type: 'setSpeed'; value: number }
   | { type: 'toggleMute' }
@@ -374,7 +394,12 @@ export interface SakanaApi {
     onSettingsChanged(cb: () => void): () => void
   }
   bangumi: {
-    calendar(force?: boolean): Promise<ApiResult<CalendarResult>>
+    /**
+     * 番剧表。`force` = 主动刷新；`opts.allowRefresh` = 允许顺带后台更新一次
+     * （V1.2.3：只有番剧表页挂载与手动刷新会传 true，其余调用一律吃缓存 ——
+     *  避免为了首页推荐之类的需求白打一次 38 秒的 `/calendar`）。
+     */
+    calendar(force?: boolean, opts?: { allowRefresh?: boolean }): Promise<ApiResult<CalendarResult>>
     /**
      * 番剧表在后台刷新完成时推送（v1.1.4）。
      *
@@ -412,14 +437,16 @@ export interface SakanaApi {
      * 某个季度的番剧列表（番剧表「预览 20xx年春」弹窗）。
      * month 可传该季度内的任意一个月，主进程会规范化到季度并按季度缓存。
      *
-     * v1.1.4：`priority` 让「随机推荐」这类后台取样走 B 级（不挤占番剧表/详情）。
+     * @deprecated `priority` 已废弃：分级取消，所有请求同等排队，传值不影响行为；
+     * 参数仅为兼容旧调用点保留。
      */
     season(year: number, month: number, force?: boolean, priority?: NetPriority): Promise<ApiResult<SeasonResult>>
     /**
      * 「更新到第几集」（v0.3.7）：按分集接口每集的 airdate 数出**已放送集数**。
      * 取不到（离线 / 兜底数据源的负数 id / 条目没有分集）时 data 为 null，界面隐藏这一行。
      *
-     * v1.1.4：`priority` 缺省 S（用户正看着详情页）；仪表盘那种批量后台补齐传 B。
+     * @deprecated `priority` 已废弃：分级取消，所有请求同等排队，传值不影响行为；
+     * 参数仅为兼容旧调用点保留。
      */
     episodeProgress(id: number, priority?: NetPriority): Promise<ApiResult<EpisodeProgress | null>>
     testMirrors(): Promise<ApiResult<MirrorTestResult[]>>
@@ -536,14 +563,22 @@ export interface SakanaApi {
     cachedStream(pageUrl: string): Promise<ApiResult<{ url: string; referer?: string } | null>>
     /** 把刚嗅探到的直链记进会话缓存 */
     rememberStream(pageUrl: string, url: string, referer?: string): Promise<ApiResult<boolean>>
-    /** 后台预取某集的直链（只走 HTML 直出，不创建窗口）；一并返回播放页地址供切集复用 */
+    /**
+     * 后台预取某集的直链（只走 HTML 直出，不创建窗口）；一并返回播放页地址供切集复用。
+     * v1.3：`knownPageUrl` 是渲染层**刚刚**解析出来的播放页地址 —— 传了它就不再重跑一次 rulePlay，
+     * 同时预取会在主进程里立刻开始（与页面导航并行）。
+     * `forCurrentEpisode=true` 表示这一集马上就要播，候选可以进交接队列（5 秒零字节时才用）；
+     * 预取下一集必须省略，否则会把当前这集换到下一集的地址上。
+     */
     prefetchStream(
       ruleId: string,
       entry: RuleSearchEntry,
       lineIndex: number,
       episodeIndex: number,
       episodeLink: string,
-      vars: Record<string, string>
+      vars: Record<string, string>,
+      knownPageUrl?: string,
+      forCurrentEpisode?: boolean
     ): Promise<ApiResult<{ pageUrl: string; url: string | null; referer?: string } | null>>
   }
   media: {
@@ -575,7 +610,26 @@ export interface SakanaApi {
     togglePause(): Promise<ApiResult<boolean>>
     seek(sec: number): Promise<ApiResult<boolean>>
     setVolume(volume: number): Promise<ApiResult<boolean>>
-    getState(): Promise<ApiResult<{ time: number; length: number; playing: boolean; volume: number; muted: boolean }>>
+    getState(): Promise<
+      ApiResult<{
+        time: number
+        length: number
+        playing: boolean
+        volume: number
+        muted: boolean
+        /**
+         * v1.5：**是否真的出过画面**（渲染层弹幕/控制栏/加载进度的唯一判据）。
+         *
+         * 为什么不复用 `playing`：mpv 的 playing 只表示"已载入媒体且未暂停"——
+         * 地址失效、CDN 卡住、只解出音频时它同样是 true，但屏幕上什么都还没出来。
+         * 主进程侧的判据只有一条：内核的 `width`（video-params/w）> 0，即解码器真的产出了首帧
+         * （见 `services/mpv.ts` 的 `mpvHasPicture()`）。渲染层不要再用 time/engineState 组合推断。
+         *
+         * 语义是"本轮媒体内保持"：暂停/缓冲/拖动都不会变回 false，换媒体时才复位。
+         */
+        hasPicture: boolean
+      }>
+    >
     /**
      * 画面子窗口的诊断快照（v0.3.7）。
      *
@@ -633,6 +687,16 @@ export interface SakanaApi {
         index?: number
         /** v0.2.18：音量（uosc 的滑杆直接改 mpv 属性，这里把变化同步回渲染层） */
         volume?: number
+        /** v1.3：主进程把内核切到了另一个候选地址（5 秒零字节换候选 / 接入加速中转） */
+        url?: string
+        /**
+         * v1.5：画面出现/消失（`type === 'picture'`）。
+         *
+         * 这是"画面真的出来了"的唯一事件来源：`true` 由 startTimePump 在首帧解出时发；
+         * `false` 由 loadSource 在每次换媒体时发。渲染层收到 true 才允许显示弹幕、
+         * 才允许呼出控制栏；收到 false 就要把加载进度重新显示出来。
+         */
+        hasPicture?: boolean
       }) => void
     ): () => void
     /** 截图（v0.2.9：目录/文件名规则统一由主进程处理，见 snapshotPath） */

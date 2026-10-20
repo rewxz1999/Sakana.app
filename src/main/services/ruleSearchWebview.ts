@@ -198,8 +198,40 @@ async function runInPage(w: BrowserWindow, script: string): Promise<string> {
   }
 }
 
+/**
+ * 网页内搜索/选集的**串行闸门**（v1.2.1）。
+ *
+ * 为什么必须有：`ensureWindow()` 复用的是**同一个** BrowserWindow，
+ * 而批量预嗅探会同时跑 3 条规则。三条规则都走到「网页内搜索」兜底时，
+ * 第二个 `loadURL` 会把第一个正在等的页面顶掉（did-finish-load 提前触发），
+ * 第三个又在第二个的页面上执行 XPath —— 结果三条里通常只有一条拿到真结果，
+ * 其余全被写成「没有这部番」，而且旧版会把这种负结论**永久缓存**。
+ *
+ * 用户报的「原本能嗅探到的规则、过一段时间显示没有结果」里，这是一条独立成因：
+ * 串行之后同一时刻只有一个页面在加载，结论才可信；代价是网页兜底变慢，
+ * 但它本来就是"HTTP 拿不到才走"的少数路径。
+ */
+let webviewGate: Promise<void> = Promise.resolve()
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+  const run = webviewGate.then(fn, fn)
+  // 闸门自身永远不当成失败：上一条无论成功/失败，下一条都要能跑
+  webviewGate = run.then(
+    () => undefined,
+    () => undefined
+  )
+  return run
+}
+
 /** 用真实浏览器窗口打开搜索页并解析条目（失败返回空数组，交由上层回退） */
 export async function searchViaWebview(
+  rule: PlayRule,
+  keyword: string,
+  waitMs = 3500
+): Promise<RuleSearchEntry[]> {
+  return serialized(() => searchViaWebviewUnlocked(rule, keyword, waitMs))
+}
+
+async function searchViaWebviewUnlocked(
   rule: PlayRule,
   keyword: string,
   waitMs = 3500
@@ -333,6 +365,14 @@ function episodeExtractorScript(
 
 /** 用真实浏览器打开剧集页并解析播放列表（失败返回空数组，交由上层决定） */
 export async function episodesViaWebview(
+  rule: PlayRule,
+  entry: RuleSearchEntry,
+  waitMs = 1200
+): Promise<RuleEpisodeGroup[]> {
+  return serialized(() => episodesViaWebviewUnlocked(rule, entry, waitMs))
+}
+
+async function episodesViaWebviewUnlocked(
   rule: PlayRule,
   entry: RuleSearchEntry,
   waitMs = 1200

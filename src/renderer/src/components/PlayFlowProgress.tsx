@@ -231,12 +231,29 @@ export function PlayFlowStages({
   const t = TONE[tone]
   const running = flow.stages.find((s) => s.status === 'running')
   const bad = flow.stages.find((s) => s.status === 'failed' || s.status === 'timeout')
+  const allOk = flow.stages.every((s) => s.status === 'ok')
   const focus = bad ?? running ?? flow.stages[flow.stages.length - 1]
+  /*
+   * 紧凑版这一行是用户最常看到的那句（控制栏状态药丸）。
+   *
+   * 上一版不管阶段是成功还是失败，都写 `${第几}/3 注入播放器`：
+   * 一轮已经判失败（running=false、最后阶段 failed）时，它仍然显示
+   * 「3/3 注入播放器」——用户看到的就是「所有规则都卡在最后一步」。
+   * 所以这里必须按**真实结局**分支：失败就说失败，成功就说已就绪，
+   * 只有真的还在跑时才显示「第几/3 当前阶段」。
+   */
+  const headline = bad
+    ? `${bad.label}${bad.status === 'timeout' ? '超时' : '失败'}`
+    : flow.running
+      ? `${currentStageIndex(flow)}/3 ${focus?.label ?? ''}`
+      : allOk
+        ? '播放已就绪'
+        : '未开始'
 
   if (compact) {
     return (
       <span className={`flex items-center gap-1.5 whitespace-nowrap ${className}`}>
-        {/* 三段小方块：一眼看出卡在第几段 */}
+        {/* 三段小方块：一眼看出卡在第几段 / 哪一段失败 */}
         <span className="flex items-center gap-[3px]" title="找资源 → 取资源 → 注入播放器">
           {flow.stages.map((s) => (
             <span
@@ -253,8 +270,11 @@ export function PlayFlowStages({
             />
           ))}
         </span>
-        <span className={t.primary}>
-          {currentStageIndex(flow)}/3 {focus?.label ?? ''}
+        <span
+          className={bad ? `rounded px-1 ${t.chipDanger} ${t.danger}` : t.primary}
+          title={flow.summary}
+        >
+          {headline}
         </span>
         {focus?.startedAt !== null && focus?.elapsedMs ? (
           <span className={t.secondary}>{fmtMs(focus.elapsedMs)}</span>

@@ -36,6 +36,8 @@ Sakana · uosc 控制栏桥接脚本（v0.2.18「用 uosc 接管控制栏」）
     set-aspect <fit|cover|stretch>
     set-subtitle <id|-1>            -1 = 关闭字幕
     toggle-danmaku
+    volume-set <0-100>              直接设音量（uosc 音量菜单的 0/25/50/75/100% 快捷档）
+    volume-delta <±N>               在当前音量上增减（菜单的 ±10%），目标值由应用计算
     danmaku-json <json>             {"key":…,"value":…} → 应用的一条弹幕设置
     uosc-menu <search|total|style|delay|add>   打开 uosc_danmaku 插件自己的菜单
     open-danmaku-settings / reload-danmaku / detect-danmaku-alias
@@ -225,6 +227,23 @@ local function update_buttons(force)
   ctrl_button { name = 'sakana-back10', icon = 'replay_10', tooltip = '后退 10 秒', action = { 'back10' } }
   ctrl_button { name = 'sakana-forward10', icon = 'forward_10', tooltip = '前进 10 秒', action = { 'forward10' } }
 
+  -- 音量按钮（用户要求：音量单独做成按钮放进底部控制栏，不再用右边的竖排滑杆）。
+  -- 图标按当前状态变化：静音或 0 → volume_off；<50 → volume_down；否则 volume_up。
+  --
+  -- v1.1.6：点击**不再只发 toggle-mute**。旧行为点一下只能在"静音/恢复"之间跳，
+  -- 用户反馈「音量按钮无法调音量」。现在点开 menu_volume：-10 / +10 / 静音 / 0-100 快捷档。
+  -- 所有写入都通过 `sakana-ctrl` 回主进程执行 —— 音量的真源是应用状态与内核，
+  -- 本脚本只**读** volume/mute 来画图标和提示，绝不 set_property，否则两套音量会互相打架。
+  local vol = tonumber(mp.get_property_number('volume')) or 100
+  local muted = mp.get_property_native('mute') == true or vol <= 0
+  ctrl_button {
+    name = 'sakana-volume',
+    icon = muted and 'volume_off' or (vol < 50 and 'volume_down' or 'volume_up'),
+    tooltip = muted and '已静音（点击调音量）' or string.format('音量 %d%%（点击调音量）', math.floor(vol)),
+    action = { 'menu', 'volume' },
+    active = not muted,
+  }
+
   -- 选集 / 线路：没有剧集数据就隐藏（本地单文件播放本来就没有「集」可切）
   ctrl_button {
     name = 'sakana-episodes', icon = 'playlist_play', tooltip = '选集',
@@ -300,6 +319,7 @@ local function update_buttons(force)
   ctrl_button { name = 'sakana-flow', icon = 'network_check', tooltip = '播放流详情', action = { 'flow' } }
   -- v1.1.4「播放状态」：线路/集、分辨率与编码、码率、缓冲、网络、丢帧/音画、投屏。
   -- 菜单内容是只读读数（不可点选），只有底部「刷新读数」会重新构造一次。
+  -- v1.1.6：底部栏不再放这个按钮（用户要求删掉），只由右上角角标使用 —— 定义必须保留。
   ctrl_button {
     name = 'sakana-status', icon = 'monitor_heart',
     tooltip = '播放状态（线路 / 画质 / 缓冲 / 网络 / 丢帧 / 投屏）',
@@ -456,6 +476,57 @@ local function menu_speed()
     items[#items + 1] = item(fmt_speed(s) .. 'x', { 'set-speed', s }, { active = on, icon = on and 'check' or nil })
   end
   open_menu { type = 'sakana-speed', title = '播放倍速', footnote = '变速不变调（scaletempo2）', items = items }
+end
+
+--- 音量菜单（v1.1.6）。
+---
+--- 为什么要有它：sakana-volume 以前只发 toggle-mute，点一下只能静音/恢复，
+--- 用户要的是"能调大小"（uosc 右侧竖排滑杆已被 volume=no 关掉，没有别的入口）。
+--- 菜单只负责发动作，写入统一回主进程执行：
+---   · 应用里 playerVolume 才是界面状态的来源，主进程还做了上限与削波保护（VOLUME_MAX=200）；
+---   · Lua 直接 set volume 会绕开那条链，按钮图标、菜单读数与应用的音量状态各算各的，
+---     下一次状态同步又被拉回去 —— 所以这里只读不写。
+local VOLUME_PRESETS = { 0, 25, 50, 75, 100 }
+
+local function menu_volume()
+  -- 只读取当前值用来显示与高亮；读失败就当 100%（mpv 默认值），不编造其它数字。
+  local vol = math.max(0, math.floor((mp.get_property_number('volume') or 100) + 0.5))
+  -- 注意区分「mute 标记」与「音量为 0」：两者都听不见，但只有前者能被 toggle-mute 恢复。
+  -- 若把 0% 也当成已静音，菜单会在未静音时显示「恢复声音」，点下去反而把 mute 打开。
+  local mute_flag = mp.get_property_native('mute') == true
+  local silent = mute_flag or vol <= 0
+  local items = {
+    {
+      title = string.format('当前音量 %d%%', vol),
+      hint = silent and '已静音' or '正常',
+      value = 'ignore',
+      selectable = false,
+    },
+    item('音量 −10%', { 'volume-delta', -10 }, { icon = 'volume_down' }),
+    item('音量 +10%', { 'volume-delta', 10 }, { icon = 'volume_up' }),
+    item(mute_flag and '恢复声音' or '静音', { 'toggle-mute' }, {
+      active = mute_flag,
+      icon = mute_flag and 'volume_up' or 'volume_off',
+    }),
+    { title = '', separator = true, value = 'ignore', selectable = false },
+  }
+  for _, p in ipairs(VOLUME_PRESETS) do
+    local on = vol == p
+    items[#items + 1] = item(p .. '%', { 'volume-set', p }, {
+      active = on,
+      icon = on and 'check' or nil,
+    })
+  end
+  open_menu {
+    type = 'sakana-volume',
+    title = '音量',
+    footnote = '写入由应用执行（与 ↑/↓ 键同一个 volume 属性）；菜单只发动作',
+    items = items,
+  }
+  -- 自检证据：uosc 菜单画在 ASS 图层，Electron 侧看不到 DOM；
+  -- headless 验证只能靠这条 info 日志 + user-data/sakana-uosc-last-menu-titles 判断
+  -- 「点音量按钮确实构造出了预期的菜单项」。
+  msg.info(string.format('音量菜单已构造：%d 项，当前 %d%% mute=%s', #items, vol, tostring(mute_flag)))
 end
 
 --- 画面比例：走应用的 changeAspect（同时写回设置、下次播放沿用）
@@ -854,6 +925,7 @@ local MENUS = {
   lines = menu_lines,
   subtitle = menu_subtitle,
   speed = menu_speed,
+  volume = menu_volume,
   aspect = menu_aspect,
   danmaku = menu_danmaku,
   quality = menu_quality,
@@ -968,7 +1040,7 @@ end
 -- 那时控制栏会一个按钮都没有 —— 应用会据此回落到自己的悬浮窗控制栏，并写一条错误日志。
 --
 -- ⚠️ 改动本文件后请务必确认这条属性真的写出来了：Lua 的语法错误会让整个脚本静默退出。
-local SCRIPT_VERSION = '2026-09-uosc-ctrl-v3'
+local SCRIPT_VERSION = '2026-10-uosc-ctrl-v4'
 mp.set_property('user-data/sakana-ctrl-ready', SCRIPT_VERSION)
 
 msg.info('sakana-uosc-ctrl 已加载（控制栏按钮 + 菜单 + 动作回传，版本 ' .. SCRIPT_VERSION .. '）')

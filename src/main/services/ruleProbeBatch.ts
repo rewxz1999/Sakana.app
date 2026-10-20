@@ -6,6 +6,7 @@ import { addProbeListeners } from './probeEvents'
 import {
   MEDIA_EXT_RE,
   extractStreamCandidates,
+  isPlayerOrDanmakuPage,
   isStreamCandidate,
   resolveFirstPlayable,
   runAutoPlayClicks
@@ -39,62 +40,80 @@ import {
  * 探测结果只是给用户一个"这条线路有没有货"的参考，点哪条规则仍然走原来的完整流程。
  */
 
-/** 同时探测几条规则。取 3：再多会同时开太多窗口，站点也容易把我们当成爬虫 */
-const CONCURRENCY = 3
-/** 搜索/剧集/播放页这类纯 HTTP 步骤的单步超时 */
-const STEP_TIMEOUT_MS = 12_000
-/** 开窗口嗅探的最长等待 */
-const SNIFF_TIMEOUT_MS = 12_000
+/**
+ * 同时探测几条规则 = **严格 3 条**（用户原话：「规则嗅探我指的是 3 个一次的来嗅探」）。
+ *
+ * 上一版把 AGE / aafun / sorani 三条单独提出来「同时开始」，再给其余规则开 3 个 worker ——
+ * 实际并发是 **6**（3 条优先 + 3 条排队），这既不是用户要的 3，也是站点压力的来源：
+ * 每次探测慢路都要开一个真实浏览器窗口，6 条一起开时站点风控与 S 级网络队列会同时被顶满，
+ * 后面那些规则更容易超时，看起来就是「以前能嗅到、现在没结果」。
+ *
+ * 所以这里只有一个池子：**所有规则**（含三条常用规则）一起按这个上限排队，没有例外。
+ * 允许用环境变量覆盖（排障时想临时跑 1 条复现最稳），默认仍是 3。
+ */
+const DEFAULT_CONCURRENCY = 3
+function probeConcurrency(): number {
+  const raw = Number(process.env.SAKANA_RULE_PROBE_CONCURRENCY ?? '')
+  if (Number.isFinite(raw) && raw >= 1) return Math.min(8, Math.floor(raw))
+  return DEFAULT_CONCURRENCY
+}
+/**
+ * 纯 HTTP 步骤（搜索 / 选集 / 播放页抓取）的单步超时。
+ *
+ * 为什么从 12s 提到 20s：axios 自己的超时是 30s，而 v1.1 新增的 S/A/B 网络队列
+ * 会让「搜索」这类 S 级请求**先排队再发**。12s 的窗口在站点稍慢/队列稍忙时就会先到点，
+ * 而超时的请求并不会被取消（它继续占着 S 槽直到 30s），于是越等越慢、越慢越超时。
+ * 20s 既给了真实站点（实测 sorani/AGE 的详情页 0.4~12s）余量，也仍能在
+ * 「站点真挂了」时及时收手去开窗口嗅探。
+ */
+const STEP_TIMEOUT_MS = 45_000
+/** 开窗口嗅探的最长等待（15s：点击脚本在 1.2/3/6s 各跑一次，至少留两轮机会） */
+const SNIFF_TIMEOUT_MS = 15_000
 /** 拿到第一个候选后再多等一会儿，把同一部剧的其它候选（多码率/多分片）也收进来 */
 const SNIFF_GRACE_MS = 2_500
-/** 整个任务的预算：超时后剩下的规则直接标成"未探测完"，不让用户一直等 */
+/** 整个任务的预算：到点后**逐条**给未完成的规则发结论并停止，不让界面永远停在「搜索中」 */
 const JOB_BUDGET_MS = 150_000
 
-/**
- * 「默认三规则」名单（AGE / aafun / sorani）。
- *
- * 它们**同时开始**探测：用户进「选择数据源」就是要马上知道这三条常用线路有没有货，
- * 让它们排在一个 3 并发的队列里等前一条跑完（每条十几秒）等于让用户白等。
- * 判定用「规则名小写」而不是 id：内置规则的 id 是 `default-<小写名>`，
- * 但从仓库导入/用户自建的规则可能是任意 id，名字才是用户眼里的"这条线路"。
- */
-const DEFAULT_THREE = ['age', 'aafun', 'sorani']
-function isDefaultThree(t: BatchProbeTarget): boolean {
-  return DEFAULT_THREE.includes(String(t.name ?? '').toLowerCase())
-}
+/* 默认三规则优先已移除：所有规则共用一个 3 并发池（见上面的 DEFAULT_CONCURRENCY） */
 
 /**
- * 探测结果缓存（v1.1 重做：从「整批按关键词」改成「逐规则按番剧」+ LRU + 常驻）。
+ * 探测结果缓存：**只常驻「真的抓到流」的正结果**，负结果只短存 1 分钟。
  *
- * ## 为什么键是「规则id + 番剧条目」而不是「关键词 + 这一批规则」
+ * ## 为什么必须把负结果从常驻缓存里赶出去（v1.2.1 修的就是这条回归）
  *
- * 旧键（`keyword | 排序后的规则 id 列表`）有两个硬伤：
- *  ① 只要规则集变一点（用户启用/停用一条规则），**整批缓存全部作废**，
- *     明明其它规则的结论没变，用户还得再等一轮十几秒的探测；
- *  ② 缓存只活 30 分钟 —— 用户看一集再回来、或者中途去看了别的番，回来又要重等。
- * 用户这次的要求是「嗅探结果只要应用没关闭就一直保留」「重新进同一个番剧/同一集不应再等」，
- * 所以改成逐规则条目：一条结果 = `规则id | 番剧（subjectId 或关键词）`，
- * 规则集变化只影响新规则，其它条目的结论继续命中。
+ * 上一版（V1.2.0）把「这条规则没结果」也写进了同一张 LRU，而且**永不过期**。
+ * 一次探测定性为负的原因很多，而且大多**是临时的**：
+ *   · 搜索/选集请求刚好排在本应用 S 级网络队列里，12s 单步超时先到点（请求其实还在走）；
+ *   · 站点这一会儿 5xx / 人机验证 / 限流；
+ *   · 开窗口嗅探时站点播放器还没初始化完，15s 窗口先关了。
+ * 这些都会被写成「这条规则里没有这部番剧」并**在该进程内永久命中** ——
+ * 用户看到的现象正是「原本能嗅探到的规则，过一段时间再进就显示没有结果」。
  *
- * ## 为什么是 LRU + 容量上限（而不是无限增长）
+ * 所以缓存分两层：
+ *   · `probeCache`（正结果：count>0 或拿到了 url）—— 用户要求「应用没关闭就一直保留」，常驻 + LRU 400；
+ *   · `negativeCache`（负结果）—— 只活 `NEGATIVE_TTL_MS`（60s），不占 LRU、不参与淘汰，
+ *     每次命中都会打一条明确日志（「负结果短缓存 42s，到期自动重探」），
+ *     用户点「重新探测」（force）时正负两层一起清掉。
  *
- * 一条结果里带着搜索结果列表与整季剧集（几十~几百个对象，几 KB 到几十 KB）。
- * 用户连看几十部番之后，不设上限就是几十 MB 的常驻内存 —— 这是个播放器，不是爬虫。
- * 上限 400 条 ≈ 最多几 MB，够装「几十部番 × 全部规则」；超出时丢**最久没用过**的那条
- * （用户刚看过的番永远还在，只有很久以前探过的才会被淘汰）。
+ * ## 为什么键是「规则id + 番剧条目」
  *
- * ## 为什么不过期
+ * 键里不放「这一批规则」，否则启用/停用任意一条规则就会让整批缓存作废；
+ * 键里放 subjectId（没有就放关键词），同一部番换一集回来仍然命中。
  *
- * 用户明确要求「只要应用没关闭就一直保留」。站点是否可用确实是"这一会儿"的事，
- * 所以界面同时保留「重新探测」（force=true）作为唯一的手动刷新出口 ——
- * 用"我们猜它可能过期了"去悄悄丢掉结果，反而会变成"刚探完又要点一次"。
+ * ## 为什么正结果不过期
+ *
+ * 用户明确要求「只要应用没关闭就一直保留」；站点是否可用是"这一会儿"的事，
+ * 所以保留「重新探测」作为唯一手动刷新出口，不用"我们猜它过期了"去悄悄丢掉结果。
  */
 const PROBE_CACHE_MAX = 400
+/** 负结果只保留这么久：够挡住「同一个列表来回开关」的重复探测，又不至于让临时故障变永久结论 */
+const NEGATIVE_TTL_MS = 60_000
 interface ProbeCacheEntry {
   at: number
   update: BatchProbeUpdate
 }
 const probeCache = new Map<string, ProbeCacheEntry>()
+const negativeCache = new Map<string, ProbeCacheEntry>()
 
 /** 番剧标识：优先条目 id（同一部番的中文名可能变），没有就用关键词 */
 function subjectKeyOf(job: ActiveJob): string {
@@ -105,21 +124,32 @@ function cacheKeyOf(job: ActiveJob, ruleId: string): string {
   return `${ruleId}|${subjectKeyOf(job)}`
 }
 
-/** 读缓存（命中即刷新 LRU 顺序：Map 的插入顺序就是"最近使用"顺序） */
+/**
+ * 「这条结果算不算正结果」——**唯一判据**：真的拿到了候选流。
+ *
+ * 只有「有番剧、有剧集、但抓不到流」和「没有这部番」都不算：
+ * 前者对播放没有价值（点进去还是播不了），后者更是一次探测的失败态。
+ * 两类都只进 60s 的负缓存，下次进列表会重新探。
+ */
+function hasStreamResult(u: BatchProbeUpdate): boolean {
+  return !!u.ok && ((u.count ?? 0) > 0 || !!u.url)
+}
+
+/** 读正缓存（命中即刷新 LRU 顺序：Map 的插入顺序就是"最近使用"顺序） */
 function cacheGet(job: ActiveJob, ruleId: string): BatchProbeUpdate | null {
   const key = cacheKeyOf(job, ruleId)
   const hit = probeCache.get(key)
   if (!hit) return null
   probeCache.delete(key)
   probeCache.set(key, hit)
-  return hit.update
+  return { ...hit.update, cached: true, probedAt: hit.at }
 }
 
-/** 写缓存 + 超容量淘汰最久未用的（Map 的第一个键就是它） */
+/** 写正缓存 + 超容量淘汰最久未用的（Map 的第一个键就是它） */
 function cacheSet(job: ActiveJob, ruleId: string, update: BatchProbeUpdate): void {
   const key = cacheKeyOf(job, ruleId)
   probeCache.delete(key)
-  probeCache.set(key, { at: Date.now(), update })
+  probeCache.set(key, { at: Date.now(), update: { ...update, probedAt: Date.now() } })
   while (probeCache.size > PROBE_CACHE_MAX) {
     const oldest = probeCache.keys().next().value as string | undefined
     if (!oldest) break
@@ -127,9 +157,69 @@ function cacheSet(job: ActiveJob, ruleId: string, update: BatchProbeUpdate): voi
   }
 }
 
+/**
+ * 写负缓存（短 TTL，不进 LRU）。
+ * 同键的正结果**不删**：一次临时失败（限流/超时）不该抹掉上次真的抓到流的结论；
+ * 用户可以继续用上次的命中信息点进去重试，60s 后本次负缓存自然过期再重探。
+ */
+function negativeSet(job: ActiveJob, ruleId: string, update: BatchProbeUpdate): void {
+  const key = cacheKeyOf(job, ruleId)
+  negativeCache.set(key, { at: Date.now(), update: { ...update, probedAt: Date.now() } })
+  /*
+   * 负缓存也要有上限：它不参与 LRU 淘汰，若只靠「读的时候顺手删过期」，
+   * 用户连看几十部番、再也不点回去，那些条目（可能带着整季剧集）就会一直留在内存里。
+   * 每次写入时清一遍到期项 + 硬上限兜底，和正缓存同样最多 400 条。
+   */
+  const now = Date.now()
+  for (const [k, v] of negativeCache) {
+    if (now - v.at > NEGATIVE_TTL_MS) negativeCache.delete(k)
+  }
+  while (negativeCache.size > PROBE_CACHE_MAX) {
+    const oldest = negativeCache.keys().next().value as string | undefined
+    if (!oldest) break
+    negativeCache.delete(oldest)
+  }
+}
+
+/**
+ * 读负缓存：过期即删。
+ *
+ * ⚠️ 命中时**不刷新**时间戳：TTL 是从那次探测结束算起的 60s，
+ * 到点后必须重探。如果每次命中都续命，用户每隔半分钟开关一次列表，
+ * 一条临时失败的规则就会永远停在「没有结果」——那又是这次要修的回归。
+ */
+function negativeGet(job: ActiveJob, ruleId: string): BatchProbeUpdate | null {
+  const key = cacheKeyOf(job, ruleId)
+  const hit = negativeCache.get(key)
+  if (!hit) return null
+  const age = Date.now() - hit.at
+  if (age > NEGATIVE_TTL_MS) {
+    negativeCache.delete(key)
+    return null
+  }
+  return {
+    ...hit.update,
+    cached: true,
+    probedAt: hit.at,
+    message: `${hit.update.message ?? '没有结果'}（${Math.round(age / 1000)}s 前的结论，稍后会自动重探）`
+  }
+}
+
+/** 清掉某个键的正/负缓存（force=true 时用） */
+function cacheDelete(job: ActiveJob, ruleId: string): void {
+  const key = cacheKeyOf(job, ruleId)
+  probeCache.delete(key)
+  negativeCache.delete(key)
+}
+
 /** 自检/设置页用：缓存条目数与命中情况 */
-export function probeCacheStats(): { size: number; capacity: number } {
-  return { size: probeCache.size, capacity: PROBE_CACHE_MAX }
+export function probeCacheStats(): { size: number; capacity: number; negative: number; negativeTtlMs: number } {
+  return {
+    size: probeCache.size,
+    capacity: PROBE_CACHE_MAX,
+    negative: negativeCache.size,
+    negativeTtlMs: NEGATIVE_TTL_MS
+  }
 }
 
 export interface BatchProbeTarget {
@@ -151,8 +241,18 @@ interface ActiveJob {
 
 let job: ActiveJob | null = null
 
-function send(job: ActiveJob, update: BatchProbeUpdate): void {
-  const w = job.win
+/**
+ * 把一条探测更新推给发起窗口。
+ *
+ * 只推**当前这一批**的更新（v1.2.1）：用户切换番剧时 `startBatchProbe` 会取消上一批，
+ * 但上一批已经发出去的 HTTP 请求还要过一会儿才回来 —— 那些迟到的 update
+ * 如果继续推给界面，会把新一批已经显示出来的「搜索中…」覆盖成上一部番的结论
+ * （用户看到的就是「刚进来好好的，等一会儿变成没有结果」）。缓存仍然照写：
+ * 旧番的结论对旧番自己有效，只是不该出现在新番的列表里。
+ */
+function send(j: ActiveJob, update: BatchProbeUpdate): void {
+  if (j !== job) return
+  const w = j.win
   if (w && !w.isDestroyed() && !w.webContents.isDestroyed()) {
     w.webContents.send(CH.evRuleBatchProbe, update)
   }
@@ -182,16 +282,46 @@ function update(
    * 出结果的那一条立刻写进缓存（不等整批跑完）：
    * 用户可能中途关掉播放源列表（那会 stopBatchProbe 取消剩下规则），
    * 已经探到的结论不该跟着丢掉。缓存键是「规则 + 番剧」，与这一批跑了多少条无关。
+   *
+   * ⚠️ 正负分流的唯一入口（v1.2.1 修回归）：**只有真的抓到候选流**才进常驻 LRU；
+   * 其它「没结果 / 搜索失败 / 拿不到播放页 / 嗅探 0 条」一律只进 60s 负缓存，
+   * 并且把「为什么是负」原样留在 message 里 —— 既不会永久污染缓存，也方便用户对账。
    */
-  if (phase === 'done') cacheSet(job, target.id, payload)
+  if (phase === 'done') {
+    if (hasStreamResult(payload)) {
+      cacheSet(job, target.id, payload)
+      negativeCache.delete(cacheKeyOf(job, target.id))
+    } else {
+      negativeSet(job, target.id, payload)
+      log.append(
+        'info',
+        'rule-batch',
+        `负结果只短存 ${NEGATIVE_TTL_MS / 1000}s：${target.name}｜${payload.message ?? '没有结果'}`
+      )
+    }
+  }
   return payload
 }
 
-/** 超时不抛错，只返回 null（探测这件事失败是常态，不该把整批任务掀翻） */
-async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
-  return await Promise.race([
-    p.catch(() => null),
-    new Promise<null>((r) => setTimeout(() => r(null), ms))
+/**
+ * 单步结果：**必须能区分「超时」「明确异常」与「拿到空结果」**。
+ *
+ * 上一版把前三者都压成 `null`，于是「搜索请求 12s 没回来」和「站点明确没有这部番」
+ * 在调用方看来一模一样，最终都写成「这条规则里没有这部番剧」并**永久缓存**。
+ * 现在：
+ *   · 超时 → `{ timedOut: true }`，界面文案是「搜索超时」，只进 60s 负缓存；
+ *   · 明确异常 → `{ failed, error }`，界面显示真实原因（404/证书/解析失败）；
+ *   · 拿到空结果 → `{ value }`，这才是「站点说没有」。
+ */
+type StepResult<T> = { value: T } | { timedOut: true } | { failed: true; error: string }
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<StepResult<T>> {
+  return await Promise.race<StepResult<T>>([
+    p.then((value) => ({ value })).catch((e: unknown) => ({
+      failed: true as const,
+      // 明确的异常（404/证书/解析）不是超时：必须把真实原因带给界面，不能一律说「超时」
+      error: String((e as { message?: string })?.message ?? e).slice(0, 120)
+    })),
+    new Promise<StepResult<T>>((r) => setTimeout(() => r({ timedOut: true }), ms))
   ])
 }
 
@@ -257,7 +387,16 @@ async function sniffWindow(
   })
 
   const onLoad = (): void => {
-    for (const delay of [1200, 3000, 6000]) setTimeout(() => runAutoPlayClicks(win), delay)
+    /*
+     * 多点几次「播放」：不只是一次性点一下（v1.2.1 补 10s）。
+     *
+     * 实测 AGE 的播放页本身只有一个 iframe，指向第三方解析站（WASM 启动 + 签名），
+     * 真流请求经常在 6~12s 才出现。以前只有 1.2/3/6s 三次点击，12s 窗口一到就关，
+     * 于是明明能出的流被判成「没有发出可识别的视频请求」。
+     * 现在窗口放宽到 15s，并在 10s 再补一次点击（仍在窗口内），
+     * 覆盖「解析站启动慢」这一类；不会无限重试。
+     */
+    for (const delay of [1200, 3000, 6000, 10_000]) setTimeout(() => runAutoPlayClicks(win), delay)
   }
   win.webContents.on('did-finish-load', onLoad)
 
@@ -298,22 +437,46 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
   const { ruleSearch, ruleEpisodes, rulePlay } = await import('./rules')
 
   update(current, target, 'search', t0)
-  const search = await withTimeout(
+  const searchStep = await withTimeout(
     ruleSearch(target.id, current.keyword, current.subjectId),
     STEP_TIMEOUT_MS
   )
   if (current.cancelled) return
-  if (!search || !search.items?.length) {
+  /*
+   * 超时 ≠ 没有这部番（v1.2.1 的关键区分）。
+   * 上一版两者都报「这条规则里没有这部番剧」并写进常驻缓存 ——
+   * 用户看到的「以前能嗅到、现在说没有结果」就是这么来的。
+   */
+  if ('timedOut' in searchStep) {
     update(current, target, 'done', t0, {
-      ok: true,
+      ok: false,
       items: [],
-      message: search?.error ? `搜索失败：${search.error}` : '这条规则里没有这部番剧'
+      message: `搜索超时（${STEP_TIMEOUT_MS / 1000}s 内站点没有响应，可点「重新探测」重试）`
+    })
+    return
+  }
+  if ('failed' in searchStep) {
+    update(current, target, 'done', t0, {
+      ok: false,
+      items: [],
+      message: `搜索失败：${searchStep.error}`
+    })
+    return
+  }
+  const search = searchStep.value
+  if (!search.items?.length) {
+    update(current, target, 'done', t0, {
+      // 站点明确没有这部番：这是一条「负结论」，只短存 60s，不进常驻缓存
+      ok: !search.error,
+      items: [],
+      message: search.error ? `搜索失败：${search.error}` : '这条规则里没有这部番剧'
     })
     return
   }
   const entry = search.items[0]
-  const eps = await withTimeout(ruleEpisodes(target.id, entry), STEP_TIMEOUT_MS)
+  const epsStep = await withTimeout(ruleEpisodes(target.id, entry), STEP_TIMEOUT_MS)
   if (current.cancelled) return
+  const eps = 'value' in epsStep ? epsStep.value : null
   const group = eps?.groups?.[0]
   const episodeCount = eps?.groups?.reduce((n, g) => n + (g.episodes?.length ?? 0), 0) ?? 0
   /*
@@ -322,6 +485,24 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
    * 用户点第一条是最常见的路径；其它条目仍按需拉取（但搜索结果本身已经是本地的了）。
    */
   const base = { items: search.items, groups: eps?.groups ?? [], vars: eps?.vars ?? {} }
+  if ('timedOut' in epsStep) {
+    update(current, target, 'done', t0, {
+      hit: true,
+      ok: false,
+      ...base,
+      message: `选集超时（${STEP_TIMEOUT_MS / 1000}s 内详情页没有响应，可重试）`
+    })
+    return
+  }
+  if ('failed' in epsStep) {
+    update(current, target, 'done', t0, {
+      hit: true,
+      ok: false,
+      ...base,
+      message: `选集失败：${epsStep.error}`
+    })
+    return
+  }
   if (!group || !group.episodes?.length) {
     update(current, target, 'done', t0, {
       hit: true,
@@ -332,28 +513,45 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
     return
   }
   const vars = eps?.vars ?? {}
-  const play = await withTimeout(
+  const playStep = await withTimeout(
     rulePlay(target.id, entry, 0, 0, group.episodes[0].link, vars),
     STEP_TIMEOUT_MS
   )
   if (current.cancelled) return
-  if (!play?.url) {
+  if ('timedOut' in playStep || 'failed' in playStep || !playStep.value?.url) {
     update(current, target, 'done', t0, {
       hit: true,
       episodes: episodeCount,
-      ok: true,
+      ok: false,
       ...base,
-      message: '拿不到播放页地址'
+      message: 'failed' in playStep ? `播放页解析失败：${playStep.error}` : '拿不到播放页地址'
     })
     return
   }
+  const play = playStep.value
 
   // 快路：播放页 HTML 里直接写着真实地址（MacCMS 系站点）
-  const direct = await withTimeout(extractStreamCandidates(play.url, target.baseUrl), STEP_TIMEOUT_MS)
+  const directStep = await withTimeout(extractStreamCandidates(play.url, target.baseUrl), STEP_TIMEOUT_MS)
   if (current.cancelled) return
-  if (direct && direct.length > 0) {
-    const playable = await withTimeout(resolveFirstPlayable(direct, target.baseUrl), STEP_TIMEOUT_MS)
+  /*
+   * 播放页超时**不是失败**：慢路（窗口嗅探）本来就要在这个地址上再跑一次，
+   * 所以这里直接落到慢路，而不是把整条规则判成「拿不到地址」。
+   * （实测 sorani 的播放页在 node 侧 45~60s 才回，窗口侧会走真实浏览器、通常快得多。）
+   */
+  const directRaw = 'value' in directStep ? directStep.value : []
+  /*
+   * V1.4：过滤「播放器/弹幕页」这类假候选。
+   *
+   * 真机证据（E站/中二病）：播放页 HTML 里出现
+   *   https://player.ezdmw.com/danmuku/?nk=…&type=1…
+   * `extractStreamCandidates` 把它当成媒体地址返回，于是界面显示"1 个候选"，
+   * 用户点进去必然失败。这类地址是 iframe 的**页面**，不是媒体流，一律丢掉。
+   */
+  const direct = directRaw.filter((u) => !isPlayerOrDanmakuPage(u))
+  if (direct.length > 0) {
+    const playableStep = await withTimeout(resolveFirstPlayable(direct, target.baseUrl), STEP_TIMEOUT_MS)
     if (current.cancelled) return
+    const playable = 'value' in playableStep ? playableStep.value : null
     update(current, target, 'done', t0, {
       hit: true,
       episodes: episodeCount,
@@ -388,15 +586,15 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
  * 开始一批探测。同一时刻只允许一批（再开一批会取消上一批）：
  * 这是对第三方的礼貌 —— 用户来回切番剧时不该堆出几十个探测任务。
  *
- * ## 调度（v1.1 重做）
+ * ## 调度（v1.2.1：严格 3 并发，不再给任何规则开小灶）
  *
- * 1. **缓存先回放**：逐条查「规则 + 番剧」的常驻缓存，命中的立刻推给界面（标 cached），
- *    这些规则不再参与探测 —— 重新进同一部番时界面是"瞬间就有结果"的。
- * 2. **默认三规则同时开始**：AGE / aafun / sorani 是用户最常用的三条，
- *    它们同时跑（`Promise.all`，不排队），因为它们彼此独立、站点也不同。
- * 3. **其余规则排队**：按 CONCURRENCY=3 的 worker 池依次探测。
- *    为什么不给它们也开无限并发：每条慢路都会开一个真实浏览器窗口，
- *    十几条规则一起开会同时弹出十几个离屏窗口、把内存与站点风控一起点着。
+ * 1. **缓存先回放**：逐条查「规则 + 番剧」的常驻缓存（只含正结果）与 60s 负缓存，
+ *    命中的立刻推给界面（标 cached），这些规则不再参与探测。
+ * 2. **所有要探的规则进同一个池子**：`Math.min(3, 待探数)` 个 worker 依次取任务。
+ *    AGE / aafun / sorani 也一样排队 —— 用户要的就是「3 个一次」，
+ *    上一版给它们单开并行、再叠 3 个 worker，实际是 6 个，站点一忙就集体超时。
+ * 3. **每次开工/收工都打印账本**：`当前在嗅探 N 个、排队 M 个`，
+ *    用户拿日志就能核对「是不是真的只有 3 个在跑」，排障也不用再猜。
  */
 export function startBatchProbe(
   win: BrowserWindow,
@@ -405,6 +603,7 @@ export function startBatchProbe(
   stopBatchProbe()
   const id = `bp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
   const targets = req.rules.filter((r) => r && r.id)
+  const concurrency = probeConcurrency()
   const current: ActiveJob = {
     id,
     keyword: req.keyword,
@@ -413,21 +612,35 @@ export function startBatchProbe(
     cancelled: false,
     budgetTimer: null
   }
+  /*
+   * 先登记成「当前批次」再回放缓存：`send()` 只推当前批次的更新，
+   * 否则下面这些 cached 事件会被自己过滤掉（见 send 的说明）。
+   */
+  job = current
 
   /*
-   * ① 逐条回放缓存。`force`（用户点「重新探测」）时一律跳过缓存重跑。
+   * ① 逐条回放缓存。`force`（用户点「重新探测」）时把该规则的正/负缓存都清掉重跑。
    * 注意这里是**逐条**判断：一批里可能只有几条命中（其它是用户新启用的规则），
    * 命中的直接出结果，没命中的继续探 —— 不会因为一条没缓存就把整批重跑。
    */
   const pending: BatchProbeTarget[] = []
   let cachedCount = 0
+  let negativeCount = 0
   let latestAt = 0
   for (const t of targets) {
-    const hit = req.force ? null : cacheGet(current, t.id)
+    if (req.force) cacheDelete(current, t.id)
+    const hit = cacheGet(current, t.id)
     if (hit) {
       cachedCount++
       latestAt = Math.max(latestAt, hit.probedAt ?? 0)
       send(current, { ...hit, jobId: id, cached: true })
+      continue
+    }
+    const neg = negativeGet(current, t.id)
+    if (neg) {
+      negativeCount++
+      send(current, { ...neg, jobId: id, cached: true })
+      log.append('info', 'rule-batch', `负结果短缓存命中（60s 内不重探）：${t.name}｜${neg.message ?? ''}`)
       continue
     }
     pending.push(t)
@@ -437,32 +650,66 @@ export function startBatchProbe(
     log.append(
       'info',
       'rule-batch',
-      `批量预嗅探全部命中常驻缓存（${cachedCount} 条，最早探测于 ${latestAt ? new Date(latestAt).toLocaleTimeString() : '未知'}）`
+      `批量预嗅探全部命中缓存（正结果 ${cachedCount} 条、负结果 ${negativeCount} 条，最早探测于 ${
+        latestAt ? new Date(latestAt).toLocaleTimeString() : '未知'
+      }）`
     )
     job = null
     return { jobId: `${id}-cached`, total: targets.length, cached: true, probedAt: latestAt || undefined }
   }
-  if (cachedCount > 0) {
-    log.append('info', 'rule-batch', `批量预嗅探：${cachedCount} 条直接命中缓存，剩 ${pending.length} 条要探`)
+  if (cachedCount > 0 || negativeCount > 0) {
+    log.append(
+      'info',
+      'rule-batch',
+      `批量预嗅探：正结果命中 ${cachedCount} 条、负结果短存命中 ${negativeCount} 条，剩 ${pending.length} 条要探`
+    )
   }
 
-  job = current
   log.append(
     'info',
     'rule-batch',
-    `开始批量预嗅探「${req.keyword}」：${pending.length} 条规则` +
-      `（默认三规则同时开始，其余排队）${req.force ? '（用户要求重新探测）' : ''}`
+    `开始批量预嗅探「${req.keyword}」：${pending.length} 条规则，并发上限 ${concurrency}` +
+      `（当前在嗅探 0 个、排队 ${pending.length} 个）${req.force ? '（用户要求重新探测）' : ''}`
   )
+
+  /** 已出结论的目标（预算到点时用来补发「未完成」，避免界面永远停在「搜索中」） */
+  const done = new Set<string>()
+  const jobStart = Date.now()
+  let started = 0
+  let active = 0
 
   current.budgetTimer = setTimeout(() => {
     if (job !== current) return
-    log.append('warn', 'rule-batch', `批量预嗅探超时（${JOB_BUDGET_MS / 1000}s），停止剩余规则`)
+    log.append(
+      'warn',
+      'rule-batch',
+      `批量预嗅探超时（${JOB_BUDGET_MS / 1000}s）：已完成 ${done.size}/${pending.length} 条，剩余规则将收到「未完成」结论`
+    )
+    /*
+     * 必须**逐条补发 done**：上一版只是取消，没出结论的规则在界面上永远停在
+     * 「搜索中…」——用户分不清是"还没探完"还是"这条规则坏了"。
+     */
+    for (const t of pending) {
+      if (done.has(t.id)) continue
+      update(current, t, 'done', jobStart, {
+        ok: false,
+        message: `探测未完成（整批 ${JOB_BUDGET_MS / 1000}s 预算到点，可点「重新探测」单独重试）`
+      })
+    }
     stopBatchProbe()
   }, JOB_BUDGET_MS)
 
   /** 探一条；异常也要给出结论，否则界面永远停在「搜索中…」 */
   const runOne = async (target: BatchProbeTarget): Promise<void> => {
     if (current.cancelled || job !== current) return
+    started += 1
+    active += 1
+    const queued = Math.max(0, pending.length - started)
+    log.append(
+      'info',
+      'rule-batch',
+      `开始嗅探「${target.name}」（当前在嗅探 ${active} 个、排队 ${queued} 个）`
+    )
     try {
       await probeRule(current, target)
     } catch (err) {
@@ -470,30 +717,32 @@ export function startBatchProbe(
         ok: false,
         message: `探测异常：${String((err as Error)?.message ?? err).slice(0, 100)}`
       })
+    } finally {
+      active = Math.max(0, active - 1)
+      done.add(target.id)
+      log.append(
+        'info',
+        'rule-batch',
+        `嗅探收工「${target.name}」（当前在嗅探 ${active} 个、排队 ${Math.max(0, pending.length - started)} 个）`
+      )
     }
-  }
-
-  // ② 默认三规则：同时开始（只在 pending 里的那些，已命中缓存的不重复跑）
-  const priority = pending.filter(isDefaultThree)
-  const rest = pending.filter((t) => !isDefaultThree(t))
-  if (priority.length > 0) {
-    log.append('info', 'rule-batch', `默认规则并行开始：${priority.map((t) => t.name).join('、')}`)
   }
 
   let cursor = 0
   const worker = async (): Promise<void> => {
-    while (cursor < rest.length) {
+    while (cursor < pending.length) {
       if (current.cancelled || job !== current) return
-      await runOne(rest[cursor++])
+      await runOne(pending[cursor++])
     }
   }
 
-  void Promise.all([
-    ...priority.map((t) => runOne(t)),
-    ...Array.from({ length: Math.min(CONCURRENCY, rest.length) }, worker)
-  ]).then(() => {
+  void Promise.all(Array.from({ length: Math.min(concurrency, pending.length) }, worker)).then(() => {
     if (job !== current) return
-    log.append('info', 'rule-batch', `批量预嗅探结束（${targets.length} 条规则，其中 ${cachedCount} 条来自缓存）`)
+    log.append(
+      'info',
+      'rule-batch',
+      `批量预嗅探结束（${targets.length} 条规则，其中正结果缓存 ${cachedCount} 条、负结果短存 ${negativeCount} 条）`
+    )
     stopBatchProbe()
   })
 

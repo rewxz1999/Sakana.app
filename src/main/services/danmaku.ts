@@ -33,8 +33,14 @@ import { noteNetworkFetch, readCachedBatches, runEnabledSources } from './danmak
  *   其中 `p` 的时间单位是**秒**，模式 1=滚动 4=底部 5=顶部（其它值按滚动处理）。
  */
 
-/** 默认弹幕接口（已配置 AppId 的反代；界面不展示） */
-const DEFAULT_BASE = 'https://danmu-api.sankana-bangumi.de5.net/87654321'
+/**
+ * 默认弹幕接口（已配置 AppId 的反代；界面不展示）。
+ *
+ * V1.4：与 bangumi 双反代一致，**不在二进制里留明文地址**（用户红线：地址不外露）。
+ * 这里用 Base64 拆两段存放、运行时拼回 —— 说明白：这是**混淆不是加密**，
+ * 拿到安装包的人总能还原；真正防滥用要靠服务端限流。目的只是别让 `strings` 一眼看到。
+ */
+const DEFAULT_BASE = Buffer.from('aHR0cHM6Ly9kYW5tdS1hcGkuc2Fua2FuYS1iYW5ndW1pLmRlNS5uZXQvODc2NTQzMjE=', 'base64').toString('utf8')
 /** 官方地址：仅在用户自己填了 AppId/AppSecret 时使用 */
 const OFFICIAL_BASE = 'https://api.dandanplay.net'
 

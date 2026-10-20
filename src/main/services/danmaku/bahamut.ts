@@ -379,9 +379,31 @@ export async function bahamutKeywords(ctx: FetcherContext & { subjectId?: number
   if (cached && Date.now() - cached.at < KEYWORD_TTL) return [...cached.names]
 
   const names: string[] = []
+  /**
+   * 清掉"番名之外的尾巴"再拿去搜（V1.4）。
+   *
+   * 真机证据：番剧库里《学生会也有洞》的日文名是
+   *   `生徒会にも穴はある！アニメCM`
+   * 巴哈用这个名字搜**一条都没有**（日志：「搜索「生徒会にも穴はある！アニメCM」没有结果」），
+   * 因为巴哈的番剧表里没有"アニメCM"这种宣传片后缀。
+   * 这里把 CM / PV / アニメ / 予告 / 第N弾 之类的宣传物料尾巴剥掉，
+   * **先搜干净的那个**，再退回原名（宁可多试一次，也不要因为一个后缀丢掉整部番）。
+   */
+  const sanitize = (s: string): string =>
+    s
+      .replace(/[（(][^）)]{0,20}[）)]\s*$/g, ' ')
+      .replace(/\s*(アニメ)?\s*(CM|PV|ティザー|予告編?|特報|プロモーション?ビデオ)\s*$/i, ' ')
+      .replace(/\s*第\s*\d+\s*弾\s*$/g, ' ')
+      .replace(/\s*(アニメ|テレビアニメ|TVアニメ)\s*$/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
   const push = (s: unknown): void => {
     const t = String(s ?? '').trim()
-    if (t && !names.includes(t)) names.push(t)
+    if (!t) return
+    const clean = sanitize(t)
+    // 干净版优先（更可能命中），原名随后兜底
+    if (clean && clean !== t && clean.length >= 2 && !names.includes(clean)) names.push(clean)
+    if (!names.includes(t)) names.push(t)
   }
 
   // 用户手动输入的别名优先（它就是要搜的词）

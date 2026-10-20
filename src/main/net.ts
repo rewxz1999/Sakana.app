@@ -1,10 +1,12 @@
 import axios, { type AxiosRequestConfig } from 'axios'
+import http from 'node:http'
+import https from 'node:https'
 import { app, net } from 'electron'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import { SocksProxyAgent } from 'socks-proxy-agent'
-import type { AppSettings, PlayRule, ProxyConfig } from '@shared/types'
+import type { AppSettings, ProxyConfig } from '@shared/types'
 import { DEFAULT_SETTINGS } from '@shared/types'
-import { netQueue, type NetPriority } from './net-priority'
+import { netQueue } from './net-priority'
 import { store } from './store'
 
 /*
@@ -74,15 +76,19 @@ export function installCertFallback(): void {
 installCertFallback()
 
 /*
- * ───────── v1.1.4：全应用分级网络（S / A / B）─────────
+ * ───────── 全局网络并发闸门（分级已废弃）─────────
  *
  * 为什么挂在 axios 拦截器上：本应用真正发网络请求的模块有十几个
  * （bangumi / 规则 / 弹幕 / galgame / mikan / 更新…），逐个改调用点既容易漏，
- * 也无法形成统一的并发上限。这里在所有 axios 请求进入 adapter 之前排队，
- * 调用点只要**愿意**就可以写 `netPriority` 显式分级；没写的按 URL 自动归类：
- *   · 本机服务（qbit / aria2 / 直播中转）→ 不排队（它们不是外网带宽，排队只会卡自己的 RPC）；
- *   · 自建反代 / 公共镜像 / 规则站点 → S；其中搜索路径是 B（用户明确要求）；
- *   · Jikan / AniList / 蜜柑 / 弹幕 / galgame 等其余外网 → A。
+ * 也无法形成统一的并发上限。这里在所有 axios 请求进入 adapter 之前排队。
+ *
+ * 用户已经明确取消 S/A/B 分级，所以这里**不再按 URL 判断重要性**：
+ *   · 所有外网请求同一条 FIFO 队列，只受 `net-priority` 里的全局并发上限约束；
+ *   · 调用点写 `netPriority` 也不会改变行为（字段仅为兼容保留）；
+ *   · `netTag` 仍然有用：它是日志/诊断里**不含主机名**的接口标签；
+ *   · `netBypass` 保留：播放中的媒体流不排队，这是硬隔离而不是优先级；
+ *   · 本机服务（qbit / aria2 / 直播中转）不排队 —— 它们不是外网带宽，
+ *     排进队列只会卡住自己的 RPC，与"谁重要"无关。
  *
  * 注意：这里只**限流**，不改任何请求的地址、超时、重试与响应处理 ——
  * 出问题时可以单独关掉（删掉 installNetworkPriority() 调用）而不影响其余逻辑。
@@ -91,7 +97,6 @@ const LOCAL_HOST = /^(127\.0\.0\.1|localhost|\[::1\])$/i
 
 /** 分类结果里带一个不含主机名的标签，日志/诊断只用它 */
 interface NetTag {
-  level: NetPriority
   tag: string
 }
 
@@ -114,63 +119,27 @@ function pathLabel(url: string): string {
   }
 }
 
-/** 设置里配置的数据源主机（自建反代 + 公共镜像）。缓存 5 秒，避免每个请求都深拷贝设置。 */
-let sourceHostCache: { at: number; hosts: Set<string> } | null = null
-function sourceHosts(): Set<string> {
-  if (sourceHostCache && Date.now() - sourceHostCache.at < 5000) return sourceHostCache.hosts
-  const s = getSettings()
-  const hosts = new Set<string>()
-  for (const m of [s.bangumiCustomApi, ...(s.bangumiMirrors ?? []), s.bangumiBase]) {
-    const h = hostOf(String(m ?? '').trim())
-    if (h) hosts.add(h)
-  }
-  sourceHostCache = { at: Date.now(), hosts }
-  return hosts
-}
-
-/** 用户启用的规则站点主机（规则取站点资源属于 S 级）。缓存 10 秒，规则不会秒变。 */
-let ruleHostCache: { at: number; hosts: Set<string> } | null = null
-function ruleHosts(): Set<string> {
-  if (ruleHostCache && Date.now() - ruleHostCache.at < 10000) return ruleHostCache.hosts
-  const hosts = new Set<string>()
-  try {
-    const rules = store.get<PlayRule[]>('rules', [])
-    for (const rule of Array.isArray(rules) ? rules : []) {
-      if (!rule?.enabled) continue
-      for (const raw of [rule.baseUrl, rule.search?.url]) {
-        const h = hostOf(String(raw ?? ''))
-        if (h) hosts.add(h)
-      }
-    }
-  } catch {
-    /* 规则读不出来时退化为默认 A 级，不影响请求本身 */
-  }
-  ruleHostCache = { at: Date.now(), hosts }
-  return ruleHostCache.hosts
-}
-
 function classifyRequest(config: AxiosRequestConfig): NetTag | null {
+  /*
+   * 播放链路显式要求绕过队列（见 net-priority 的 netBypass 说明）。
+   * 必须在所有判断之前返回：这类请求是用户正在等的那一路流，
+   * 排在普通外网请求后面就可能让播放器拿到列表时已经超时。
+   */
+  if (config.netBypass) return null
   const url = String(config.url ?? '')
   const host = hostOf(url)
-  // 本机服务不占用外网优先级额度（qbit/aria2 的轮询很频繁，混进来会把 A 级占满）
+  // 本机服务不占用外网并发额度（qbit/aria2 的轮询很频繁，混进来会把额度占满）
   if (host && LOCAL_HOST.test(host)) return null
-  if (config.netPriority) return { level: config.netPriority, tag: config.netTag ?? pathLabel(url) }
-  if (!host) return { level: 'A', tag: config.netTag ?? '请求' }
-  if (sourceHosts().has(host)) {
-    // 搜索/建议：用户明确划为 B 级（可以等，不该挤占番剧数据与播放资源）
-    if (/\/search|subject_search/i.test(url)) return { level: 'B', tag: '搜索' }
-    return { level: 'S', tag: config.netTag ?? pathLabel(url) }
-  }
-  if (ruleHosts().has(host)) return { level: 'S', tag: config.netTag ?? '规则站点' }
-  return { level: 'A', tag: config.netTag ?? pathLabel(url) }
+  // `netPriority` 已废弃：这里只取标签，传不传级别都不影响排队顺序
+  return { tag: config.netTag ?? pathLabel(url) }
 }
 
-let priorityNetworkInstalled = false
+let networkGateInstalled = false
 
-/** 安装全局分级队列（幂等）。在 net.ts 被 import 时装上，第一条请求前就生效。 */
+/** 安装全局并发闸门（幂等）。在 net.ts 被 import 时装上，第一条请求前就生效。 */
 export function installNetworkPriority(): void {
-  if (priorityNetworkInstalled) return
-  priorityNetworkInstalled = true
+  if (networkGateInstalled) return
+  networkGateInstalled = true
 
   /** 请求 config → 槽位释放函数。WeakMap 让失败/取消的请求也不会漏掉（config 被回收即消失） */
   const held = new WeakMap<object, () => void>()
@@ -187,7 +156,7 @@ export function installNetworkPriority(): void {
     if (!meta) return config
     // 信号透传：请求被取消时把它从排队里摘掉，别占着位置等一个已经没人要的结果
     const signal = (config.signal ?? undefined) as AbortSignal | undefined
-    const fn = await netQueue.acquire(meta.level, meta.tag, signal)
+    const fn = await netQueue.acquire(meta.tag, signal)
     held.set(config, fn)
     return config
   })
@@ -249,9 +218,192 @@ export function getSettings(): AppSettings {
   }
 }
 
+/**
+ * 全局 keep-alive agent（V1.2.1）。
+ *
+ * 为什么必须有：真机实测自建反代的 TLS 握手 **1~8.7 秒**、首字节 5~32 秒（`curl -w` 三段计时，
+ * 同一台机器三次请求里第三次连建连都挂死）。node 默认每个请求新开连接，
+ * 于是**每一条** bangumi 请求都要再付一次 1~8.7 秒的握手 —— 这就是"点一下等半天"的主要来源。
+ * 复用连接后，握手只在第一批请求上付一次，后续请求直接走已建立的 TLS 会话。
+ *
+ * 数值取舍：
+ *   · keepAliveMsecs=30s：与常见的 CDN 空闲回收（60~120s）留出余量，又不至于抱着死连接不放；
+ *   · maxSockets=16：S(4)+A(2)+B(3) 的上限之和是 9，留一倍余量给规则嗅探/弹幕这类直连请求；
+ *   · maxFreeSockets=8：空闲连接不无限留，避免反代那边已经掐了我们还留着。
+ */
+const keepAliveHttps = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 16,
+  maxFreeSockets: 8,
+  timeout: 60_000
+})
+const keepAliveHttp = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 16,
+  maxFreeSockets: 8
+})
+
+/** 给调用方拿一份 keep-alive agent（未启用代理时用；启用了代理则走代理 agent） */
+export function buildKeepAliveAgents(): Partial<AxiosRequestConfig> {
+  return { httpAgent: keepAliveHttp, httpsAgent: keepAliveHttps }
+}
+
+export interface StreamGetOptions {
+  /** 整轮硬上限（毫秒） */
+  timeoutMs?: number
+  headers?: Record<string, string>
+  /** 只用于日志统计 */
+  netTag?: string
+  /** buildProxyAgents() 的返回值，原样展开进 axios 配置 */
+  agents?: Partial<AxiosRequestConfig>
+  /**
+   * 响应是 JSON：空闲收尾前先校验能否解析，解析不过就继续等（防止半截 JSON）。
+   * 见 `idleFinish` 的注释（真机踩过 Truncated JSON）。
+   */
+  requireJson?: boolean
+}
+
+/**
+ * 流式 GET 文本，**内容到齐就收尾**，不等连接关闭（V1.5）。
+ *
+ * 为什么必须有它：我们的两个自建反代（Cloudflare Worker）在真机上的表现是
+ *   · 首字节 3.6~9.9 秒就来了；
+ *   · 但 `total` 永远等于客户端设的超时上限，正文其实已经收齐（6.8KB / 15KB / 173KB 都有）。
+ * 也就是**响应体不结束**（没有 Content-Length、连接不 close）。
+ * axios 的 `timeout` 是按"整轮结束"算的，于是每个请求都要耗满超时，再叠加重试与排队 ——
+ * 一屏番剧表能被拖到几分钟，日志里就是「HTTP 200 73.8KB 49844ms（在途 29；排队 21）」。
+ *
+ * 判定：收到首个数据块后 **3 秒没有新数据**即视为响应完整并返回已收内容
+ * （3 秒是实测的经验值：服务端两次 flush 之间偶有 1~2 秒空档，取 1.5 秒会截断正文）。
+ * 正常结束的响应仍走同一条 resolve 路径，行为不变。
+ */
+export async function streamGetText(url: string, opts: StreamGetOptions = {}): Promise<string> {
+  /*
+   * 硬上限 35s（比 BANGUMI_TIMEOUT=22s 宽）。
+   *
+   * 实测：季度检索的响应体可以到 326KB，数据一直在流、只是慢（每次 chunk 间隔 <3s，空闲判定不触发），
+   * 22 秒会把它判死 → 触发"换端点重试"，总耗时反而变成 40~80 秒。
+   * 空闲 3 秒才是"没数据了"的判据；这里的硬上限只用来兜住真正挂死的连接。
+   */
+  const timeoutMs = opts.timeoutMs ?? 20_000
+  const idleMs = 3_000
+  const res = await axios.get(url, {
+    timeout: timeoutMs,
+    responseType: 'stream',
+    headers: opts.headers ?? {},
+    ...(opts.netTag ? { netTag: opts.netTag } : {}),
+    ...(opts.agents ?? {})
+  } as AxiosRequestConfig)
+  if (res.status !== 200) throw new Error(`HTTP ${res.status}`)
+  const stream = res.data as NodeJS.ReadableStream & { destroy?: () => void }
+  /**
+   * 服务端给了 `Content-Length` 就**按字节数收尾**（V1.5.2）。
+   *
+   * 这是最准的判定：Worker 现在会带 Content-Length，收到够数立刻结束，
+   * 不必等连接 close、也不靠"空闲 3 秒"去猜 —— 后者在 300KB 的季度响应上会误判：
+   * 要么截断成半截 JSON（日志里的 Unterminated string），要么苦等到 35 秒硬上限（更慢）。
+   */
+  const declared = Number(res.headers['content-length'] ?? 0)
+  const expectBytes = Number.isFinite(declared) && declared > 0 ? declared : 0
+  return await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let received = 0
+    let idle: NodeJS.Timeout | null = null
+    let done = false
+    const finish = (err?: Error): void => {
+      if (done) return
+      done = true
+      if (idle) clearTimeout(idle)
+      clearTimeout(hard)
+      try {
+        stream.destroy?.()
+      } catch {
+        /* ignore */
+      }
+      if (err) reject(err)
+      else resolve(Buffer.concat(chunks).toString('utf-8'))
+    }
+    const hard = setTimeout(() => finish(new Error(`流式接收超过 ${timeoutMs / 1000}s`)), timeoutMs)
+    /**
+     * 空闲到点时的收尾判定（V1.5.1）。
+     *
+     * 真机踩到的坑：`/calendar` 的响应有 80KB，服务端两次 flush 之间偶尔超过 3 秒，
+     * 空闲判定就把它当成"传完了"，结果是**半截 JSON**：
+     *   `Unterminated string in JSON at position 13711` / `Bad Unicode escape at position 17341`
+     * 比慢更糟 —— 数据直接不可用。
+     *
+     * 所以：`requireJson` 时先尝试解析，**解析得过才收尾**；解析不过就继续等
+     * （要么后续数据到了、要么连接 end、要么撞 35 秒硬上限）。
+     * 服务端已经把 `Content-Length` 正确带上了，正常情况下 'end' 会立刻触发，走不到这里。
+     */
+    const idleFinish = (): void => {
+      if (opts.requireJson) {
+        const text = Buffer.concat(chunks).toString('utf-8')
+        try {
+          JSON.parse(text)
+        } catch {
+          // 还没收全：继续等下一个数据块或 end；不在这里收尾
+          return
+        }
+      }
+      finish()
+    }
+    const bump = (): void => {
+      if (idle) clearTimeout(idle)
+      idle = setTimeout(idleFinish, idleMs)
+    }
+    stream.on('data', (c: Buffer) => {
+      const buf = Buffer.isBuffer(c) ? c : Buffer.from(c)
+      chunks.push(buf)
+      received += buf.length
+      // 有了 Content-Length：收够就立刻收尾（最准，且不依赖连接关闭）
+      if (expectBytes > 0 && received >= expectBytes) {
+        finish()
+        return
+      }
+      bump()
+    })
+    stream.on('end', () => finish())
+    stream.on('error', (e: Error) => finish(e))
+  })
+}
+
+/**
+ * 用 **Chromium 的网络栈**取文本（V1.2.2）。
+ *
+ * 为什么需要它：用户实测「同一个反代地址在浏览器里打得开」，而 node 这边不断超时/被重置
+ * （`curl` 三次里两次失败，TLS 握手 1~8.7 秒）。两者的差别不在服务端，而在**客户端这一侧**：
+ * Chromium 用 HTTP/2 + 自己的 TLS 指纹与连接池，node 的 https 模块在这些中间设备上更容易被掐。
+ * 所以当 node 这条路失败时，改走 Electron 的 `net.fetch`（就是 Chromium 的那套栈）再试一次 ——
+ * 这不是"绕过安全校验"，只是换一条同样受系统证书约束的 HTTP 实现。
+ *
+ * @param timeoutMs 超时（毫秒）；到点用 AbortController 中断，不留悬挂请求
+ */
+export async function chromiumGetText(
+  url: string,
+  timeoutMs = 12_000,
+  headers: Record<string, string> = {}
+): Promise<string> {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    const res = await net.fetch(url, {
+      method: 'GET',
+      signal: ctrl.signal,
+      headers: { Accept: '*/*', ...headers }
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return await res.text()
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** 按代理设置构造 axios agent（http / socks5 均支持） */
 export function buildProxyAgents(proxy: ProxyConfig): Partial<AxiosRequestConfig> {
-  if (!proxy?.enabled || !proxy.host) return {}
+  if (!proxy?.enabled || !proxy.host) return buildKeepAliveAgents()
   const auth = proxy.username
     ? `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@`
     : ''
@@ -262,7 +414,7 @@ export function buildProxyAgents(proxy: ProxyConfig): Partial<AxiosRequestConfig
     return { httpAgent: agent, httpsAgent: agent }
   } catch (err) {
     console.error('[net] 代理配置无效:', err)
-    return {}
+    return buildKeepAliveAgents()
   }
 }
 

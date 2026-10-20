@@ -14,7 +14,7 @@ import {
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import type { LocalRuleEntry, PlayRule, RuleEpisodesDef, RuleOrigin, RuleSearchDef, RulesRepoMeta } from '@shared/types'
-import { DEFAULT_RULES, emptyRule, isPinnedRule, sortRulesPinnedFirst } from '@shared/types'
+import { DEFAULT_RULES, emptyRule, isRecommendedRule, sortRulesBySpeed } from '@shared/types'
 import { api } from '@/lib/api'
 import { toast } from '@/stores/app'
 import { Badge, Button, Input, Modal, Select, Spinner, Switch, Textarea } from '@/components/ui'
@@ -38,6 +38,16 @@ function fmtFullTime(ts: number): string {
     `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ` +
     fmtCheckTime(ts)
   )
+}
+
+/**
+ * 实测耗时的展示文案（列表里那一小行）。
+ * 为什么显示它：顺序改成"按速度排"之后，用户需要看到**凭什么**这条在前面，
+ * 否则会以为排序是随机的（以前置顶至少有个「置顶」角标解释顺序）。
+ */
+function fmtSpeed(ms?: number): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '未测速'
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`
 }
 
 /**
@@ -420,9 +430,9 @@ export function RulesPage() {
       </div>
 
       <div className="flex min-h-0 flex-1">
-        {/* 左侧：规则列表（置顶规则（aafun / AGE / sorani…）排在最前，见 shared 的 PINNED_RULES） */}
+        {/* 左侧：规则列表（按实测的决定性耗时排序，快的在前；见 shared 的 sortRulesBySpeed） */}
         <div className="flex w-60 shrink-0 flex-col overflow-y-auto border-r border-border p-2.5">
-          {sortRulesPinnedFirst(rules).map((rule) => (
+          {sortRulesBySpeed(rules).map((rule) => (
             <div
               key={rule.id}
               role="button"
@@ -441,9 +451,13 @@ export function RulesPage() {
               <div className="flex items-center justify-between gap-2">
                 <span className="line-clamp-1 min-w-0 text-[13px] font-medium">
                   {rule.name || '未命名规则'}
-                  {/* 置顶规则标出来：顺序变了但没有任何提示的话，用户会以为是自己记错了 */}
-                  {isPinnedRule(rule.name) ? (
-                    <span className="ml-1 align-middle text-[10px] text-accent">置顶</span>
+                  {/*
+                    推荐角标（不是置顶）：置顶已按用户要求去掉，顺序只由实测速度决定。
+                    角标保留是因为「推荐」表达的是产品判断（这三条最值得先试），
+                    与"当前谁更快"是两件事 —— 一条规则可能被推荐、但不是最快的。
+                  */}
+                  {isRecommendedRule(rule.name) ? (
+                    <span className="ml-1 align-middle text-[10px] text-accent">推荐</span>
                   ) : null}
                 </span>
                 <button
@@ -467,7 +481,19 @@ export function RulesPage() {
                   {originLabel(ruleOriginOf(rule))}
                 </Badge>
                 <span className="text-[10px] text-faint">v{rule.version}</span>
+                {/* 实测的决定性耗时：顺序就是按它排的（未测速的排最后） */}
+                <span className="text-[10px] text-faint">{fmtSpeed(rule.speedMs)}</span>
               </div>
+              {/*
+                规则的**限制说明**（如"暂不可用：四部番全败"、"需人机验证"）。
+                为什么显示在列表里而不是详情页：停用的规则如果不写原因，用户只会看到一条
+                灰掉的线路，既不知道是我们主动停用，也不知道该不该重新打开。
+              */}
+              {rule.playbackNote ? (
+                <div className="line-clamp-2 text-[10px] leading-relaxed text-faint" title={rule.playbackNote}>
+                  {rule.playbackNote}
+                </div>
+              ) : null}
             </div>
           ))}
           {rules.length === 0 ? (

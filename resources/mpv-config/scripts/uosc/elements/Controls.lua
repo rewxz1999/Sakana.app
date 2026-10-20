@@ -319,6 +319,8 @@ function Controls:update_dimensions()
 
 	-- Container
 	self.bx = display.width - window_border - margin
+	-- 用户最终决定：进度条在最底、**按钮在它上面**（恢复 uosc 原版布局）。
+	-- 与 Timeline.lua 的 update_dimensions 成对修改；只改一处会重叠。
 	self.by = Elements:v('timeline', 'ay', display.height - window_border) - margin
 	self.ax, self.ay = window_border + margin, self.by - size
 

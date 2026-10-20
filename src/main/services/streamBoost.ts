@@ -436,6 +436,13 @@ async function openStream(
     // 一旦被 axios 解压，Range 分段的字节数就对不上了（续传会错位）
     decompress: false,
     headers: { ...headers, ...(opts.range ? { Range: opts.range } : {}) },
+    /*
+     * 播放加速的测速/预热/分片请求全部绕过分级队列（v1.2.1）。
+     * 这些请求的目的是「让正在播的那一路更快」，把它们的测速请求排在 A 级后面
+     * 等于先让用户等队列、再谈加速；更糟的是 `enginePlay` 会 await 测速结果，
+     * 排队久 = loadfile 迟迟不发出 = 界面上一直停在「注入播放器」。
+     */
+    netBypass: true,
     ...buildProxyAgents(getSettings().proxy)
   })
   return {
@@ -812,6 +819,8 @@ async function httpText(url: string, headers: Record<string, string>): Promise<s
       responseType: 'text',
       maxRedirects: 5,
       headers,
+      // 同上：这是加速器读播放列表，属于播放链路，不能排在队列里
+      netBypass: true,
       ...buildProxyAgents(getSettings().proxy)
     })
     return typeof res.data === 'string' ? res.data : String(res.data ?? '')

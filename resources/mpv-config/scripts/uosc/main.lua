@@ -25,6 +25,10 @@ defaults = {
 	progress_line_width = 20,
 	timeline_persistency = '',
 	timeline_border = 1,
+	-- Sakana 补丁：进度条与控制按钮之间的间距（px，正数让进度条往按钮方向压下去）。
+	-- 必须出现在默认值里，否则 mp.options 会把 conf 里这一行当 unknown key 直接忽略
+	-- （实测日志：`script-opts/uosc.conf:58 unknown key 'timeline_controls_gap', ignoring`）。
+	timeline_controls_gap = 0,
 	timeline_step = '5',
 	timeline_cache = true,
 	timeline_heatmap = 'overlay',

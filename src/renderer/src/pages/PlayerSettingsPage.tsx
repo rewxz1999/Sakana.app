@@ -1,6 +1,11 @@
 import { useEffect, useState } from 'react'
-import { CheckCircle2, MonitorPlay, RefreshCw, Sparkles, TriangleAlert, XCircle } from 'lucide-react'
+import { CheckCircle2, HardDrive, MonitorPlay, RefreshCw, Sparkles, TriangleAlert, XCircle } from 'lucide-react'
 import type { PlayerAssets } from '@shared/api'
+import {
+  TEMP_MEDIA_CACHE_EPISODES_MAX,
+  TEMP_MEDIA_CACHE_EPISODES_MIN,
+  resolveTempMediaCacheEpisodes
+} from '@shared/mediaCache'
 import {
   ANIME4K_MODES,
   ANIME4K_TIERS,
@@ -265,11 +270,18 @@ export function PlayerSettingsPage() {
   const a4kMissing = assets !== null && assets.anime4k === false
   const installedShaders = assets?.shaders ?? []
 
+  /*
+   * 本地临时缓存（边下边播，v1.4）：设置项只有「最多保留几集」。
+   * 界面上的值一律经 `resolveTempMediaCacheEpisodes` 收窄 —— 与主进程用的是同一个函数，
+   * 所以滑杆显示 3 集时，磁盘上就一定按 3 集淘汰。
+   */
+  const tempCacheEpisodes = resolveTempMediaCacheEpisodes(settings.tempMediaCacheEpisodes)
+
   return (
     <SubPage
       icon={MonitorPlay}
       title="播放器设置"
-      desc="播放内核、Anime4K 超分辨率、音频（音质调控）、画面比例与内置组件；FFmpeg 与快捷键等已拆到同区域下的其它设置项"
+      desc="播放内核、本地临时缓存（边下边播）、Anime4K 超分辨率、音频（音质调控）、画面比例与内置组件；FFmpeg 与快捷键等已拆到同区域下的其它设置项"
       actions={
         <Button size="sm" variant="outline" icon={RefreshCw} loading={checking} onClick={() => void detect()}>
           重新检测
@@ -301,6 +313,78 @@ export function PlayerSettingsPage() {
               <code className="mx-1 font-mono">npm run mpv:build</code>。
             </span>
           </div>
+        </div>
+      </Card>
+
+      {/*
+        本地临时缓存 + 边下边播（v1.4）。
+        用户原话：「先将资源临时缓存到本地，缓存多少播多少，可以在设置中选择允许临时缓存的集数，
+        关闭应用后释放缓存的视频资源」。这里只放一个「集数」——总开关不暴露：缓存失败会自动回退直连，
+        关掉它反而得不到任何收益，所以默认就是开的。
+      */}
+      <Card
+        title="本地临时缓存（边下边播）"
+        desc="先把资源按序缓存到本地临时文件，播放器再从已缓存的部分读取；拖动与重播不再等上游"
+      >
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-text">
+                <HardDrive size={13} className="text-accent" />
+                允许临时缓存的集数
+              </div>
+              <div className="mt-0.5 text-[10px] leading-snug text-faint">
+                最多同时保留 {tempCacheEpisodes} 集；超出的按「最久未用」淘汰，正在播的那一集不会被淘汰
+              </div>
+            </div>
+            <span className="shrink-0 font-mono text-sm text-accent">{tempCacheEpisodes} 集</span>
+          </div>
+
+          <div>
+            <input
+              type="range"
+              min={TEMP_MEDIA_CACHE_EPISODES_MIN}
+              max={TEMP_MEDIA_CACHE_EPISODES_MAX}
+              step={1}
+              value={tempCacheEpisodes}
+              data-temp-cache-episodes={tempCacheEpisodes}
+              onChange={(e) => save({ tempMediaCacheEpisodes: resolveTempMediaCacheEpisodes(Number(e.target.value)) })}
+              className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-elev2 accent-accent"
+            />
+            <div className="mt-1 flex justify-between text-[10px] text-faint">
+              <span>{TEMP_MEDIA_CACHE_EPISODES_MIN} 集</span>
+              <span>{TEMP_MEDIA_CACHE_EPISODES_MAX} 集</span>
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-border bg-elev2/50 px-3 py-2.5 text-[11px] leading-relaxed text-dim">
+            <div>
+              <span className="font-semibold text-text">占用空间：</span>
+              <span className="text-faint">
+                缓存文件的大小与片源本身相当（一集常见 200MB–1.5GB），所以最坏情况约占{' '}
+                {Math.round(tempCacheEpisodes * 1.5)} GB；不是看过的每一集都会留下，只有最近用到的这几集。
+              </span>
+            </div>
+            <div className="mt-1.5">
+              <span className="font-semibold text-text">退出自动清空：</span>
+              <span className="text-faint">
+                缓存写在当前缓存根目录下的 tmp-media（默认是数据根目录的 cache/tmp-media），
+                关闭应用时整个目录会被删除；启动时还会再清一次上次异常退出的残留，不需要你手动清理。
+              </span>
+            </div>
+          </div>
+
+          <p className="text-[11px] leading-relaxed text-faint">
+            <span className="text-dim">失败会自动回退：</span>
+            缓存服务不可用、写盘失败或上游异常时，会立刻改回直连原地址，不会因此播不了；
+            本次走的是缓存还是直连，日志里都有明确的一行（缓存失败的那一行会说明原因）。
+          </p>
+          <p className="text-[11px] leading-relaxed text-faint">
+            <span className="text-dim">不适用范围：</span>
+            HLS（m3u8）是「一个列表 + 许多独立分片」，整段字节缓存没有意义；没有总长度的直播/分块流
+            与超过 8GB 的单集也不会缓存 —— 这几种情况仍按原来的直连/加速链路播放，只是不享受缓存。
+            集数改动在下一集起播时生效（正在播的这一集不会被删）。
+          </p>
         </div>
       </Card>
 

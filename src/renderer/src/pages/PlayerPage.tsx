@@ -266,14 +266,61 @@ export function PlayerPage() {
   /** 最近一次自检的结果（v0.3.9）：非空时在状态区显示「自检做了什么」，用户要求不许静默 */
   const [selfCheckNote, setSelfCheckNote] = useState('')
   /**
-   * 本轮流程是否**成功出过画面**（v0.3.9）。
+   * 本轮流程是否**开播过**（v0.3.9；v1.5 起明确不再代表"有画面"）。
    *
-   * 为什么必须有它：「加载中」这一层不能只看 `!playing` ——
-   * 用户暂停之后 `playing` 也是 false，那时再盖一层「加载中 + 过程进度」就成了严重的误报
-   * （暂停的画面被一块半透明黑罩住，还写着加载中）。
-   * 所以判据是「本轮还没有真正开播过」。
+   * 为什么保留它：状态药丸的文案要用它 —— 用户暂停之后 playing 也是 false，
+   * 只有"本轮还没开播过"才说明仍在等待，而不是暂停（否则暂停会被盖一层加载中）。
+   * ⚠️ 它**不能**用来判断"画面是否出来了"：playing 比首帧早得多
+   * （地址一交给内核就变 true，此时可能还是一整段黑屏）。
+   * 那个判据只认下面的 hasPicture（唯一来源：内核 width>0）；
+   * 加载卡、弹幕层、控制栏门控全部看它。
    */
   const [startedOnce, setStartedOnce] = useState(false)
+  /**
+   * 本轮媒体**是否真的出过画面**（v1.5，用户三条反馈的共同前提）。
+   *
+   * 为什么不继续用现成的两个判据：
+   *   · `time > 0` —— 有声音没画面时它在走，但屏幕是黑的；
+   *   · `engineState === 'active'` —— 只说明内核 attach 成功，连媒体都还没载入。
+   * 唯一可靠的信号在**主进程**：mpv 的 `width`（video-params/w）> 0，
+   * 也就是解码器真的产出了首帧（`services/mpv.ts` 的 `mpvHasPicture()`）。
+   * 这里不加任何本地推断，只做它的镜像：事件 `picture` 是主路径，
+   * 800ms 轮询用 `getState().hasPicture` 兜底（事件订阅晚一拍时也能自愈）。
+   *
+   * 语义是"本轮媒体内保持 true"：暂停 / 缓冲 / 拖动都不会变回 false（否则一暂停
+   * 弹幕和控制栏就消失），只有换媒体（主进程 loadSource 发 `picture:false`）时才复位。
+   */
+  const [hasPicture, setHasPicture] = useState(false)
+  const hasPictureRef = useRef(false)
+  hasPictureRef.current = hasPicture
+  /**
+   * 把"有画面"复位成 false（v1.5）。
+   *
+   * 主进程在每次 loadfile 时会发 `picture:false`，这里再显式标一次是**本地兜底**：
+   * 渲染层发起新一轮播放到主进程回事件之间有一次 IPC 往返，
+   * 那几十毫秒里若还按 true 处理，就会出现"上一集的弹幕/控制栏还挂在屏幕上"。
+   * 用 function 声明而不是 const 箭头：它在下面的 startRuleProbe 里被调用，
+   * const 会因为暂时性死区在运行时抛 ReferenceError（本文件已有同类教训）。
+   */
+  function markNoPicture(): void {
+    hasPictureRef.current = false
+    setHasPicture(false)
+  }
+  /**
+   * 组件是否还挂载着（v1.5）。
+   *
+   * 为什么需要：下面「等画面出现后再确认插件弹幕」是一条**自触发的延时链**，
+   * 每 4.5 秒看一次；如果页面已经卸载，闭包里的 ref 仍然存在、条件仍然成立，
+   * 这条链会永远自触发下去（历史上这类"卸载后还在跑的定时器"正是内存与日志的污染源）。
+   */
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
   /** 自动续播提示：非空时右下角显示「是否撤销本次跳转」 */
   const [resumeHint, setResumeHint] = useState<{ at: number; target: number } | null>(null)
   const [switching, setSwitching] = useState(false)
@@ -374,18 +421,25 @@ export function PlayerPage() {
     ? { kind: 'failed', text: '播放失败' }
     : ruleProbeFailed
       ? { kind: 'failed', text: '播放失败' }
-      : playing
-        ? { kind: 'playing', text: '播放中' }
-        : ruleProbing
-          ? { kind: 'capturing', text: '捕捉视频流中' }
-          : switching
-            ? { kind: 'loading', text: '切换中' }
-            : engineState === 'trying' || preparing
-              ? // 规则模式挂载到开始嗅探之间还有一个「解析播放页」的阶段，单独给出文案（v0.2.7）
-                state.mode === 'rule'
-                ? { kind: 'loading' as PlayStatus, text: '准备播放源' }
-                : { kind: 'loading' as PlayStatus, text: '加载中' }
-              : { kind: 'idle', text: '已暂停' }
+      : /**
+         * v1.5：`playing` 但**没有画面**时必须说「加载中」，不能报「播放中」。
+         * 用户报的正是这个：状态栏说在播、屏幕上什么都没有，也没有任何加载提示。
+         * 判据只看 hasPicture（与弹幕门控、控制栏门控同一条来源）。
+         */
+        playing && !hasPicture
+        ? { kind: 'loading', text: '加载中（等待画面）' }
+        : playing
+          ? { kind: 'playing', text: '播放中' }
+          : ruleProbing
+            ? { kind: 'capturing', text: '捕捉视频流中' }
+            : switching
+              ? { kind: 'loading', text: '切换中' }
+              : engineState === 'trying' || preparing
+                ? // 规则模式挂载到开始嗅探之间还有一个「解析播放页」的阶段，单独给出文案（v0.2.7）
+                  state.mode === 'rule'
+                  ? { kind: 'loading' as PlayStatus, text: '准备播放源' }
+                  : { kind: 'loading' as PlayStatus, text: '加载中' }
+                : { kind: 'idle', text: '已暂停' }
 
   /**
    * 直连播放失败时的补救（v0.2.6）。
@@ -648,6 +702,12 @@ export function PlayerPage() {
       probeDisposeRef.current = null
     }
     if (probeCancelRef.current) probeCancelRef.current()
+    /*
+     * v1.5：新一轮嗅探 = 画面必然要重新出现一次。
+     * 这里先本地复位"有画面"，弹幕层/控制栏立刻收起、加载进度立刻显示 ——
+     * 不用等主进程 loadfile 时那条 picture:false 的 IPC 往返（那会让上一集的状态多挂几十毫秒）。
+     */
+    markNoPicture()
     // 新一轮嗅探：重置播放/中转状态并停掉上一条中转流
     playingRef.current = false
     relayTriedRef.current = false
@@ -756,6 +816,19 @@ export function PlayerPage() {
         setRuleProbing(false)
         probingRef.current = false
         relayTriedRef.current = false
+        /*
+         * 过程进度（v1.2.1）：抓到候选 = 「获取播放资源」真的完成了。
+         *
+         * 以前只有"命中直链缓存"那条路会 mark acquire ok，正常嗅探这条路一直停在
+         * 「获取播放资源 进行中」——于是整个面板看起来永远推进不到最后一步，
+         * 即使其实已经进了注入阶段。这里如实收尾第二阶段，第三阶段由主进程的
+         * loadfile/首帧/15s 注入看门狗负责。
+         */
+        void api.player.flowMark({
+          kind: 'ok',
+          stage: 'acquire',
+          detail: `已捕获媒体地址（${ev.kind ?? '流'}），正在交给播放内核`
+        })
         // 命中后先别销毁网页视图：等确认开播再关（见上面的说明）
         closeWebviewIfIdle()
         void api.ruleProbe.stop()
@@ -866,6 +939,12 @@ export function PlayerPage() {
             if (pageUrl) {
               toast.info(`视频流 ${ONLINE_PLAY_TIMEOUT_MS / 1000} 秒未出画面，正在重新解析…`)
               console.log('[player] 直连未开播：重新嗅探获取新的直链')
+              /*
+               * 上一轮可能已经被「注入失败」收尾（running=false，v1.2.1 的 15s 看门狗）。
+               * 不重开一轮的话，下面 startRuleProbe 里的 locate/acquire/inject 标记全会因为
+               * “本轮已结束”被忽略 —— 用户会看到进度条停在失败态不动。
+               */
+              void api.player.flowMark({ kind: 'begin', mode: state.mode, title: state.title })
               // 返回的清理函数必须留下来（体检 M3）：下一轮开始前要先把这一轮的两个 IPC 监听拆掉
               probeDisposeRef.current = startRuleProbe(pageUrl) ?? null
               /*
@@ -894,6 +973,14 @@ export function PlayerPage() {
         probingRef.current = false
         if (usedWebview) void api.ruleWebview.close()
         toast.info(ev.message ?? '未捕获到视频流')
+        /*
+         * 一轮嗅探结束却没抓到流 = 本轮**真的失败了**，必须给流程一个终点（v1.2.1）。
+         * 只 failStage 的话 running 仍是 true、activeStage 仍是 acquire，
+         * 状态药丸会一直显示「获取播放资源」；补一条 done 让整轮结束并显示原因。
+         */
+        const why = ev.message ?? '播放页没有发出可识别的视频请求'
+        void api.player.flowMark({ kind: 'fail', stage: 'acquire', error: why, reason: 'site' })
+        void api.player.flowMark({ kind: 'done', ok: false, summary: `获取播放资源失败：${why}`, reason: 'site' })
       }
     })
     /** 完整嗅探（建窗口 / 隐藏窗口）；缓存直链失败时也会走这里 */
@@ -1389,9 +1476,16 @@ export function PlayerPage() {
       if (files.length === 0) return
       void api.player.setPlaylist(files.map((f) => f.path))
       const f = files[currentIndex]
+      /*
+       * v1.5：交出新地址 = 画面还没出来（与主进程 loadSource 里的 picture:false 是同一件事）。
+       * 本地播放同样要先把弹幕/控制栏收起、把加载进度显示出来 —— 换集时尤其明显：
+       * 上一集的最后一帧还留在原生窗口上，弹幕却已经按新一集的时间轴在动。
+       */
+      markNoPicture()
       if (f) void api.player.play(f.path)
     } else if (state.mode === 'online') {
       // 直连流模式：url 本身就是媒体地址
+      markNoPicture()
       if (state.url) void api.player.play(state.url)
     }
     /*
@@ -1477,7 +1571,9 @@ export function PlayerPage() {
             stage: 'inject',
             text: '内核已开始拉流，正在等待首帧画面…'
           })
-          // 本轮已经真正开播过：此后不再显示「加载中」那一层（暂停不该被当成加载中）
+          // 本轮已经真正开播过（内核开始拉流）：状态药丸的文案据此切换。
+          // ⚠️ v1.5：悬浮窗那张「加载中」卡片**不再看它** —— 卡片改由 hasPicture 驱动，
+          // 因为 playing 比首帧早，按它收卡就会留下一整段全黑无提示的空白。
           setStartedOnce(true)
           // 记录本集开播时刻：自动连播的进度兜底要求「已经播够久」，避免刚开播就被判定为播完
           playStartedAtRef.current = Date.now()
@@ -1488,6 +1584,19 @@ export function PlayerPage() {
           // 新媒体的比例设置会被内核重置，重新下发一次
           applyAspect(aspectRef.current)
           setTimeout(() => void refreshEngineSubs(), 300)
+          break
+        /**
+         * v1.5：**画面出现 / 消失**（主进程唯一来源，见 mpv.ts 的 mpvHasPicture）。
+         *
+         * 这条事件是三条用户反馈的开关：
+         *   ① true 之前不显示弹幕（内置画布不挂载；插件那侧由主进程拦住注入）；
+         *   ② false 期间必须显示"加载中/加载失败"，不能是空白；
+         *   ③ false 期间控制栏既不显示也不能被鼠标呼出。
+         * 注意它**不是** `playing`：`playing` 只说明内核开始拉流，黑屏时同样是 true。
+         */
+        case 'picture':
+          hasPictureRef.current = ev.hasPicture === true
+          setHasPicture(ev.hasPicture === true)
           break
         case 'paused':
           if (awaitingStartRef.current) break
@@ -1532,6 +1641,29 @@ export function PlayerPage() {
           if (typeof ev.index === 'number' && state.mode === 'local') {
             setCurrentIndex(ev.index)
             setVideoError(null)
+          }
+          break
+        /**
+         * v1.3：主进程把内核切到了另一个地址（5 秒零字节换候选 / 接入加速中转）。
+         *
+         * 为什么渲染层也要知道：`ruleStreamRef` 决定**投屏地址**与「是不是已经有流」，
+         * 不同步的话，投屏与诊断会继续指向一条已经被内核放弃的地址。
+         * 不在这里做任何「重新起播」的动作 —— 换流是主进程已经做完的事。
+         */
+        case 'source':
+          if (state.mode === 'rule' && typeof ev.url === 'string' && ev.url) {
+            /*
+             * 只更新 ref，不动 `ruleStreamUrl` 的 state：
+             * 那个 state 是字幕加载 effect 的 key（见上面 `sourceKey`），
+             * 换一次候选就会让它把同一批字幕再挂一遍（内核里出现重复字幕轨）。
+             * 投屏/诊断读的都是 ref，所以同步 ref 已经够了。
+             */
+            ruleStreamRef.current = ev.url
+            void api.player.flowMark({
+              kind: 'detail',
+              stage: 'inject',
+              text: '内核已切换到另一条可用地址（原地址 5 秒零字节或接入加速中转）'
+            })
           }
           break
         case 'error':
@@ -1771,6 +1903,24 @@ export function PlayerPage() {
 
   // 控件自动隐藏（鼠标移动浮现，静止 5 秒隐藏；选集/详情抽屉保持打开，点击按钮再关闭）
   const poke = useCallback(() => {
+    /*
+     * v1.5 需求 ④：**没有画面时控制栏不显示、也不能被呼出**。
+     *
+     * 这是页面这一侧的判据（真正的控制栏是 uosc，它那一侧的门控在
+     * PlayerOverlayPage 的 poke 与 mpv.ts 的 ensureMpvInputWindow 里）。
+     * 这里必须一起拦：鼠标在画面边缘移动时页面根节点也会收到 mousemove，
+     * 不拦的话 `visible` 会被反复置 true（旧的自绘栏虽然不渲染了，
+     * 但选集/详情抽屉、截屏浮钮以及悬浮窗的"控制栏显示中"判断都还看这个状态）。
+     * 判据只用 hasPicture（与弹幕门控同一条来源），不用 playing —— 黑屏时 playing 也是 true。
+     */
+    if (engineState !== 'fallback' && !hasPictureRef.current) {
+      if (hideTimer.current) {
+        window.clearTimeout(hideTimer.current)
+        hideTimer.current = undefined
+      }
+      setVisible(false)
+      return
+    }
     setVisible(true)
     if (hideTimer.current) window.clearTimeout(hideTimer.current)
     hideTimer.current = window.setTimeout(() => {
@@ -1778,8 +1928,16 @@ export function PlayerPage() {
       if (probingRef.current) return
       setVisible(false)
     }, HIDE_DELAY)
-  }, [])
+  }, [engineState])
   pokeRef.current = poke
+
+  /*
+   * v1.5：画面一旦消失（换集 / 换源加载中），立刻把控制栏收起 ——
+   * 不能等下一次鼠标移动才收，否则上一集的控制栏会一直挂在黑屏上。
+   */
+  useEffect(() => {
+    if (engineState !== 'fallback' && !hasPicture) setVisible(false)
+  }, [hasPicture, engineState])
 
   useEffect(() => {
     poke()
@@ -1947,6 +2105,41 @@ export function PlayerPage() {
           const nv = Math.max(0, Math.min(100, Math.round(a.value)))
           setPlayerVolume(nv)
           void api.player.setVolume(nv)
+          break
+        }
+        /*
+         * v1.1.6：uosc 音量菜单（sakana-volume 点开）的 -10 / +10 / 0-100 快捷档。
+         *
+         * 与上面的 'setVolume' 共用 api.player.setVolume（音量真源不变），区别在语义：
+         * 滑杆是高频拖动、只改音量；菜单是一次明确点选，所以
+         *   · 设到非零 / 往上调时顺手解除静音 —— 否则静音状态下点 +10% 仍然没声音，
+         *     用户会以为"音量按钮还是坏的"（正是这次反馈的原始问题）；
+         *   · 给一条 toast —— uosc 菜单点完立刻关闭，没有反馈就看不出生效没有。
+         * 增量上限 200 与应用现有的 ↑/↓ 键、旧滑杆保持一致；直接设档按菜单只到 100。
+         */
+        case 'volumeSet': {
+          const nv = Math.max(0, Math.min(100, Math.round(a.value)))
+          setPlayerVolume(nv)
+          void api.player.setVolume(nv)
+          if (nv === 0) {
+            setPlayerMuted(true)
+            void api.player.setMute(true)
+          } else if (playerMuted) {
+            setPlayerMuted(false)
+            void api.player.setMute(false)
+          }
+          toast.info(nv === 0 ? '音量 0%（已静音）' : `音量 ${nv}%`)
+          break
+        }
+        case 'volumeDelta': {
+          const nv = Math.max(0, Math.min(200, Math.round(playerVolume + a.delta)))
+          setPlayerVolume(nv)
+          void api.player.setVolume(nv)
+          if (nv > 0 && a.delta > 0 && playerMuted) {
+            setPlayerMuted(false)
+            void api.player.setMute(false)
+          }
+          toast.info(`音量 ${nv}%`)
           break
         }
         case 'setSpeed': {
@@ -2209,10 +2402,26 @@ export function PlayerPage() {
       void api.player.flow().then((fr) => {
         if (fr.ok) setFlow(fr.data)
       })
-      if (playingRef.current) return
+      /*
+       * v1.5：**"有没有画面"的兜底确认也走这条既有轮询**（不新增定时器）。
+       *
+       * 只有在"已经开播、但画面还没出现"这一小段里才需要问内核 ——
+       * 一旦两者都成立（正常播放中）就恢复原来的省 IPC 行为，直接返回。
+       * 为什么要兜底：`picture` 事件是主路径，但渲染层订阅晚一拍（极快的源、页面刚挂载）
+       * 时事件会丢；`getState().hasPicture` 与事件同源，问一次就能把界面纠回来。
+       */
+      if (playingRef.current && hasPictureRef.current) return
       void api.player.getState().then((r) => {
         if (!r.ok) return
         const st = r.data
+        // 内核刚被销毁时主进程可能回 null（engineGetState 的既有行为）：不能让轮询在这里抛错
+        if (!st) return
+        if (st.hasPicture === true && !hasPictureRef.current) {
+          console.log('[player] 轮询确认画面已出现（hasPicture=true）')
+          hasPictureRef.current = true
+          setHasPicture(true)
+        }
+        if (playingRef.current) return
         if (!st.playing || (st.time <= 0 && st.length <= 0)) return
         console.log(`[player] 轮询确认内核已在播放（time=${Math.round(st.time)}s length=${Math.round(st.length)}s）`)
         playingRef.current = true
@@ -2301,7 +2510,12 @@ export function PlayerPage() {
       // v0.3.9：过程进度与自检说明跟着这条既有推送一起下去（悬浮窗画进度显示器要用）
       flow,
       selfCheckNote,
-      startedOnce
+      startedOnce,
+      /*
+       * v1.5：画面是否真的出来了（与弹幕/控制栏门控同一条来源）。
+       * 悬浮窗用它决定：画不画内置弹幕、显示"加载中/加载失败"、允不允许呼出控制栏。
+       */
+      hasPicture
     })
   }, [
     overlayActive,
@@ -2332,7 +2546,9 @@ export function PlayerPage() {
     // v0.3.9：过程进度与自检说明也在这次推送里，必须进依赖表，否则悬浮窗看不到它们变化
     flow,
     selfCheckNote,
-    startedOnce
+    startedOnce,
+    // v1.5：画面状态必须进依赖表，否则悬浮窗的弹幕/控制栏门控永远停在旧值
+    hasPicture
   ])
 
   /**
@@ -2758,22 +2974,40 @@ export function PlayerPage() {
          * 分两轮看：注入必须等 mpv 载入文件（否则插件会崩、脚本被终止），
          * 所以第一轮看到 pending=true 时不能急着回落，再等一轮；两轮都没挂上才回落到内置画布 ——
          * 用户要的是「看到弹幕」，不是「必须由插件画」。
+         *
+         * v1.5：**画面没出来之前 `pending=true` 是正常的，不能按它回落**。
+         * 主进程现在有意把注入压到首帧之后（见 mpv.ts 的 mpvPushDanmakuFile），
+         * 那时 `mpvPluginDanmakuPending()` 必然是 true。如果这里还按老规则"两轮就回落"，
+         * 画面出来时会变成「插件刚注入一份 + 内置画布也画一份」= 弹幕叠两遍。
+         * 所以把两个计数分开：
+         *   · `round` —— 等画面的轮数（每轮 4.5 秒，上限 200 轮 ≈ 15 分钟，只是防死循环的保险）；
+         *   · `pendingRounds` —— 画面出现后"插件还没挂上"的轮数，仍然是**两轮**才回落，
+         *     与改动前的判定口径一致（不会因为等画面等久了就草草判插件没挂上）。
          */
         if (uoscActiveRef.current) {
           const checkKey = key
-          const check = (round: number): void => {
+          const check = (round: number, pendingRounds = 0): void => {
             window.setTimeout(() => {
               void (async () => {
-                if (danmakuKeyRef.current !== checkKey) return
+                // 页面已卸载 / 已经换集：这条等待链必须停，否则它会永远自触发下去
+                if (!mountedRef.current || danmakuKeyRef.current !== checkKey) return
+                if (!hasPictureRef.current && round < 200) {
+                  if (round === 0) {
+                    console.log('[player] 画面还没出现：弹幕先不交给插件渲染，等首帧后再确认')
+                  }
+                  check(round + 1)
+                  return
+                }
                 const s = await api.uosc.status()
                 if (!s.ok || !s.data.active) return
                 if (s.data.loaded) {
                   console.log('[player] uosc_danmaku 已挂上弹幕（has-danmaku=true）')
                   return
                 }
-                if (s.data.pending && round < 2) {
-                  console.log('[player] uosc_danmaku 弹幕还在等文件就绪，稍后再确认')
-                  check(round + 1)
+                // 画面刚出现时注入可能还在路上：再给两轮（约 9 秒），不吃掉"插件真的挂了"的判定
+                if (s.data.pending && pendingRounds < 2) {
+                  console.log('[player] uosc_danmaku 弹幕还在等文件/首帧就绪，稍后再确认')
+                  check(round + 1, pendingRounds + 1)
                   return
                 }
                 console.warn('[player] uosc_danmaku 未挂上弹幕，回落到内置画布渲染')
@@ -3332,6 +3566,17 @@ export function PlayerPage() {
               recordWatch()
             }}
             onPause={() => setPlaying(false)}
+            /*
+             * v1.5：HTML5 回退路径没有 mpv 的 `width` 属性，等价的"首帧已解出"信号是
+             * `loadeddata`（浏览器在该事件触发时已经有当前帧的数据）。只在这一条回退路径上用它，
+             * 两条路径的语义因此完全一致：**真的有画面**才置 true。
+             */
+            onLoadedData={() => {
+              if (!hasPictureRef.current) {
+                hasPictureRef.current = true
+                setHasPicture(true)
+              }
+            }}
             onTimeUpdate={(e) => setCurrent(e.currentTarget.currentTime)}
             onDurationChange={(e) => setDuration(e.currentTarget.duration || 0)}
             onEnded={() => {

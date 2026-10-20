@@ -6,13 +6,16 @@ import { BROWSER_UA } from '../net'
 import { addProbeListeners } from './probeEvents'
 import { noteCapturedStream } from './playerInfo'
 import { beginStage, flowDetail, pushStep, succeedStage } from './playFlow'
+import { offerHandoffCandidate } from './playHandoff'
 import {
   MEDIA_EXT_RE,
-  extractStreamCandidates,
+  extractStreamCandidatesCached,
+  hasMediaExtensionInPath,
+  isPlayerOrDanmakuPage,
   isStreamCandidate,
   notifyProbeHook,
-  rememberStream,
-  resolveFirstPlayable
+  refererForCandidate,
+  rememberStream
 } from './ruleProbe'
 
 /** 本实现同样属于「获取播放资源」阶段（与 ruleProbe 共用同一阶段，二者是同一件事的两种做法） */
@@ -93,13 +96,30 @@ function unwrapPlayerUrl(raw: string): string {
 function reportFound(url: string, kind: string, referer?: string): void {
   const target = unwrapPlayerUrl(url)
   if (!active || foundUrls.includes(target)) return
+  /*
+   * V1.4：**统一在这里挡掉"播放器/弹幕页"**。
+   *
+   * 前面在 webRequest 两处加了判断，但真机复测（E站/中二病）仍会把
+   * `player.ezdmw.com/danmuku/?…` 当成候选上报 —— 说明它来自别的上报点
+   * （CDP 深嗅探 / 页面 HTML 提取）。逐个点在源头挡既容易漏，也难维护；
+   * 这里是所有候选的**唯一汇合处**，放在这里才真正兜住。
+   */
+  if (isPlayerOrDanmakuPage(target)) {
+    log.append('info', 'rule-webview', `忽略播放器/弹幕页（不是媒体流）：${target.slice(0, 110)}`)
+    return
+  }
   foundUrls.push(target)
   noteCapturedStream({ url: target, kind, referer, channel: 'webview', capturedAt: Date.now() })
   log.append('info', 'rule-webview', `捕获媒体流(${kind}): ${target.slice(0, 130)}`)
   pushStep(STAGE, `网页播放器捕获媒体流（${kind}）：${target.slice(0, 70)}`)
   succeedStage(STAGE, '已获取播放资源（网页播放器嗅探）')
-  // 异步补齐 Cookie 后再上报，避免播放器取流时缺少站点会话
+  /*
+   * v1.3：先把候选交给交接队列（坏地址 5 秒内可换），再按既有语义补 Cookie 后上报。
+   * Cookie 查询走的是会话内存，通常几毫秒；保留它是为了「带站点会话取流」不回归。
+   */
+  offerHandoffCandidate({ url: target, referer })
   void collectCookies(target).then((cookies) => {
+    offerHandoffCandidate({ url: target, referer, cookies })
     emit({ type: 'found', url: target, kind, referer, cookies })
   })
 }
@@ -245,16 +265,36 @@ export function openRuleWebview(
   // 1) 网络层嗅探（媒体扩展名 / media 资源类型）
   const onBeforeRequest = (details: { url: string; resourceType: string }): void => {
     if (!active) return
+    /*
+     * V1.3.5 诊断开关：`SAKANA_PROBE_LOG_ALL=1` 时把**所有** XHR/fetch 请求打到日志里。
+     *
+     * 为什么需要它：AniWatch 这类 SPA 站点开了 devtools 就 `about:blank`（反调试），
+     * 用户拿不到列表接口，而规则又必须走 API 型才可能工作。
+     * 我们自己的嗅探窗口没有附加 devtools，站点不会 self-blank —— 于是可以借它
+     * "代理一次 devtools"：把 XHR 全打印出来，从里面找出真正的列表接口。
+     * 默认关闭（正常播放不该被这些日志刷屏），只在排障时开。
+     */
+    if (process.env.SAKANA_PROBE_LOG_ALL === '1' && /^https?:/i.test(details.url)) {
+      log.append('info', 'probe', `REQ[${details.resourceType}] ${details.url.slice(0, 180)}`)
+    }
     // 先排除开发服务器/打包产物的 JS 模块（`.ts` 与 MPEG-TS 撞车，见 ruleProbe.isDevServerAsset）
     if (!isStreamCandidate(details.url)) return
-    if (details.resourceType === 'media' || MEDIA_EXT_RE.test(details.url)) {
+    /*
+     * V1.4：播放器/弹幕页不算媒体流。
+     * E站的播放窗口是 `player.ezdmw.com/danmuku/?…` 这种 iframe 页面，扩展名藏在查询串里时
+     * 会被当成视频候选（真机实测：中二病因此显示"1 个资源"，点进去必然失败）。
+     * 假阳性会直接误导用户，所以这里在源头挡住。
+     */
+    if (isPlayerOrDanmakuPage(details.url)) return
+    if (details.resourceType === 'media' || hasMediaExtensionInPath(details.url)) {
       reportFound(details.url, /\.m3u8(\?|$)/i.test(details.url) ? 'm3u8' : 'media')
     }
   }
   const onCompleted = (details: { url: string; statusCode: number }): void => {
     if (!active) return
     if (!isStreamCandidate(details.url)) return
-    if (details.statusCode < 400 && MEDIA_EXT_RE.test(details.url)) {
+    if (isPlayerOrDanmakuPage(details.url)) return
+    if (details.statusCode < 400 && hasMediaExtensionInPath(details.url)) {
       reportFound(details.url, /\.m3u8(\?|$)/i.test(details.url) ? 'm3u8' : 'media')
     }
   }
@@ -374,15 +414,21 @@ export function openRuleWebview(
     log.append('warn', 'rule-webview', `CDP 不可用: ${String(err)}`)
   }
 
-  // 3) 播放页 HTML 直出地址（MacCMS player_aaaa 等）——**多候选并行探测**后优先采用
-  void extractStreamCandidates(url, referer).then(async (candidates) => {
+  // 3) 播放页 HTML 直出地址（MacCMS player_aaaa 等）——**首个候选立即交给播放器**（v1.3 乐观交接）
+  void extractStreamCandidatesCached(url, referer).then((candidates) => {
     if (!active || candidates.length === 0) return
-    const ok = await resolveFirstPlayable(candidates, referer)
-    if (!active || !ok) return
-    // referer 空串 = 经校验确定不能带 Referer（很多 CDN 因 Referer 返回 400）
-    reportFound(ok.url, 'direct', ok.referer ?? '')
+    const alts = candidates.slice(0, 6).map((u) => ({ url: u, referer: refererForCandidate(u, url) }))
+    for (const a of alts) offerHandoffCandidate(a)
+    const first = alts[0]
+    /*
+     * 为什么不再先 `resolveFirstPlayable`：那一步是 HEAD + Range GET 的探测（正常几百毫秒、慢 CDN 几秒），
+     * 而它挡在「已经有了直链 → 交给内核」这条最短路上。判错的代价由内核侧的
+     * 「5 秒零字节换候选」兜住，而备选候选已经在交接队列里了。
+     * Referer 用启发式：同站带播放页地址、跨域 CDN 不带（见 ruleProbe.refererForCandidate）。
+     */
+    reportFound(first.url, 'direct', first.referer ?? '')
     // 记进会话直链缓存：同一集来回切、退出再进都能直接用，省掉整轮嗅探
-    rememberStream(url, ok.url, ok.referer ?? referer)
+    rememberStream(url, first.url, first.referer ?? referer, alts.slice(1))
   })
 
   // 3b) 嵌套播放器：播放页 JS 常把真实播放页塞进 iframe（如 baimao 的 #hm_playfram），
@@ -401,14 +447,13 @@ export function openRuleWebview(
     for (const src of srcs.slice(0, 3)) {
       if (!active) return
       log.append('info', 'rule-webview', `发现内嵌播放器 iframe: ${src.slice(0, 120)}`)
-      const inner = await extractStreamCandidates(src, referer || url)
+      const inner = await extractStreamCandidatesCached(src, referer || url)
       if (inner.length === 0) continue
-      const okInner = await resolveFirstPlayable(inner, referer)
-      if (okInner) {
-        reportFound(okInner.url, 'direct', okInner.referer ?? '')
-        rememberStream(url, okInner.url, okInner.referer ?? referer)
-        return
-      }
+      const alts = inner.slice(0, 6).map((u) => ({ url: u, referer: refererForCandidate(u, src) }))
+      for (const a of alts) offerHandoffCandidate(a)
+      reportFound(alts[0].url, 'direct', alts[0].referer ?? '')
+      rememberStream(url, alts[0].url, alts[0].referer ?? referer, alts.slice(1))
+      return
     }
   }
   /*

@@ -46,9 +46,18 @@ window_border_size=0
 # ── 进度条 / 时间显示 ─────────────────────────────────────────────────────────
 # line   = 细线样式（默认），与旧自绘控制栏那条细进度条观感一致
 timeline_style=line
-timeline_line_width=2
-# 进度条所在行的总高度（含鼠标交互热区；越大越好点）
-timeline_size=40
+# 「细化」进度条（用户要求：现在的太宽了）：
+#   timeline_line_width = **线的粗细**，2px 看着发胖，1px 就够；
+#   timeline_size = 整块热区高度，40 让那一条显得很厚，缩到 22 既细又好点
+#   （热区仍然远大于线宽，鼠标不用精确压线）。
+timeline_line_width=1
+timeline_size=22
+# 进度条与控制按钮之间的间距（px，正数 = 进度条往**下**靠、更贴近按钮；负数 = 往下贴到底边方向）。
+# 用户反馈"进度条离底部按钮太远"，这条就是给他随时微调的旋钮：
+# 改成 0 就等于"进度条贴着按钮顶边"，加上数值会往下压进按钮行一点点，视觉上更紧凑。
+# 0 = 进度条在控制栏上沿；正数继续往**下**压，压到按钮行里（用户要求"贴着按钮上面"）。
+# 20 ≈ 在实际缩放（1.25）下再下移 25px，正好落在按钮图标的上沿。
+timeline_controls_gap=20
 # 左右方向键的跳转步长（秒）；键盘绑定见 input.conf
 timeline_step=5
 # 进度条悬停缩略图（用户点名要）——由 thumbfast 生成、uosc 负责画。
@@ -65,8 +74,10 @@ progress_size=2
 # 其它可选值：playtime-remaining（预计播完时刻）、time-remaining、duration
 destination_time=total
 time_precision=0
-# 暂停时常显进度条（鼠标离开底部也不会缩回去，便于看清进度）
-timeline_persistency=paused
+# ⚠️ 用户要求"控制栏和进度条要一体"：两者都**不要**设 persistency，
+# 这样它们跟随同一套接近判定，一起出现、一起隐藏。
+# （之前 timeline_persistency=paused 会让进度条在暂停时常驻，而控制栏已经缩回去了 —— 正是用户看到的现象。）
+timeline_persistency=
 
 
 # ── 底部控制栏（按钮顺序 = 界面从左到右） ─────────────────────────────────────
@@ -82,16 +93,27 @@ timeline_persistency=paused
 #   gap                 弹性空隙（按比例分配）；space = 撑满剩余空间
 #
 # 用户点名的按钮必须在：退出、暂停/播放、上一集、下一集、弹幕、弹幕设置、画面比例、
-# 全屏/窗口、字幕、详情、播放状态、截图。v1.1.4 补上 sakana-status（播放状态菜单）；
+# 全屏/窗口、字幕、详情、播放状态、截图。
 # sakana-prev/next 由脚本始终保留（不可用时置灰，不隐藏）。
 #
-# 分组（v1.1.5，按用户逐条指定的位置排版）：
-#   左（底部栏左侧）：播放控制        上一集 · -10s · 播放/暂停 · +10s · 下一集
-#   右（底部栏右侧）：应用相关，按用户给的顺序
-#        选集 · 弹幕 · 倍速 · 弹幕设置 · 画面比例 · 全屏(窗口) · 字幕 · 画质
-#        外加「播放状态」（用户最早点名要的读数，放在这组最前）
-#   右上角（corner_controls）：番剧详情 · 截图 · 播放流详情
+# 分组（v1.1.6，按用户逐条指定的位置排版）：
+#   左（底部栏左侧）：播放控制
+#        上一集 · -10s · 播放/暂停 · +10s · 下一集 · 音量 · 倍速
+#        倍速放在左组末尾而不是右组首位：它和「跳 10 秒 / 音量」一样是播放过程中高频
+#        微调的东西，放左手边不用每次跨过大半个屏幕；右组则保持用户点名的七项顺序不变。
+#   右（底部栏右侧）：应用相关，严格按用户给的顺序
+#        选集 · 弹幕 · 弹幕设置 · 画面比例 · 全屏(窗口) · 字幕 · 画质
+#   中间：gap + space。
+#        为什么不是只写 gap：uosc 的 gap 是**固定比例**空隙（controls_size × 0.3 ≈ 12px），
+#        只写它，右组会紧贴在左组后面，根本到不了栏的右边；真正把右组顶到右边缘的是
+#        space（吃满剩余空间）。保留 gap 是为了窄窗口下 space 被压到 0 时，两组仍有一个最小间隔。
+#   右上角（corner_controls）：番剧详情 · 截图 · 播放状态
 #   左上角（corner_controls）：退出
+#
+# v1.1.6 用户要求：底部栏删掉「播放状态」（sakana-status）—— 右上角角标已经有同一个菜单，
+# 底部栏再放一份等于同一功能出现两次，还挤占右侧七项的空间。角标那份保持不变。
+# 音量按钮不再「点一下只会静音」：点击改为弹音量菜单（-10 / +10 / 静音 / 0-100 快捷档），
+# 菜单动作回到主进程执行，见 sakana-uosc-ctrl.lua 的 menu_volume。
 #
 # 角标为什么不用 uosc 的顶栏（top_bar）画：
 #    uosc 的 `controls` 只能画在底部一条；顶栏（`top_bar`）只支持标题与三个窗口按钮，
@@ -106,25 +128,30 @@ timeline_persistency=paused
 # 角标语法（CornerButtons.lua 的 parse_corner_controls；容错：写错只跳过、不报错退出）：
 #    top-left:按钮名;top-right:按钮名1,按钮名2        分号分隔角落，逗号分隔按钮
 #    按钮名就是 button:<名字> 里的 <名字>；写成 button:<名字> 也兼容。
-controls=button:sakana-prev,button:sakana-back10,play-pause,button:sakana-forward10,button:sakana-next,gap,button:sakana-episodes,button:sakana-status,button:sakana-danmaku,button:sakana-speed,button:sakana-danmaku-settings,button:sakana-aspect,button:sakana-fullscreen,button:sakana-subtitle,button:sakana-a4k
-# 角标按钮：左上=退出；右上=详情 · 截图 · 播放流详情（顺序按用户原话，flow 在最后）
-# 这四个已经从下面的 controls= 里移除，否则底部栏会出现第二份。
-corner_controls=top-left:sakana-exit;top-right:sakana-info,sakana-snapshot,sakana-flow
+controls=button:sakana-prev,button:sakana-back10,play-pause,button:sakana-forward10,button:sakana-next,button:sakana-volume,button:sakana-speed,gap,space,button:sakana-episodes,button:sakana-danmaku,button:sakana-danmaku-settings,button:sakana-aspect,button:sakana-fullscreen,button:sakana-subtitle,button:sakana-a4k
+# 角标按钮：左上=退出；右上=详情 · 截图 · 播放状态（顺序按用户原话）
+# 这三个已经从上面的 controls= 里移除，否则底部栏会出现第二份。
+# 用户要求：把「播放状态」放到原来「播放流详情」那个位置（右上角第三格），并**去掉播放流详情**。
+# v1.1.6：播放状态从底部栏整条移除，只留右上角这一份（见上面的分组说明）。
+# 右上三个：详情 · 截图 · 播放状态；左上：退出。
+corner_controls=top-left:sakana-exit;top-right:sakana-info,sakana-snapshot,sakana-status
 # 按钮直径 / 左右边距 / 按钮间距（px，会再乘 UI 缩放）
 # V1.1.4：32→34、间距 2→5、边距 8→10。原来太挤，17 个按钮几乎连成一条线，
 # 用户分不清"哪几个是一组"，这也是他要求调整排版的原因之一。
 # 角标按钮同样复用这三个值（见 elements/CornerButtons.lua），所以两边尺寸天然一致。
-controls_size=34
-controls_margin=10
-controls_spacing=5
-# 暂停时常显控制栏
-controls_persistency=paused
+controls_size=40
+controls_margin=14
+controls_spacing=8
+# 暂停时常显控制栏（用户要求与进度条一致：这里**也**留空，两者一起出现/隐藏）
+controls_persistency=
 
 
 # ── 音量滑杆 ─────────────────────────────────────────────────────────────────
 # right/left = 贴右/左边框的**竖排**滑杆（鼠标移到边缘才浮现，滚轮也能调）。
 # 旧自绘控制栏是横排滑杆；uosc 只提供竖排，行为等价（值是 mpv 的 volume 属性）。
-volume=right
+# 音量**不再用右侧竖排滑杆**（用户要求：音量单独做成底部栏按钮 sakana-volume）。
+# `volume=no` 关掉滑块；音量属性本身不变，滚轮/方向键调音量仍然有效。
+volume=no
 volume_size=40
 # 滚轮/方向键每档步长（百分比）
 volume_step=1

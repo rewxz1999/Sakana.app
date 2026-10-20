@@ -5,7 +5,7 @@ import type { OverlayAction, OverlayDanmaku, OverlayEpisodes, OverlayState } fro
 import type { CastDevice, CastReceiverInfo, PlayFlowSnapshot, SubjectDetail } from '@shared/types'
 import { api } from '@/lib/api'
 import { StreamInfoModal } from '@/components/StreamInfoModal'
-import { PlayFlowStages, flowHeadline } from '@/components/PlayFlowProgress'
+import { PlayFlowStages, flowHeadline, reasonLabel } from '@/components/PlayFlowProgress'
 import { CoverImage } from '@/components/CoverImage'
 import { DanmakuLayer } from '@/components/DanmakuLayer'
 
@@ -414,12 +414,64 @@ export default function PlayerOverlay(): React.ReactElement {
   const [flowLive, setFlowLive] = useState<PlayFlowSnapshot | null>(null)
   const flow = flowLive ?? state?.flow ?? null
   /**
+   * v1.5：**画面是否真的出来了**（与播放页、主进程同一条来源：内核首帧 width>0）。
+   *
+   * 本窗口要用它做三件事，全部是用户这次的三条反馈：
+   *   ① 没有画面 → 不画内置弹幕（下面 danmaku 分支的条件里）；
+   *   ② 没有画面 → 显示"加载中 / 加载失败"的明确提示（卡片在穿透层里）；
+   *   ③ 没有画面 → 控制栏不显示、也不能被鼠标呼出（见 poke）。
+   * 用 ref 是因为 poke 是稳定回调（useCallback([])），读不到最新闭包；
+   * 这个 ref 在每次渲染时同步，事件回调里读它永远是本帧的值。
+   */
+  const hasPictureRef = useRef(false)
+  hasPictureRef.current = state?.hasPicture === true
+  /** 这一帧是不是「还没有画面」（state 还没推到时也算：那时屏幕上确实什么都没有） */
+  const waitingForPicture = !!state && state.hasPicture !== true
+  /**
+   * 「没有画面」到底是**正在加载**还是**加载失败**（需求 ③ 要求两者可区分）。
+   *
+   * 失败的两个来源都看：
+   *   · `state.error`：播放页已经给出失败结论（视频错误 / 嗅探失败）；
+   *   · 主进程的过程进度 `flow`：某一阶段 failed/timeout，或整轮已结束但不是成功 ——
+   *     例如 15 秒没有首帧、只有音频没有视频，这些不会写成 videoError，
+   *     但 flow 里一定留着原因。只看其中一个都会漏。
+   */
+  const badStage = flow?.stages.find((s) => s.status === 'failed' || s.status === 'timeout')
+  const flowFailed = !!flow && !flow.running && (flow.reason !== 'none' || !!badStage)
+  const pictureFailed = waitingForPicture && (Boolean(state?.error) || flowFailed)
+  const pictureFailReason =
+    state?.error ?? badStage?.error ?? (flowFailed ? String(flow?.summary ?? '') : '')
+  /**
+   * 已等待秒数（需求 ③ 的"已等待秒数"）。
+   *
+   * 优先用主进程 `flow.startedAt`（本轮流程真实的开始时刻，包含找资源/取流/注入）；
+   * 没有正在跑的流程时退回本地观察到的起点 —— 两者都是**真实墙钟**，
+   * 不是按阶段编出来的假进度。1 秒一跳的 ticker 只在弹幕窗口、且只在等待时开。
+   */
+  const [observedAt, setObservedAt] = useState<number | null>(null)
+  const [nowMs, setNowMs] = useState<number>(() => Date.now())
+  useEffect(() => {
+    if (waitingForPicture) setObservedAt((prev) => prev ?? Date.now())
+    else setObservedAt(null)
+  }, [waitingForPicture])
+  const waitStart = flow?.running && flow.startedAt > 0 ? flow.startedAt : observedAt
+  const waitedSec = waitStart ? Math.max(0, Math.floor((nowMs - waitStart) / 1000)) : 0
+  /**
    * 本窗口的角色（v0.3.9 第三轮拆窗口）：主进程用 `#/overlay?part=ui|danmaku` 加载两块窗口，
    * 这里按 part 决定渲染哪一半 —— 弹幕窗口只画弹幕，UI 窗口画控制栏与所有面板。
    */
   const location = useLocation()
   const part: OverlayPart = new URLSearchParams(location.search).get('part') === 'danmaku' ? 'danmaku' : 'ui'
   const isDanmakuPart = part === 'danmaku'
+  /*
+   * 等待秒数的 1 秒 ticker：只在弹幕窗口、且只在「没有画面」期间开。
+   * 放这里（isDanmakuPart 已声明之后）而不是 state 那一段：依赖数组在渲染期就要读它。
+   */
+  useEffect(() => {
+    if (!isDanmakuPart || !waitingForPicture) return
+    const t = window.setInterval(() => setNowMs(Date.now()), 1000)
+    return () => window.clearInterval(t)
+  }, [isDanmakuPart, waitingForPicture])
   const [episodes, setEpisodes] = useState<OverlayEpisodes | null>(null)
   /** v0.2.8：弹幕数据与设置（由播放页推送，换集/改设置时更新） */
   const [danmaku, setDanmaku] = useState<OverlayDanmaku | null>(null)
@@ -1136,6 +1188,25 @@ export default function PlayerOverlay(): React.ReactElement {
 
   /** 唤出控制栏：显示 + 5 秒后自动隐藏（"接收鼠标"不再由这里决定，见 syncInteractive） */
   const poke = useCallback(() => {
+    /*
+     * ═══ v1.5 需求 ④：没有画面时控制栏不显示、也不能被鼠标呼出 ═══
+     *
+     * 这里拦的是**我们自己的**那一条唤出路径，两件事都做：
+     *   · `setVisible(false)`：应用自己的控制栏/浮层状态不允许是"显示中"；
+     *   · 不再调 `api.uosc.reveal()`：这是唯一由我们主动让 uosc 把控制栏闪出来的通道
+     *     （见下面 v0.3.3 的说明）。没有画面时把它掐掉，鼠标在边缘怎么划都不会冒出来。
+     *
+     * 为什么不改 uosc 的配置/元素：uosc 自己的 hover 行为是它内部实现，
+     * 用户明确要求不要动它；我们只改"什么时候允许我们这边的唤出"。
+     * 真正的硬门控在主进程：首帧前不把鼠标还给 mpv 的画面窗口（见 mpv.ts 的 ensureMpvInputWindow），
+     * 所以即使 uosc 自己有 hover 逻辑，它那时也收不到鼠标事件。
+     * 判据只用 hasPicture（同一条来源），不用 playing —— 黑屏时 playing 也是 true。
+     */
+    if (!hasPictureRef.current) {
+      window.clearTimeout(hideTimer.current)
+      setVisible(false)
+      return
+    }
     setVisible(true)
     /*
      * v0.3.3：uosc 模式下**主动让 mpv 把控制栏显示出来**。
@@ -1246,7 +1317,12 @@ export default function PlayerOverlay(): React.ReactElement {
   // 浮层打开时不要按 5 秒计时自动隐藏（否则面板还在屏幕上、窗口一起收了）
   useEffect(() => {
     holdRef.current = showInfo || showInfoPanel || state?.showEpisodes === true
-    if (holdRef.current) setVisible(true)
+    /*
+     * v1.5 需求 ④：没有画面时**即使面板开着也不显示控制栏**。
+     * 面板本身不读 `visible`（它们只看 showInfo/showEpisodes），所以这里只是不把
+     * "控制栏显示中"这个状态置起来 —— 关掉面板后自然还是隐藏态。
+     */
+    if (holdRef.current) setVisible(hasPictureRef.current)
     else poke()
     /*
      * 依赖只放"会打开应用自绘浮层"的那几个开关。
@@ -1256,6 +1332,18 @@ export default function PlayerOverlay(): React.ReactElement {
   }, [showInfo, showInfoPanel, state?.showEpisodes, poke])
 
   useEffect(() => api.overlay.onState(setState), [])
+
+  /**
+   * v1.5：画面一消失（换集 / 换源加载中）立刻把"控制栏显示中"收掉（需求 ④）。
+   *
+   * 不能等下一次鼠标移动：换集时用户往往不动鼠标，上一集的控制栏状态会一直挂着；
+   * 而这时屏幕上还是一片黑（旧帧），控制栏看起来就像"在没有画面时被呼出来了"。
+   */
+  useEffect(() => {
+    if (hasPictureRef.current) return
+    window.clearTimeout(hideTimer.current)
+    setVisible(false)
+  }, [state?.hasPicture])
 
   /*
    * 过程进度/速度：每秒拉一次纯内存快照（v1.1）。
@@ -1447,8 +1535,14 @@ export default function PlayerOverlay(): React.ReactElement {
            * （由 playerOverlay.ts 设一次，此后绝不切换）—— 于是"要不要吃鼠标"不再有运行期决策。
            * 为什么弹幕必须单独一块窗口：控制栏那块窗口用 setShape 限定可点区域，而 setShape 同时裁剪绘制，
            * 铺满画面中部的弹幕会被裁没。
+           *
+           * v1.5 需求 ②：**画面出来之前不渲染弹幕层**。
+           * 判据是 `state.hasPicture`（= 主进程 mpvHasPicture：内核首帧 width>0），不是 playing/time。
+           * 这是内置画布这条路；uosc_danmaku 插件那条路在渲染层管不到，
+           * 由主进程在首帧前拒绝注入（见 mpv.ts 的 mpvPushDanmakuFile），两条路因此同时被门控。
+           * 画面出现后这个条件自然成立，弹幕从当前时间继续（画布会按 time 重新定位，不会从头补画）。
            */}
-          {state && danmaku && danmaku.settings.enabled && danmaku.comments.length > 0 && !danmaku.pluginActive ? (
+          {state && state.hasPicture === true && danmaku && danmaku.settings.enabled && danmaku.comments.length > 0 && !danmaku.pluginActive ? (
             <DanmakuLayer
               comments={danmaku.comments}
               settings={danmaku.settings}
@@ -1456,6 +1550,11 @@ export default function PlayerOverlay(): React.ReactElement {
               playing={state.playing}
               rect={danmakuRect(state, visible)}
               scale={window.devicePixelRatio || 1}
+              /*
+               * 第二道门（v1.5）：即使将来有人把这个组件挂到别的分支上，
+               * 只要 active=false 就只清画布、不画任何一条弹幕。
+               */
+              active={state.hasPicture === true}
             />
           ) : null}
           {/*
@@ -1471,29 +1570,68 @@ export default function PlayerOverlay(): React.ReactElement {
             卡片照样看得见，画面中心的点击照样归 mpv。z 序上它在 UI 窗口之下（主窗口 → 弹幕 → UI），
             但 UI 窗口只有在控制栏/面板那几块矩形里才绘制，所以卡片不会被挡住。
             卡片本身是 `pointer-events-none`（纯提示），放在穿透层里语义完全一致。
+
+            ── v1.5 需求 ③：这张卡改由 `hasPicture` 驱动，并区分「正在加载 / 加载失败」──
+            过去它挂在 `!startedOnce`（= 还没 playing）上，而 playing 比首帧早得多：
+            内核一开始拉流这张卡就消失，于是"地址交出去、画面还没出来"的整段时间是**全黑空白** ——
+            这正是用户报的「播放器中没有画面时未显示加载进度」。
+            现在条件是 `!hasPicture`，并且卡片自己带三样真实数据：
+              · 已等待秒数（flow.startedAt 或本地观察起点，真实墙钟）；
+              · 三阶段进度（PlayFlowStages，里面含内核实时速率/已收字节）；
+              · 失败态（红色标题 + 原因），而不是继续显示"加载中"。
           */}
-          {state && !state.startedOnce && !state.error ? (
+          {waitingForPicture ? (
             <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center">
               <div className="flex max-w-lg flex-col items-center gap-2 rounded-2xl bg-black/70 px-5 py-4 text-xs text-white backdrop-blur">
                 <div className="flex items-center gap-2 whitespace-nowrap">
-                  <span className="h-2 w-2 animate-pulse rounded-full bg-amber-300" />
-                  {flow && flow.stages.some((s) => s.startedAt !== null) ? (
-                    // 进度已经在跑：标题直接说「现在在做什么」，不再叠一句「加载中」
-                    <span className="text-white/90">{flowHeadline(flow)}</span>
-                  ) : (
-                    <span className="text-white/90">加载中…</span>
-                  )}
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      pictureFailed ? 'bg-red-300' : 'animate-pulse bg-amber-300'
+                    }`}
+                  />
+                  <span className={pictureFailed ? 'text-red-200' : 'text-white/90'}>
+                    {pictureFailed
+                      ? '画面加载失败'
+                      : `正在加载画面… 已等待 ${waitedSec} 秒`}
+                  </span>
                 </div>
-                {/* 三阶段过程进度：全屏下这是唯一能看出「卡在哪一步」的地方 */}
-                <PlayFlowStages flow={flow} tone="onVideo" />
-                {flow?.reason === 'slow' ? (
-                  <div className="text-[11px] text-amber-300">
-                    资源获取速度过慢，仍在继续等待（有数据在动就不结束）
-                  </div>
-                ) : null}
-                {state.selfCheckNote ? (
-                  <div className="max-w-md text-center text-[10px] text-white/70">{state.selfCheckNote}</div>
-                ) : null}
+                {pictureFailed ? (
+                  /* 失败态：原因必须写出来（用户明确要求区分"正在加载"与"加载失败（带原因）"）。
+                     退出按钮在 UI 窗口的底部错误条里（那是可点窗口），这里只负责说清原因。 */
+                  <>
+                    <div className="max-w-md text-center text-[11px] leading-relaxed text-white/85">
+                      {pictureFailReason ||
+                        '内核已接收地址，但没有解出画面，也没有给出原因（可在「播放流详情」里看完整现场）'}
+                    </div>
+                    {flow?.reason && flow.reason !== 'none' ? (
+                      <div className="text-[10px] text-amber-200">
+                        <span className="rounded bg-amber-400/20 px-1">判定：{reasonLabel(flow.reason)}</span>
+                      </div>
+                    ) : null}
+                  </>
+                ) : (
+                  <>
+                    <span className="text-[11px] text-white/85">
+                      {flow && flow.stages.some((s) => s.startedAt !== null)
+                        ? // 进度已经在跑：标题直接说「现在在做什么」，不再叠一句「加载中」
+                          flowHeadline(flow)
+                        : state?.playing
+                          ? // 内核已经开始拉流（playing），但还没有首帧 —— 这正是用户报的"空白"那段
+                            '内核已开始拉流，正在等待首帧画面…'
+                          : '正在准备播放…'}
+                    </span>
+                    {/* 三阶段过程进度：全屏下这是唯一能看出「卡在哪一步」的地方（含已收字节/速率） */}
+                    <PlayFlowStages flow={flow} tone="onVideo" />
+                    {flow?.reason === 'slow' ? (
+                      <div className="text-[11px] text-amber-300">
+                        资源获取速度过慢，仍在继续等待（有数据在动就不结束）
+                      </div>
+                    ) : null}
+                    {state?.selfCheckNote ? (
+                      <div className="max-w-md text-center text-[10px] text-white/70">{state.selfCheckNote}</div>
+                    ) : null}
+                  </>
+                )}
               </div>
             </div>
           ) : null}
@@ -1786,9 +1924,12 @@ export default function PlayerOverlay(): React.ReactElement {
         v0.3.9 重写：用户要求「播放器还没有显示时…在播放器状态里加一个过程进度显示器」，
         并且「在播放内容没加载出来之前增加一个加载中」。
         条件从「capturing / loading」改成「本轮还没出过画面且没有错误」——
-        全屏/小窗下画面全是黑的，这一层是用户唯一的反馈来源；
-        而用 `startedOnce` 而不是 `!playing`，是为了不让「暂停」被误判成「加载中」。
+        全屏/小窗下画面全是黑的，这一层是用户唯一的反馈来源。
         flow 由播放页跟着那条既有的状态推送带下来（没有新增轮询）。
+
+        v1.5：加载卡本身（居中那张）已改由 `hasPicture` 判断，见上面 `isDanmakuPart` 分支里的说明；
+        这里剩下的是**可点击的失败条**（它要收鼠标，所以必须在 UI 窗口里），
+        以及下面那段"为什么不能把加载卡放回来"的教训。
 
         v0.3.9 补充（用户报「两重提示叠在一起」）：这张卡现在是**全应用唯一**的加载/进度提示。
         主窗口页面里那张同内容的居中层已经删掉（见 PlayerPage 里那段说明），

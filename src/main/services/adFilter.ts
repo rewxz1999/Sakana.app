@@ -142,6 +142,12 @@ async function fetchText(url: string, s: AdSession): Promise<string | null> {
     responseType: 'text',
     maxContentLength: 16 * 1024 * 1024,
     headers,
+    /*
+     * 绕过 S/A/B 队列（v1.2.1）：这个请求是**播放器正在同步等**的播放列表，
+     * 排在 A 级后面会让 mpv 迟迟拿不到清单 → 0 字节 → 被判「注入失败」。
+     * 见 net-priority 的 netBypass 说明。
+     */
+    netBypass: true,
     ...buildProxyAgents(getSettings().proxy)
   })
   return typeof res.data === 'string' ? res.data : null

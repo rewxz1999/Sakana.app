@@ -276,6 +276,54 @@ end
 
 options.scale_factor = math.floor(options.scale_factor)
 
+-- ── 给宿主（Sakana 的 Electron 主进程）的缩略图状态文件 ──
+-- 为什么需要：libmpv 内嵌在主进程里，thumbfast 的 mp.msg 日志不会进应用日志；
+-- 主进程只有靠这个文件才知道「这张图到底生成成功没有、失败原因是什么」。
+-- 失败时 uosc 仍会画预览框，而我们的主题背景是白色 —— 用户看到的就是一块白图，
+-- 没有这行状态，日志里完全看不出是“没生成”还是“生成了空帧”。
+-- 路径放在 config-dir/script-opts 下：mpvAttach 已保证该目录可写（thumbfast.conf 就写在这里）。
+local status_path = nil
+if not pre_0_30_0 then
+    local expanded = mp.command_native({"expand-path", "~~/script-opts/thumbfast-status.json"})
+    -- 只接受绝对路径：`config=no` 时 `~~` 会退化成相对路径，
+    -- 写到当前工作目录既找不到也污染安装目录。
+    if type(expanded) == "string" and
+        (expanded:match("^%a:[/\\]") or expanded:sub(1, 1) == "/" or expanded:sub(1, 2) == "\\\\") then
+        status_path = expanded
+    end
+end
+local last_status_json = ""
+local function report_status(ok, err, bytes, w, h)
+    if not status_path then return end
+    local data = {ok = ok, error = err, path = options.thumbnail .. ".bgra", bytes = bytes or 0}
+    if ok then
+        data.width, data.height = w, h
+    end
+    local json = mp.utils.format_json(data)
+    if not json or json == last_status_json then return end
+    last_status_json = json
+    local f = io.open(status_path, "w")
+    if f then
+        f:write(json)
+        f:close()
+    end
+end
+
+--[[
+V1.2.8 探针：脚本一加载就先写一次状态。
+
+为什么必须加：真机上（安装版 1.2.4/1.2.5/1.2.6）**日志里一行 thumbfast 都没有**，
+连 `thumbfast-status.json` 都没生成 —— 而自检证明 mpv.exe 完全可执行。
+这就分不清到底是
+  a) 这个脚本压根没加载（我们的 load-script 没生效）；
+  b) 加载了，但 uosc 从来没发 `thumb` 请求（握手失败）；
+  c) 请求了，但子进程失败（这条本来会写 status）。
+先写一条 `{stage="init"}`，跑一次就能把 a) 排除掉：
+文件存在 = 脚本加载成功；不存在 = 加载就失败了。
+]]
+report_status(false, "init：脚本已加载，等待 uosc 请求缩略图")
+
+
 local mpv_path = options.mpv_path
 local frontend_path
 
@@ -404,6 +452,10 @@ local function info(w, h)
     disabled = (w or 0) == 0 or (h or 0) == 0 or
         has_vid == 0 or
         (properties["demuxer-via-network"] and not options.network) or
+        -- 不可 seek 的源（直播、无索引的流）截不到任意时间点的帧：
+        -- 子进程的 `--start=<time>` 会一直等不到目标帧。与其让 uosc 画一块白底，
+        -- 不如直接告诉它 disabled。
+        properties["seekable"] == false or
         (albumart and not options.audio) or
         (image and not albumart) or
         force_disabled
@@ -434,6 +486,26 @@ local function remove_thumbnail_files()
 end
 
 local activity_timer
+
+--- 把父进程当前的请求头转成子进程的 `--http-header-fields` 参数。
+--
+-- 为什么必须带：子进程是独立 mpv（`--no-config`），不会继承宿主 libmpv 用
+-- `setProperty('http-header-fields', ...)` 设下的 Referer/Cookie/UA。
+-- 我们的源几乎都靠 Referer/Cookie 才能取到真正的视频流；不带时 CDN 返回
+-- 403/错误页，子进程一帧也解不出来 —— 进度条悬停就只剩 uosc 画的白色底框。
+--
+-- 为什么不是原样转发：这个选项是**字符串列表**，逗号是列表分隔符；
+-- BROWSER_UA 里的 "(KHTML, like Gecko)" 含逗号，不转义会被拆成两个头。
+-- 按 mpv 的规则把值里的反斜杠和逗号转义后再拼，读回来才是同一组头。
+local function http_header_fields_arg()
+    local headers = mp.get_property_native("http-header-fields")
+    if type(headers) ~= "table" or #headers == 0 then return nil end
+    local parts = {}
+    for i = 1, #headers do
+        parts[i] = tostring(headers[i]):gsub("\\", "\\\\"):gsub(",", "\\,")
+    end
+    return table.concat(parts, ",")
+end
 
 local function spawn(time)
     if disabled then return end
@@ -504,6 +576,11 @@ local function spawn(time)
         table.insert(args, "--scripts="..client_script_path)
     end
 
+    local header_fields = http_header_fields_arg()
+    if header_fields then
+        table.insert(args, "--http-header-fields="..header_fields)
+    end
+
     table.insert(args, "--")
     table.insert(args, path)
 
@@ -516,6 +593,21 @@ local function spawn(time)
                 spawned = false
                 spawn_waiting = false
                 options.tone_mapping = "no"
+                local reason = "spawn failed"
+                if success == true and result then
+                    reason = "mpv exit " .. tostring(result.status)
+                    if result.error_string and result.error_string ~= "" then
+                        -- 只是 "init"/"exec" 这类进程创建错误，不含播放地址（日志红线）。
+                        reason = reason .. " (" .. tostring(result.error_string) .. ")"
+                    end
+                end
+                report_status(false, reason)
+                -- 子进程确定起不来/一启动就失败：让 uosc 别再画预览框。
+                -- 我们的主题 background=ffffff，uosc 在 disabled=false 时画的框就是一块白图；
+                -- 原生 thumbfast 只在 ImPlay 分支里这样做，我们用的是自定义 mpv_path，
+                -- 不补这一下就会一直显示白块。
+                force_disabled = true
+                info(real_w or effective_w, real_h or effective_h)
                 mp.msg.error("mpv subprocess create failed")
                 if not spawn_working then -- notify users of required configuration
                     if options.mpv_path == "mpv" then
@@ -692,6 +784,7 @@ local function check_new_thumb()
     local w, h = real_res(effective_w, effective_h, finfo.size)
     if w then -- only accept valid thumbnails
         move_file(tmp, options.thumbnail..".bgra")
+        report_status(true, nil, finfo.size, w, h)
 
         real_w, real_h = w, h
         if real_w and (real_w ~= last_real_w or real_h ~= last_real_h) then
@@ -702,6 +795,13 @@ local function check_new_thumb()
             file_timer:kill()
         end
         return true
+    end
+
+    -- 只报“0 字节”——那是子进程写出了空文件（用户看到的白图就是它）；
+    -- 非 0 但尺寸对不上多半是 60Hz 轮询撞上还没写完的帧，下一帧会自己恢复，
+    -- 报出来只会刷日志。
+    if finfo.size == 0 then
+        report_status(false, "empty frame", 0)
     end
 
     return false
@@ -897,6 +997,10 @@ local function file_load()
     last_real_w, last_real_h = nil, nil
     last_tone_mapping = nil
     last_seek_time = nil
+    -- 上一集如果因为“子进程起不来/源不支持”被禁用，换一集必须重新给一次机会；
+    -- 同时让状态文件在新一集里至少再报一次（成功/失败都写一行）。
+    force_disabled = false
+    last_status_json = ""
     if info_timer then
         info_timer:kill()
         info_timer = nil
@@ -943,6 +1047,13 @@ mp.observe_property("path", "native", update_property)
 mp.observe_property("vid", "native", sync_changes)
 mp.observe_property("edition", "native", sync_changes)
 mp.observe_property("duration", "native", on_duration)
+-- seekable 有时要等 demuxer 读到索引才从 no 变 yes（网络流尤其明显）。
+-- info() 用它做 disabled 判据，所以每次变化都要重新发一次 thumbfast-info，
+-- 否则 uosc 会一直按“截不到帧”处理，永远不显示缩略图。
+mp.observe_property("seekable", "native", function(name, value)
+    properties[name] = value
+    info(real_w or effective_w, real_h or effective_h)
+end)
 
 mp.register_script_message("thumb", thumb)
 mp.register_script_message("clear", clear)

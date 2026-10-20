@@ -72,7 +72,12 @@ export const useSchedule = create<ScheduleState>((set, get) => ({
   load: async (force = false) => {
     if (get().loading) return
     set({ loading: true })
-    const r = await api.bangumi.calendar(force)
+    /*
+     * V1.2.3（用户要求）：**只有打开番剧表与手动刷新才联网**。
+     * 这里传 allowRefresh=true；其它地方（首页推荐、收藏等）调 `bangumi.calendar()` 不传，
+     * 主进程就只读缓存，不会为了它们白打一次 38 秒的 `/calendar`。
+     */
+    const r = await api.bangumi.calendar(force, { allowRefresh: true })
     if (r.ok) {
       get().applyCalendar(r.data)
       /*

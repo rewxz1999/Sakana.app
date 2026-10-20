@@ -55,7 +55,7 @@ const api: SakanaApi = {
     onSettingsChanged: (cb) => subscribe<[]>(CH.evSettings, cb)
   },
   bangumi: {
-    calendar: (force) => call(CH.bgmCalendar, force),
+    calendar: (force, opts) => call(CH.bgmCalendar, force, opts),
     onCalendar: (cb) => subscribe<[CalendarResult]>(CH.evBgmCalendar, cb),
     subject: (id, priority) => call(CH.bgmSubject, id, priority),
     // v1.1.4：详情页首屏（纯缓存）+ 评分板块（缓存优先、可后台刷新）
@@ -113,8 +113,18 @@ const api: SakanaApi = {
     // v0.2.7 附加：直链会话缓存 / 预取（进入播放与切集提速）
     cachedStream: (pageUrl) => call(CH.rulesCachedStream, pageUrl),
     rememberStream: (pageUrl, url, referer) => call(CH.rulesRememberStream, pageUrl, url, referer),
-    prefetchStream: (ruleId, entry, lineIndex, episodeIndex, episodeLink, vars) =>
-      call(CH.rulesPrefetchStream, ruleId, entry, lineIndex, episodeIndex, episodeLink, vars)
+    prefetchStream: (ruleId, entry, lineIndex, episodeIndex, episodeLink, vars, knownPageUrl, forCurrentEpisode) =>
+      call(
+        CH.rulesPrefetchStream,
+        ruleId,
+        entry,
+        lineIndex,
+        episodeIndex,
+        episodeLink,
+        vars,
+        knownPageUrl,
+        forCurrentEpisode
+      )
   },
   media: {
     listVideos: (folder) => call(CH.mediaListVideos, folder),

@@ -278,7 +278,10 @@ export function SettingsPage() {
     })
   }, [])
 
-  const mainSource = settings.dataSources?.main || settings.bangumiBase || 'https://bangumi.pro'
+  // 只显示类型，不显示地址：内置双反代地址与 PSK 不进入渲染层
+  const mainSource = settings.bangumiCustomApi
+    ? '自定义反代（地址已隐藏）'
+    : '内置双反代（地址已隐藏）'
   const mirrorCount = settings.dataSources?.mirrors?.length ?? settings.bangumiMirrors.length
 
   return (

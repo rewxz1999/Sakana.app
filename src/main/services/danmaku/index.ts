@@ -3,7 +3,9 @@ import { getSettings } from '../../net'
 import { listSources } from '../danmakuSources'
 import { bahamutFetcher } from './bahamut'
 import { danmuboxFetcher } from './danmubox'
+import { ezdmwFetcher } from './ezdmw'
 import { linkFetcher } from './link'
+import { tucaoFetcher } from './tucao'
 import type { DanmakuFetcher } from './types'
 
 /**
@@ -23,6 +25,8 @@ import type { DanmakuFetcher } from './types'
 const REGISTRY: Record<DanmakuFetcherId, DanmakuFetcher> = {
   bahamut: bahamutFetcher,
   danmubox: danmuboxFetcher,
+  tucao: tucaoFetcher,
+  ezdmw: ezdmwFetcher,
   link: linkFetcher
 }
 
@@ -55,6 +59,21 @@ export const DANMAKU_SOURCE_OPTIONS: { id: DanmakuFetcherId; name: string; desc:
     id: 'danmubox',
     name: danmuboxFetcher.name,
     desc: 'danmubox.github.io：按番剧名检索加密静态索引 → 下载 7z → 解出 B 站 XML。以 2019–2021 存档为主，新番基本搜不到。'
+  },
+  {
+    id: 'tucao',
+    name: tucaoFetcher.name,
+    desc:
+      'tucao.my：搜索 → 播放页数集 → 弹幕接口 index.php?m=mukio&c=index&a=init。' +
+      '该站对裸请求只给残缺页，必须走应用内浏览器会话（已内置），所以速度受站点本身影响（搜索 3~30 秒）。'
+  },
+  {
+    id: 'ezdmw',
+    name: ezdmwFetcher.name,
+    desc:
+      'ezdmw.org：搜索 → 番剧页数集 → 播放页里的弹幕 iframe（player.ezdmw.com/danmuku）→ ' +
+      '截获它自己发出的 getData.html 请求（含必要的 sign）→ 拿回标准 B 站 XML。' +
+      '因为要起一个隐藏窗口等播放器发请求，单集约 5~15 秒。'
   }
 ]
 

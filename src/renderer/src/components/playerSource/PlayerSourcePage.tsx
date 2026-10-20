@@ -52,7 +52,7 @@ import { classifySourceFailure, isVerifyWall, type SourceFailure } from './sourc
  * ## 与既有能力的边界（诉求 4）
  *
  * · 批量预嗅探（`ruleBatchProbe`）：原样搬过来（订阅 / 重探 / 关闭即停），命中数与原因仍挂在源条目上；
- * · 置顶顺序：由调用方 `sortRulesPinnedFirst()` 排好再传进来，这里不重排、不改名；
+ * · 顺序：由调用方按实测速度排好（`sortRulesBySpeed()`）再传进来，这里不重排、不改名；
  * · 人机验证：仍然走调用方的 `onNeedVerify`（同一个 `VerifyModal`），判据与主进程同源；
  * · 播放链路：**完全复用** `api.rules.play` + `/player` 的 navigate 参数（一个字段都没动），
  *   因此「点集数后换源换集自动重新投屏」等播放器内部逻辑不受影响。
@@ -64,7 +64,7 @@ const WIDE_MIN_PX = 960
 interface PlayerSourcePageProps {
   open: boolean
   onClose: () => void
-  /** 已启用且已按置顶顺序排好的规则（调用方负责过滤与排序） */
+  /** 已启用且已按实测速度排好的规则（调用方负责过滤与排序） */
   rules: PlayRule[]
   /** 用来搜索的关键词（番剧中文名优先，回落原名） */
   keyword: string
@@ -281,6 +281,15 @@ export function PlayerSourcePage({
     if (manualKw.trim() !== keyword.trim()) return null
     const p = probe[ruleId]
     if (!p || p.phase !== 'done' || !p.items) return null
+    /*
+     * 只有「预嗅探真的搜到了条目」才拿来做本地渲染（v1.2.1）。
+     *
+     * 上一版只要 phase=done 就用 p.items —— 包括空数组。于是探测失败/超时留下的
+     * 60s 负缓存会让用户点开源时**瞬间**看到"没有结果"，连一次真正的搜索都不发；
+     * 用户自然会认为"这条规则坏了/以前明明能搜到"。
+     * 现在空结果一律回到正常搜索：慢一点，但给的是站点此刻的真实回答。
+     */
+    if (p.ok === false || p.items.length === 0) return null
     return p.items
   }
 
@@ -443,7 +452,13 @@ export function PlayerSourcePage({
       toast.error(`无法解析这一集的播放地址：${res.error}`)
       return
     }
-    void api.rules.prefetchStream(activeRule.id, entry, groupIdx, epIdx, episodeLink, vars)
+    /*
+     * v1.3：把刚刚解析出来的播放页地址一起带过去，并声明「这一集马上要播」。
+     * 预取不再重跑一次 rulePlay（省一次主进度往返 + 一次重复解析），
+     * 并且主进程在 `rules.play` 返回时就已经开始抓播放页了 —— 与页面导航并行；
+     * 候选同时进交接队列，坏地址 5 秒零字节可换，不必重开嗅探。
+     */
+    void api.rules.prefetchStream(activeRule.id, entry, groupIdx, epIdx, episodeLink, vars, res.data.url, true)
     void api.danmaku.prefetch(title, epIdx + 1)
     onClose()
     navigate('/player', {
@@ -602,6 +617,18 @@ export function PlayerSourcePage({
     if (p.phase === 'search') return <Badge tone="neutral">搜索中…</Badge>
     if (p.phase === 'sniff') return <Badge tone="neutral">嗅探中…</Badge>
     if (p.count > 0) return <Badge tone="ok">命中 {p.count} 个资源</Badge>
+    /*
+     * 探测失败 ≠ 没有这部番（v1.2.1）。
+     *
+     * 上一版只有命中/未命中两档：搜索超时、站点 5xx、被验证墙挡住……全都显示成
+     * 「没有这部番」。用户看到的正是「以前能嗅探到的规则，过一段时间显示没有结果」。
+     * 现在先按 `ok=false` 分出「探测失败」这一档，具体原因仍写在下一行的 message 里；
+     * 只有站点**明确回了搜索结果但为空**（ok=true、hit=false）才说「没有这部番」。
+     */
+    if (p.ok === false) {
+      const timeout = /超时|未完成/.test(p.message ?? '')
+      return <Badge tone="warn">{timeout ? '探测未完成' : '探测失败'}</Badge>
+    }
     if (p.hit && p.episodes > 0) return <Badge tone="warn">有剧集·未抓到流</Badge>
     if (p.hit) return <Badge tone="neutral">有番剧·无剧集</Badge>
     return <Badge tone="neutral">没有这部番</Badge>
@@ -676,7 +703,14 @@ export function PlayerSourcePage({
          * 于是返回按钮在面板打开时**依然看得见、点得着**，不用先关面板再点第二次。
          * 面板本体跟着改成 `h-full`（父容器已经扣掉了这 104px），不会溢出屏幕。
          */
-        className="fixed inset-x-0 bottom-0 top-[104px] z-[65] flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm"
+        /*
+         * V1.4：**去掉黑玻璃罩**（用户反馈"每次打开选源-选集窗口，后面都有一层黑色透明玻璃"）。
+         *
+         * 原来这里是 `bg-black/55 backdrop-blur-sm` —— 一层压暗 + 模糊的背景。
+         * 但这个面板本身就是不透明的卡片（`bg-elev1` + 阴影），黑罩对可读性没帮助，
+         * 只会让"面板后面是什么"变得看不清。现在改成完全透明：只保留定位与点击关闭的语义。
+         */
+        className="fixed inset-x-0 bottom-0 top-[104px] z-[65] flex items-center justify-center bg-transparent p-4"
         data-ps-stage={stage}
         /*
          * 点浮层空白处 = 关闭（V1.1 补）。
@@ -815,9 +849,9 @@ export function PlayerSourcePage({
                     <div className="flex items-center justify-between gap-2">
                       <span className="min-w-0 text-[10px] leading-relaxed text-faint">
                         {probing
-                          ? `正在探测各线路有没有资源…（${probeDoneCount}/${rules.length}）`
+                          ? `正在探测各线路有没有资源…（${probeDoneCount}/${rules.length}，默认同时 3 条）`
                           : probeMeta.cached && probeMeta.probedAt
-                            ? `${new Date(probeMeta.probedAt).toLocaleTimeString()} 的探测结果（30 分钟内不重复探测）`
+                            ? `${new Date(probeMeta.probedAt).toLocaleTimeString()} 的探测结果（正结果常驻；失败结论只存 1 分钟）`
                             : '「命中 N 个资源」= 抓到 N 个候选视频地址；探测不播放'}
                       </span>
                       <button
