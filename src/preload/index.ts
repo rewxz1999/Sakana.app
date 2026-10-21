@@ -124,7 +124,10 @@ const api: SakanaApi = {
         vars,
         knownPageUrl,
         forCurrentEpisode
-      )
+      ),
+    // V2.0「点播放才取流」：一次调用拿直链（内部无头窗口，拿到就销毁并起本地缓存）
+    acquireStream: (playUrl, referer) => call(CH.rulesAcquireStream, playUrl, referer),
+    acquireCancel: () => call(CH.rulesAcquireCancel)
   },
   media: {
     listVideos: (folder) => call(CH.mediaListVideos, folder),

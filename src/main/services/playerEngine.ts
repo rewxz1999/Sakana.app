@@ -4,6 +4,8 @@ import { log } from '../log'
 import { failStageAndEnd, flowRunning } from './playFlow'
 import { proxyHlsUrl } from './adFilter'
 import { onTempMediaCacheFailure, pauseTempMediaCache, startTempMediaCache } from './mediaCache'
+// V2.0：把「直链缓存到本地」的进度喂给过程进度快照（加载卡显示 MB / 百分比 / 速率）
+import { watchCacheSession } from './cacheFlowMeter'
 import { planStreamBoost, stopAllBoost } from './streamBoost'
 import {
   mpvAddSubtitleFile,
@@ -288,6 +290,14 @@ export function enginePlay(path: string, referer?: string, cookies?: string): vo
   let playReferer = referer
   let playCookies = cookies
   if (cacheStart.ok) {
+    /*
+     * V2.0：开始采样落盘进度（加载卡上的「已缓存 x / y MB、百分比、KB/s」）。
+     *
+     * 为什么放在这里而不是渲染层：只有主进程知道会话 id；
+     * 而且同一条直链在 `playAcquire` 里可能已经起过缓存，这里拿到的是**同一个会话**
+     * （mediaCache 按 url+头复用），采样器对重复 id 是幂等的（不会把速率重置成 0）。
+     */
+    watchCacheSession(cacheStart.sessionId)
     playUrl = cacheStart.url
     // 上游需要的 Referer/Cookie 由本机缓存服务带：内核不必、也不该把 Cookie 发给本机端口
     playReferer = undefined

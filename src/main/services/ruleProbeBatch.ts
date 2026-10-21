@@ -16,28 +16,38 @@ import {
  * 播放源列表的「批量预嗅探」（v0.3.7，用户要求：
  * 「在选择播放源页就自动加载所有规则下是否嗅探到资源、嗅探到多少资源，并显示在规则条目上」）。
  *
- * ## 为什么不能直接用现有的两套嗅探
+ * ## V2.0 重写：批量嗅探只到「拿到播放页 URL」为止
  *
- * `ruleProbe`（离屏隐藏窗口）与 `ruleWebview`（屏幕外可见窗口）都是**严格单例**：
- * 两者开头都会先把自己上一次的窗口关掉（`stopRuleProbe()` / `closeRuleWebview()`），
- * 而且候选数组、超时器都是模块级变量。批量探测要同时跑好几条规则，
- * 用它们的结果就是「后一条规则把前一条的窗口拆了」，而且候选互相串台。
- * 所以这里另起一套：每个任务自己的窗口 + 自己的候选数组，
- * 只复用**判定与交互那部分**（`isStreamCandidate` / `extractStreamCandidates` /
- * `runAutoPlayClicks`）——那才是真正难写、也最不该出现两份的东西。
+ * 用户原话：「批量嗅探只到拿到播放页 URL 为止，不要每条规则都进『抓番剧视频资源』这一步 ——
+ * 这是应用变卡的根源；参考 kazumi：规则定位播放页 → 停。」
  *
- * ## 成本控制（为什么要分两阶段）
+ * 旧流程每条规则都要：搜索 → 选集 → `rules.play()` → **抓播放页 HTML 提候选** →
+ * 还提不到就**开一个 1280×720 的真实窗口**加载播放页、注入自动点击、等站点播放器自己发流（最多 15 秒）。
+ * 一次 19 条规则就是十几个真实窗口排着队开 —— Chromium 每开一个窗口就要起渲染进程、
+ * 跑站点脚本、拉广告与播放器资源，内存与网络队列一起被顶满，用户看到的就是「一进选源页就卡」。
  *
- * 一次完整嗅探要开窗口、加载播放页、等播放器自己请求流，一条规则十几秒。
- * 19 条规则全跑一遍会让「打开播放源列表」等上好几分钟。所以每条规则先走**便宜的两步**：
- *   ① 规则引擎的搜索 + 剧集（纯 HTTP，一两秒）——找不到这部番就直接结束，不必开窗口；
- *   ② 播放页 HTML 直出地址（MacCMS 系站点把真实地址写在页面里，一次 GET 就能拿到）。
- * 只有这两步都没结果，才开窗口去嗅探（贵的那一步）。实测大多数"能用"的规则在第①步就能给出结论。
+ * 现在每条规则只做**纯 HTTP 的三步**（搜索 / 选集 / 解析 `rules.play()`），拿到播放页地址就收工：
+ *   · `count` 恒为 0（不再假装批量阶段有候选流）；
+ *   · `playUrl` / `url` 都是那个播放页地址，`stage='play-page'`；
+ *   · 取流交给用户点选集后的 `rules.acquireStream`（无头窗口 + Hook，见 `playAcquire.ts`）。
+ * 因此**一次批量探测里一个 BrowserWindow 都不会创建**（本文件在收尾日志里如实打窗口数，
+ * 让"没有开窗"这件事可以从日志核对，而不是只靠读代码相信）。
+ *
+ * ## 兜底开关
+ *
+ * `SAKANA_PROBE_SNIFF=1` 时保留旧行为（HTML 直出 + 窗口嗅探），只用于两种情况：
+ * ① 某站点在无头取流里表现异常，需要对照旧路径排查；② 用户明确要求"就是想先知道有没有货"。
+ * 默认关闭 —— 它正是变卡的根源。开关只在**批量探测**里生效，播放时的取流不受影响。
+ *
+ * ## 为什么不再需要"快路/慢路"两阶段
+ *
+ * 旧注释里的两阶段是为了"贵的窗口嗅探尽量少开"。既然现在**完全不开窗口**，
+ * 那套分层就没有意义了：三步纯 HTTP 本身就是最便宜的一档。
  *
  * ## 与真实播放的关系
  *
- * 这里**只探测、不播放**，也不写直链缓存（缓存的语义是"用户真的播过这条流"）。
- * 探测结果只是给用户一个"这条线路有没有货"的参考，点哪条规则仍然走原来的完整流程。
+ * 这里**只定位、不取流**，也不写直链缓存（缓存的语义是"用户真的播过这条流"）。
+ * 探测结果只是给用户一个"这条线路能不能点"的参考，点哪条规则仍然走完整播放流程。
  */
 
 /**
@@ -67,12 +77,22 @@ function probeConcurrency(): number {
  * 「站点真挂了」时及时收手去开窗口嗅探。
  */
 const STEP_TIMEOUT_MS = 45_000
-/** 开窗口嗅探的最长等待（15s：点击脚本在 1.2/3/6s 各跑一次，至少留两轮机会） */
+/** 开窗口嗅探的最长等待（仅在 `SAKANA_PROBE_SNIFF=1` 兜底路径下使用） */
 const SNIFF_TIMEOUT_MS = 15_000
 /** 拿到第一个候选后再多等一会儿，把同一部剧的其它候选（多码率/多分片）也收进来 */
 const SNIFF_GRACE_MS = 2_500
 /** 整个任务的预算：到点后**逐条**给未完成的规则发结论并停止，不让界面永远停在「搜索中」 */
 const JOB_BUDGET_MS = 150_000
+
+/**
+ * 兜底开关：`SAKANA_PROBE_SNIFF=1` 才走旧的「HTML 直出 + 开窗口嗅探」。
+ *
+ * 为什么保留：站点行为差异很大，排查「到底是播放页没流，还是无头取流这条路走不通」时
+ * 需要一条能对照的旧路径。默认关闭是本次改造的核心 —— 它会为每条规则开一个真实窗口。
+ */
+function sniffFallbackEnabled(): boolean {
+  return String(process.env.SAKANA_PROBE_SNIFF ?? '').trim() === '1'
+}
 
 /* 默认三规则优先已移除：所有规则共用一个 3 并发池（见上面的 DEFAULT_CONCURRENCY） */
 
@@ -125,14 +145,15 @@ function cacheKeyOf(job: ActiveJob, ruleId: string): string {
 }
 
 /**
- * 「这条结果算不算正结果」——**唯一判据**：真的拿到了候选流。
+ * 「这条结果算不算正结果」——**唯一判据**：真的拿到了能播的东西。
  *
- * 只有「有番剧、有剧集、但抓不到流」和「没有这部番」都不算：
- * 前者对播放没有价值（点进去还是播不了），后者更是一次探测的失败态。
- * 两类都只进 60s 的负缓存，下次进列表会重新探。
+ * V2.0：定位到播放页（`playUrl`）就是正结果。
+ * 为什么：播放页地址是稳定的（站点换集只换集数参数），而"这一集能不能出流"要等用户真的点。
+ * 把"已定位播放页"判成负结果，会让用户每次进选源页都重新探一遍（3 步 HTTP 也不便宜），
+ * 更糟的是旧逻辑会把 `count===0` 显示成"有剧集·未抓到流"，看起来像线路坏了。
  */
 function hasStreamResult(u: BatchProbeUpdate): boolean {
-  return !!u.ok && ((u.count ?? 0) > 0 || !!u.url)
+  return !!u.ok && ((u.count ?? 0) > 0 || !!u.url || !!u.playUrl)
 }
 
 /** 读正缓存（命中即刷新 LRU 顺序：Map 的插入顺序就是"最近使用"顺序） */
@@ -222,6 +243,16 @@ export function probeCacheStats(): { size: number; capacity: number; negative: n
   }
 }
 
+/**
+ * 当前批次真实创建过的窗口数（没有批次时为 0）。
+ *
+ * 用处：这是"批量嗅探不开窗"的**可观测**读数 —— 自检脚本与设置页都能读到它，
+ * 不必去任务管理器数进程，也不必只相信日志里那一行。
+ */
+export function batchProbeWindowCount(): number {
+  return job?.windowsOpened ?? 0
+}
+
 export interface BatchProbeTarget {
   id: string
   name: string
@@ -237,6 +268,14 @@ interface ActiveJob {
   win: BrowserWindow
   cancelled: boolean
   budgetTimer: NodeJS.Timeout | null
+  /**
+   * 本批次**真的创建过几个 BrowserWindow**。
+   *
+   * 为什么要记：这次改造的核心承诺就是"批量嗅探不开窗"，而"没开窗"必须能从日志核对，
+   * 不能只让用户相信代码。默认路径恒为 0；只有 `SAKANA_PROBE_SNIFF=1` 兜底时才可能 >0，
+   * 那时日志里会明确写出来（否则用户会以为窗口嗅探还在偷偷跑）。
+   */
+  windowsOpened: number
 }
 
 let job: ActiveJob | null = null
@@ -270,6 +309,12 @@ function update(
     ruleId: target.id,
     ruleName: target.name,
     phase,
+    /*
+     * `stage` 的默认值按 phase 推：
+     * 还在搜索 = search；已经进到播放页嗅探（只有兜底路径会出现）= stream（它真的在取流）；
+     * 'done' 由调用方显式给（可能是 play-page / stream / 失败态）。
+     */
+    stage: phase === 'search' ? 'search' : phase === 'sniff' ? 'stream' : undefined,
     hit: false,
     episodes: 0,
     count: 0,
@@ -326,7 +371,7 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<StepResult<T>>
 }
 
 /**
- * 开一个窗口去嗅探某个播放页。
+ * 开一个窗口去嗅探某个播放页（**仅 `SAKANA_PROBE_SNIFF=1` 兜底路径**）。
  * 返回捕获到的候选地址（去重、保持发现顺序）；窗口一定会被销毁、监听一定会注销。
  */
 async function sniffWindow(
@@ -359,6 +404,8 @@ async function sniffWindow(
   } catch (err) {
     return { urls: [], error: `嗅探窗口创建失败：${String(err).slice(0, 80)}` }
   }
+  // 真的开出来了才记账：日志里的"本批次窗口数"要是真实开窗数，不是"打算开几个"
+  job.windowsOpened += 1
   // 广告弹窗：批量探测期间不需要任何新窗口，一律拒绝（否则会满屏弹广告窗）
   try {
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
@@ -530,7 +577,45 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
   }
   const play = playStep.value
 
-  // 快路：播放页 HTML 里直接写着真实地址（MacCMS 系站点）
+  /*
+   * ===== 默认路径（V2.0）：定位到播放页就收工 =====
+   *
+   * 这里**不再**抓播放页 HTML、更不开窗口。理由见文件头：
+   * 批量阶段的目标从"这条线路有没有货"改成"这条线路能不能点"，
+   * 而"能不能点"只需要播放页地址。真正的取流发生在用户点选集之后（无头窗口 + Hook），
+   * 一条规则只花这一次搜索/选集/解析播放页的 HTTP 成本。
+   *
+   * 为什么 count 明确写 0 而不是省略：界面与旧缓存都按这个字段判"抓到几个资源"，
+   * 省略会读到 undefined（旧代码的 `(u.count ?? 0)` 恰好没事，但新代码不该依赖这种巧合）。
+   * message 直接说明「播放时再取流」，用户点开条目就知道下一步会发生什么。
+   */
+  if (!sniffFallbackEnabled()) {
+    const payload = update(current, target, 'done', t0, {
+      hit: true,
+      episodes: episodeCount,
+      count: 0,
+      stage: 'play-page',
+      playUrl: play.url,
+      // url 仍然填播放页地址：既有的"最佳地址"字段在批量阶段现在只有一个语义
+      url: play.url,
+      ok: true,
+      ...base,
+      message: '已定位播放页，播放时再取流'
+    })
+    log.append(
+      'info',
+      'rule-batch',
+      `定位播放页「${target.name}」用时 ${payload.ms}ms（本批次窗口数 ${current.windowsOpened}）`
+    )
+    return
+  }
+
+  /*
+   * ===== 兜底路径：SAKANA_PROBE_SNIFF=1 =====
+   * 旧行为原样保留（HTML 直出 → 开窗口嗅探）。它会给每条规则开一个真实窗口，
+   * 所以只在排障时用；日志里会明确写出走的是兜底路径，避免与默认路径的结论混淆。
+   */
+  log.append('warn', 'rule-batch', `兜底路径（SAKANA_PROBE_SNIFF=1）：${target.name} 将开窗口嗅探`)
   const directStep = await withTimeout(extractStreamCandidates(play.url, target.baseUrl), STEP_TIMEOUT_MS)
   if (current.cancelled) return
   /*
@@ -556,15 +641,17 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
       hit: true,
       episodes: episodeCount,
       count: direct.length,
+      stage: 'stream',
+      playUrl: play.url,
       url: playable?.url ?? direct[0],
       ok: true,
       ...base,
-      message: `播放页直出 ${direct.length} 个候选`
+      message: `播放页直出 ${direct.length} 个候选（兜底路径）`
     })
     return
   }
 
-  // 慢路：开窗口嗅探
+  // 慢路：开窗口嗅探（仅兜底路径）
   update(current, target, 'sniff', t0, { hit: true, episodes: episodeCount, ...base })
   const sniffed = await sniffWindow(current, play.url, target.baseUrl)
   if (current.cancelled) return
@@ -572,12 +659,14 @@ async function probeRule(current: ActiveJob, target: BatchProbeTarget): Promise<
     hit: true,
     episodes: episodeCount,
     count: sniffed.urls.length,
-    url: sniffed.urls[0],
+    stage: sniffed.urls.length > 0 ? 'stream' : 'play-page',
+    playUrl: play.url,
+    url: sniffed.urls[0] ?? play.url,
     ok: true,
     ...base,
     message:
       sniffed.urls.length > 0
-        ? `嗅探到 ${sniffed.urls.length} 个候选`
+        ? `嗅探到 ${sniffed.urls.length} 个候选（兜底路径）`
         : sniffed.error ?? '播放页没有发出可识别的视频请求'
   })
 }
@@ -610,7 +699,8 @@ export function startBatchProbe(
     subjectId: req.subjectId,
     win,
     cancelled: false,
-    budgetTimer: null
+    budgetTimer: null,
+    windowsOpened: 0
   }
   /*
    * 先登记成「当前批次」再回放缓存：`send()` 只推当前批次的更新，
@@ -652,7 +742,7 @@ export function startBatchProbe(
       'rule-batch',
       `批量预嗅探全部命中缓存（正结果 ${cachedCount} 条、负结果 ${negativeCount} 条，最早探测于 ${
         latestAt ? new Date(latestAt).toLocaleTimeString() : '未知'
-      }）`
+      }）；本批次创建 0 个 BrowserWindow`
     )
     job = null
     return { jobId: `${id}-cached`, total: targets.length, cached: true, probedAt: latestAt || undefined }
@@ -669,7 +759,10 @@ export function startBatchProbe(
     'info',
     'rule-batch',
     `开始批量预嗅探「${req.keyword}」：${pending.length} 条规则，并发上限 ${concurrency}` +
-      `（当前在嗅探 0 个、排队 ${pending.length} 个）${req.force ? '（用户要求重新探测）' : ''}`
+      `（当前在嗅探 0 个、排队 ${pending.length} 个）${req.force ? '（用户要求重新探测）' : ''}` +
+      (sniffFallbackEnabled()
+        ? '｜⚠ 兜底路径 SAKANA_PROBE_SNIFF=1：会为每条规则开窗口'
+        : '｜只发 HTTP 请求、不创建 BrowserWindow（取流推迟到用户点选集）')
   )
 
   /** 已出结论的目标（预算到点时用来补发「未完成」，避免界面永远停在「搜索中」） */
@@ -738,10 +831,21 @@ export function startBatchProbe(
 
   void Promise.all(Array.from({ length: Math.min(concurrency, pending.length) }, worker)).then(() => {
     if (job !== current) return
+    /*
+     * 收尾必须**如实报窗口数**：
+     * 默认路径下它必须是 0 —— 这是"批量嗅探不再逐条取流"的可核对证据；
+     * 兜底路径下它会等于探到的规则条数，看到这个数字就知道自己开了开关。
+     *
+     * ⚠️ 口径：这里只数**播放页嗅探窗口**（本次改造删掉的那一步）。
+     * 搜索/选集在 HTTP 被站点拦截时仍可能走既有的网页兜底（`ruleSearchWebview`，
+     * 它只维护一个复用窗口），那条老路径不在本计数内，日志里也不能假装它不存在。
+     */
     log.append(
       'info',
       'rule-batch',
-      `批量预嗅探结束（${targets.length} 条规则，其中正结果缓存 ${cachedCount} 条、负结果短存 ${negativeCount} 条）`
+      `批量预嗅探结束（${targets.length} 条规则，其中正结果缓存 ${cachedCount} 条、负结果短存 ${negativeCount} 条）；` +
+        `本批次共创建 ${current.windowsOpened} 个播放页嗅探窗口，总耗时 ${Date.now() - jobStart}ms` +
+        '（搜索/选集若触发网页兜底会另开 1 个复用窗口，不在本计数内）'
     )
     stopBatchProbe()
   })

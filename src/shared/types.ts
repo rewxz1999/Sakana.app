@@ -662,6 +662,29 @@ export interface PlayFlowMetrics {
   source?: 'probe' | 'engine'
 }
 
+/**
+ * 「直链先缓存到本地」的实时进度（V2.0 重写「规则 → 播放」流程）。
+ *
+ * 为什么单独一块、而不是复用 `PlayFlowMetrics`：
+ * 那一块描述的是**网络取流**（可达性探测 / 内核 `cache-speed`），
+ * 这一块描述的是**本地落盘**（mediaCache 把上游字节写进 <缓存根>/tmp-media）。
+ * 两者同时存在、含义不同：取流阶段的 KB/s 是"访问播放页时页面自己发出的流量"，
+ * 缓存阶段的 MB / 百分比是"已经落到磁盘、播放器马上就能读到的量"。
+ * 混在一个对象里，界面上就会出现「已缓存 30MB，但速率还是访问播放页时的 12KB/s」这种自相矛盾的读数。
+ */
+export interface PlayFlowCacheProgress {
+  /** 已可靠落盘的字节数 */
+  received: number
+  /** 上游声明的总字节数；chunked / 未知时为 null */
+  total: number | null
+  /** 落盘速率（字节/秒，按两次采样差算，不是上游声明的码率） */
+  rateBps: number
+  /** 百分比（0~100）；总长未知时为 null（界面显示"总长未知"，不许编一个百分比） */
+  percent: number | null
+  /** mediaCache 的会话状态：opening / streaming / done / failed / paused */
+  state: string
+}
+
 export interface PlayFlowSnapshot {
   /** 每开一轮新流程 +1：渲染层据此识别「换了一集/换了一条线」，而不是同一轮的抖动 */
   id: number
@@ -674,6 +697,13 @@ export interface PlayFlowSnapshot {
   /** 当前正在进行（或失败）的阶段 key，界面高亮用 */
   activeStage: PlayFlowStageKey | null
   metrics: PlayFlowMetrics
+  /**
+   * 「直链缓存到本地」的进度；没有启动本地缓存（HLS / 已关闭 / 直连）时为 null。
+   *
+   * 放在快照里而不是单开一条事件通道：播放状态详情与播放器加载卡本来就每秒读一次这个快照
+   * （`api.player.flow()` 是纯内存读），缓存进度因此不需要新的轮询或推送。
+   */
+  cache?: PlayFlowCacheProgress | null
   /** 一句话结论：正在做什么 / 卡在哪一步 / 为什么失败 */
   summary: string
   reason: PlayFlowReason
@@ -2918,14 +2948,33 @@ export interface BatchProbeUpdate {
   ruleName: string
   /** search=正在搜番剧 / sniff=已进播放页正在嗅探 / done=这条规则出结果了 */
   phase: 'search' | 'sniff' | 'done'
+  /**
+   * 更细的阶段（V2.0 重写「规则 → 播放」流程）。
+   *
+   * 为什么在 `phase` 之外还要一个：
+   *   · `phase` 是**批量任务自己的生命周期**（还在搜 / 已出结论），界面靠它判断"要不要继续转圈"；
+   *   · `stage` 是**这条规则走到流程的哪一步**（搜到条目 / 定位到播放页 / 已取到流），
+   *     界面靠它区分「已定位播放页，播放时再取流」与「真的抓到流」。
+   * 批量探测现在**只到 play-page 为止**（不再逐条开窗口取流），所以绝大多数条目会是 play-page。
+   */
+  stage?: 'search' | 'play-page' | 'stream'
   /** 这条规则里有没有这部番剧 */
   hit: boolean
   /** 解析到的总集数（0 = 没解析到剧集） */
   episodes: number
-  /** 嗅探到的候选流数量（用户要的"嗅探到多少资源"） */
+  /** 嗅探到的候选流数量（V2.0 起批量探测不再取流，正常为 0；只有兜底开关打开时才可能非 0） */
   count: number
   /** 最佳候选地址：只用于日志与内部判断，界面不展示完整地址 */
   url?: string
+  /**
+   * 这条规则定位到的**播放页地址**（V2.0 核心字段）。
+   *
+   * 为什么必须有它：批量探测的产出从"候选流"变成了"播放页"。
+   * 用户点选集时拿这个地址直接开无头窗口取流（`rules.acquireStream`），
+   * 不必在批量阶段就把每条规则的播放页都跑一遍 —— 那正是应用变卡的根源。
+   * 有 `playUrl` 就说明这条线路"能点、能播"，界面不能再按 `count===0` 判成没资源。
+   */
+  playUrl?: string
   ok: boolean
   /** 给用户看的一句话说明（中文，直接显示在规则条目上） */
   message?: string

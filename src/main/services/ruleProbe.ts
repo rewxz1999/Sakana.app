@@ -13,7 +13,8 @@ import {
   upgradeSameSite,
   withNetRetry
 } from './rules'
-import { beginStage, flowDetail, pushStep, succeedStage } from './playFlow'
+import { beginStage, flowDetail, pushStep, setMetrics, succeedStage } from './playFlow'
+import { PROBE_HOOK_MARK, PROBE_HOOK_SOURCE } from './probeHookSource'
 import { offerHandoffCandidate } from './playHandoff'
 
 /**
@@ -825,10 +826,106 @@ export function runAutoPlayClicks(win: BrowserWindow | null): void {
 }
 
 
+/**
+ * 提前注入的「取流 Hook」（V2.0 提速 ①）。
+ *
+ * ## 为什么这一步能明显提速
+ *
+ * 站点播放器取流有两条路：
+ *   · `XMLHttpRequest`（大量老播放器 / MacCMS 系） —— webRequest 能看到 URL，但看不到"这一条是播放器发的"；
+ *   · `fetch` + `ReadableStream`（现代播放器 / MSE） —— URL 经常不带扩展名，webRequest 只能靠 CDP 猜。
+ * 过去的做法是等页面自己跑起来、再用 webRequest / CDP 事后观察；现在把
+ * `XMLHttpRequest.prototype.open/send` 与 `window.fetch` 在**页面脚本之前**就包一层，
+ * 请求一发出就把绝对地址上报（console-message 回传），不必等 CDP 的
+ * `Network.responseReceived → getResponseBody` 整条链路（后者要等响应体落地）。
+ *
+ * ## 为什么用 CDP 的 `Page.addScriptToEvaluateOnNewDocument` 而不是 executeJavaScript
+ *
+ * `webContents.executeJavaScript` 在页面脚本开始执行之后才落地，而播放器可能在这之前
+ * 就发起了第一个请求（尤其 SPA 直接 hydrate 的站点）；`did-finish-load` 更晚。
+ * `Page.addScriptToEvaluateOnNewDocument` 是浏览器保证「每个新文档、任何页面脚本之前」执行，
+ * 与 contextIsolation 也不冲突（它在主世界执行，正是我们要包的那一层）。
+ *
+ * ## 与 webRequest 的关系：双保险，不是替代
+ *
+ * Hook 只上报**看起来像媒体**的地址（扩展名 / playlist 路径 / 签名图片扩展名），
+ * 真正的判定仍在主进程（`isStreamCandidate` / `verifiedByContent`）。
+ * webRequest 与 CDP 两条老路一条都不删：Hook 漏掉的（例如 Service Worker 代理、
+ * WebSocket 推流）由它们兜底，反之 Hook 能比它们更早拿到地址。
+ */
+/*
+ * Hook 的源码与上报前缀都放在 `probeHookSource.ts`（纯字符串、无 electron 依赖），
+ * 这里只引用 —— 这样它可以在 Node 里用 vm 直接跑一遍验证"两条都劫持了"，
+ * 也避免同一段注入脚本在仓库里出现两份。
+ */
+const HOOK_MARK = PROBE_HOOK_MARK
+const EARLY_HOOK_SOURCE = PROBE_HOOK_SOURCE
+
+/* ─────────────────────────────────────────────────────────────
+ * 访问播放页期间的网络流量采样（V2.0 / 加载界面上的 KB/s）
+ *
+ * 数据来源是 CDP 的 `Network.loadingFinished.encodedDataLength`：
+ * 它是**真的从网络上收到的字节**（含压缩后大小），不是我们估的。
+ * 用途只有一个：用户在「识别视频流」这段等待里能看到"页面确实在动、有多快"，
+ * 而不是盯着一个转圈。它不参与任何成功/失败判定（判定仍看有没有候选）。
+ * ───────────────────────────────────────────────────────────── */
+let netTimer: NodeJS.Timeout | null = null
+let probeNetBytes = 0
+let netLastBytes = 0
+let netLastAt = 0
+
+function stopNetMeter(): void {
+  if (netTimer) clearInterval(netTimer)
+  netTimer = null
+}
+
+function startNetMeter(): void {
+  stopNetMeter()
+  probeNetBytes = 0
+  netLastBytes = 0
+  netLastAt = Date.now()
+  netTimer = setInterval(() => {
+    if (!probeActive) {
+      stopNetMeter()
+      return
+    }
+    const now = Date.now()
+    const dt = Math.max(0.2, (now - netLastAt) / 1000)
+    const rate = Math.max(0, (probeNetBytes - netLastBytes) / dt)
+    netLastBytes = probeNetBytes
+    netLastAt = now
+    setMetrics({ bytes: Math.round(probeNetBytes), rateBps: Math.round(rate), source: 'probe' })
+    if (probeNetBytes > 0) {
+      flowDetail(
+        STAGE,
+        `正在识别视频流（XHR + fetch Hook）… 访问播放页已收 ${Math.round(probeNetBytes / 1024)} KB，` +
+          `${Math.round(rate / 1024)} KB/s`
+      )
+    }
+  }, 500)
+  // 纯展示用的采样器不该拖住进程退出
+  netTimer.unref?.()
+}
+
 /** 自检钩子：主进程内直接观察嗅探事件（SAKANA_ONLINE_TEST 使用） */
 let probeHook: ((payload: Record<string, unknown>) => void) | null = null
 export function setProbeHook(cb: ((payload: Record<string, unknown>) => void) | null): void {
   probeHook = cb
+}
+
+/**
+ * 进程内的事件订阅（V2.0「点播放才取流」用）。
+ *
+ * 为什么不能只靠 `setProbeHook`：那是给自检用的**单例**钩子，谁后设置谁生效。
+ * 而 `playAcquire` 需要和自检并存地观察 "found / done" 这两个事件，
+ * 所以这里改成一组订阅者，与 `probeHook` 并行通知（互不覆盖）。
+ */
+const probeEventListeners = new Set<(payload: Record<string, unknown>) => void>()
+export function onProbeEvent(cb: (payload: Record<string, unknown>) => void): () => void {
+  probeEventListeners.add(cb)
+  return () => {
+    probeEventListeners.delete(cb)
+  }
 }
 
 /** 供 ruleWebview 等其它嗅探实现复用同一个自检钩子 */
@@ -850,6 +947,13 @@ function emit(win: BrowserWindow | null | undefined, payload: Record<string, unk
     probeHook?.(payload)
   } catch {
     /* ignore */
+  }
+  for (const cb of [...probeEventListeners]) {
+    try {
+      cb(payload)
+    } catch {
+      /* 单个订阅者的异常不能影响嗅探本身 */
+    }
   }
   if (process.env.SAKANA_PROBE_TEST) {
     console.log(`[rule-probe] emit: ${JSON.stringify(payload).slice(0, 160)}`)
@@ -913,13 +1017,22 @@ function pickBest(urls: string[], adClips?: Set<string>): string | null {
   return pool.find((u) => /\.(mp4|flv)(\?|$)/i.test(u)) ?? pool[0] ?? null
 }
 
-export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: string): boolean {
+/**
+ * 启动播放页嗅探（无头窗口）。
+ *
+ * V2.0：`mainWin` 允许为 null —— 「点播放才取流」由主进程的 `playAcquire` 驱动时，
+ * 事件只发给进程内订阅者（`onProbeEvent`），不需要再往渲染层推一份，
+ * 否则播放页自己的 onFound 和 acquire 会同时接手同一条流（重复 loadfile）。
+ */
+export function startRuleProbe(mainWin: BrowserWindow | null, url: string, referer?: string): boolean {
   stopRuleProbe()
   foundUrls = []
   doneSent = false
   probeActive = true
-  beginStage(STAGE, '正在打开嗅探窗口（规则站点的隐藏网页）')
+  // 阶段文案按用户要的三步写：打开播放页 → 识别视频流 → 缓存到本地（缓存由 playAcquire 接着写）
+  beginStage(STAGE, '正在打开播放页（无头窗口，Hook 已提前注入）')
   pushStep(STAGE, `开始嗅探播放页：${url.slice(0, 90)}`)
+  startNetMeter()
   // 使用默认会话（自定义分区会话会导致页面加载 ERR_FAILED；probeActive 标志防止误报）
   const ses = session.defaultSession
   try {
@@ -963,6 +1076,34 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
    * 若直到超时都只有疑似候选，收尾时仍会把它交出去（有广告看总比什么都放不出来强），
    * 日志里会写明"只抓到疑似广告短片"，用户与我们都还能看出发生了什么。
    */
+  /*
+   * 加载诊断（V2.1）：把"窗口有没有真的把播放页加载起来"变成可看的事实。
+   *
+   * 之前取流 60 秒超时，日志里只有 `Hook 提前注入失败: No target available` ——
+   * 三种可能（窗口没导航 / 导航失败 / 加载了但没有请求）在日志里长得一模一样，无法定位。
+   * 现在打三条：开始加载（只记 host）、加载完成、加载失败（错误码+描述）。
+   */
+  try {
+    const hostOf = (u: string): string => {
+      try {
+        return new URL(u).host
+      } catch {
+        return '（无法解析的地址）'
+      }
+    }
+    probeWin.webContents.on('did-start-loading', () => {
+      log.append('info', 'rule-probe', `嗅探窗口开始加载：${hostOf(url)}`)
+    })
+    probeWin.webContents.on('did-finish-load', () => {
+      log.append('info', 'rule-probe', `嗅探窗口加载完成：${hostOf(probeWin?.webContents.getURL() ?? url)}`)
+    })
+    probeWin.webContents.on('did-fail-load', (_e, code, desc) => {
+      log.append('warn', 'rule-probe', `嗅探窗口加载失败（${code} ${desc}）：${hostOf(url)}`)
+    })
+  } catch {
+    /* 诊断事件注册失败不影响嗅探 */
+  }
+
   const AD_CLIP_MAX_BYTES = 4 * 1024 * 1024
   const AD_CLIP_MAX_SECONDS = 90
   const adClipUrls = new Set<string>()
@@ -1010,6 +1151,12 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
    *   普通站点（URL 里没有这些词）一次额外请求都不会发，没有任何延迟代价。
    */
   const deliverCandidate = (u: string, channel: string): void => {
+    /*
+     * 已经拿到候选：停止"访问播放页"的流量采样。
+     * 再采下去就会和内核自己的速率采样（source='engine'）互相覆盖，
+     * 加载卡上的速度就会在两个不同含义的数字之间跳。
+     */
+    stopNetMeter()
     log.append('info', 'rule-probe', `捕获媒体流: ${u.slice(0, 120)}`)
     pushStep(STAGE, `捕获媒体流（${channel}）：${u.slice(0, 70)}`)
     flowDetail(STAGE, `已捕获 ${foundUrls.length} 个候选，已直接交给播放器（1 字节未到时才换下一个）`)
@@ -1101,6 +1248,37 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
   if (disposeListeners) disposeListeners()
   disposeListeners = addProbeListeners({ onBeforeRequest, onCompleted })
 
+  /*
+   * Hook 上报通道（V2.0）：页面里的 XHR/fetch 包装器用 `console.log('SAKANA_HOOK:<url>')` 回传。
+   *
+   * 为什么走 console-message 而不是再开一条 IPC：嗅探窗口里没有 preload、也不该有
+   * （站点页面 + node 权限是明确的红线），而 `console-message` 是主进程**无需给页面任何权限**
+   * 就能拿到的通道。日志里有噪音的代价是可控的：Hook 只上报"像媒体"的地址。
+   */
+  const onConsoleMessage = (details: Electron.WebContentsConsoleMessageEventParams): void => {
+    if (!probeActive) return
+    const text = String(details?.message ?? '')
+    if (!text.startsWith(HOOK_MARK)) return
+    const u = text.slice(HOOK_MARK.length).trim()
+    if (!u || !isStreamCandidate(u) || foundUrls.includes(u)) return
+    if (hasMediaExtensionInPath(u)) {
+      captureCandidate(u, 'hook:XHR/fetch')
+      return
+    }
+    // 路径里没有媒体扩展名 → 可能是伪装的播放列表，交给内容判定（不可疑就不收）
+    if (looksLikeDisguisedPlaylist(u)) {
+      void verifyM3u8ByContent(u).then((kind) => {
+        if (!probeActive) return
+        if (kind) captureCandidate(u, kind === 'm3u8' ? 'hook:m3u8(伪装)' : 'hook:dash(伪装)')
+      })
+    }
+  }
+  try {
+    probeWin.webContents.on('console-message', onConsoleMessage)
+  } catch {
+    /* 老版本签名差异不影响其它嗅探通道 */
+  }
+
   // 先尝试直接从播放页 HTML 提取真实地址（MacCMS 等）：**首个候选立即交给播放器**，窗口仅作兜底
   void extractStreamCandidatesCached(url, referer).then((candidates) => {
     if (!probeActive || candidates.length === 0) return
@@ -1143,13 +1321,94 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
   const cdpCandidates = new Map<string, string>()
   const dbg = probeWin.webContents.debugger
   let cdpReady: Promise<void> = Promise.resolve()
+  /** CDP bootstrap 只做一次（did-start-loading 与兜底定时器可能都想触发） */
+  let cdpBootstrapped = false
   try {
-    dbg.attach('1.3')
-    // 必须先完成 Network.enable 再加载页面，否则页面首批请求（播放器 API）不会被记录
-    cdpReady = dbg
-      .sendCommand('Network.enable')
-      .then(() => undefined)
-      .catch(() => undefined)
+    /*
+     * ★ V2.1 关键修正：**先导航、再 attach CDP** ★
+     *
+     * 真机症状：窗口刚创建就 `dbg.attach()` + `Page.enable` → `No target available`；
+     * 于是 Hook 注入失败、退化成"只有 webRequest"，而页面加载又被我们排在
+     * `cdpReady.then(loadURL)` 里 —— 整条链变成「等一个永远不来的事件」，60 秒超时。
+     * 正确顺序是：窗口先开始导航（Chromium 立刻有了 page target）→ 再 attach →
+     * 注入 Hook → **重载一次**，让重载出的文档从头带 Hook。
+     */
+    let hookReloaded = false
+    const attachWithRetry = async (): Promise<boolean> => {
+      for (let i = 0; i < 25; i++) {
+        try {
+          if (!dbg.isAttached()) dbg.attach('1.3')
+          return true
+        } catch {
+          await new Promise((r) => setTimeout(r, 120))
+        }
+      }
+      return false
+    }
+    // 先完成 Network.enable 再加载页面，否则页面首批请求（播放器 API）不会被记录
+    cdpReady = (async (): Promise<void> => {
+      const attached = await attachWithRetry()
+      if (!attached) {
+        log.append('warn', 'rule-probe', 'CDP 附加失败（无 page target），只用 webRequest 嗅探')
+        return
+      }
+      try {
+        await dbg.sendCommand('Network.enable')
+      } catch {
+        /* 没有 Network 域就只能靠 webRequest 与 HTML 直出 */
+      }
+      /*
+       * 提前注入 Hook（V2.0 提速 ①，见 EARLY_HOOK_SOURCE 的说明）。
+       *
+       * 必须在 `loadURL` **之前**完成：`Page.addScriptToEvaluateOnNewDocument`
+       * 只对之后创建的文档生效，晚一步就只能等下一集了。
+       *
+       * ⚠️ 真机踩到的坑：`dbg.attach()` 之后立刻 `sendCommand` 会偶发
+       *   `Error: No target available`
+       * —— 调试目标还没就绪（尤其是刚创建、还没导航过的窗口）。
+       * 这时如果直接放弃，就退化成一个"只有 webRequest"的慢路径（实测某站点 60 秒抓不到流）。
+       * 所以这里**带退避重试**：最多 8 次、每次 80ms，通常第 1~2 次就成功。
+       */
+      const sendWithRetry = async (method: string, params?: Record<string, unknown>): Promise<void> => {
+        let lastErr: unknown = null
+        for (let i = 0; i < 8; i++) {
+          try {
+            await dbg.sendCommand(method, params)
+            return
+          } catch (err) {
+            lastErr = err
+            const msg = String((err as Error)?.message ?? err)
+            // 只有"目标还没就绪"值得等；其它错误（协议不支持等）立刻放弃
+            if (!/No target available|Target closed|not attached/i.test(msg)) throw err
+            await new Promise((r) => setTimeout(r, 80))
+          }
+        }
+        throw lastErr ?? new Error('CDP 不可用')
+      }
+      try {
+        await sendWithRetry('Page.enable')
+        await sendWithRetry('Page.addScriptToEvaluateOnNewDocument', { source: EARLY_HOOK_SOURCE })
+        log.append('info', 'rule-probe', '已在页面脚本之前注入 XHR + fetch Hook（提前注入完成）')
+        pushStep(STAGE, 'Hook 已提前注入（XHR + fetch 同时劫持）')
+        /*
+         * 注入发生在"窗口已经开始导航"之后（见上面的顺序修正），所以当前这个文档
+         * 是不带 Hook 的。**重载一次**，让新文档从第一个脚本起就带 Hook。
+         * 只做一次（`hookReloaded`），避免无限重载。
+         */
+        if (!hookReloaded) {
+          hookReloaded = true
+          setTimeout(() => {
+            const w = probeWin
+            if (!probeActive || !w || w.isDestroyed()) return
+            log.append('info', 'rule-probe', '为让 Hook 生效，重载播放页一次')
+            w.webContents.reload()
+          }, 50)
+        }
+      } catch (err) {
+        log.append('warn', 'rule-probe', `Hook 注入失败（仅用 webRequest 嗅探）: ${String((err as Error)?.message ?? err).slice(0, 100)}`)
+        pushStep(STAGE, 'Hook 注入失败，仅用 webRequest 嗅探')
+      }
+    })()
     const emitFound = (u: string, kind: string): void => {
       if (foundUrls.includes(u)) return
       foundUrls.push(u)
@@ -1187,7 +1446,14 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
             if (p.requestId) cdpCandidates.set(p.requestId, url)
           }
         } else if (method === 'Network.loadingFinished') {
-          const p = params as { requestId?: string }
+          const p = params as { requestId?: string; encodedDataLength?: number }
+          /*
+           * 流量采样（V2.0）：`encodedDataLength` 是这条请求**真的从网络上收到的字节**
+           * （压缩后大小）。累加它就能给加载界面一个诚实的 KB/s ——
+           * 不用猜码率、也不用等内核开始拉流。它只用于显示，不参与任何判定。
+           */
+          const encoded = Number(p.encodedDataLength ?? 0)
+          if (Number.isFinite(encoded) && encoded > 0) probeNetBytes += encoded
           const id = p.requestId
           if (!id) return
           const url = cdpCandidates.get(id)
@@ -1216,22 +1482,38 @@ export function startRuleProbe(mainWin: BrowserWindow, url: string, referer?: st
   if (referer) headers['Referer'] = referer
   const loadOpts: Electron.LoadURLOptions = { userAgent: BROWSER_UA }
   if (referer) loadOpts.httpReferrer = referer
-  // 等 CDP 就绪后再加载页面（保证不丢首批请求）
-  void cdpReady.then(() => {
+  /*
+   * ★ V2.1：**立即导航**，不再等 CDP 就绪 ★
+   *
+   * 原来这里是 `cdpReady.then(loadURL)` —— 而 cdpReady 又要先 attach 调试器，
+   * 没导航过的窗口根本没有 page target，于是互相等待，60 秒空转（真机复现过）。
+   * 现在：先 loadURL 让窗口拥有 target → `did-start-loading` 里再 bootstrap CDP
+   * （attach → Network.enable → 注入 Hook → 重载一次）。
+   */
+  {
     const w = probeWin
-    if (!probeActive || !w || w.isDestroyed()) return
+    if (!probeActive || !w || w.isDestroyed()) return false
     void w.loadURL(url, loadOpts).catch((err) => {
       const e = err as { code?: string; message?: string }
       log.append('warn', 'rule-probe', `播放页加载失败 (${e.code ?? ''}): ${e.message ?? String(err)}`)
     })
-  })
+  }
+  // 导航一开始（此时 Chromium 已有 page target）就 bootstrap CDP；再兜一个定时器防止事件没来
+  const bootstrapCdpOnce = (): void => {
+    if (cdpBootstrapped) return
+    cdpBootstrapped = true
+    log.append('info', 'rule-probe', '播放页导航已开始，开始附加 CDP 并注入 Hook')
+    void cdpReady
+  }
+  probeWin.webContents.once('did-start-loading', bootstrapCdpOnce)
+  setTimeout(bootstrapCdpOnce, 1200)
   probeWin.on('closed', () => {
     probeWin = null
   })
 
   // 播放页大多需要“交互”才会加载播放器：注入脚本自动点击播放按钮 / 触发 video.play()
   probeWin.webContents.on('did-finish-load', () => {
-    flowDetail(STAGE, '播放页已加载，正在触发页面播放器（自动点击）')
+    flowDetail(STAGE, '播放页已加载，正在识别视频流（Hook + webRequest 双通道）')
     pushStep(STAGE, '播放页已加载，注入自动点击')
     for (const delay of [1200, 3000, 6000, 10000]) setTimeout(() => runAutoPlayClicks(probeWin), delay)
   })
@@ -1276,6 +1558,8 @@ let disposeListeners: (() => void) | null = null
 
 export function stopRuleProbe(): void {
   probeActive = false
+  // 停止流量采样：窗口一销毁就没有字节可数了，留着定时器只会一直报 0 KB/s
+  stopNetMeter()
   if (disposeListeners) {
     try {
       disposeListeners()

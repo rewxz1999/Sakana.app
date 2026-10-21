@@ -64,6 +64,8 @@ import {
 } from './services/ruleProbe'
 // v0.3.7：播放源列表的批量预嗅探（每条规则命中多少资源）
 import { startBatchProbe, stopBatchProbe } from './services/ruleProbeBatch'
+// V2.0：点选集之后才开的无头取流（拿到直链 → 立即销毁窗口 → 先缓存再注入）
+import { acquireStream, cancelAcquire } from './services/playAcquire'
 // v0.3.7：人机验证窗口
 import { closeVerifyWindow, openVerifyWindow, reloadVerifyWindow, setVerifyBounds } from './services/ruleVerify'
 // v0.3.8：投屏（发现设备 + DLNA/Sakana 控制）
@@ -700,6 +702,34 @@ export function registerIpc(): void {
   // 规则仓库导入（KazumiRules 镜像优先）
   ipcMain.handle(CH.rulesRepoIndex, () => rulesRepoIndex())
   ipcMain.handle(CH.rulesRepoImport, (_e, names: string[]) => rulesRepoImport(names))
+  /*
+   * V2.0「点播放才取流」：播放页地址 → 直链（无头窗口，拿到候选立刻销毁；先起本地缓存）。
+   *
+   * 为什么主窗口传 null：这条路径的结果由**调用方**（播放页）直接消费，
+   * 事件再推一份给渲染层会让页面自己的 onFound 与这里同时接手同一条流（两次 loadfile）。
+   * 失败原因走返回值，不靠事件 —— 调用方能直接 toast/写进错误条。
+   */
+  ipcMain.handle(CH.rulesAcquireStream, async (_e, playUrl: string, referer?: string) => {
+    const r = await acquireStream(null, String(playUrl ?? ''), referer)
+    /*
+     * 失败用 throw 而不是 {ok:false}：preload 的 `call()` 会把异常统一包成
+     * `{ ok:false, error }`，渲染层拿到的形状与其它 rules.* 接口完全一致
+     * （界面已有"分类失败原因 + 换线路重试"的那套 UI，直接复用）。
+     */
+    if (!r.ok || !r.url) throw new Error(r.error ?? '取流失败：没有拿到可播放的视频地址')
+    return {
+      url: r.url,
+      referer: r.referer,
+      ms: r.ms,
+      channel: r.channel,
+      cacheStarted: r.cacheStarted,
+      cacheReason: r.cacheReason
+    }
+  })
+  ipcMain.handle(CH.rulesAcquireCancel, () => {
+    cancelAcquire()
+    return true
+  })
   // 播放页流嗅探（隐藏窗口捕获 m3u8/mp4 → 交给 libmpv 直连）
   ipcMain.handle(CH.ruleProbeStart, (_e, url: string, referer?: string) => {
     const w = getMainWindow()

@@ -5,7 +5,7 @@ import type { OverlayAction, OverlayDanmaku, OverlayEpisodes, OverlayState } fro
 import type { CastDevice, CastReceiverInfo, PlayFlowSnapshot, SubjectDetail } from '@shared/types'
 import { api } from '@/lib/api'
 import { StreamInfoModal } from '@/components/StreamInfoModal'
-import { PlayFlowStages, flowHeadline, reasonLabel } from '@/components/PlayFlowProgress'
+import { PlayFlowAcquireSteps, PlayFlowCacheLine, PlayFlowStages, flowHeadline, reasonLabel } from '@/components/PlayFlowProgress'
 import { CoverImage } from '@/components/CoverImage'
 import { DanmakuLayer } from '@/components/DanmakuLayer'
 
@@ -1622,6 +1622,14 @@ export default function PlayerOverlay(): React.ReactElement {
                     </span>
                     {/* 三阶段过程进度：全屏下这是唯一能看出「卡在哪一步」的地方（含已收字节/速率） */}
                     <PlayFlowStages flow={flow} tone="onVideo" />
+                    {/*
+                      V2.0：加载卡上要能直接看到「访问播放页 → 识别视频流 → 缓存到本地」
+                      三步、以及**实时 KB/s、已缓存 MB / 总 MB、百分比**。
+                      数据全部来自主进程快照（flow.metrics 与 flow.cache），没有本地计时器，
+                      所以数字是真的在动；没有启动缓存时这一行不渲染（不编假进度）。
+                    */}
+                    <PlayFlowAcquireSteps flow={flow} tone="onVideo" />
+                    <PlayFlowCacheLine flow={flow} tone="onVideo" />
                     {flow?.reason === 'slow' ? (
                       <div className="text-[11px] text-amber-300">
                         资源获取速度过慢，仍在继续等待（有数据在动就不结束）

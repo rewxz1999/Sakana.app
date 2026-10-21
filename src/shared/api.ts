@@ -580,6 +580,37 @@ export interface SakanaApi {
       knownPageUrl?: string,
       forCurrentEpisode?: boolean
     ): Promise<ApiResult<{ pageUrl: string; url: string | null; referer?: string } | null>>
+    /**
+     * V2.0「点播放才取流」：拿到播放页地址之后，才开无头窗口去取直链。
+     *
+     * 顺序由主进程保证：打开播放页（Hook 提前注入）→ 等第一个候选 → **立即销毁窗口**
+     * → 校验候选 → 先起本地缓存 → 返回直链。调用方拿到 `url` 就可以直接 loadfile。
+     * 失败时 `error` 是可读中文（"播放页没有发出可识别的视频请求" / 超时），可直接显示给用户。
+     */
+    acquireStream(
+      playUrl: string,
+      referer?: string
+    ): Promise<
+      ApiResult<{
+        url: string
+        referer?: string
+        /** 从点击到拿到候选的毫秒数 */
+        ms: number
+        /** 候选来自哪条通道（hook:XHR/fetch / webRequest / m3u8 / html 直出） */
+        channel?: string
+        /** 是否已经把直链交给本地缓存 */
+        cacheStarted: boolean
+        /** 本地缓存没启用的原因（HLS / 已关闭 / 目录不可写） */
+        cacheReason?: string
+      }>
+    >
+    /**
+     * 取消正在进行的取流（换集 / 退出播放时调用）。
+     *
+     * 语义是「立刻销毁无头窗口、让等待中的 acquireStream 以可读原因失败」，
+     * 而不是「下一次别取流」；没有进行中的取流时调用它也无害。
+     */
+    acquireCancel(): Promise<ApiResult<boolean>>
   }
   media: {
     listVideos(folder: string): Promise<ApiResult<LocalVideoFile[]>>

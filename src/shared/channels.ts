@@ -89,6 +89,16 @@ export const CH = {
   rulesCachedStream: 'rules:cached-stream',
   rulesPrefetchStream: 'rules:prefetch-stream',
   rulesRememberStream: 'rules:remember-stream',
+  /**
+   * V2.0「点播放才取流」：用户点选集后，用无头窗口访问播放页取直链。
+   *
+   * 与 `ruleProbeStart` 的区别：那条是渲染层自己订阅 onFound 的交互式嗅探；
+   * 这条是**一次调用拿结果**（内部仍复用 ruleProbe 的窗口与判定），
+   * 拿到候选就销毁窗口、起本地缓存，然后把直链返回给调用方注入播放器。
+   */
+  rulesAcquireStream: 'rules:acquire-stream',
+  /** 取消上一轮取流（换集/退出播放）：主进程立刻销毁无头窗口并让等待中的调用落地 */
+  rulesAcquireCancel: 'rules:acquire-cancel',
 
   // 媒体
   mediaListVideos: 'media:list-videos',

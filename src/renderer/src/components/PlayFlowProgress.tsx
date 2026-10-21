@@ -1,4 +1,10 @@
-import type { DanmakuProgressSnapshot, PlayFlowSnapshot, PlayFlowStage, PlayFlowStageKey } from '@shared/types'
+import type {
+  DanmakuProgressSnapshot,
+  PlayFlowCacheProgress,
+  PlayFlowSnapshot,
+  PlayFlowStage,
+  PlayFlowStageKey
+} from '@shared/types'
 
 /**
  * 播放过程进度显示器（v0.3.9）。
@@ -208,6 +214,116 @@ export function metricsLine(flow: PlayFlowSnapshot | null | undefined): string {
 export function flowHeadline(flow: PlayFlowSnapshot | null | undefined): string {
   if (!flow) return ''
   return flow.summary || '准备中'
+}
+
+/** 字节 → 人类可读（缓存行要的是 MB 级，和 fmtBytes 一样但保留一位小数更好读） */
+function fmtMB(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0 MB'
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+/**
+ * 「直链缓存到本地」这一行（V2.0）。
+ *
+ * 用户要求的加载界面三件事：阶段文案、**KB/s**、已缓存 MB / 总 MB、百分比。
+ * 阶段文案由 `flow.summary` / 阶段 detail 给（打开播放页 → 识别视频流 → 缓存到本地），
+ * 这一行负责把"缓存到什么程度"用**真实落盘字节**说清楚：
+ *   · 总长未知（chunked）时显示"总长未知"，不编百分比；
+ *   · 速率是采样差值（见主进程 cacheFlowMeter），不是上游声明的码率。
+ */
+export function PlayFlowCacheLine({
+  flow,
+  tone = 'surface',
+  className = ''
+}: {
+  flow: PlayFlowSnapshot | null | undefined
+  tone?: Tone
+  className?: string
+}): React.ReactElement | null {
+  const cache = flow?.cache
+  if (!cache) return null
+  const t = TONE[tone]
+  const total = cache.total && cache.total > 0 ? cache.total : null
+  const percent = cache.percent !== null && cache.percent !== undefined ? cache.percent : null
+  return (
+    <div className={`flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] leading-relaxed ${className}`}>
+      <span className={t.primary}>缓存到本地</span>
+      <span className={t.secondary}>
+        {fmtMB(cache.received)}
+        {total ? ` / ${fmtMB(total)}` : ' / 总长未知'}
+      </span>
+      {percent !== null ? (
+        <span className={`rounded px-1 ${t.chipOk} ${t.ok}`}>{percent.toFixed(1)}%</span>
+      ) : null}
+      {/* 速率一律按 KB/s 口径显示（>1MB/s 时才换成 MB/s），与用户要的"流量速度（KB/s）"一致 */}
+      <span className={t.secondary}>
+        {cache.rateBps > 0
+          ? cache.rateBps < 1024 * 1024
+            ? `${Math.round(cache.rateBps / 1024)} KB/s`
+            : `${(cache.rateBps / 1024 / 1024).toFixed(2)} MB/s`
+          : cache.state === 'done'
+            ? '已缓存完成'
+            : '等待数据…'}
+      </span>
+      {total && percent !== null && percent < 100 ? (
+        <span className={`block h-1 w-24 overflow-hidden rounded-full ${t.segIdle}`}>
+          <span
+            className={`block h-full rounded-full ${t.segOk}`}
+            style={{ width: `${Math.min(100, Math.max(1, percent))}%` }}
+          />
+        </span>
+      ) : null}
+    </div>
+  )
+}
+
+/**
+ * 「访问播放页 → 识别视频流 → 缓存到本地」三步指示（V2.0）。
+ *
+ * 为什么不直接复用三阶段（locate / acquire / inject）：
+ * 那三个阶段描述的是**整个播放流程**；用户这次要的是取流这三步的细粒度。
+ * 三步的当前步由真实信号推导，不按时间猜：
+ *   · 有缓存进度 → 已经在第 3 步；
+ *   · 访问播放页有字节（metrics.source='probe' 且 bytes>0）→ 第 2 步；
+ *   · 否则第 1 步。
+ */
+export function PlayFlowAcquireSteps({
+  flow,
+  tone = 'onVideo',
+  className = ''
+}: {
+  flow: PlayFlowSnapshot | null | undefined
+  tone?: Tone
+  className?: string
+}): React.ReactElement | null {
+  if (!flow || flow.mode !== 'rule') return null
+  const t = TONE[tone]
+  const cache: PlayFlowCacheProgress | null = flow.cache ?? null
+  const sawPageBytes = flow.metrics.source === 'probe' && flow.metrics.bytes > 0
+  const step = cache ? 3 : sawPageBytes ? 2 : 1
+  const labels = ['访问播放页', '识别视频流', '缓存到本地']
+  return (
+    <div className={`flex flex-wrap items-center gap-1 text-[10px] ${className}`}>
+      {labels.map((label, i) => {
+        const idx = i + 1
+        const done = idx < step
+        const active = idx === step
+        return (
+          <span key={label} className="flex items-center gap-1">
+            {i > 0 ? <span className={t.tertiary}>→</span> : null}
+            <span
+              className={`rounded px-1 ${
+                done ? `${t.chipOk} ${t.ok}` : active ? `${t.chipWarn} ${t.warn}` : t.tertiary
+              }`}
+            >
+              {done ? '✓ ' : active ? '● ' : ''}
+              {label}
+            </span>
+          </span>
+        )
+      })}
+    </div>
+  )
 }
 
 export function PlayFlowStages({

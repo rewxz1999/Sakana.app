@@ -608,14 +608,26 @@ export function PlayerSourcePage({
   }, [open, narrow, entry, activeRule?.id])
 
   /**
-   * 把一条规则的探测结果翻成一句人话 + 颜色（v0.3.7 原样保留）。
-   * 三种"没资源"必须分得清：没有这部番 / 有番剧但没剧集 / 有剧集但抓不到流。
+   * 把一条规则的探测结果翻成一句人话 + 颜色（v0.3.7 原样保留；V2.0 语义更新）。
+   *
+   * V2.0：批量探测**只定位播放页**，所以最重要的徽章是「已定位播放页」。
+   * `count`（抓到几个候选流）在这一阶段恒为 0，**不再**等于"没有资源"：
+   * 用户点选集之后才开无头窗口取流（见 rules.acquireStream）。
+   * 三种"没资源"仍然必须分得清：没有这部番 / 有番剧但没剧集 / 拿不到播放页。
    */
   const probeBadge = (ruleId: string): React.ReactElement => {
     const p = probe[ruleId]
     if (!p) return <Badge tone="neutral">待探测</Badge>
     if (p.phase === 'search') return <Badge tone="neutral">搜索中…</Badge>
     if (p.phase === 'sniff') return <Badge tone="neutral">嗅探中…</Badge>
+    /*
+     * V2.0 的首要判据：有 playUrl 就能点。
+     * 必须排在 `count > 0` 前面 —— 正常批量探测的 count 是 0，
+     * 按旧逻辑会一路掉到"未抓到流"，用户会以为线路坏了。
+     */
+    if (p.playUrl) {
+      return <Badge tone="ok">{p.count > 0 ? `已定位播放页 · ${p.count} 个候选` : '已定位播放页'}</Badge>
+    }
     if (p.count > 0) return <Badge tone="ok">命中 {p.count} 个资源</Badge>
     /*
      * 探测失败 ≠ 没有这部番（v1.2.1）。
@@ -629,7 +641,7 @@ export function PlayerSourcePage({
       const timeout = /超时|未完成/.test(p.message ?? '')
       return <Badge tone="warn">{timeout ? '探测未完成' : '探测失败'}</Badge>
     }
-    if (p.hit && p.episodes > 0) return <Badge tone="warn">有剧集·未抓到流</Badge>
+    if (p.hit && p.episodes > 0) return <Badge tone="warn">有剧集·未拿到播放页</Badge>
     if (p.hit) return <Badge tone="neutral">有番剧·无剧集</Badge>
     return <Badge tone="neutral">没有这部番</Badge>
   }
@@ -792,8 +804,11 @@ export function PlayerSourcePage({
                         /*
                          * 探针说这条线路"需要人机验证"时，点它先弹验证窗口 ——
                          * 直接进去只会再吃一次 403，用户会以为是"这条线路坏了"（v0.3.7）。
+                         * V2.0：已经定位到播放页的线路不再走这条路 —— 能定位就说明搜索/选集都通了，
+                         * 验证墙此时已经过掉，没必要再打扰用户。
                          */
-                        const needVerify = !!p && (p.count === 0 || p.hit) && isVerifyWall(p.message ?? '')
+                        const needVerify =
+                          !!p && !p.playUrl && isVerifyWall(p.message ?? '')
                         const active = activeRule?.id === rule.id
                         const kbHere = kb.col === 0 && kb.idx === i
                         return (
@@ -849,10 +864,10 @@ export function PlayerSourcePage({
                     <div className="flex items-center justify-between gap-2">
                       <span className="min-w-0 text-[10px] leading-relaxed text-faint">
                         {probing
-                          ? `正在探测各线路有没有资源…（${probeDoneCount}/${rules.length}，默认同时 3 条）`
+                          ? `正在定位各线路的播放页…（${probeDoneCount}/${rules.length}，默认同时 3 条）`
                           : probeMeta.cached && probeMeta.probedAt
-                            ? `${new Date(probeMeta.probedAt).toLocaleTimeString()} 的探测结果（正结果常驻；失败结论只存 1 分钟）`
-                            : '「命中 N 个资源」= 抓到 N 个候选视频地址；探测不播放'}
+                            ? `${new Date(probeMeta.probedAt).toLocaleTimeString()} 的探测结果（播放页地址常驻；失败结论只存 1 分钟）`
+                            : '「已定位播放页」= 这条线路能点；批量探测只发 HTTP、不取流，点选集后才用无头窗口取流并缓存到本地'}
                       </span>
                       <button
                         className="flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-0.5 text-[10px] text-dim transition-colors hover:border-accent hover:text-accent disabled:opacity-50"

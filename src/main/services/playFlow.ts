@@ -1,4 +1,5 @@
 import type {
+  PlayFlowCacheProgress,
   PlayFlowMark,
   PlayFlowMetrics,
   PlayFlowReason,
@@ -133,6 +134,15 @@ let running = false
 let stages: PlayFlowStage[] = STAGE_ORDER.map(emptyStage)
 let activeStage: PlayFlowStageKey | null = null
 let metrics: PlayFlowMetrics = emptyMetrics()
+/**
+ * 「直链缓存到本地」的进度（V2.0）。
+ *
+ * 为什么放在状态机里、由 mediaCache 的采样器写：
+ * 加载卡和流详情面板读的是同一份快照（`api.player.flow()`），
+ * 缓存进度写进快照就等于**一次改动同时喂到两处**，不需要新增事件通道或额外轮询。
+ * 只在真的启动了本地缓存时才有值；HLS / 关闭缓存 / 直连时为 null（不编假进度）。
+ */
+let cacheProgress: PlayFlowCacheProgress | null = null
 let summary = ''
 let reason: PlayFlowReason = 'none'
 /** 已经判定过失败/超时的阶段，避免后面迟到的 step 把它重新点亮 */
@@ -167,6 +177,7 @@ export function beginFlow(opts: { mode: string; title: string }): number {
   stages = STAGE_ORDER.map(emptyStage)
   activeStage = null
   metrics = emptyMetrics()
+  cacheProgress = null
   summary = ''
   reason = 'none'
   settled.clear()
@@ -322,6 +333,21 @@ export function getMetrics(): PlayFlowMetrics {
   return { ...metrics }
 }
 
+/**
+ * 写入本地缓存进度（V2.0）。
+ *
+ * 由 `cacheFlowMeter` 每 500ms 采一次 `mediaCache` 的会话状态后调用；
+ * 一轮结束后（`running=false`）仍然继续接受写入 —— 缓存还在落盘，界面上的
+ * 「已缓存 x / y MB」不应该在注入阶段一结束就冻住。真正的清零发生在 `beginFlow` / `resetFlow`。
+ */
+export function setCacheProgress(p: PlayFlowCacheProgress | null): void {
+  cacheProgress = p ? { ...p } : null
+}
+
+export function getCacheProgress(): PlayFlowCacheProgress | null {
+  return cacheProgress ? { ...cacheProgress } : null
+}
+
 /** 整轮结束（成功或放弃）。注意：成功结束不覆盖已经记下的失败归因 */
 export function endFlow(opts?: { ok?: boolean; summary?: string; reason?: PlayFlowReason }): void {
   if (!running) return
@@ -382,6 +408,7 @@ export function resetFlow(): void {
   stages = STAGE_ORDER.map(emptyStage)
   activeStage = null
   metrics = emptyMetrics()
+  cacheProgress = null
   summary = ''
   reason = 'none'
   settled.clear()
@@ -444,6 +471,7 @@ export function snapshot(): PlayFlowSnapshot {
     stages: stagesOut,
     activeStage,
     metrics: { ...metrics },
+    cache: cacheProgress ? { ...cacheProgress } : null,
     summary: buildSummary(),
     reason
   }

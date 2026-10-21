@@ -759,6 +759,12 @@ export function PlayerPage() {
       probingRef.current = false
       window.removeEventListener('resize', syncBounds)
       if (usedWebview) void api.ruleWebview.close()
+      /*
+       * V2.0：还要取消主进程那一轮 acquireStream。
+       * 否则用户换集/退出后，上一轮的无头窗口会继续加载播放页，
+       * 它的结果回来时还会往**新一轮**的过程进度里写（旧一轮的失败盖掉新一轮的进行中）。
+       */
+      void api.rules.acquireCancel()
       void api.ruleProbe.stop()
     }
     /*
@@ -785,7 +791,21 @@ export function PlayerPage() {
       }
       pendingCloseWebviewRef.current = true
     }
-    const offFound = api.ruleProbe.onFound((ev) => {
+    /**
+     * 拿到一条候选后的统一处理（V2.0）。
+     *
+     * 为什么抽成函数：候选现在有两个来源 ——
+     *   ① `rules.acquireStream` 的返回值（主进程无头取流，正常路径）；
+     *   ② `ruleProbe.onFound`（用户点「重跑」、或手动打开网页视图等老入口的事件）。
+     * 两条必须走**同一段**逻辑，否则会出现「主路径会起缓存、某个老入口不会」的差异，
+     * 而那类差异最难在真机上复现。
+     */
+    const acceptFound = (ev: {
+      url: string
+      kind?: string
+      referer?: string
+      cookies?: string
+    }): void => {
       if (cancelled) return
       const current = ruleStreamRef.current
       const started = playingRef.current
@@ -964,40 +984,128 @@ export function PlayerPage() {
           void startFfmpegRelay(ev.url, refForPlay, ev.cookies)
         }, ONLINE_PLAY_TIMEOUT_MS)
       }
-    })
+    }
+    /*
+     * 老入口（「重跑」之外的网页视图/旧嗅探）仍然会推 onFound：直接复用上面那段处理。
+     * 正常路径不再依赖它 —— V2.0 由 `rules.acquireStream` 的返回值驱动（见 runFullProbe）。
+     */
+    const offFound = api.ruleProbe.onFound((ev) => acceptFound(ev))
+    /**
+     * 取流失败的统一收尾（V2.0）。
+     *
+     * 与旧的 onDone 分支**同一套动作**：置失败态、允许「重跑」、把原因写进过程进度并结束整轮。
+     * 抽出来是因为失败现在有两个来源（acquire 的返回值 / 老嗅探的 done 事件），
+     * 两处各写一遍迟早会有一处漏掉 `flowMark done`，界面就永远停在「获取播放资源中」。
+     */
+    const markAcquireFailure = (message?: string): void => {
+      if (cancelled || ruleStreamRef.current) return
+      setRuleProbeFailed(true)
+      setRuleProbing(false)
+      probingRef.current = false
+      if (usedWebview) void api.ruleWebview.close()
+      const why = message || '播放页没有发出可识别的视频请求'
+      toast.info(why)
+      void api.player.flowMark({ kind: 'fail', stage: 'acquire', error: why, reason: 'site' })
+      void api.player.flowMark({ kind: 'done', ok: false, summary: `获取播放资源失败：${why}`, reason: 'site' })
+    }
     const offDone = api.ruleProbe.onDone((ev) => {
       if (cancelled) return
-      if (!ruleStreamRef.current) {
-        setRuleProbeFailed(true)
-        setRuleProbing(false)
-        probingRef.current = false
-        if (usedWebview) void api.ruleWebview.close()
-        toast.info(ev.message ?? '未捕获到视频流')
-        /*
-         * 一轮嗅探结束却没抓到流 = 本轮**真的失败了**，必须给流程一个终点（v1.2.1）。
-         * 只 failStage 的话 running 仍是 true、activeStage 仍是 acquire，
-         * 状态药丸会一直显示「获取播放资源」；补一条 done 让整轮结束并显示原因。
-         */
-        const why = ev.message ?? '播放页没有发出可识别的视频请求'
-        void api.player.flowMark({ kind: 'fail', stage: 'acquire', error: why, reason: 'site' })
-        void api.player.flowMark({ kind: 'done', ok: false, summary: `获取播放资源失败：${why}`, reason: 'site' })
-      }
+      markAcquireFailure(ev.message)
     })
-    /** 完整嗅探（建窗口 / 隐藏窗口）；缓存直链失败时也会走这里 */
+    /**
+     * 取流（V2.0 架构改造的核心入口）。
+     *
+     * 顺序：用户点选集 → 进到播放页（此时才）开**无头窗口** → Hook 提前注入 →
+     * 等第一个候选 → 主进程**立刻销毁窗口** → 校验 → 直链先缓存到本地 → 返回给这里注入内核。
+     * 这一段全在主进程 `rules.acquireStream` 里完成（复用 ruleProbe 的窗口与判定），
+     * 渲染层只负责：先把阶段写进过程进度、拿结果 / 拿失败原因。
+     *
+     * 为什么不再优先开「可见网页视图」（旧行为）：
+     *   ① 用户明确要求无头，且窗口用完即毁 —— 可见视图在播放器里会挡住画面、也不受"拿到即销毁"约束；
+     *   ② 视图那套没有 Hook 提前注入，慢站点要等页面播放器自己发请求，而这正是要提速的一环。
+     * 兜底：URL 上带 `?playWebview=1` 时切回旧的可见网页视图路径（排障用：某些站点可能只有
+     * 在可见页面里才初始化播放器）。默认永远走无头取流；这不是"死开关"——它有明确用途与入口。
+     */
+    const useLegacyWebview = (): boolean => {
+      // 渲染层读不到 process.env（contextIsolation），所以用 URL 参数作为显式排障入口
+      try {
+        return new URLSearchParams(window.location.search).get('playWebview') === '1'
+      } catch {
+        return false
+      }
+    }
+    /**
+     * 把 IPC 抛出的错误洗成人话（V2.0）。
+     *
+     * `ipcRenderer.invoke` 在 reject 时会把错误包成
+     * `Error invoking remote method 'rules:acquire-stream': Error: 播放页没有发出可识别的视频请求`，
+     * 直接显示给用户就是一句带内部方法名的噪音。这里只剥掉那层壳，原因本身原样保留。
+     */
+    const readableIpcError = (err: unknown): string => {
+      const raw = String((err as { message?: string })?.message ?? err ?? '')
+      return raw.replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/i, '').trim()
+    }
     const runFullProbe = (): void => {
       if (cancelled) return
       setRuleProbing(true)
       probingRef.current = true
-      void api.player.flowMark({ kind: 'stage', stage: 'acquire', detail: '正在打开播放页并嗅探媒体地址' })
-      // 优先走可见网页视图；创建失败则回退到隐藏窗口嗅探
-      void api.ruleWebview.open(pageUrl, currentBounds(), state.referer).then((r) => {
-        if (cancelled) return
-        if (r.ok && r.data) {
-          usedWebview = true
-        } else {
-          void api.ruleProbe.start(pageUrl, state.referer)
-        }
+      void api.player.flowMark({
+        kind: 'stage',
+        stage: 'acquire',
+        detail: '正在打开播放页（无头窗口，Hook 已提前注入）'
       })
+      if (useLegacyWebview()) {
+        // 排查用旧路径：可见网页视图（会挡住画面，正常播放不该走到这里）
+        void api.ruleWebview.open(pageUrl, currentBounds(), state.referer).then((r) => {
+          if (cancelled) return
+          if (r.ok && r.data) {
+            usedWebview = true
+          } else {
+            void api.ruleProbe.start(pageUrl, state.referer)
+          }
+        })
+        return
+      }
+      void api.rules
+        .acquireStream(pageUrl, state.referer)
+        .then((r) => {
+          if (cancelled) return
+          if (!r.ok || !r.data?.url) {
+            // preload 会把主进程抛出的可读原因原样带回来（"播放页没有发出可识别的视频请求" / 超时）
+            markAcquireFailure(r.ok ? '取流没有返回地址' : readableIpcError(r.error))
+            return
+          }
+          const data = r.data
+          console.log(
+            `[player] 无头取流命中（${data.channel ?? '?'}，${data.ms}ms，本地缓存${
+              data.cacheStarted ? '已启动' : `未启用：${data.cacheReason ?? '未知'}`
+            }）`
+          )
+          void api.player.flowMark({
+            kind: 'step',
+            stage: 'acquire',
+            text: `无头取流命中：${data.ms}ms（${data.channel ?? '未知通道'}）；${
+              data.cacheStarted ? '直链已开始缓存到本地' : `本地缓存未启用：${data.cacheReason ?? '未知'}`
+            }`
+          })
+          /*
+           * 交给同一段处理（与老的 onFound 完全一致）：
+           * acceptFound 内会 mark acquire ok、play、diagnose、rememberStream、看门狗……
+           * 一处逻辑两条来源，避免"主路径少了某一步"。
+           *
+           * kind 按**地址本身**归一（m3u8 才算 m3u8）：acceptFound 用 kind 判断
+           * "已开播后要不要换流"，而 acquire 报回来的 channel 是通道名（hook / webRequest）。
+           */
+          acceptFound({
+            url: data.url,
+            referer: data.referer,
+            kind: /\.m3u8(\?|$)/i.test(data.url) ? 'm3u8' : (data.channel ?? 'direct')
+          })
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return
+          markAcquireFailure(readableIpcError(err))
+        })
     }
     /*
      * 先看会话直链缓存（v0.2.7 附加）：命中就直接播，省掉整轮嗅探。
