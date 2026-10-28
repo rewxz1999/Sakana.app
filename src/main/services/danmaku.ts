@@ -11,8 +11,9 @@ import type {
 } from '@shared/types'
 import { resolveDanmakuSettings } from '@shared/types'
 import { log } from '../log'
-import { buildProxyAgents, getSettings } from '../net'
+import { buildProxyAgents, getSettings, proxyForUrl } from '../net'
 import { readCachedSource, writeCachedSource } from './danmakuCache'
+import { builtInDanmuApiBase } from './danmakuApiConfig'
 import { integrateDanmaku, type DanmakuBatch } from './danmakuIntegrator'
 import { progressBegin, progressDone, progressFail, progressStep } from './danmakuProgress'
 import { enabledFetchers } from './danmaku/index'
@@ -43,9 +44,17 @@ import { noteNetworkFetch, readCachedBatches, runEnabledSources } from './danmak
 const DEFAULT_BASE = Buffer.from('aHR0cHM6Ly9kYW5tdS1hcGkuc2Fua2FuYS1iYW5ndW1pLmRlNS5uZXQvODc2NTQzMjE=', 'base64').toString('utf8')
 /** 官方地址：仅在用户自己填了 AppId/AppSecret 时使用 */
 const OFFICIAL_BASE = 'https://api.dandanplay.net'
-
 const TTL_SEARCH = 24 * 3600 * 1000
 const TTL_COMMENTS = 7 * 24 * 3600 * 1000
+/**
+ * V1.5.2：两级超时。
+ *
+ * `/search/anime` 是索引查询，正常 1 秒内返回，给 8 秒已经很宽松；
+ * `/search/episodes` 与 `/bangumi/{id}` 可能现场抓源，给 10 秒 —— 但**失败就走兜底**，
+ * 不再像以前那样 3 次重试 × 12 秒把一次弹幕匹配拖到半分钟。
+ */
+const SEARCH_TIMEOUT_MS = 8000
+const EPISODE_TIMEOUT_MS = 10000
 /** 同一集最多合并多少个来源（弹幕库同一集常有 youku/bilibili/tencent 等多份） */
 const MERGE_SOURCES = 3
 /** 合并时最多等多久（毫秒）：超时先用已到的来源，慢的来源继续在后台写缓存 */
@@ -72,6 +81,12 @@ function baseUrl(): string {
   const s = getSettings() as unknown as { danmakuApiBase?: string }
   const custom = s.danmakuApiBase?.trim().replace(/\/+$/, '')
   if (custom) return custom
+  /*
+   * V1.5.2：默认走用户自建的 danmu_api（dandanplay 兼容，地址里带 TOKEN）。
+   * 解不出来（常量损坏）才回退到旧底座/官方地址 —— 弹幕链路不该因为一个常量而整条挂掉。
+   */
+  const builtIn = builtInDanmuApiBase()
+  if (builtIn) return builtIn
   return signed() ? OFFICIAL_BASE : DEFAULT_BASE
 }
 
@@ -110,7 +125,8 @@ async function get<T>(path: string, timeoutMs = 12000): Promise<T> {
       const res = await axios.get<T>(url, {
         timeout: timeoutMs,
         headers: authHeaders(path),
-        ...buildProxyAgents(getSettings().proxy)
+        // V1.5.2：应用代理未启用时，境外接口（如 danmu_api 的 vercel 域名）自动走系统代理
+        ...buildProxyAgents(proxyForUrl(url))
       })
       return res.data
     } catch (err) {
@@ -304,9 +320,30 @@ interface SearchAnime {
   typeDescription?: string
   episodes?: { episodeId: number; episodeTitle: string }[]
   imageUrl?: string
+  /** danmu_api 聚合的来源（bahamut / dandan / renren …，见 /search/anime 的 source 字段） */
+  source?: string
+  /** 条目总集数（/search/anime 会给，用来在"没有剧集明细"时兜底判断） */
+  episodeCount?: number
+  aliases?: string[]
+  startDate?: string
 }
 
 const MOVIE_RE = /剧场版|劇場版|电影|電影|total\s*eclipse|总集篇|總集篇|movie|特别篇|特別篇/i
+
+/**
+ * 来源优先级（danmu_api 会在 animeTitle 里带 `from <source>`）。
+ *
+ * 用户实测同一部番返回三个来源：bahamut（4 集、信息完整）、dandan（12 集、别名全）、renren。
+ * 用户点名「优先选 bahamut」，所以给它一个温和的加分（只影响同分候选的排序，
+ * 不会盖过标题匹配与集数闸门）；三个来源都会被 `takeBest` 合并，条数反而更多。
+ */
+function sourceBonus(source: string | undefined): number {
+  const s = String(source ?? '').toLowerCase()
+  if (s === 'bahamut') return 6
+  if (s === 'dandan') return 4
+  if (s === 'renren') return 3
+  return 0
+}
 
 /**
  * 相似度打分：完全一致 > 包含 > 关键词重合，并按「集数是否对得上」做加权。
@@ -318,6 +355,11 @@ const MOVIE_RE = /剧场版|劇場版|电影|電影|total\s*eclipse|总集篇|�
  *   对「确实存在该集数」的候选加权，优先选能对上集数的来源。
  */
 function scoreAnime(title: string, anime: SearchAnime, wantEp = 1): number {
+  const base = scoreAnimeBase(title, anime, wantEp)
+  return base + sourceBonus(anime.source)
+}
+
+function scoreAnimeBase(title: string, anime: SearchAnime, wantEp = 1): number {
   const q = normalizeTitle(title)
   const t = normalizeTitle(anime.animeTitle)
   if (!q || !t) return 0
@@ -339,7 +381,14 @@ function scoreAnime(title: string, anime: SearchAnime, wantEp = 1): number {
     score = Math.round((hit / a.size) * 50)
   }
   const eps = anime.episodes ?? []
-  const hasWanted = eps.some((e) => episodeNumberFromTitle(e.episodeTitle) === wantEp)
+  /*
+   * V1.5.2：条目可能只有 `episodeCount`（`/search/anime` 的返回），没有剧集明细。
+   * 这时仍然可以判断「有没有这一集」，否则 12 集的 dandan 条目会被当成"没有剧集"直接淘汰。
+   */
+  const count = eps.length > 0 ? eps.length : Number(anime.episodeCount) || 0
+  const hasWanted = eps.length > 0
+    ? eps.some((e) => episodeNumberFromTitle(e.episodeTitle) === wantEp)
+    : count >= wantEp
   if (hasWanted) score += 25
   if (wantEp > 1) {
     const looksMovie =
@@ -347,7 +396,7 @@ function scoreAnime(title: string, anime: SearchAnime, wantEp = 1): number {
       MOVIE_RE.test(anime.typeDescription ?? '') ||
       MOVIE_RE.test(anime.type ?? '')
     if (looksMovie) score -= 45
-    if (eps.length <= 1) score -= 25
+    if (count <= 1) score -= 25
   }
   return score
 }
@@ -359,17 +408,151 @@ function scoreAnime(title: string, anime: SearchAnime, wantEp = 1): number {
  */
 const CACHE_V = 'v2'
 
-async function searchEpisodes(title: string, useCache = true): Promise<SearchAnime[]> {
+/**
+ * 番剧级搜索：`/api/v2/search/anime?keyword=…`。
+ *
+ * V1.5.2 回归修复的关键：**这条比 `/search/episodes` 快得多，而且是 danmu_api 的主要能力**。
+ *
+ * 实测（用户提供的线上返回）：`/search/anime` 立即返回 3 个来源（bahamut/dandan/renren），
+ * 带 `animeId / source / episodeCount / aliases`；而 `/search/episodes?anime=…` 在本机
+ * 12 秒都回不来（它要现场遍历各源抓剧集，最慢的一条会拖死整次匹配）。
+ * 所以搜索改成「先拿条目，再按 animeId 取剧集」，把慢接口降级成兜底。
+ */
+async function searchAnimeList(title: string, useCache = true): Promise<SearchAnime[]> {
+  const kw = String(title ?? '').trim()
+  if (!kw) return []
+  const cacheKey = `anime:${CACHE_V}:${kw}`
+  if (useCache) {
+    const cached = readCache<SearchAnime[]>(cacheKey, TTL_SEARCH)
+    if (cached) return cached
+  }
+  const path = `/api/v2/search/anime?keyword=${encodeURIComponent(kw)}`
+  const data = await get<{ success?: boolean; animes?: SearchAnime[] }>(path, SEARCH_TIMEOUT_MS)
+  const list = Array.isArray(data?.animes) ? data.animes : []
+  if (useCache && list.length > 0) writeCache(cacheKey, list)
+  return list
+}
+
+/**
+ * 取某个条目的剧集明细（三种接口按顺序试）。
+ *
+ * 为什么不是只认一个接口：danmu_api 是社区实现，不同版本暴露的路径不一样；
+ * 这里按「最标准 → 最兼容 → 最慢」排序，任何一个成功就缓存，失败不影响其它候选。
+ */
+async function fetchAnimeEpisodes(anime: SearchAnime): Promise<{ episodeId: number; episodeTitle: string }[]> {
+  const id = Number(anime.animeId)
+  if (!Number.isFinite(id) || id <= 0) return []
+  const cacheKey = `eps:${CACHE_V}:${id}`
+  const cached = readCache<{ episodeId: number; episodeTitle: string }[]>(cacheKey, TTL_SEARCH)
+  if (cached && cached.length > 0) return cached
+
+  const attempts: { path: string; pick: (d: unknown) => { episodeId: number; episodeTitle: string }[] }[] = [
+    {
+      // dandanplay 标准：/api/v2/bangumi/{animeId}
+      path: `/api/v2/bangumi/${id}`,
+      pick: (d) => {
+        const eps = (d as { bangumi?: { episodes?: { episodeId?: number; episodeTitle?: string }[] } })?.bangumi?.episodes
+        return Array.isArray(eps)
+          ? eps
+              .filter((e) => Number(e?.episodeId) > 0)
+              .map((e) => ({ episodeId: Number(e.episodeId), episodeTitle: String(e.episodeTitle ?? '') }))
+          : []
+      }
+    },
+    {
+      // danmu_api 可能的扩展参数
+      path: `/api/v2/search/episodes?animeId=${id}`,
+      pick: (d) => {
+        const animes = (d as { animes?: SearchAnime[] })?.animes ?? []
+        const hit = animes.find((a) => Number(a?.animeId) === id) ?? animes[0]
+        return Array.isArray(hit?.episodes)
+          ? hit.episodes.filter((e) => Number(e?.episodeId) > 0).map((e) => ({ episodeId: Number(e.episodeId), episodeTitle: String(e.episodeTitle ?? '') }))
+          : []
+      }
+    }
+  ]
+  for (const attempt of attempts) {
+    try {
+      const data = await get<unknown>(attempt.path, EPISODE_TIMEOUT_MS)
+      const eps = attempt.pick(data)
+      if (eps.length > 0) {
+        writeCache(cacheKey, eps)
+        log.append('info', 'danmaku', `条目 ${id}（${anime.source ?? '?'}）取到 ${eps.length} 集：${attempt.path}`)
+        return eps
+      }
+    } catch {
+      /* 换下一个接口 */
+    }
+  }
+  /*
+   * 最后一条路：**按 danmu_api 的 episodeId 约定合成**。
+   *
+   * danmu_api 把 episodeId 定义成 `animeId * 1000 + 集号`（uosc_danmaku 插件里
+   * `episodeNumber = episodeid % 1000` 就是这个约定），所以即使拿不到剧集明细，
+   * 也能直接构造出每一集的 episodeId 去取弹幕。
+   * 构造错了最坏情况只是 comment 接口返回空（与现在完全一样），不会放错弹幕。
+   */
+  const count = Math.max(0, Math.min(999, Number(anime.episodeCount) || 0))
+  if (count > 0) {
+    const eps = Array.from({ length: count }, (_, i) => ({
+      episodeId: id * 1000 + (i + 1),
+      episodeTitle: `第${i + 1}集`
+    }))
+    writeCache(cacheKey, eps)
+    log.append(
+      'info',
+      'danmaku',
+      `条目 ${id}（${anime.source ?? '?'}）没有剧集明细，按约定合成 episodeId（${eps[0].episodeId}…${eps[eps.length - 1].episodeId}）`
+    )
+    return eps
+  }
+  return []
+}
+
+/** 旧的慢接口，只在上面全都拿不到剧集时兜底用（它才是 12s 超时的来源） */
+async function searchEpisodesLegacy(title: string, useCache = true): Promise<SearchAnime[]> {
   const cacheKey = `search:${CACHE_V}:${title}`
   if (useCache) {
     const cached = readCache<SearchAnime[]>(cacheKey, TTL_SEARCH)
     if (cached) return cached
   }
   const path = `/api/v2/search/episodes?anime=${encodeURIComponent(title)}`
-  const data = await get<{ success?: boolean; animes?: SearchAnime[] }>(path)
+  const data = await get<{ success?: boolean; animes?: SearchAnime[] }>(path, EPISODE_TIMEOUT_MS)
   const list = Array.isArray(data?.animes) ? data.animes : []
   if (useCache && list.length > 0) writeCache(cacheKey, list)
   return list
+}
+
+/**
+ * 搜索（V1.5.2 重写）：先 `/search/anime`（快），再按 animeId 取剧集；
+ * 只有全都拿不到时才退回旧的 `/search/episodes`。
+ *
+ * 为什么值得重写：用户日志里 5 个标题（中文/日文/罗马音/英文）全部 `timeout of 12000ms`，
+ * 弹幕一条都出不来；而 `/search/anime` 在同一网络下是**立即**返回的。
+ */
+async function searchEpisodes(title: string, useCache = true): Promise<SearchAnime[]> {
+  const kw = String(title ?? '').trim()
+  if (!kw) return []
+  try {
+    const animes = await searchAnimeList(kw, useCache)
+    if (animes.length > 0) {
+      /*
+       * 这里**不再**给每个候选预取剧集：
+       *   · `/search/anime` 本身不带 episodes（这是它快的原因）；
+       *   · 预取会把 3 个候选 × 3 个接口全打一遍，而真正会用到的往往只有 1~2 个。
+       * 剧集改为在 `takeBest` / `matchDanmaku` 里**按需取**（带缓存与合成兜底）。
+       */
+      return [...animes].sort((x, y) => scoreAnime(kw, y, 1) - scoreAnime(kw, x, 1))
+    }
+  } catch (err) {
+    log.append('warn', 'danmaku', `条目搜索失败（${kw}）：${String((err as Error)?.message ?? err).slice(0, 120)}`)
+  }
+  try {
+    return await searchEpisodesLegacy(kw, useCache)
+  } catch (err) {
+    log.append('warn', 'danmaku', `剧集接口兜底也失败（${kw}）：${String((err as Error)?.message ?? err).slice(0, 120)}`)
+    return []
+  }
 }
 
 /**
@@ -434,7 +617,10 @@ export async function matchDanmaku(title: string, episode: number): Promise<Danm
       if (parsed.length > 0) return parsed.find((x) => x.n === wantEp)?.e ?? null
       return wantEp <= eps.length ? eps[wantEp - 1] : null
     }
-    const ep = pickEpisode(best.a)
+    // 剧集明细按需取（条目的 episodes 在 /search/anime 里没有）
+    const bestAnime: SearchAnime =
+      (best.a.episodes?.length ?? 0) > 0 ? best.a : { ...best.a, episodes: await fetchAnimeEpisodes(best.a) }
+    const ep = pickEpisode(bestAnime)
     if (!ep) {
       log.append('info', 'danmaku', `弹幕库条目没有可用剧集（${best.a.animeTitle}）`)
       return null
@@ -442,7 +628,7 @@ export async function matchDanmaku(title: string, episode: number): Promise<Danm
     log.append(
       'info',
       'danmaku',
-      `弹幕匹配：${kw} 第${wantEp}集 → ${best.a.animeTitle} / ${ep.episodeTitle}（相似度 ${best.score}）`
+      `弹幕匹配：${kw} 第${wantEp}集 → ${best.a.animeTitle} / ${ep.episodeTitle}（来源 ${best.a.source ?? '?'}，相似度 ${best.score}）`
     )
     return {
       animeId: best.a.animeId,
@@ -687,22 +873,22 @@ async function loadWithSources(
    * 表面上条数对得上（看起来像成功了），实际上**数据源一次都没被问到**，
    * 获取记录里也是空的。用户要的正是"数据源必须真的被调用"，所以这里必须先分流。
    */
-  if (opts.sourcesOnly) return await loadSourcesOnly(kw, episode, opts)
+  // V1.5.2：外部数据源已删除（用户要求只保留 danmu_api），第二段取源入口直接返回空
+  if (opts.sourcesOnly) return null
 
   progressBegin(kw, episode)
   const settings = resolveDanmakuSettings(getSettings().danmaku)
-  const autoSources = settings.autoSources !== false
   const toleranceMs = settings.errorToleranceMs ?? 100
   const force = opts.force === true
-  // 关掉自动源时，缓存/补全都只针对内置库（用户明确不想发源请求）
-  const bindings = autoSources ? enabledFetchers() : []
-
-  // 1) 本地缓存：每个启用的源各查各的（文件名带源名，互不混淆）+ 内置那一份
-  const cachedExternal = force
-    ? { batches: [] as DanmakuBatch[], missing: bindings }
-    : readCachedBatches(kw, episode, bindings)
+  /*
+   * V1.5.2：**只剩 danmu_api（内置）这一条链**。
+   *
+   * 用户原话：「请删除原来的弹幕数据源获取方式，但还是保留将弹幕缓存到本地的设置。
+   * 现在请使用我部署的 danmu_api。」
+   * 缓存键名沿用 BUILTIN_SOURCE_NAME，老用户已缓存的弹幕仍能命中，不会白下一遍。
+   */
   const builtinCached = force ? null : readCachedSource(kw, episode, BUILTIN_SOURCE_NAME)
-  const cachedBatches: DanmakuBatch[] = [...cachedExternal.batches]
+  const cachedBatches: DanmakuBatch[] = []
   if (builtinCached) {
     progressDone('builtin', BUILTIN_SOURCE_NAME, 1, 1, `本地缓存命中（${builtinCached.comments.length} 条，未发网络请求）`)
     cachedBatches.push({
@@ -715,27 +901,11 @@ async function loadWithSources(
       kind: 'builtin'
     })
   }
-  const allCached = cachedExternal.missing.length === 0 && Boolean(builtinCached)
-
   /*
    * 2) 有缓存 → 立刻返回（用户要求「当前集有本地缓存就直接用，不重新加载」）。
-   *
-   * 后台任务只补**缺的那部分**：缓存已经齐全时连任务都不发，第二次进同一集网络请求为 0。
-   * 还有缺失时发一条 `sourcesPending`，渲染层按两段式去取第二段（外部行为保持不变）。
+   *    第二次进同一集网络请求为 0。
    */
   if (cachedBatches.length > 0) {
-    const missingNames = cachedExternal.missing.map((b) => b.name)
-    /*
-     * 已经有任意缓存时**不再为了内置库发网络请求**：
-     * 用户要的是"当前集有本地缓存就直接用，不重新加载"。内置库上一轮没取到就让它留在缺省，
-     * 不能因为"内置还没缓存"就让第二次进同一集又发一次请求（那正好违背用户点名的证据）。
-     * 只有"一点缓存都没有"的首轮才同时跑内置与数据源。
-     */
-    const needBuiltin = !builtinCached && cachedExternal.batches.length === 0
-    const job =
-      allCached || (missingNames.length === 0 && !needBuiltin)
-        ? null
-        : startSupplement(kw, episode, opts, autoSources, missingNames, needBuiltin)
     const integ = integrateDanmaku(cachedBatches, { toleranceMs })
     return resultOfIntegration(
       integ,
@@ -745,31 +915,21 @@ async function loadWithSources(
         matchedBy: opts.keyword || kw,
         aliasUsed: Boolean(opts.keyword && normalizeTitle(opts.keyword) !== normalizeTitle(kw))
       },
-      // fromCache 说的是"这一批是不是全来自缓存"，不是"所有源都缓存了没"：
-      // 有源缺缓存时这批仍是缓存（同时 sourcesPending=true，第二段会补）
-      { sourcesPending: Boolean(job), fromCache: integ.fromCache }
+      { fromCache: integ.fromCache }
     )
   }
 
   /*
-   * 3) 一点缓存都没有：必须等（用户要求「除非从数据源获取不到」）。
-   *    内置与数据源是并行的，谁先回来都算数；全部失败才返回 null。
+   * 3) 一点缓存都没有：向 danmu_api 取一次（失败返回 null，界面照常播放、只是没有弹幕）。
    */
-  const job = startSupplement(
-    kw,
-    episode,
-    opts,
-    autoSources,
-    cachedExternal.missing.map((b) => b.name),
-    true
-  )
+  const job = startSupplement(kw, episode, opts, false, [], true)
   if (!job) {
-    log.append('info', 'danmaku', '没有启用的数据源，也没有内置缓存')
+    log.append('info', 'danmaku', '没有可用的弹幕接口（danmu_api 未配置）')
     return null
   }
   const r = await job.catch(() => null)
   if (!r || r.batches.length === 0) {
-    log.append('info', 'danmaku', `内置与数据源都没有取到弹幕${r?.errors?.length ? `（${r.errors.slice(0, 3).join('；')}）` : ''}`)
+    log.append('info', 'danmaku', `danmu_api 没有取到弹幕${r?.errors?.length ? `（${r.errors.slice(0, 3).join('；')}）` : ''}`)
     return null
   }
   const integ = integrateDanmaku(r.batches, { toleranceMs })
@@ -856,63 +1016,28 @@ const BUILTIN_WAIT_MS = 6000
  */
 const EXTERNAL_WAIT_MS = 8000
 
+/**
+ * V1.5.2：外部数据源（巴哈/弹幕盒子/直链…）的等待与合并已整体删除。
+ *
+ * 用户要求「删除原来的弹幕数据源获取方式」，所以「补全任务」现在只向 danmu_api 要一次。
+ * 函数签名保留 `includeSources/missingNames` 只是为了不改调用点（传什么都当 false），
+ * 这样将来若要接第二个 danmu_api 地址，只需要在这里加一条并行请求。
+ */
 async function runSupplement(
   kw: string,
   episode: number,
   opts: DanmakuLoadOptions,
-  includeSources: boolean,
-  missingNames: string[],
+  _includeSources: boolean,
+  _missingNames: string[],
   includeBuiltin: boolean
 ): Promise<SupplementResult> {
   const errors: string[] = []
-  const builtinP = includeBuiltin
-    ? loadBuiltinBatch(kw, episode, opts).catch((err): null => {
-        errors.push(`内置弹弹play：${String((err as Error)?.message ?? err)}`)
-        return null
-      })
-    : Promise.resolve(null)
-  const externalP = (
-    includeSources
-      ? runEnabledSources({
-          title: kw,
-          episode,
-          aliases: opts.aliases ?? [],
-          keyword: opts.keyword,
-          subjectId: opts.subjectId,
-          force: opts.force,
-          missingSourceNames: missingNames,
-          trigger: opts.trigger ?? 'play'
-        })
-      : Promise.resolve({ batches: [] as DanmakuBatch[], errors: [] as string[], cacheHits: 0 })
-  ).catch((err) => {
-    errors.push(`数据源：${String((err as Error)?.message ?? err)}`)
-    return { batches: [] as DanmakuBatch[], errors: [] as string[], cacheHits: 0 }
+  if (!includeBuiltin) return { batches: [], errors }
+  const builtin = await loadBuiltinBatch(kw, episode, opts).catch((err): null => {
+    errors.push(`danmu_api：${String((err as Error)?.message ?? err)}`)
+    return null
   })
-
-  const external = await Promise.race([
-    externalP,
-    new Promise<{ batches: DanmakuBatch[]; errors: string[]; cacheHits: number }>((resolve) =>
-      setTimeout(
-        () =>
-          resolve({
-            batches: [] as DanmakuBatch[],
-            errors: [`数据源超过 ${EXTERNAL_WAIT_MS / 1000} 秒还没全回，本次先用已到的（后台继续跑并写缓存）`],
-            cacheHits: 0
-          }),
-        EXTERNAL_WAIT_MS
-      )
-    )
-  ])
-  // 内置最多等 BUILTIN_WAIT_MS；超时后它继续在后台跑（结果仍会落缓存）
-  const builtin = await Promise.race([
-    builtinP,
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), BUILTIN_WAIT_MS))
-  ])
-  const batches: DanmakuBatch[] = []
-  if (builtin) batches.push(builtin)
-  batches.push(...external.batches)
-  errors.push(...external.errors)
-  return { batches, errors }
+  return { batches: builtin ? [builtin] : [], errors }
 }
 
 /**
@@ -1048,13 +1173,19 @@ async function loadDanmakuInner(
      * 宁可显示「未找到弹幕」，也不放别的季/别的集的弹幕进来。
      */
     const skipped: string[] = []
-    for (const { a, by, score } of ranked.slice(0, limit)) {
+    for (const entry of ranked.slice(0, limit)) {
+      const { by, score } = entry
       // 别名轮里，分数太低的候选取信度不足（容易命中同名无关条目），直接跳过
       if (aliasRound && score < 40) continue
-      if (seasonOfTitle(a.animeTitle) !== wantSeason) {
-        skipped.push(`季数不符「${a.animeTitle.slice(0, 24)}」(第${seasonOfTitle(a.animeTitle)}季)`)
+      if (seasonOfTitle(entry.a.animeTitle) !== wantSeason) {
+        skipped.push(`季数不符「${entry.a.animeTitle.slice(0, 24)}」(第${seasonOfTitle(entry.a.animeTitle)}季)`)
         continue
       }
+      /*
+       * V1.5.2：剧集明细按需取（`/search/anime` 只给条目与集数，没有 episodeId）。
+       * 放在季数闸门之后，避免为无关候选白打一轮请求。
+       */
+      const a: SearchAnime = (entry.a.episodes?.length ?? 0) > 0 ? entry.a : { ...entry.a, episodes: await fetchAnimeEpisodes(entry.a) }
       const eps = a.episodes ?? []
       if (eps.length === 0) continue
       const parsed = eps
@@ -1086,6 +1217,11 @@ async function loadDanmakuInner(
       log.append('info', 'danmaku', `严格筛选：第${wantSeason}季第${wantEp}集，排除 ${skipped.length} 个候选（${skipped.slice(0, 3).join('；')}）`)
     }
     if (targets.length === 0) return null
+    log.append(
+      'info',
+      'danmaku',
+      `合并来源：${targets.map((t) => `${t.a.source ?? '?'}「${t.a.animeTitle.slice(0, 22)}」`).join(' + ')}`
+    )
 
     // 第一个来源是否为缓存命中（用于 fromCache 展示；force 时不看缓存）
     const primaryCached = opts.force !== true && Boolean(

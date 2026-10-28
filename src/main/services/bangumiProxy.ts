@@ -117,6 +117,34 @@ export function isBuiltInBangumiHost(raw: unknown): boolean {
 }
 
 /**
+ * 数据源模式（V1.5.1）：直连官方 or 内置反代。
+ *
+ * 用户要求：启动时问一次"能否自行连接 bangumi 主站"，能就连官方的 API 与图片
+ * （图片也走官方图床，不再经过我们的反代），不能才用内置反代。
+ *
+ * 为什么用模块级开关而不是给每个调用点加参数：
+ * `resolveBangumiEndpoints` / `rewriteImageUrl` 有几十个调用点，逐个传参等于把
+ * "用哪个数据源"这件事散到全项目；开关只有一个，启动时设一次、用户在弹窗里改一次即可，
+ * 也不会出现"API 走官方、图片却还走反代"这种错配。
+ *
+ * 默认 false（用内置反代）：这是老用户的实际状态，升级不该悄悄改变数据源。
+ */
+let officialSource = false
+
+/** 设置数据源模式：true = 直连官方（api.bgm.tv + 原始图床），false = 内置反代 */
+export function setOfficialBangumiSource(on: boolean): void {
+  officialSource = on
+}
+
+/** 当前是否直连官方数据源 */
+export function bangumiSourceIsOfficial(): boolean {
+  return officialSource
+}
+
+/** 官方 API 根地址（公开地址，不含任何反代信息/密钥） */
+export const OFFICIAL_BANGUMI_API = 'https://api.bgm.tv'
+
+/**
  * 根据设置里的「API 地址」解析本次要用的端点池。
  *
  * 分配策略在 `orderBangumiEndpoints`：**同一时刻在途请求最少者优先**，在途数相同则轮询。
@@ -130,6 +158,12 @@ export function resolveBangumiEndpoints(customApi?: string): BangumiEndpoint[] {
   const raw = String(customApi ?? '').trim()
   const useBuiltIn = !raw || isBuiltInBangumiApi(raw)
   if (useBuiltIn) {
+    /*
+     * V1.5.1：直连官方模式 → 只打 api.bgm.tv。
+     * 用户自己填了自定义 API 地址时仍然优先用他的（上面 useBuiltIn 已把"填了"排除掉），
+     * 所以这个开关只影响"本该用内置反代"的那批用户。
+     */
+    if (officialSource) return [{ id: 'official', label: '官方', baseUrl: OFFICIAL_BANGUMI_API }]
     return BUILT_IN_ENDPOINTS.map((ep) => ({ id: ep.id, label: ep.label, baseUrl: ep.baseUrl }))
   }
   // 用户自定义：允许空格/逗号分隔多个地址，方便高级用户自己再组一套双端点。

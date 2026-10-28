@@ -537,7 +537,11 @@ export function SubscriptionsPage() {
                 className={`h-2 w-2 rounded-full ${downloaderStatus ? (downloaderStatus.ok ? 'bg-ok' : 'bg-danger') : 'bg-faint'}`}
               />
               <span className="text-xs font-medium">
-                {settings.downloader.type === 'aria2' ? '内置 aria2' : '外部 qBittorrent'}
+                {settings.downloader.type === 'aria2'
+                  ? '内置 aria2'
+                  : settings.downloader.type === 'transmission'
+                    ? '外部 Transmission'
+                    : '外部 qBittorrent'}
               </span>
             </div>
             <div className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-faint">

@@ -42,6 +42,7 @@ import type {
 import { resolveDanmakuSettings } from '@shared/types'
 import { mergeDanmakuBatches } from '@shared/danmakuTimeline'
 import { ENGINE_ATTACH_TIMEOUT_MS, ONLINE_PLAY_TIMEOUT_MS, RELAY_READY_TIMEOUT_MS } from '@shared/onlinePlay'
+import { localEpisodeIndex } from '@shared/localEpisode'
 import { api } from '@/lib/api'
 import { fmtDuration, localSubUrl, localVideoUrl } from '@/lib/format'
 import { useLibrary } from '@/stores/library'
@@ -1212,17 +1213,18 @@ export function PlayerPage() {
     startRuleProbe(pageUrl, { skipCache: true })
   }
 
-  /** 当前播放对象的进度键：在线用「规则 + 条目链接」，本地用文件路径 */
+  /** 当前播放对象的进度键：在线用「规则 + 条目链接」，本地用**番剧目录**（单文件播放退回文件路径） */
   const progressKeyOf = useCallback((): string => {
     if (state.mode === 'rule' && state.ruleId && state.entry?.link) {
       return onlineKey(state.ruleId, state.entry.link)
     }
     if (state.mode === 'local') {
       const f = files[currentIndex]
-      if (f) return localKey(f.path)
+      // V1.5.3：同一部番的所有集共用一条进度（按目录），这样 watched / 集数才会累积
+      if (f) return localKey(state.folder || f.path)
     }
     return ''
-  }, [state.mode, state.ruleId, state.entry, files, currentIndex])
+  }, [state.mode, state.ruleId, state.entry, state.folder, files, currentIndex])
 
   /** 开始播放某一集时登记进度（同时把该集标为已看） */
   const rememberEpisode = useCallback(
@@ -1249,12 +1251,18 @@ export function PlayerPage() {
     [progressKeyOf, state.title, state.subjectId, state.mode, state.ruleId, state.entry, state.groups]
   )
 
-  /** 本地播放也记一条（本地没有线路/集序号，用当前索引） */
+  /** 本地播放也记一条：集数用**文件名解析出的真实集数**，不是列表下标 */
   const rememberLocal = useCallback(
     (index: number): void => {
       const id = progressKeyOf()
       const f = files[index]
       if (!id || !f) return
+      /*
+       * V1.5.3：用户报「本地库播放第 N 集后，进度要按 N 更新」。
+       * 原来这里传的是 `episodeIndex: index`（这个文件在列表里的下标）——
+       * 只下了第 5~8 集时，播第 5 集会被记成第 1 集，收藏卡的「观看到第几集」全错。
+       * 现在用文件名解析出的集数（第 5 集 → episodeIndex=4），解析不出才退回下标。
+       */
       progressApi.noteEpisode({
         id,
         title: state.title,
@@ -1262,7 +1270,7 @@ export function PlayerPage() {
         source: 'local',
         filePath: f.path,
         groupIndex: 0,
-        episodeIndex: index,
+        episodeIndex: localEpisodeIndex(f.episode, index),
         episodeName: f.episode != null ? `第 ${f.episode} 集` : f.name
       })
     },
@@ -1278,13 +1286,22 @@ export function PlayerPage() {
     (force = false): void => {
       const id = progressKeyOf()
       if (!id || duration <= 0 || current <= 0) return
+      /*
+       * 本地播放显式传「第几集」的键：换集后 rememberLocal 之前也可能上报一次，
+       * 不传就会把新一集的时间写到上一集的位置里（本地按目录共用一条记录，键写错会串集）。
+       */
+      const episodeKey =
+        state.mode === 'local'
+          ? epKey(0, localEpisodeIndex(currentFile?.episode, currentIndex))
+          : undefined
       const now = Date.now()
-      if (!force && progressRef.current.key === id && now - progressRef.current.at < 10000) return
-      progressRef.current = { key: id, at: now }
-      progressApi.setPosition(id, current, duration)
+      const stamp = `${id}#${episodeKey ?? ''}`
+      if (!force && progressRef.current.key === stamp && now - progressRef.current.at < 10000) return
+      progressRef.current = { key: stamp, at: now }
+      progressApi.setPosition(id, current, duration, episodeKey)
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [progressKeyOf, current, duration]
+    [progressKeyOf, current, duration, state.mode, currentFile?.episode, currentIndex]
   )
 
   /**
@@ -1522,13 +1539,23 @@ export function PlayerPage() {
     const id = progressKeyOf()
     if (!id) return
     const line = ruleCurrent?.line ?? 0
-    const ep = ruleCurrent?.ep ?? currentIndex
+    /*
+     * 集序号：规则模式用嗅探到的集；本地模式用**真实集数-1**（与 rememberLocal 同一口径）。
+     * 本地以前只看 `stored.positionSec`（整部番的断点），换成"按目录一条进度"之后
+     * 必须按集去 positions 里取，否则点第 6 集会从第 5 集看到的位置继续播。
+     */
+    const ep =
+      state.mode === 'rule'
+        ? (ruleCurrent?.ep ?? currentIndex)
+        : state.mode === 'local'
+          ? localEpisodeIndex(currentFile?.episode, currentIndex)
+          : 0
     const stamp = `${id}#${line}:${ep}`
     if (resumeDoneRef.current === stamp) return
     resumeDoneRef.current = stamp
     const stored = progressApi.items.find((i) => i.id === id)
     // 先看「这一集自己的断点」，没有再退回整部番剧的断点（兼容旧记录）
-    const perEpisode = state.mode === 'rule' ? progressApi.positionOf(id, epKey(line, ep)) : 0
+    const perEpisode = progressApi.positionOf(id, epKey(line, ep))
     const explicit = state.startSec
     const target =
       explicit && explicit > RESUME_MIN_SEC
@@ -3066,64 +3093,12 @@ export function PlayerPage() {
               : '')
         )
         /*
-         * v1.1.2 两段式加载的第二段：数据源那批弹幕。
-         *
-         * 第一段（上面这次调用）拿到的是本地库/内置那批，几百毫秒就上屏了；
-         * 主进程在返回它的同时**已经**把"已启用的数据源"那一路发起（所以"播放前必须调用数据源"
-         * 是结构上的保证，不取决于这里）。这里只是去把已经在跑的结果取回来合并。
-         * 用户报的正是"设置里能搜到、播放时却没有源弹幕"，根因就是以前压根没这一步。
-         */
-        if (r.data.sourcesPending)
-          void mergeSourceDanmaku(key, episode, aliases, { keyword: opts.keyword, force: hard })
-        /*
-         * v0.2.9：插件渲染时，确认插件**真的**把这批弹幕挂上了。
-         * 判据是插件自己暴露的 `user-data/uosc_danmaku/has-danmaku`（v2.1.0 没有条数属性）。
-         *
-         * 分两轮看：注入必须等 mpv 载入文件（否则插件会崩、脚本被终止），
-         * 所以第一轮看到 pending=true 时不能急着回落，再等一轮；两轮都没挂上才回落到内置画布 ——
-         * 用户要的是「看到弹幕」，不是「必须由插件画」。
-         *
-         * v1.5：**画面没出来之前 `pending=true` 是正常的，不能按它回落**。
-         * 主进程现在有意把注入压到首帧之后（见 mpv.ts 的 mpvPushDanmakuFile），
-         * 那时 `mpvPluginDanmakuPending()` 必然是 true。如果这里还按老规则"两轮就回落"，
-         * 画面出来时会变成「插件刚注入一份 + 内置画布也画一份」= 弹幕叠两遍。
-         * 所以把两个计数分开：
-         *   · `round` —— 等画面的轮数（每轮 4.5 秒，上限 200 轮 ≈ 15 分钟，只是防死循环的保险）；
-         *   · `pendingRounds` —— 画面出现后"插件还没挂上"的轮数，仍然是**两轮**才回落，
-         *     与改动前的判定口径一致（不会因为等画面等久了就草草判插件没挂上）。
+         * V1.5.2：画布弹幕已删除，这里也不再需要"插件没挂上就回落画布"的等待链。
+         * 那条链每 4.5 秒醒一次、最长能跑十几分钟（等画面），既没有回落目标，
+         * 也是退出播放器时残留定时器的一个来源。只保留一条日志，插件是否挂上由它自己负责。
          */
         if (uoscActiveRef.current) {
-          const checkKey = key
-          const check = (round: number, pendingRounds = 0): void => {
-            window.setTimeout(() => {
-              void (async () => {
-                // 页面已卸载 / 已经换集：这条等待链必须停，否则它会永远自触发下去
-                if (!mountedRef.current || danmakuKeyRef.current !== checkKey) return
-                if (!hasPictureRef.current && round < 200) {
-                  if (round === 0) {
-                    console.log('[player] 画面还没出现：弹幕先不交给插件渲染，等首帧后再确认')
-                  }
-                  check(round + 1)
-                  return
-                }
-                const s = await api.uosc.status()
-                if (!s.ok || !s.data.active) return
-                if (s.data.loaded) {
-                  console.log('[player] uosc_danmaku 已挂上弹幕（has-danmaku=true）')
-                  return
-                }
-                // 画面刚出现时注入可能还在路上：再给两轮（约 9 秒），不吃掉"插件真的挂了"的判定
-                if (s.data.pending && pendingRounds < 2) {
-                  console.log('[player] uosc_danmaku 弹幕还在等文件/首帧就绪，稍后再确认')
-                  check(round + 1, pendingRounds + 1)
-                  return
-                }
-                console.warn('[player] uosc_danmaku 未挂上弹幕，回落到内置画布渲染')
-                setUoscActive(false)
-              })()
-            }, 4500)
-          }
-          check(0)
+          console.log('[player] uosc_danmaku 渲染模式：弹幕交给插件（无画布回落）')
         }
         if (opts.aliasMode) toast.success(`别名检测成功：${r.data.episodeTitle} 共 ${r.data.count} 条`)
       } else {
@@ -3140,29 +3115,11 @@ export function PlayerPage() {
     }
   }
 
-  /** 弹幕数据 / 设置推送到悬浮窗（低频：换集、改设置、开关时各一次） */
-  useEffect(() => {
-    if (!overlayActive) return
-    const push = (): void => {
-      api.overlay.setDanmaku({
-        comments: danmaku.comments,
-        settings: danmakuSettings,
-        source: danmaku.source,
-        loading: danmaku.loading,
-        // v0.2.9：插件渲染时内置画布让位，避免两套弹幕叠加
-        pluginActive: uoscActive
-      })
-    }
-    push()
-    // 悬浮窗是异步创建的：和选集一样补推两次，避免首推早于窗口就绪
-    const t1 = window.setTimeout(push, 1200)
-    const t2 = window.setTimeout(push, 3500)
-    return () => {
-      window.clearTimeout(t1)
-      window.clearTimeout(t2)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [overlayActive, danmaku, danmakuSettings.enabled, danmakuSettings.area, danmakuSettings.maxCount, danmakuSettings.offsetMs, uoscActive])
+  /*
+   * V1.5.2：原来这里会把弹幕与设置推给悬浮窗的**内置画布**。
+   * 画布已删除，推送目标不存在了，整段移除（顺带少了一条低频 IPC 与两个补推定时器）。
+   * 弹幕现在只走 uosc_danmaku：主进程在 danmakuLoad 里把合并后的 XML 注入插件。
+   */
 
   /**
    * v0.2.18：uosc 控制栏状态下行（按钮的图标/激活态/角标 + 各菜单的内容）。

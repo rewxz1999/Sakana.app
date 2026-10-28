@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { motion } from 'framer-motion'
-import { CircleCheck, CircleX, Eye, FolderOpen, Heart, HeartOff, Search, Star, StarOff } from 'lucide-react'
+import { CircleCheck, CircleX, Cloud, Eye, FolderOpen, HardDrive, Heart, HeartOff, Search, Star, StarOff } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import type { FavoriteItem } from '@shared/types'
 import { FAVORITE_SEASON_BUCKETS, favoritesSeasonKey, groupFavoritesBySeason } from '@shared/favoritesSeason'
@@ -13,13 +13,64 @@ import { AnimeCard } from '@/components/AnimeCard'
 import { EmptyState } from '@/components/ui'
 import { ContextMenu, type ContextMenuItem } from '@/components/stat/ContextMenu'
 import { resolveLocalPlay } from '@/lib/localPlay'
+import { LocalLibraryTab } from '@/components/library/LocalLibraryTab'
 
 /** 年份归属键：与左侧年份条一致（日期解析不出年份 → 0 = 未知年份）；0 只用于分组，不参与显示 */
 function yearKeyOf(f: FavoriteItem): number {
   return yearOf(f.airDate) ?? 0
 }
 
+/**
+ * 我的番剧库（V1.5.1）。
+ *
+ * 用户要求：「在收藏的顶部中增加分区切换，并将收藏改成「我的番剧库」，
+ * 原来的收藏页分区命名为在线库，新增的分区为以番剧视频资源保存文件夹为基础的本地库。」
+ *
+ * 两个分区刻意保持**完全独立的数据来源**：
+ *   · 在线库 = 原来的收藏页（联网拿封面/详情，靠 store 里的 favorites）；
+ *   · 本地库 = 主进程扫描下载目录的结果（纯磁盘事实，断网也照常显示）。
+ * 这样"我收藏了但没下载"和"我下载了但没收藏"都不会被对方的数据盖住。
+ */
 export function FavoritesPage() {
+  const [tab, setTab] = useState<'online' | 'local'>('online')
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border bg-elev1/40 px-5 py-2.5">
+        <Heart size={15} className="text-accent" />
+        <h1 className="text-sm font-semibold">我的番剧库</h1>
+        <div className="ml-2 flex items-center gap-0.5 rounded-lg bg-elev2/60 p-0.5">
+          {(
+            [
+              { id: 'online', label: '在线库', icon: Cloud },
+              { id: 'local', label: '本地库', icon: HardDrive }
+            ] as const
+          ).map((t) => {
+            const active = tab === t.id
+            return (
+              <button
+                key={t.id}
+                onClick={() => setTab(t.id)}
+                title={t.id === 'online' ? '收藏的番剧（联网取数据）' : '已下载到本机的番剧（只读本地文件）'}
+                className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-[11px] transition-colors ${
+                  active ? 'bg-elev1 font-semibold text-accent shadow-sm' : 'text-dim hover:text-text'
+                }`}
+              >
+                <t.icon size={12} /> {t.label}
+              </button>
+            )
+          })}
+        </div>
+        <span className="text-[11px] text-faint">
+          {tab === 'online' ? '收藏的番剧，联网取封面与详情' : '下载文件夹里真实存在的番剧，断网也能看'}
+        </span>
+      </div>
+      {tab === 'online' ? <OnlineLibrary /> : <LocalLibraryTab />}
+    </div>
+  )
+}
+
+/** 在线库（原「收藏」页，行为与之前完全一致） */
+function OnlineLibrary() {
   const navigate = useNavigate()
   const { favorites, keyConcerns, watchHistory, removeFavorite, toggleKeyConcern, toggleWatched } = useLibrary()
   // 观看进度（v0.2.4）：搜索已迁出本页，收藏卡片底部改为展示「观看到第几集」
@@ -312,7 +363,7 @@ export function FavoritesPage() {
   }
 
   return (
-    <div className="flex h-full min-h-0">
+    <div className="flex min-h-0 flex-1">
       {/*
         左侧两条竖导航（年份切换回到左侧竖条，用户要求：顶部不要再加导航栏遮挡内容）：
         · 年份条：选年份（再点一次回到全部年份），按住上下拖仍可快速定位列表；

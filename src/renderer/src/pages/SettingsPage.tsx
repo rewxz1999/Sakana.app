@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
+  Activity,
   Ban,
   Camera,
   Cast,
@@ -9,7 +10,6 @@ import {
   Download,
   ExternalLink,
   FileText,
-  FlaskConical,
   FolderOpen,
   Gamepad2,
   Gauge,
@@ -23,6 +23,7 @@ import {
   RefreshCw,
   ScrollText,
   ShieldOff,
+  SlidersHorizontal,
   Wifi,
   WifiOff
 } from 'lucide-react'
@@ -301,7 +302,7 @@ export function SettingsPage() {
           · 番剧表与过滤：番剧表设置 + 黑名单 + 屏蔽表（v0.3.9 把后两者从番剧表设置里拆出来，
             整个区域**与外观分开**，不再挂在外观下面）
           · 外观：只剩主题配色
-          · 测试性：FFmpeg 与控制栏（v0.3.9 从播放器设置拆出）
+          · 高级：FFmpeg 与控制栏（v0.3.9 从播放器设置拆出）
 
           注意：所有设置字段名都没动（settings.json 里仍是 ffmpegPath / uoscControlBar /
           castStrategy / hlsAdFilter / biliDanmaku …），老用户升级后设置原样生效，只是位置变了。
@@ -329,14 +330,15 @@ export function SettingsPage() {
             />
             <RowDivider />
             {/*
-              v0.3.9 补充更新：在线播放加速器独立成设置项（用户要求「放在外面的播放与下载区域」）。
-              说明里必须点名「加速」「优化记录」「对比图」，否则总览上看不出这一行管什么。
+              V1.5.1：原来的「在线播放设置」升级成「嗅探设置」——
+              用户要求「设置中增加嗅探设置，并说明采用了什么技术，原先的加速模块也放到这个设置中」。
+              入口只保留这一行，加速器的档位/实时状态/优化记录都并入那一页。
             */}
             <OpenRow
               icon={Gauge}
-              title="在线播放设置"
-              desc="在线播放加速（自动档位 / 强制加速 / 关闭）、当前是否在加速与实时速率，以及每次加速的真实效果记录与直连对比图"
-              onOpen={() => openSmall('/stream-boost-settings', 700, 620, '在线播放设置')}
+              title="嗅探设置"
+              desc="取流加速技术说明与开关（Range 多连接分段 / 自适应并发 / 请求头伪装），以及在线播放加速档位、实时速率与对比记录"
+              onOpen={() => openSmall('/sniff-settings', 720, 680, '嗅探设置')}
             />
             <RowDivider />
             <OpenRow
@@ -438,14 +440,14 @@ export function SettingsPage() {
           </div>
         </Section>
 
-        {/* 测试性 */}
-        <Section title="测试性" desc="实验性与排障用的开关，普通使用不需要改（放这里是为了不干扰日常设置）">
+        {/* 高级 */}
+        <Section title="高级" desc="进阶与排障用的选项，普通使用不需要改（放这里是为了不干扰日常设置）">
           <div className="flex flex-col">
             <OpenRow
-              icon={FlaskConical}
-              title="测试性设置"
+              icon={SlidersHorizontal}
+              title="高级设置"
               desc="FFmpeg 路径（转码兜底 / 在线流中转）与播放器控制栏实现（应用控制栏 / mpv uosc）"
-              onOpen={() => openSmall('/experimental-settings', 700, 620, '测试性设置')}
+              onOpen={() => openSmall('/experimental-settings', 700, 620, '高级设置')}
             />
           </div>
         </Section>
@@ -458,6 +460,13 @@ export function SettingsPage() {
               title="数据源配置"
               desc={`主数据源：${mainSource} · 镜像站 ${mirrorCount} 个`}
               onOpen={() => openSmall('/datasource', 720, 560, '数据源配置')}
+            />
+            <RowDivider />
+            <OpenRow
+              icon={Activity}
+              title="流量监控"
+              desc="按数据源统计本次运行的请求与流量，附最近 30 分钟的速率折线图"
+              onOpen={() => openSmall('/traffic', 980, 720, '流量监控')}
             />
             <RowDivider />
             <OpenRow
@@ -494,17 +503,22 @@ export function SettingsPage() {
               <Switch checked={settings.galgameDetect} onChange={(v) => save({ galgameDetect: v })} />
             </div>
             <RowDivider />
+            {/*
+              V1.5.2：内存识别 BGM / 章节已取消（用户要求从 galgame 助手中删除）。
+              这里不再提供开关；老设置文件里的 galgameMemRead 字段保留但主进程不再读取。
+            */}
             <div className="flex items-center justify-between gap-3">
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 text-xs text-dim">
                   <Gamepad2 size={13} className="text-accent" />
-                  内存识别 BGM / 章节
+                  内存识别 BGM / 章节（已移除）
                 </div>
                 <div className="mt-0.5 text-[11px] leading-relaxed text-faint">
-                  仅读取游戏内存中的音频文件名与章节名，不会修改游戏任何数据；识别到的 BGM 见游戏卡片右键菜单，章节名显示在卡片上
+                  V1.5.2 起不再读取游戏内存（避免扫描带来的卡顿）。解包、立绘 / CG / 文本 / 音乐提取仍在「Galgame 工具」里，
+                  走的是游戏文件与封包，不依赖内存扫描。
                 </div>
               </div>
-              <Switch checked={settings.galgameMemRead} onChange={(v) => save({ galgameMemRead: v })} />
+              <span className="shrink-0 rounded-full bg-elev2 px-2 py-0.5 text-[10px] text-faint">已移除</span>
             </div>
             <RowDivider />
             <OpenRow

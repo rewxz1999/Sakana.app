@@ -508,6 +508,8 @@ export async function extractImages(opts: {
   }
 
   for (const c of wanted.slice(0, limit)) {
+    // V1.5.2：全部提取时可能有几百张 CG；每张让一轮事件循环，避免主进程 UI 卡死
+    await yieldToLoop()
     const r = readArchiveEntry(c.entry, { maxBytes: 64 * 1024 * 1024 })
     if (!r.ok || !r.bytes) continue
     const file = join(dir, sanitizeName(basename(c.entry.name).replace(/\.png$/i, '')) + '.png')

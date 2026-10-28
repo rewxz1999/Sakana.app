@@ -647,7 +647,13 @@ export function RecommendTablePage() {
           >
             <EditLeftPanel ctx={editCtx} />
           </aside>
-        ) : pages.length === 0 || !currentPage ? null : panelHidden ? null : (
+        ) : panelHidden ? null : (
+          /*
+           * V1.5.2 修：这里以前多了一个 `pages.length === 0 || !currentPage` 的条件 ——
+           * 于是**刚新建的空表**左侧「添加作品」面板根本不渲染，用户点「添加作品」
+           * 只能看到按钮状态变化、没有任何面板出现（"不弹出添加作品的面板"）。
+           * 添加面板恰恰是空表唯一需要的东西，条件只保留 `panelHidden`（用户手动收起）。
+           */
           <aside className="flex min-h-0 w-[330px] shrink-0 flex-col rounded-xl border border-border bg-elev1/50 p-3">
             <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-dim">
               <BookOpen size={13} />

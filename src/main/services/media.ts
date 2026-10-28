@@ -16,10 +16,15 @@ import type { ImageDataUrlResult, LocalSubFile, LocalVideoFile } from '@shared/t
 import { parseEpisode } from '../lib/parse'
 import { log } from '../log'
 import { dataPaths } from './paths'
+import { cacheRoot } from './cacheRoot'
 import { BROWSER_UA, getSettings } from '../net'
 import { rewriteImageUrl, unresizedImageUrl } from './bangumi'
+import { imageVariantUrls } from './bangumiImageUrl'
+import { onlineImageTo8443 } from './onlineDb'
 import { builtInImgOrigin } from './bangumiProxy'
 import { liveStream } from './transcode'
+import { fallbackCoverForSubject, subjectIdFromCoverUrl } from './animeImageFallback'
+import { recordTraffic } from './traffic'
 
 const VIDEO_EXTS = new Set([
   '.mp4',
@@ -224,14 +229,130 @@ function isLocalImagePath(p: string): boolean {
 }
 
 function imageCacheDir(): string {
-  // 缓存根目录可由「设置 → 缓存设置」自定义（留空则 userData/cache）
-  const root = getSettings().cacheDir?.trim() || join(app.getPath('userData'), 'cache')
-  const dir = join(root, 'img')
+  // V1.5.1：统一走 cacheRoot()（settings.cacheDir 优先，留空 = <数据根>/cache）。
+  // 以前这里默认拼的是 userData/cache，与设置页统计/清理的目录不是同一个 —— 见 cacheRoot.ts 的说明。
+  const dir = join(cacheRoot(), 'img')
   mkdirSync(dir, { recursive: true })
   return dir
 }
 
+/**
+ * 图片缓存目录（V1.5.1）：缓存数据库要按"哪些图属于哪部番"统计体积与决定保留时长，
+ * 需要一个可读的目录路径。仍然走 `imageCacheDir()`（会顺带 mkdir），保证与取图路径**同一个**目录。
+ */
+export function imageCacheDirPath(): string {
+  return imageCacheDir()
+}
+
 const inflight = new Map<string, Promise<Response>>()
+
+/*
+ * ───────── 图片跨页面复用 + 更长缓存（V1.5.3）─────────
+ *
+ * 用户要求：「图片跨页面复用 + 更长缓存」。
+ *
+ * 原来的链路只有磁盘缓存：每次翻页/切页，渲染层重新挂载 `<img>` → 重新请求 `sakana-img://` →
+ * 主进程命中磁盘也要开一次文件流；而自定义协议的响应只给了 `max-age=86400`，
+ * Chromium 对非 http(s) 协议的缓存策略本来就不稳定，实测常常还是每次重新取。
+ *
+ * 现在叠三层，从快到慢：
+ *   1. **内存 LRU**（本文件）：最近看过的图片直接给字节，翻回上一页是 0 磁盘 IO；
+ *   2. **磁盘缓存**（既有 `cache/img`，sha1 命名）：内存没命中时读盘并回填内存；
+ *   3. **浏览器 HTTP 缓存**：响应带 30 天 `immutable` + `ETag`，并支持 `If-None-Match` → 304，
+ *      这样 Chromium 自己就能跨页面复用，连 IPC 都不用发。
+ *
+ * 为什么上限是 96MB：一屏 20 张 400px 封面约 2~4MB，96MB 足够放下几十页；
+ * 再大就变成和用户抢内存（应用本身还有 libmpv/缓存）。超过上限按最久未用淘汰。
+ */
+const IMAGE_CACHE_CONTROL = 'public, max-age=2592000, immutable'
+const IMAGE_MEM_MAX_BYTES = 96 * 1024 * 1024
+const IMAGE_MEM_MAX_ENTRIES = 1500
+/**
+ * 单张图进内存的上限：超过就退回文件流。
+ * 常规封面只有 5~60KB，读进内存几乎无感；但原图可以到 25MB，
+ * 在主进程同步读 25MB 会卡住所有窗口的 IPC —— 这种图不值得用内存换速度。
+ */
+const IMAGE_MEM_READ_MAX = 8 * 1024 * 1024
+const imageMemory = new Map<string, { buf: Buffer; type: string; at: number }>()
+let imageMemBytes = 0
+
+function imageMemGet(key: string): { buf: Buffer; type: string } | null {
+  const hit = imageMemory.get(key)
+  if (!hit) return null
+  // LRU：Map 的插入顺序就是"最近使用"顺序，命中后重新插到末尾
+  imageMemory.delete(key)
+  hit.at = Date.now()
+  imageMemory.set(key, hit)
+  return hit
+}
+
+function imageMemPut(key: string, buf: Buffer, type: string): void {
+  if (!buf.length) return
+  const prev = imageMemory.get(key)
+  if (prev) {
+    imageMemBytes -= prev.buf.length
+    imageMemory.delete(key)
+  }
+  imageMemory.set(key, { buf, type, at: Date.now() })
+  imageMemBytes += buf.length
+  while (
+    (imageMemBytes > IMAGE_MEM_MAX_BYTES || imageMemory.size > IMAGE_MEM_MAX_ENTRIES) &&
+    imageMemory.size > 1
+  ) {
+    const oldest = imageMemory.keys().next().value as string | undefined
+    if (!oldest) break
+    const entry = imageMemory.get(oldest)
+    if (entry) imageMemBytes -= entry.buf.length
+    imageMemory.delete(oldest)
+  }
+}
+
+/** 单张图片的 ETag（目标地址的 sha1 已经唯一，长度再用上，避免理论上同 hash 不同内容） */
+function imageETag(hash: string, size: number): string {
+  return `"${hash}-${size}"`
+}
+
+/** 大图走文件流（不占内存），但缓存头与 ETag 与内存路径一致 */
+function imageStreamResponse(
+  path: string,
+  type: string,
+  size: number,
+  etag: string,
+  ifNoneMatch?: string | null
+): Response {
+  if (ifNoneMatch && ifNoneMatch === etag) {
+    return new Response(null, {
+      status: 304,
+      headers: { ETag: etag, 'Cache-Control': IMAGE_CACHE_CONTROL }
+    })
+  }
+  return new Response(createReadStream(path) as unknown as ReadableStream, {
+    headers: {
+      'Content-Type': type,
+      'Content-Length': String(size),
+      'Cache-Control': IMAGE_CACHE_CONTROL,
+      ETag: etag
+    }
+  })
+}
+
+/** 统一构造图片响应：长缓存 + ETag + 304 协商 */
+function imageResponse(buf: Buffer, type: string, etag: string, ifNoneMatch?: string | null): Response {
+  if (ifNoneMatch && ifNoneMatch === etag) {
+    return new Response(null, {
+      status: 304,
+      headers: { ETag: etag, 'Cache-Control': IMAGE_CACHE_CONTROL }
+    })
+  }
+  return new Response(new Uint8Array(buf) as unknown as ReadableStream, {
+    headers: {
+      'Content-Type': type,
+      'Content-Length': String(buf.length),
+      'Cache-Control': IMAGE_CACHE_CONTROL,
+      ETag: etag
+    }
+  })
+}
 
 /**
  * 图片缓存瘦身（v0.3.9 体检 M6）。
@@ -244,7 +365,19 @@ const inflight = new Map<string, Promise<Response>>()
  *   · 超过上限（默认 1GB）时按**最后访问时间**从旧到新删，删到上限的 80% 为止（留出余量，避免每次启动都删）；
  *   · 读不到/删不掉的单个文件直接跳过，绝不影响正常加载。
  */
-export function pruneImageCache(maxBytes = 1024 * 1024 * 1024): { removed: number; freedBytes: number } {
+export function pruneImageCache(
+  maxBytes = 1024 * 1024 * 1024,
+  opts?: {
+    /**
+     * 受保护文件判定（V1.5.1）：命中就不参与"超上限按最久未用删除"。
+     *
+     * 谁会受保护：收藏番剧的图片（永久）、以及缓存数据库判定尚未过期的图片。
+     * 用户的要求是"图片一定要缓存得久一点"，如果 1GB 上限一到就把收藏卡的封面删了，
+     * 下次开收藏页会一次性重拉几十张图 —— 既难看，也正好把 API 压力顶起来。
+     */
+    protect?: (path: string) => boolean
+  }
+): { removed: number; freedBytes: number } {
   const dir = imageCacheDir()
   const entries: { path: string; size: number; atime: number }[] = []
   try {
@@ -270,6 +403,7 @@ export function pruneImageCache(maxBytes = 1024 * 1024 * 1024): { removed: numbe
   let freed = 0
   for (const e of entries) {
     if (total <= target) break
+    if (opts?.protect?.(e.path)) continue
     try {
       unlinkSync(e.path)
       total -= e.size
@@ -307,7 +441,7 @@ export function registerMediaProtocols(): void {
           headers: { 'Content-Type': type, 'Cache-Control': 'max-age=86400' }
         })
       }
-      return await fetchImageWithCache(target)
+      return await fetchImageWithCache(target, { ifNoneMatch: req.headers.get('if-none-match') })
     } catch (err) {
       log.append('warn', 'img', `图片加载失败 (${target}): ${String(err)}`)
       return new Response('error', { status: 502 })
@@ -587,23 +721,142 @@ export async function prefetchImages(urls: string[], limit = 18): Promise<void> 
   )
 }
 
-async function fetchImageWithCache(rawTarget: string): Promise<Response> {
+/**
+ * V1.5.2：bangumi 图床「连续失败就降级」的熔断状态。
+ *
+ * 用户要求「在 bangumi 源多次取不到图片时再启用」备用图源。逐张失败才兜底虽然也能工作，
+ * 但反代整体挂掉时，一屏十几张图会每张都先白等 8~16 秒才去兜底。
+ * 所以这里记一个连续失败计数：连续 3 张失败 → 2 分钟内对**可识别 id 的封面**先走备用源
+ * （备用源也没图时再退回主源），既不让用户看一片灰，也不会长期绕过自己的反代。
+ */
+let bgmImageFailStreak = 0
+let bgmImageDegradedUntil = 0
+function noteBgmImageFailure(): void {
+  bgmImageFailStreak += 1
+  if (bgmImageFailStreak >= 3) {
+    bgmImageDegradedUntil = Date.now() + 120_000
+    log.append('warn', 'img', 'bangumi 图床连续失败，已临时启用备用图片源（AniList / Jikan / Kitsu），2 分钟后自动重试主源')
+    bgmImageFailStreak = 0
+  }
+}
+function noteBgmImageSuccess(): void {
+  bgmImageFailStreak = 0
+}
+function bgmImageDegraded(): boolean {
+  return Date.now() < bgmImageDegradedUntil
+}
+
+/** 取一张备用源的图并按**备用地址**缓存（与主源缓存互不覆盖） */
+async function serveFallbackImage(
+  url: string,
+  opts?: { ifNoneMatch?: string | null }
+): Promise<Response | null> {
+  let type = 'image/jpeg'
+  try {
+    const ext = (() => {
+      const e = extname(new URL(url).pathname).toLowerCase()
+      return IMAGE_EXTS[e] ? e : '.jpg'
+    })()
+    type = IMAGE_EXTS[ext] ?? 'image/jpeg'
+    const hash = createHash('sha1').update(url).digest('hex').slice(0, 24)
+    const cachePath = join(imageCacheDir(), `${hash}${ext}`)
+    const mem = imageMemGet(url)
+    if (mem) {
+      recordTraffic({ source: 'image', requests: 0, cacheHits: 1, cacheBytes: mem.buf.length })
+      return imageResponse(mem.buf, mem.type, imageETag(hash, mem.buf.length), opts?.ifNoneMatch)
+    }
+    if (existsSync(cachePath)) {
+      const size = statSync(cachePath).size
+      if (size > IMAGE_MEM_READ_MAX) {
+        recordTraffic({ source: 'image', requests: 0, cacheHits: 1, cacheBytes: size })
+        return imageStreamResponse(cachePath, type, size, imageETag(hash, size), opts?.ifNoneMatch)
+      }
+      const buf = readFileSync(cachePath)
+      imageMemPut(url, buf, type)
+      recordTraffic({ source: 'image', requests: 0, cacheHits: 1, cacheBytes: buf.length })
+      return imageResponse(buf, type, imageETag(hash, buf.length), opts?.ifNoneMatch)
+    }
+    const res = await withImageSlot(() => fetchImageOnce(url))
+    if (!res.ok) {
+      recordTraffic({ source: 'image', requests: 1, errors: 1 })
+      return null
+    }
+    let ct = res.headers.get('content-type') ?? 'image/jpeg'
+    if (!ct.startsWith('image/')) ct = type
+    const buf = Buffer.from(await res.arrayBuffer())
+    if (buf.length === 0 || buf.length > MAX_IMAGE_BYTES) {
+      recordTraffic({ source: 'image', requests: 1, errors: 1 })
+      return null
+    }
+    recordTraffic({ source: 'image', bytes: buf.length, requests: 1 })
+    imageMemPut(url, buf, ct)
+    try {
+      writeFileSync(cachePath, buf)
+    } catch {
+      /* 缓存失败不影响显示 */
+    }
+    return imageResponse(buf, ct, imageETag(hash, buf.length), opts?.ifNoneMatch)
+  } catch (err) {
+    log.append('warn', 'img', `备用图片源取图失败：${String((err as Error)?.message ?? err).slice(0, 90)}`)
+    recordTraffic({ source: 'image', requests: 1, errors: 1 })
+    return null
+  }
+}
+
+async function fetchImageWithCache(
+  rawTarget: string,
+  opts?: { ifNoneMatch?: string | null }
+): Promise<Response> {
   // 配了自建图片反代时，官方图床地址改写到反代域名（Worker 按路径转发 + 按需缩放）
   const target = rewriteImageUrl(rawTarget)
+  const hash = createHash('sha1').update(target).digest('hex').slice(0, 24)
+  const ext = (() => {
+    const e = extname(new URL(target).pathname).toLowerCase()
+    return IMAGE_EXTS[e] ? e : '.img'
+  })()
+  const cachePath = join(imageCacheDir(), `${hash}${ext}`)
+  /*
+   * 内存 → 磁盘 → 网络。前两层在 inflight 之外处理：
+   * 命中时能立刻回 304/字节，不必和正在飞的那张图共用同一个 Promise；
+   * 反过来说，网络那张图仍然单飞（同一张封面并发只取一次）。
+   */
+  const mem = imageMemGet(target)
+  if (mem) {
+    recordTraffic({ source: 'image', requests: 0, cacheHits: 1, cacheBytes: mem.buf.length })
+    return imageResponse(mem.buf, mem.type, imageETag(hash, mem.buf.length), opts?.ifNoneMatch)
+  }
+  if (existsSync(cachePath)) {
+    const type = IMAGE_EXTS[ext] ?? 'image/jpeg'
+    try {
+      const size = statSync(cachePath).size
+      if (size > IMAGE_MEM_READ_MAX) {
+        recordTraffic({ source: 'image', requests: 0, cacheHits: 1, cacheBytes: size })
+        return imageStreamResponse(cachePath, type, size, imageETag(hash, size), opts?.ifNoneMatch)
+      }
+      const buf = readFileSync(cachePath)
+      if (buf.length > 0) {
+        imageMemPut(target, buf, type)
+        recordTraffic({ source: 'image', requests: 0, cacheHits: 1, cacheBytes: buf.length })
+        return imageResponse(buf, type, imageETag(hash, buf.length), opts?.ifNoneMatch)
+      }
+    } catch {
+      /* 读盘失败就退回网络取图，不能因为一张缓存坏掉让图不显示 */
+    }
+  }
   const existing = inflight.get(target)
   if (existing) return existing
   const p = (async () => {
-    const hash = createHash('sha1').update(target).digest('hex').slice(0, 24)
-    const ext = (() => {
-      const e = extname(new URL(target).pathname).toLowerCase()
-      return IMAGE_EXTS[e] ? e : '.img'
-    })()
-    const cachePath = join(imageCacheDir(), `${hash}${ext}`)
-    if (existsSync(cachePath)) {
-      const type = IMAGE_EXTS[ext] ?? 'image/jpeg'
-      return new Response(createReadStream(cachePath) as unknown as ReadableStream, {
-        headers: { 'Content-Type': type, 'Cache-Control': 'max-age=86400' }
-      })
+    /*
+     * V1.5.2：主源处于"连续失败"状态时，可识别 id 的封面**先**试备用源。
+     * 反代整体挂掉时这能省掉每张图 8~16 秒的白等；备用源也没图就继续按原流程走主源。
+     */
+    const earlySubjectId = subjectIdFromCoverUrl(target)
+    if (earlySubjectId && bgmImageDegraded()) {
+      const fb = await fallbackCoverForSubject(earlySubjectId)
+      if (fb) {
+        const served = await serveFallbackImage(fb.url, opts)
+        if (served) return served
+      }
     }
     /*
      * 取图：并发受限 + 超时 + 一次重试 + 缩放路径兜底（v0.2.7 附加）。
@@ -634,26 +887,80 @@ async function fetchImageWithCache(rawTarget: string): Promise<Response> {
     }
     let res = await attempt(target)
     if (!res) {
-      // 缩放路径可能没被反代支持：退回原图路径再试一次（宁可慢一点也要有图）
-      const plain = unresizedImageUrl(target)
-      if (plain !== target) {
-        log.append('info', 'img', `缩放路径不可用，改取原图: ${plain.slice(0, 90)}`)
-        res = await attempt(plain)
+      /*
+       * V1.5.2：先按**缩放变体**降级（800 → 400），再退回原图。
+       *
+       * 详情页用的是 `large`（`/pic/cover/l/…`，没有 /r/ 前缀），卡片用的是 `/r/400/…`；
+       * 两者缓存键不同，而 large 在部分网络下直连会被中断（实测：large 442KB 直连报
+       * "stream has been aborted"，同域 /r/400 的 58KB 正常）。降级成功后字节仍按原始地址缓存，
+       * 下次同一条 large 直接命中 —— 用户就不用再为"同一张封面详情页出不来"困惑了。
+       */
+      for (const alt of imageVariantUrls(target)) {
+        if (alt === target) continue
+        res = await attempt(alt)
+        if (res) {
+          log.append('info', 'img', `封面原尺寸取不到，已改用缩放变体（${alt.slice(0, 80)}）`)
+          break
+        }
+      }
+      if (!res) {
+        // 缩放路径可能没被反代支持：退回原图路径再试一次（宁可慢一点也要有图）
+        const plain = unresizedImageUrl(target)
+        if (plain !== target) {
+          log.append('info', 'img', `缩放路径不可用，改取原图: ${plain.slice(0, 90)}`)
+          res = await attempt(plain)
+        }
+      }
+      /*
+       * V1.5.3：在线图床 443 失败 → 换 8443（用户给的兜底写法）。
+       * 实测 `/s/<id>` 在 443 上会连接超时、8443 正常；`/r/400/...` 443 正常，所以只在失败时换。
+       */
+      if (!res) {
+        const alt = onlineImageTo8443(target)
+        if (alt !== target) {
+          log.append('info', 'img', `在线图床 443 失败，改试 8443: ${alt.slice(0, 90)}`)
+          res = await attempt(alt)
+        }
       }
     }
-    if (!res) return new Response('upstream error', { status: 502 })
+    /*
+     * V1.5.2：主源（bangumi 反代）取不到时，改用备用图源。
+     *
+     * 只对「能从路径里认出条目 id 的封面」启用（见 animeImageFallback 的说明）：
+     * 认不出 id 就不知道该去哪找这张图，硬换只会给错图。
+     * 备用源也拿不到时，照旧回 502 —— 行为与以前一致，不会让图片链路卡住。
+     */
+    if (!res) {
+      const subjectId = subjectIdFromCoverUrl(target)
+      if (subjectId) {
+        noteBgmImageFailure()
+        const fb = await fallbackCoverForSubject(subjectId)
+        if (fb) {
+          const served = await serveFallbackImage(fb.url, opts)
+          if (served) {
+            log.append('info', 'img', `封面已改用 ${fb.source}（条目 #${subjectId}）`)
+            return served
+          }
+        }
+      }
+      return new Response('upstream error', { status: 502 })
+    }
+    noteBgmImageSuccess()
     let type = res.headers.get('content-type') ?? 'image/jpeg'
     if (!type.startsWith('image/')) type = 'image/jpeg'
     const buf = Buffer.from(await res.arrayBuffer())
-    if (buf.length > MAX_IMAGE_BYTES) return new Response('too large', { status: 502 })
+    if (buf.length > MAX_IMAGE_BYTES) {
+      recordTraffic({ source: 'image', requests: 1, errors: 1 })
+      return new Response('too large', { status: 502 })
+    }
+    recordTraffic({ source: 'image', bytes: buf.length, requests: 1 })
+    imageMemPut(target, buf, type)
     try {
       writeFileSync(cachePath, buf)
     } catch {
       /* 缓存失败不影响显示 */
     }
-    return new Response(new Uint8Array(buf) as unknown as ReadableStream, {
-      headers: { 'Content-Type': type, 'Cache-Control': 'max-age=86400' }
-    })
+    return imageResponse(buf, type, imageETag(hash, buf.length), opts?.ifNoneMatch)
   })().finally(() => {
     inflight.delete(target)
   })

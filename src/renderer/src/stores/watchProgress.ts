@@ -57,9 +57,20 @@ export function onlineKey(ruleId: string, entryLink: string): string {
   return `${ruleId}::${entryLink}`
 }
 
-/** 本地播放的稳定键：文件路径 */
-export function localKey(filePath: string): string {
-  return `local::${filePath}`
+/**
+ * 本地播放的稳定键（V1.5.3 改为**按番剧目录**）。
+ *
+ * 以前是「一个文件一个键」(`local::<文件路径>`)，后果是：
+ *   · 看完第 5 集再点第 6 集，等于换了一条进度记录，`watched` 永远只有 1 集；
+ *   · 收藏卡按 subjectId/标题找进度时，命中哪一条取决于数组顺序，
+ *     且 `episodeIndex` 是**文件在列表里的下标**（第 5 集如果是列表第一个文件就记成第 1 集）。
+ * 改成按目录后，一部番只有一条记录，每集的断点存在 `positions[0:N-1]` 里，
+ * `episodeIndex` 用真实集数（见 PlayerPage 的 rememberLocal），进度才会"播第 N 集就是第 N 集"。
+ *
+ * 单文件播放（没有 folder）仍然退回文件路径：它本来就不属于任何一部番。
+ */
+export function localKey(key: string): string {
+  return `local::${key}`
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null

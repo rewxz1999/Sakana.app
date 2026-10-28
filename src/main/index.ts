@@ -12,11 +12,15 @@ import { CH } from '@shared/channels'
 import { ensureDefaultRules, rulesRepoAutoUpdate } from './services/rules'
 import { createTray, destroyTray, markQuitting } from './tray'
 import { createMainWindow, getMainWindow, realWindows } from './window'
+import { ensureCacheLayout } from './services/cacheRoot'
+import { flushCacheDb, initCacheDb, noteLibraryChanged, setImagePruner } from './services/cacheDb'
 import { ruleEpisodes, ruleSearch } from './services/rules'
 import { convertSubtitleToVtt, listVideos } from './services/media'
 import { initLiveServer, stopAllLive } from './services/transcode'
-import { maybeShowIntro } from './services/onboarding'
-import { applySessionProxy } from './net'
+import { applySavedBangumiSource, runStartupAsks } from './services/startupAsk'
+import { applySessionProxy, systemProxyConfig } from './net'
+// V1.5.3：装流量归属判定（模块加载即注册；只把真实基址收进主进程，不进界面/日志）
+import './services/trafficSources'
 import { logThumbfastMpv } from './services/mpv'
 import axios from 'axios'
 
@@ -179,6 +183,25 @@ if (!gotLock) {
     store.init()
     log.init()
     /*
+     * V1.5.2：启动时就探测一次系统代理并写进进程环境变量。
+     *
+     * 为什么要提前：uosc_danmaku 取弹幕走的是**外部 curl 子进程**，它只认 `http_proxy`
+     * 环境变量；如果等到第一次播放才设置，第一个子进程可能已经按直连跑过了。
+     * 这里探测本身有 5 分钟缓存，读不到注册表也只是打一条日志，不影响启动。
+     */
+    try {
+      systemProxyConfig()
+    } catch {
+      /* 探测失败按没有系统代理处理 */
+    }
+    /*
+     * V1.5.1：缓存目录统一 + 老数据迁移（必须在任何写缓存的模块启动前）。
+     *
+     * 过去图片与条目 JSON 写在 `userData/cache`，而设置页统计/清理的是 `<数据根>/cache` ——
+     * 两个目录。先把这个历史包袱一次性搬正，后面的缓存数据库、体积统计才可能是准的。
+     */
+    ensureCacheLayout()
+    /*
      * v0.3.9 体检 M4：把"落盘失败"接到日志上（以前只 console.error，打包后等于静默）。
      * ⚠️ 必须跳过 `logs` 这个命名空间：日志本身也要落盘，磁盘满时若还去写日志就会无限递归。
      */
@@ -196,6 +219,11 @@ if (!gotLock) {
      */
     let settingsBroadcastTimer: NodeJS.Timeout | null = null
     store.onNamespaceWritten = (ns) => {
+      /*
+       * V1.5.1：收藏/黑名单被改动后，缓存数据库要跟着重新判定保留档位
+       * （"取消收藏的也自动清理"就靠这一条；不接的话要等下一次启动才生效）。
+       */
+      noteLibraryChanged(ns)
       if (ns !== 'settings') return
       /*
        * 合并短时间内的多次写入：设置偶尔会被连续写（数据源迁移 + 用户操作、或主进程几处连锁写），
@@ -230,7 +258,27 @@ if (!gotLock) {
      */
     logThumbfastMpv()
     log.append('info', 'app', `数据根目录：${dataRootLabel()}${DATA_PATHS.fallback ? '（安装目录不可写）' : ''}`)
+    /*
+     * V1.5.1：先把"上次选择的数据源模式"应用上，再 init bangumi。
+     * 顺序反了的话，init 里写进日志的链路与实际请求用的链路会不一致 —— 排查数据源问题时最误导人。
+     */
+    applySavedBangumiSource()
     bangumi.init()
+    /*
+     * V1.5.1：本地缓存数据库。放在 bangumi.init() 之后 ——
+     * 图片文件名的推算规则由 bangumi.init() 注入（见 setImageNameResolver），
+     * 早于它初始化的话，"哪些图属于哪部番"就全都算不出来，清理会把收藏封面一起删掉。
+     *
+     * 延迟 2.5 秒执行：它要扫图片目录与条目 JSON（本机 842MB/1400+ 文件）来统计体积、
+     * 收养老缓存，属于纯后台整理，没必要和首屏抢磁盘。
+     */
+    setTimeout(() => {
+      try {
+        initCacheDb()
+      } catch (err) {
+        log.append('warn', 'cache-db', `缓存数据库初始化失败（不影响使用）：${String(err)}`)
+      }
+    }, 2500)
     /*
      * v1.1.4：番剧表现在**先用磁盘缓存秒开**，联网刷新在后台做。
      * 刷新成功后在这里广播给所有窗口（主窗口 + 小窗），界面立刻换上最新数据，
@@ -267,8 +315,14 @@ if (!gotLock) {
     // 网页视图 / 嗅探窗口 / 图片协议同样走应用代理（否则部分站点只有 HTTP 能访问）
     applySessionProxy(session.defaultSession)
 
-    // 首次启动提示数据保存位置（只显示一次，自检/冒烟模式下自动跳过）
-    setTimeout(() => maybeShowIntro(), 3000)
+    /*
+     * V1.5.1：启动询问（V1.5.1 取代了旧的"首次启动提示一次数据位置"）。
+     * 延迟 2.5 秒：等主窗口真正画出来再弹模态框，否则用户会看到"先弹框、后出窗口"的怪顺序。
+     * 两个弹窗是串行的（先网络环境、再保存位置），互不阻塞；自检模式下整体跳过。
+     */
+    setTimeout(() => {
+      void runStartupAsks()
+    }, 2500)
 
     // 方案 4.2：应用启动时自动检测订阅更新（延迟 4s，避免抢占启动网络），需用户确认后下载
     setTimeout(() => {
@@ -348,19 +402,27 @@ if (!gotLock) {
           log.append('warn', 'cast', `投屏服务启动失败：${String((err as Error)?.message ?? err).slice(0, 140)}`)
         }
         /*
-         * 图片缓存瘦身（v0.3.9 体检 M6）：只在启动时跑一次。
+         * 图片缓存瘦身（v0.3.9 体检 M6；V1.5.1 交给缓存数据库统一处理）。
+         *
          * 放在这里（而不是启动最前面）是因为它要读目录、统计大小，没必要和首屏抢时间；
          * 也不能放进每张图的写入路径 —— 那样每次加载都要扫目录，得不偿失。
+         *
+         * V1.5.1 之后这里做三件事：
+         *   1. 把 media 的"超上限按最久未用删除"注入给缓存数据库（避免两边互相 import）；
+         *   2. 跑一次**带保护**的清理 —— 收藏与未过期的图不会被删，这是"图片留久一点"的落点；
+         *   3. 兼容 `SAKANA_IMG_CACHE_MAX` 自检上限覆盖。
          */
         try {
           const { pruneImageCache } = await import('./services/media')
+          const { pruneCacheDbNow } = await import('./services/cacheDb')
+          setImagePruner(pruneImageCache)
           /*
            * `SAKANA_IMG_CACHE_MAX` 是给自检用的上限覆盖（字节）：不设就用默认 1GB。
            * 有了它，"超限就删最久未用的"这条路径可以真跑一遍（见 .e2e 里的说明），
            * 而不是只能靠读代码相信它。
            */
           const limit = Number(process.env.SAKANA_IMG_CACHE_MAX)
-          pruneImageCache(Number.isFinite(limit) && limit > 0 ? limit : undefined)
+          pruneCacheDbNow(Number.isFinite(limit) && limit > 0 ? limit : undefined)
         } catch (err) {
           log.append('warn', 'img', `图片缓存清理失败：${String((err as Error)?.message ?? err).slice(0, 140)}`)
         }
@@ -5391,6 +5453,19 @@ if (!gotLock) {
     destroyTray()
     // v0.3.6：播放内核 + 播放相关窗口/服务一并收掉（见上面的说明）
     void cleanupPlaybackOnQuit()
+    /*
+     * V1.5.2：退出兜底。
+     *
+     * 退出卡死的老根因（libmpv 的 terminate_destroy 同步阻塞）已经在 mpvDestroy 里改掉了；
+     * 这一条只防"某个清理分支自己卡住/等太久"的情况：1.5 秒还没走到 will-quit 就强制退出。
+     * 用 unref 让它本身不拖住进程；will-quit 正常触发时清掉。
+     */
+    const forced = setTimeout(() => {
+      log.append('warn', 'app', '退出清理超过 1.5 秒，强制结束进程（避免 Windows 判无响应）')
+      app.exit(0)
+    }, 1500)
+    forced.unref?.()
+    app.once('will-quit', () => clearTimeout(forced))
   })
 
   /**

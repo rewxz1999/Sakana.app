@@ -55,6 +55,7 @@ const api: SakanaApi = {
     onSettingsChanged: (cb) => subscribe<[]>(CH.evSettings, cb)
   },
   bangumi: {
+    setSource: (official) => call(CH.bgmSetSource, official),
     calendar: (force, opts) => call(CH.bgmCalendar, force, opts),
     onCalendar: (cb) => subscribe<[CalendarResult]>(CH.evBgmCalendar, cb),
     subject: (id, priority) => call(CH.bgmSubject, id, priority),
@@ -103,6 +104,9 @@ const api: SakanaApi = {
     // 外部 qBittorrent：状态（连不上时给中文原因 + 探测到的端口）/ 由应用启动并等 WebUI 就绪
     qbitStatus: () => call(CH.qbitStatus),
     qbitLaunch: () => call(CH.qbitLaunch),
+    // V1.5.2：aria2 Tracker 列表（状态 / 立即更新）
+    trackerStatus: () => call(CH.dlTrackerStatus),
+    trackerUpdate: () => call(CH.dlTrackerUpdate),
     onChanged: (cb) => subscribe(CH.evDownloads, cb)
   },
   rules: {
@@ -324,12 +328,19 @@ const api: SakanaApi = {
     unpackStatus: (gameId, exePath) => call(CH.galUnpackStatus, gameId, exePath),
     extractImages: (gameId, exePath, gameName, kind, limit) =>
       call(CH.galExtractImages, gameId, exePath, gameName, kind, limit),
+    // V1.5.2：全部提取（无候选上限）+ 最近解包资源查看
+    extractPreview: (exePath, kind) => call(CH.galExtractPreview, exePath, kind),
+    extractAll: (exePath, gameName, kind) => call(CH.galExtractAll, exePath, gameName, kind),
+    resources: (gameId, gameName) => call(CH.galResources, gameId, gameName),
     refreshBgm: (gameId) => call(CH.galMemRefresh, gameId),
     dirsGet: () => call(CH.galDirsGet),
     dirsSet: (dir) => call(CH.galDirsSet, dir),
     recentShots: () => call(CH.galRecentShots),
     listShots: (gameName) => call(CH.galListShots, gameName),
     searchSites: (keyword) => call(CH.galSearchSites, keyword),
+    // V1.5.2：资源站清单与按站点生成搜索地址（不联网）
+    sites: () => call(CH.galSiteList),
+    siteUrl: (key, keyword) => call(CH.galSiteUrl, key, keyword),
     onEvent: (cb) => subscribe(CH.evGal, cb)
   },
   stat: {
@@ -389,7 +400,28 @@ const api: SakanaApi = {
     info: () => call(CH.cacheInfo),
     clear: () => call(CH.cacheClear),
     junkClear: () => call(CH.junkClear),
-    setDir: (dir) => call(CH.cacheSetDir, dir)
+    setDir: (dir) => call(CH.cacheSetDir, dir),
+    // V1.5.1：本地缓存数据库（分项占用 / 最近条目 / 立即清理 / 移除单个条目）
+    dbStats: () => call(CH.cacheDbStats),
+    dbEntries: (limit) => call(CH.cacheDbEntries, limit),
+    dbPrune: () => call(CH.cacheDbPrune),
+    dbForget: (id) => call(CH.cacheDbForget, id)
+  },
+  online: {
+    sources: () => call(CH.onlineSourcesList),
+    search: (source, keyword) => call(CH.onlineSearch, source, keyword),
+    episodes: (source, item) => call(CH.onlineEpisodes, source, item),
+    resolve: (source, item, ep) => call(CH.onlineResolve, source, item, ep)
+  },
+  traffic: {
+    // V1.5.3：数据源流量监控（主进程内存里的计数，不读盘、不联网）
+    snapshot: () => call(CH.trafficSnapshot),
+    reset: () => call(CH.trafficReset)
+  },
+  library: {
+    // V1.5.1 本地库：下载目录扫描 / 按条目解析本地目录
+    local: () => call(CH.libraryLocal),
+    localDir: (input) => call(CH.libraryLocalDir, input)
   },
   saveDirs: {
     info: () => call(CH.saveDirsInfo),

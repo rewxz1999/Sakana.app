@@ -143,16 +143,22 @@ async function readBackHasImage(): Promise<boolean> {
  */
 async function restoreClipboard(snap: ClipSnapshot): Promise<boolean> {
   try {
-    const items: ClipboardItem[] = []
-    for (const img of snap.images) {
-      items.push(new ClipboardItem({ [img.mime]: new Blob([img.buffer], { type: img.mime }) }))
-    }
-    if (snap.text) items.push(new ClipboardItem({ 'text/plain': snap.text }))
-    if (items.length === 0) {
+    /*
+     * V1.5.2：同样改成**单个 ClipboardItem 多格式原子写**。
+     *
+     * 原来图片与文本分成两个 item 写，系统剪贴板只保留"当前一个条目"的语义下，
+     * 后写的那个会把先写的顶掉 —— 于是"复原"经常只剩文本、图片丢了。
+     * 一个 item 里同时给 mime + text/plain，才能真正复原成一个完整条目。
+     * （系统剪贴板同一时刻只保留一张图片，所以多张原图时保留第一张本就如此。）
+     */
+    const payload: Record<string, Blob | string> = {}
+    if (snap.images.length > 0) payload[snap.images[0].mime] = new Blob([snap.images[0].buffer], { type: snap.images[0].mime })
+    if (snap.text) payload['text/plain'] = snap.text
+    if (Object.keys(payload).length === 0) {
       // 原来本来就是空的：那"清空"就不是我们造成的，无需复原
       return true
     }
-    await clipboard.write(items)
+    await clipboard.write([new ClipboardItem(payload)])
     const back = await clipboard.readText()
     const ok = !snap.text || back === snap.text
     if (!ok) log.append('warn', 'clipboard', `剪贴板复原后文本不一致（期望 "${snap.text}"，实际 "${back}"）`)
@@ -212,10 +218,19 @@ export async function copyImageToClipboard(file: string): Promise<ClipboardCopyR
      * Blob 在 Electron 主进程里全局可用（Node 18+ 的内置实现）。
      */
     const blob = new Blob([new Uint8Array(buf)], { type: mime })
-    await clipboard.write([
-      new ClipboardItem({ [mime]: blob }),
-      new ClipboardItem({ 'text/plain': name })
-    ])
+    /*
+     * V1.5.2：**一个 ClipboardItem 同时带图片与原文本**（用户给的方案）。
+     *
+     * 以前这里是两个 ClipboardItem：图片一份、`text/plain` 一份（写的是文件名）。
+     * 结果是用户原来复制的文字被**直接顶掉**（截图场景里那份文本往往比文件名有用），
+     * 这正是用户报的「导入系统剪贴板会把原有内容清空」。
+     *
+     * 现在：如果剪贴板原本有文本，就把它和图片放进**同一个** ClipboardItem 里原子写入 ——
+     * 图片和文字同时存在，粘到聊天框可以贴图、粘到输入框还是原来那段文字；
+     * 原本没有文本时才退回写文件名（否则只接受文本的粘贴目标会毫无反应）。
+     */
+    const keepText = snap.text && snap.text !== name ? snap.text : name
+    await clipboard.write([new ClipboardItem({ [mime]: blob, 'text/plain': keepText })])
     if (!(await readBackHasImage())) {
       // 图片没真的进去（被静默丢弃）→ 把用户原来的内容放回去，再报失败
       const restored = await restoreClipboard(snap)

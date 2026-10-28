@@ -27,7 +27,7 @@ export const NAV_ITEMS: NavItem[] = [
   { to: '/search', label: '搜索', icon: Search },
   { to: '/dashboard', label: '仪表盘', icon: LayoutDashboard },
   { to: '/subs', label: '订阅', icon: Rss },
-  { to: '/favorites', label: '收藏', icon: Heart },
+  { to: '/favorites', label: '我的番剧库', icon: Heart },
   // 这一轮改版把「galgame 导航」改名成「galgame 库」（页面默认是卡片网格，整屏壁纸改叫沉浸模式）
   { to: '/galgame', label: 'Galgame 库', icon: Gamepad2 },
   { to: '/tools', label: '工具', icon: Puzzle },

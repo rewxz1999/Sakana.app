@@ -8,6 +8,7 @@ import type { AppSettings, ProxyConfig } from '@shared/types'
 import { DEFAULT_SETTINGS } from '@shared/types'
 import { netQueue } from './net-priority'
 import { store } from './store'
+import { recordTraffic, trafficSourceOfUrl } from './services/traffic'
 
 /*
  * ───────── V1.1.1：证书错误兜底（用户报「AGE 突然搜不到番剧」的真因）─────────
@@ -174,6 +175,103 @@ export function installNetworkPriority(): void {
 }
 
 installNetworkPriority()
+
+/*
+ * ───────── 数据源流量监控（V1.5.3）─────────
+ *
+ * 为什么挂在 axios 拦截器上：应用里真正出外网的模块有十几个（规则 / 蜜柑 / 弹幕 / galgame /
+ * 在线源…），逐个加统计既容易漏，也无法保证"同一个口径"。这里在响应回来时按 URL 归类并记账，
+ * 与并发闸门共用同一份 config，不改任何请求行为。
+ *
+ * 两条边界：
+ *   · 本机地址（aria2 / qbit / 本地中转）不算外网流量，直接跳过；
+ *   · bangumi 那条链路的字节数已经由 `beginNetTrace` 按精确值记过了（见 net-priority），
+ *     这里按「分类结果是番剧数据」跳过，避免同一次请求算两遍。
+ */
+function bytesFromHeaders(headers: unknown): number {
+  const h = headers as Record<string, unknown> | undefined
+  const raw = h?.['content-length'] ?? h?.['Content-Length']
+  const n = Number(Array.isArray(raw) ? raw[0] : raw)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+function bytesFromBody(data: unknown): number {
+  if (typeof data === 'string') return Buffer.byteLength(data, 'utf-8')
+  if (Buffer.isBuffer(data)) return data.length
+  if (data instanceof ArrayBuffer) return data.byteLength
+  if (data && typeof data === 'object') {
+    try {
+      return Buffer.byteLength(JSON.stringify(data), 'utf-8')
+    } catch {
+      return 0
+    }
+  }
+  return 0
+}
+
+/** 记录一次非 bangumi 的请求（bangumi 走 beginNetTrace，避免重复计数） */
+function recordAxiosTraffic(url: string, bytes: number, errors = 0): void {
+  const source = trafficSourceOfUrl(url)
+  if (source === 'bangumi') return
+  recordTraffic({ source, bytes, requests: 1, errors })
+}
+
+function installTrafficRecorder(): void {
+  axios.interceptors.response.use(
+    (res) => {
+      const url = String(res.config?.url ?? '')
+      const host = hostOf(url)
+      if (!url || LOCAL_HOST.test(host)) return res
+      const declared = bytesFromHeaders(res.headers)
+      const stream = res.data as
+        | (NodeJS.ReadableStream & { emit?: (event: string, ...args: unknown[]) => boolean })
+        | undefined
+      /*
+       * 流式响应（播放链路的分片 / 边下边播）不能加 `data` 监听器 ——
+       * 那会把流切到 flowing 模式，调用方还没读到就被吞掉。这里改写 `emit` 旁听：
+       * 事件照旧发给真正的消费者，我们只顺带累加字节数。
+       */
+      if (stream && typeof stream.on === 'function' && typeof stream.emit === 'function') {
+        let received = 0
+        let done = false
+        const original = stream.emit.bind(stream)
+        const finish = (failed: boolean): void => {
+          if (done) return
+          done = true
+          recordAxiosTraffic(url, received || declared, failed ? 1 : 0)
+        }
+        stream.emit = (event: string, ...args: unknown[]): boolean => {
+          if (event === 'data' && args[0]) {
+            const chunk = args[0] as { length?: number }
+            received += typeof chunk.length === 'number' ? chunk.length : 0
+          } else if (event === 'end' || event === 'close') {
+            finish(false)
+          } else if (event === 'error') {
+            finish(true)
+          }
+          return original(event, ...args)
+        }
+        // 响应头里就有准确长度且调用方可能提前 destroy（不会触发 end）：先按头记账，后面不再重复
+        if (declared > 0) {
+          done = true
+          recordAxiosTraffic(url, declared)
+        }
+        return res
+      }
+      recordAxiosTraffic(url, declared || bytesFromBody(res.data))
+      return res
+    },
+    (err) => {
+      const cfg = (err as { config?: { url?: string } })?.config
+      const url = String(cfg?.url ?? '')
+      const host = hostOf(url)
+      if (url && !LOCAL_HOST.test(host)) recordAxiosTraffic(url, 0, 1)
+      return Promise.reject(err)
+    }
+  )
+}
+
+installTrafficRecorder()
 
 /*
  * UA 里的版本号从 `app.getVersion()` 取（v0.3.9 体检 L5）。
@@ -395,10 +493,145 @@ export async function chromiumGetText(
       headers: { Accept: '*/*', ...headers }
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    return await res.text()
+    const text = await res.text()
+    /*
+     * 流量记账：Chromium 这条栈的字节数不走 axios 拦截器。
+     * bangumi 的调用点外面还包着 `beginNetTrace`（那里已经有精确字节），这里跳过以免算两遍。
+     */
+    if (trafficSourceOfUrl(url) !== 'bangumi') {
+      recordTraffic({ source: trafficSourceOfUrl(url), bytes: Buffer.byteLength(text, 'utf-8'), requests: 1 })
+    }
+    return text
   } finally {
     clearTimeout(timer)
   }
+}
+
+/**
+ * 系统代理（V1.5.2 修复「danmu_api 全部超时」）。
+ *
+ * 现象：用户在系统里开了代理（Clash 之类），浏览器能打开 danmu_api，但应用里所有弹幕请求
+ * `timeout of 12000ms exceeded`。原因不是接口慢，而是**应用默认直连**：
+ * axios 走 Node HTTP，不会自动使用 Windows 的 Internet 设置；`applySessionProxy` 在
+ * 「应用代理未启用」时还显式关了 Chromium 的代理。
+ *
+ * 这里在**应用代理未启用**时探测一次系统代理（环境变量优先，其次 Windows 注册表
+ * `HKCU\...\Internet Settings` 的 ProxyEnable/ProxyServer），只用于**境外接口**
+ * （见 `proxyForUrl`），国内站点仍走直连 —— 避免给所有人都套上代理。
+ *
+ * 缓存 5 分钟：注册表可能被代理软件随时改，但没必要每个请求都起一次 reg.exe。
+ */
+let sysProxyCache: { at: number; cfg: ProxyConfig | null } | null = null
+
+export function systemProxyConfig(): ProxyConfig | null {
+  const now = Date.now()
+  if (sysProxyCache && now - sysProxyCache.at < 5 * 60 * 1000) return sysProxyCache.cfg
+  let cfg: ProxyConfig | null = null
+  const env = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
+  const fromEnv = (raw: string): ProxyConfig | null => {
+    try {
+      const u = new URL(raw.includes('://') ? raw : `http://${raw}`)
+      if (!u.hostname || !u.port) return null
+      return {
+        enabled: true,
+        type: u.protocol.startsWith('socks') ? 'socks5' : 'http',
+        host: u.hostname,
+        port: Number(u.port),
+        username: decodeURIComponent(u.username || ''),
+        password: decodeURIComponent(u.password || '')
+      }
+    } catch {
+      return null
+    }
+  }
+  if (env) cfg = fromEnv(env)
+  if (!cfg && process.platform === 'win32') {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
+      const out = execFileSync(
+        'reg',
+        ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'],
+        { encoding: 'utf8', timeout: 3000, windowsHide: true }
+      )
+      const enabled = /ProxyEnable\s+REG_DWORD\s+0x1/i.test(out)
+      if (enabled) {
+        const m = /ProxyServer\s+REG_SZ\s+([^\r\n]+)/i.exec(out)
+        const raw = String(m?.[1] ?? '').trim()
+        if (raw) {
+          // 可能是 "http=host:port;https=host:port" 或单个 "host:port"
+          const parts = raw.split(';')
+          const https = parts.find((p) => /^https=/i.test(p))
+          const http = parts.find((p) => /^http=/i.test(p)) ?? parts[0]
+          const chosen = (https ?? http ?? '').replace(/^https?=/i, '').trim()
+          cfg = fromEnv(chosen)
+        }
+      }
+    } catch {
+      /* 读不到注册表就当没有系统代理 */
+    }
+  }
+  if (cfg) {
+    /*
+     * 把系统代理写进进程环境变量。
+     *
+     * 为什么必须这样做：uosc_danmaku 插件取弹幕用的是**外部 curl 子进程**
+     * （`mp.command_native_async({name:'subprocess', args={'curl', ...}})`），
+     * mpv 的 `--http-proxy` 对它无效；而 curl 认 `http_proxy/https_proxy`。
+     * 设成环境变量后，子进程会继承 —— 插件里的自动匹配与手动搜索才能连上 danmu_api。
+     * `NO_PROXY` 排除本机（本应用的缓存服务器 / 本地文件），避免自己代理自己。
+     */
+    const url = `http://${cfg.host}:${cfg.port}`
+    for (const k of ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy']) {
+      if (!process.env[k]) process.env[k] = url
+    }
+    if (!process.env.NO_PROXY && !process.env.no_proxy) {
+      process.env.NO_PROXY = '127.0.0.1,localhost,::1'
+    }
+    console.log(`[net] 检测到系统代理（应用代理未启用），境外接口将经它转发：${cfg.host}:${cfg.port}`)
+  }
+  sysProxyCache = { at: now, cfg }
+  return cfg
+}
+
+/** 这些域名/后缀的请求视为「境外接口」，应用代理未启用时允许走系统代理 */
+const FOREIGN_HOST_SUFFIXES = [
+  '.vercel.app',
+  'api.dandanplay.net',
+  'graphql.anilist.co',
+  'api.jikan.moe',
+  'kitsu.io',
+  'allanime.day',
+  'allmanga.to',
+  'animepahe.ru',
+  'kwik.cx',
+  'cdn.jsdelivr.net',
+  'raw.githubusercontent.com',
+  'api.github.com'
+]
+
+function isForeignHost(host: string): boolean {
+  const h = host.toLowerCase()
+  return FOREIGN_HOST_SUFFIXES.some((s) => (s.startsWith('.') ? h.endsWith(s) : h === s))
+}
+
+/**
+ * 针对具体 URL 选代理：应用设置优先；未启用时，**只有境外接口**才用系统代理。
+ * 这样 danmu_api / AniList / Jikan 能用上用户开的代理，蜜柑与国内反代仍直连。
+ */
+export function proxyForUrl(url: string): ProxyConfig {
+  const p = getSettings().proxy
+  if (p?.enabled && p.host) return p
+  try {
+    const host = new URL(url).hostname
+    if (isForeignHost(host)) {
+      const sys = systemProxyConfig()
+      if (sys) return sys
+    }
+  } catch {
+    /* URL 解析失败就按设置来 */
+  }
+  return p
 }
 
 /** 按代理设置构造 axios agent（http / socks5 均支持） */
@@ -437,7 +670,12 @@ export function applySessionProxy(ses: Electron.Session): void {
       void ses.setProxy({ proxyRules: rules, proxyBypassRules: '<local>' })
       console.log(`[net] 会话代理已启用: ${proxy.type}://${proxy.host}:${proxy.port}`)
     } else {
-      void ses.setProxy({ mode: 'direct' })
+      /*
+       * V1.5.2：应用代理未启用时，不再强制 direct —— 跟随**系统代理**。
+       * 用户开 Clash 之类的系统代理时，Chromium 本来就会走它；显式 direct 会让网页侧
+       * 与 axios 侧表现不一致（浏览器能开 danmu_api、应用里却超时）。
+       */
+      void ses.setProxy({ mode: 'system' })
     }
   } catch (err) {
     console.error('[net] 会话代理设置失败:', err)

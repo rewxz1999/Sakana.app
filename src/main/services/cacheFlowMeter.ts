@@ -26,6 +26,14 @@ let timer: NodeJS.Timeout | null = null
 let sessionId = ''
 let lastAt = 0
 let lastReceived = 0
+/**
+ * 第一帧只做基准，不报速率（V1.5.1）。
+ *
+ * 以前 watchCacheSession 把 lastReceived 置 0 后立刻采样：如果会话里已经有 300MB
+ * （复用上一轮的缓存），第一帧就会算出 300MB/0.2s = 1.5GB/s 的假速度。
+ * 现在第一帧只把"当前写盘字节数"记成基准，速率从第二帧开始算。
+ */
+let primed = false
 
 /** 停掉采样（不清掉已写入的最终读数：界面要能看到"缓存完成时的最后状态"） */
 export function stopCacheMeter(): void {
@@ -44,15 +52,24 @@ function sample(): void {
   }
   const now = Date.now()
   const dt = Math.max(0.2, (now - lastAt) / 1000)
-  const rate = Math.max(0, (s.received - lastReceived) / dt)
-  lastReceived = s.received
+  /*
+   * V1.5.1：速率用 `written`（本轮真实写盘字节）而不是 `received`（已完整缓存的部分）。
+   * 并行分段下 `received` 会在一段 100+MB 的分段完成时**整段跳一下**，
+   * 用它算速率就会闪出一个"几百 MB/s"的假速度；`written` 是每写一块就 +1，才是真实吞吐。
+   */
+  const written = typeof s.written === 'number' ? s.written : s.received
+  const rate = primed ? Math.max(0, (written - lastReceived) / dt) : 0
+  lastReceived = written
   lastAt = now
+  primed = true
   setCacheProgress({
     received: s.received,
     total: s.total,
     rateBps: Math.round(rate),
     percent: s.total && s.total > 0 ? Math.min(100, Math.round((s.received / s.total) * 1000) / 10) : null,
-    state: s.state
+    state: s.state,
+    // V1.5.1：播放器正在等补字节（界面据此在播放中显示「正在加载中…」）
+    waiting: s.waiting
   })
   // 已经完整落盘 / 失败 / 关闭：不再变化，停掉定时器（最终读数留在快照里）
   if (s.state === 'done' || s.state === 'failed' || s.state === 'closed') stopCacheMeter()
@@ -71,6 +88,7 @@ export function watchCacheSession(id: string): void {
   sessionId = id
   lastAt = Date.now()
   lastReceived = 0
+  primed = false
   timer = setInterval(sample, SAMPLE_MS)
   // 纯展示采样器不该拖住进程退出
   timer.unref?.()

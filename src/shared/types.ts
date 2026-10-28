@@ -4,6 +4,8 @@
 
 import type { Anime4kMode, Anime4kTier } from './anime4k'
 import type { AudioSettings } from './audio'
+// V1.5.1 嗅探设置（Range 多连接 / 请求头伪装 / 自适应并发）的类型
+import type { SniffSettings } from './sniff'
 // 本地临时缓存（边下边播）的默认集数：设置页与主进程共用同一份口径
 import { TEMP_MEDIA_CACHE_EPISODES_DEFAULT } from './mediaCache'
 // 「导入工具」的容错解析产物（v0.3.9）：ToolMeta 会把它们存下来供界面复查
@@ -409,7 +411,7 @@ export interface DownloadTask {
   pubDate?: string // 资源发布日期（用于订阅更新判定）
   downloaderId?: string // aria2 gid 或 qBittorrent hash
   dir?: string // 实际保存目录（播放按钮使用）
-  engine?: 'aria2' | 'qbit' // 双下载器模式下该任务使用的下载器
+  engine?: 'aria2' | 'qbit' | 'transmission' // 双下载器模式下该任务使用的下载器
   status: DownloadStatus
   progress: number // 0-100
   speed?: string
@@ -683,6 +685,14 @@ export interface PlayFlowCacheProgress {
   percent: number | null
   /** mediaCache 的会话状态：opening / streaming / done / failed / paused */
   state: string
+  /**
+   * V1.5.1：播放器此刻**正在等本地缓存补字节**（读到还没缓存到的位置）。
+   *
+   * 由本机缓存服务在"要读的位置还没有数据"时置位、数据接上后清零，
+   * 所以它表达的是「正在加载中」这件事本身，而不是按时间猜出来的缓冲。
+   * 界面据此在播放中显示一条「正在加载中…」的提示（用户要求）。
+   */
+  waiting?: boolean
 }
 
 export interface PlayFlowSnapshot {
@@ -1311,11 +1321,26 @@ export interface DanmakuSettings {
   blockWords: string
   /**
    * v0.2.9：弹幕渲染方式。
-   * - `canvas`（默认）：应用自己的画布渲染（画在控制栏悬浮窗里，与视频窗口同层）；
-   * - `uosc`：交给 mpv 内置的 uosc_danmaku 插件渲染（ASS 字幕层，字幕样式/搜索菜单由插件提供）。
-   * 两种方式用的是**同一份**弹幕数据（应用侧统一做季集判定与多来源合并）。
+   *
+   * @deprecated V1.5.2：**画布弹幕已删除**，只剩 uosc_danmaku 插件渲染。
+   * 字段保留只为旧设置文件不报错；主进程已不再读取它（见 mpv.ts 的 uoscDanmakuRequested）。
    */
   renderer?: 'canvas' | 'uosc'
+  /**
+   * V1.5.2：插件渲染的平滑度开关（`vf_fps`）。
+   *
+   * uosc_danmaku 官方推荐用 mpv 的 fps 滤镜把弹幕与画面一起提到 60fps，
+   * 这是用户反馈「弹幕滚动有点卡」的直接解法；代价是多占一点 GPU。
+   * 缺省视为开启（只有显式 false 才关）。
+   */
+  uoscFpsSmooth?: boolean
+  /**
+   * V1.5.2：把弹幕缓存到本地（用户要求保留）。
+   *
+   * 关掉后既不会写应用自己的弹幕缓存，也不会让插件 `save_danmaku`；
+   * 开启时下次进同一集直接读缓存，不再请求 danmu_api。
+   */
+  cacheToLocal?: boolean
   /**
    * v1.1：数据源集合器。只有 `enabled` 的源会在播放时自动参与加载（按 priority 依次尝试）。
    * 内置弹弹play 弹幕库始终作为默认源，`sources` 是它之外的补充，不会互相顶掉。
@@ -1373,6 +1398,9 @@ export const DEFAULT_DANMAKU_SETTINGS: DanmakuSettings = {
   errorToleranceMs: 100,
   specialScale: 1,
   specialDurationSec: 4,
+  // V1.5.2：默认开启 60fps 平滑（用户反馈滚动卡）与本地缓存（用户要求保留）
+  uoscFpsSmooth: true,
+  cacheToLocal: true,
   sources: []
 }
 
@@ -1892,7 +1920,46 @@ export interface Aria2Config {
   binaryPath: string // 留空则使用内置 aria2c
   autoStart: boolean
   maxConcurrent: number // 同时下载任务数上限
+  /*
+   * V1.5.2「下载器加速」参数（全部可选：旧设置文件缺省时用 DEFAULT_ARIA2_TUNING 补齐）。
+   *
+   * 用户给的方案：HTTP/通用加速靠 `max-connection-per-server` / `split` / `min-split-size`，
+   * BT 加速靠 `bt-max-peers` / `bt-request-peer-speed-limit` / DHT/PEX/LPD 与 Tracker 更新。
+   * 这里只暴露对速度影响最大的几项，其余（auto-save-interval、dht 文件等）由程序按最佳实践给。
+   */
+  maxConnectionPerServer?: number
+  split?: number
+  minSplitSize?: string
+  lowestSpeedLimit?: string
+  diskCache?: string
+  /** BT 监听端口（单端口，UDP+TCP）；用于提示用户做端口转发 */
+  listenPort?: number
+  btMaxPeers?: number
+  btRequestPeerSpeedLimit?: string
+  /** 自动更新 Tracker 列表（ngosang/trackerslist） */
+  updateTrackers?: boolean
+  /** 自定义 Tracker 列表地址（留空 = 用 ngosang 的 trackers_best.txt） */
+  trackerListUrl?: string
 }
+
+/** V1.5.2：aria2 Tracker 列表状态（设置页显示） */
+export interface TrackerStatus {
+  /** 当前使用的 Tracker 数量（含内置兜底） */
+  count: number
+  /** 上次成功更新时间（毫秒时间戳；从未更新为 null） */
+  updatedAt: number | null
+  /** 数据源说明（不含 URL，如「ngosang/trackerslist」） */
+  source: string
+  /** 上次刷新失败原因（成功时为空） */
+  error: string
+}
+
+/*
+ * aria2 调优的默认值与收窄规则已拆到 `@shared/aria2Tuning`（纯模块，自检可脱离 Electron 断言）。
+ * 这里原样转出，历史代码继续 `from '@shared/types'` 引用即可。
+ */
+export { DEFAULT_ARIA2_TUNING, resolveAria2Tuning } from './aria2Tuning'
+export type { Aria2TuningInput } from './aria2Tuning'
 
 export interface QbitConfig {
   url: string
@@ -1912,6 +1979,30 @@ export interface QbitConfig {
   launchAuthorized?: boolean
   /** 每次下载前都询问是否启动 qBittorrent（授权框里的勾选，或设置页的开关） */
   askBeforeLaunch?: boolean
+}
+
+/**
+ * V1.5.2：Transmission 下载器配置（第三个可选引擎）。
+ *
+ * 为什么是 Transmission：用户给的候选里，WebTorrent / @jstorrent 需要新增 npm 依赖，
+ * 本机构建环境无法联网安装；而 Transmission 与已有的 qBittorrent 一样走标准 RPC，
+ * 不需要往安装包里塞任何二进制。界面会明确标注"需自行安装 Transmission"。
+ */
+export interface TransmissionConfig {
+  /** RPC 地址（默认 http://127.0.0.1:9091/transmission/rpc） */
+  url: string
+  username: string
+  password: string
+  /** transmission-daemon / transmission-qt 的程序路径（可选；应用不强制拉起） */
+  exePath?: string
+}
+
+/** Transmission 的实时状态（设置页显示「为什么连不上」） */
+export interface TransmissionStatus {
+  reachable: boolean
+  url: string
+  version?: string
+  error?: string
 }
 
 /**
@@ -1971,10 +2062,17 @@ export interface AppSettings {
   aspectMode: AspectMode // 画面比例：fit=保持比例（可留黑边）/ cover=裁剪铺满 / stretch=拉伸铺满
   cacheDir: string // 自定义缓存目录，留空使用 userData/cache
   downloader: {
-    type: 'aria2' | 'qbit'
+    type: 'aria2' | 'qbit' | 'transmission'
     dual: boolean // 同时启用两个下载器，任务自动分配以加速下载
+    /**
+     * V1.5.2：双下载器模式选哪两个（从 aria2 / qbit / transmission 里选）。
+     * 缺省 = ['aria2','qbit']（保持旧行为）；非法/不足两项时回落到缺省。
+     */
+    dualEngines?: ('aria2' | 'qbit' | 'transmission')[]
     aria2: Aria2Config
     qbit: QbitConfig
+    /** V1.5.2：第三个引擎（外部 Transmission，需要用户自己安装） */
+    transmission?: TransmissionConfig
   }
   language: 'zh' | 'en'
   autoCheckUpdate: boolean
@@ -2019,6 +2117,42 @@ export interface AppSettings {
    */
   bangumiCustomApi?: string
   bangumiCustomImg?: string
+  /**
+   * 数据源模式（V1.5.1，启动时询问用户网络环境）。
+   *
+   * - `true`  = 能直连 bangumi 主站 → 官方 API（api.bgm.tv）+ 官方图床，不经过自建反代；
+   * - `false` / 缺省 = 不能直连 → 使用内置反代（API 与图片都走反代）。
+   *
+   * 为什么做成"每次启动问一次、除非勾选不再询问"：用户可能在换了网络（开代理/关代理）之后
+   * 又需要另一种模式；写死一个值会让他在两种网络之间反复手动改设置。
+   */
+  bangumiOfficial?: boolean
+  /** 启动时是否再询问数据源（false = 用户勾了「不再询问」） */
+  askBangumiSourceOnStart?: boolean
+  /** 启动时是否再提醒保存位置（false = 用户勾了「不再询问」） */
+  askSaveDirsOnStart?: boolean
+  /** 用户已确认过保存位置（选了默认位置或去设置页改过）→ 不再每次启动提醒 */
+  saveDirsConfigured?: boolean
+  /**
+   * V1.5.2「附加在线数据源」配置。
+   *
+   * 四种路径（Apple CMS / 自托管 REST / AnimePahe / AllManga）的地址与开关都放这里：
+   *   · `cmsApis`：Apple CMS V10 采集接口列表（形如 `https://example.com/api.php/provide/vod`）；
+   *   · `restBase`：兼容 Consumet/aniwatch 的自托管服务 base URL；
+   *   · `allanimeBase`：AllAnime API 基址（默认官方，可换镜像）；
+   *   · `enabled`：总开关（默认开，测试期）。
+   */
+  onlineSources?: {
+    enabled?: boolean
+    cmsApis?: string[]
+    restBase?: string
+    allanimeBase?: string
+  }
+  /**
+   * 嗅探设置（V1.5.1）：Range 多连接分段下载 / 请求头伪装 / 自适应并发。
+   * 缺省字段由 `@shared/sniff` 的 resolveSniffSettings() 补默认值，老用户升级后直接可用。
+   */
+  sniff?: Partial<SniffSettings>
   /**
    * 弹幕显示设置（v0.2.8）。
    *
@@ -2078,6 +2212,19 @@ export interface AppSettings {
    * 里没有这个键时，`getSettings()` 的 `{...DEFAULT_SETTINGS, ...磁盘}` 会补成 true。
    */
   uoscControlBar?: boolean
+  /**
+   * 播放器控制栏外观（V1.5.1）：配色预设 + 圆角。
+   *
+   * 取值为 UI 文案里的四选一（Catppuccin / Tokyo Night / Glass / 跟随主题）；
+   * 缺省由 `@shared/uoscTheme` 的 resolveUoscAppearance() 补齐（默认 Catppuccin Mocha + 12px 圆角）。
+   * 说明见该文件的 UOSC_APPEARANCES。
+   */
+  uoscAppearance?: {
+    preset?: 'follow' | 'catppuccin' | 'tokyo' | 'glass'
+    radius?: number
+    /** V1.5.2：控制栏按钮直径（图标随按钮等比放大），32–56，默认 42 */
+    size?: number
+  }
   /**
    * 投屏策略（v0.3.8，用户要求「投屏相关设置记得添加到设置中」）。
    *
@@ -2167,6 +2314,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
       // 默认不授权 + 不每次询问：第一次需要启动时问一次，点过「启动」就记住
       launchAuthorized: false,
       askBeforeLaunch: false
+    },
+    // V1.5.2：双下载器默认仍是 aria2 + qbit（与旧行为一致）；第三个引擎需用户自行安装
+    dualEngines: ['aria2', 'qbit'],
+    transmission: {
+      url: 'http://127.0.0.1:9091/transmission/rpc',
+      username: '',
+      password: '',
+      exePath: ''
     }
   },
   language: 'zh',
@@ -2226,6 +2381,115 @@ export interface LocalVideoFile {
   episode: number | null
   size: number
   subs: LocalSubFile[]
+}
+
+// ---------------- 附加在线数据源（V1.5.2） ----------------
+
+export type OnlineSourceId = 'allmanga' | 'animepahe' | 'rest' | 'applecms'
+
+export interface OnlineSourceMeta {
+  id: OnlineSourceId
+  name: string
+  desc: string
+  /** 播放链路是否完整（false = 只能搜到条目/集数，解析步骤未完成） */
+  canPlay: boolean
+  needsConfig: 'none' | 'rest' | 'cms'
+}
+
+export interface OnlineSourceAvailability {
+  id: OnlineSourceId
+  name: string
+  ready: boolean
+  reason: string
+}
+
+export interface OnlineSearchItem {
+  source: OnlineSourceId
+  id: string
+  title: string
+  year?: string
+  cover?: string
+  remark?: string
+}
+
+export interface OnlineEpisodeItem {
+  index: number
+  title: string
+  playId: string
+}
+
+export interface OnlineResolveResult {
+  url: string
+  referer?: string
+  headers?: Record<string, string>
+}
+
+// ---------------- galgame 资源提取 / 查看（V1.5.2） ----------------
+
+/** 一次「全部提取」的预览（界面据此决定是否弹「超过 30 张」的确认） */
+export interface GalExtractPreview {
+  kind: '立绘' | 'cg' | 'bgm'
+  candidates: number
+  hint: string
+}
+
+export interface GalExtractAllResult {
+  ok: boolean
+  kind: '立绘' | 'cg' | 'bgm'
+  /** 本次新写出的文件数 */
+  count: number
+  /** 候选总数（图片：姿势/CG 数；BGM：档案里匹配到的音频数） */
+  candidates: number
+  dir: string
+  error: string
+  /** 已存在或读取失败的条数（BGM 用） */
+  skipped: number
+}
+
+export interface GalResourceFile {
+  name: string
+  path: string
+  size: number
+}
+
+export interface GalResourceFolder {
+  kind: '立绘' | 'cg' | 'bgm' | '文本'
+  dir: string
+  files: GalResourceFile[]
+  total: number
+}
+
+export interface GalResourcesResult {
+  dirs: { kind: string; dir: string }[]
+  folders: GalResourceFolder[]
+  unpackDir: string
+}
+
+// ---------------- 本地库（V1.5.1） ----------------
+
+/** 本地库里的一集（磁盘上已经存在、可以直接播放的视频文件） */
+export interface LocalLibraryEpisode {
+  path: string
+  name: string
+  /** 从文件名解析出的集数；解析不出为 null（仍可播放，只是排序靠后） */
+  episode: number | null
+  size: number
+}
+
+/**
+ * 本地库的一部番（= 下载根目录下的一个番剧文件夹）。
+ *
+ * 只描述**磁盘事实**：文件夹名、目录、可播文件、体积、最近修改时间。
+ * 封面与 bangumi 条目 id 是靠标题匹配收藏/订阅补上的（有就用，没有也能正常播放）。
+ */
+export interface LocalLibraryItem {
+  title: string
+  dir: string
+  cover: string
+  subjectId: number | null
+  episodes: LocalLibraryEpisode[]
+  totalBytes: number
+  updatedAt: number
 }
 
 // ---------------- 转码播放 ----------------
@@ -3120,6 +3384,57 @@ export interface CastMediaInput {
   sources?: { id: string; name: string }[]
   /** 当前这一集的直链是从哪条数据源解析出来的（对应 `sources[].id`） */
   sourceId?: string
+}
+
+// ---------------- 数据源流量监控（V1.5.3） ----------------
+
+/** 流量归属的数据源（类别，不是具体域名；域名属于内部信息，不进界面/日志） */
+export type TrafficSourceId = 'bangumi' | 'image' | 'mikan' | 'danmaku' | 'site'
+
+/** 单个数据源在本次运行里的累计值 */
+export interface TrafficSourceStat {
+  id: TrafficSourceId
+  label: string
+  /** 请求次数（缓存命中不计入这里） */
+  requests: number
+  /** 实际走网络的字节数 */
+  bytes: number
+  /** 失败请求数（超时/5xx 等；失败通常也拿到了错误页字节，bytes 为 0） */
+  errors: number
+  /** 命中本地缓存、没有走网络的次数 */
+  cacheHits: number
+  /** 命中的缓存本该从网络取回的字节数（「省下多少流量」） */
+  cacheBytes: number
+}
+
+/** 折线图的一个时间桶（默认 30 秒一桶） */
+export interface TrafficBucket {
+  /** 桶起点（毫秒时间戳） */
+  at: number
+  totalBytes: number
+  totalRequests: number
+  /** 每个来源在这一桶里的字节数（没有流量的来源为 0） */
+  bySource: Record<TrafficSourceId, number>
+}
+
+/** 流量快照：界面按这个结构画图与表格 */
+export interface TrafficSnapshot {
+  startedAt: number
+  now: number
+  /** 一个桶的时长（毫秒） */
+  bucketMs: number
+  /** 图表窗口总时长（毫秒） */
+  windowMs: number
+  totals: {
+    requests: number
+    bytes: number
+    errors: number
+    cacheHits: number
+    cacheBytes: number
+  }
+  sources: TrafficSourceStat[]
+  /** 按时间升序；最后一个桶是当前这一刻 */
+  series: TrafficBucket[]
 }
 
 /** 接收端当前状态（Sakana 接收端有完整状态；DLNA 电视没有查询接口，返回 null） */

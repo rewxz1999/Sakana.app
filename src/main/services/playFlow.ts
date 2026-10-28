@@ -27,9 +27,17 @@ import { logPlayTimingSummary } from './playTiming'
  *     内核注入写 inject。没发生就是 pending，不会为了「看起来在动」而点亮。
  */
 
+/**
+ * 三阶段的界面文案（V1.5.1 按用户要求改名）。
+ *
+ * 用户原话：原来的「找播放资源 / 获取播放资源 / 注入播放器」要改成
+ * 「寻找播放资源 / 缓存资源到本地 / 注入播放器」，因为中间这一步实际做的事
+ * 是**从播放 url 下载媒体资源到本地缓存**（V1.4 起有 tmp-media 边下边播），
+ * 叫「获取播放资源」会让用户以为只是拿了个地址。
+ */
 const STAGE_LABEL: Record<PlayFlowStageKey, string> = {
-  locate: '找播放资源',
-  acquire: '获取播放资源',
+  locate: '寻找播放资源',
+  acquire: '缓存资源到本地',
   inject: '注入播放器'
 }
 

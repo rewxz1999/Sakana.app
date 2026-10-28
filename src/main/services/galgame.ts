@@ -1070,19 +1070,14 @@ function launchPidReady(id: string, child: ChildProcess, pid: number): GalLaunch
     startDetect(id, run)
   }
 
-  // 只读内存识别（BGM / 章节）：设置开启后随游戏启动自动启用
-  if (getSettings().galgameMemRead) {
-    galMemStart({
-      gameId: id,
-      pid,
-      exePath: game.exePath,
-      title: game.title,
-      onChapter: (chapter) => {
-        const updated = updateGame(id, (g) => (g.chapterName === chapter ? g : { ...g, chapterName: chapter }))
-        if (updated) pushGames()
-      }
-    })
-  }
+  /*
+   * V1.5.2：**取消「从内存读取当前 BGM 名称」**（用户要求，从 galgame 助手中删除）。
+   *
+   * 原来这里会按设置启动内存扫描（galMemStart）：周期性读游戏进程内存找音频文件名/章节，
+   * 既吃 CPU（galgame 常是 32 位老引擎、内存扫描更慢），也是"截图/操作卡一下"的来源之一。
+   * 解包与立绘/CG 提取走的是**文件/封包**那条路（galMemUnpack / galMemExtractImages），
+   * 不依赖这里的运行时内存扫描，所以整段直接移除即可。
+   */
   return { started: true }
 }
 

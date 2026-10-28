@@ -453,9 +453,84 @@ export function PlayFlowStages({
 
 /** 供悬浮窗/页面共用：三阶段 key 的中文名（避免两处各写一份文案） */
 export const STAGE_LABELS: Record<PlayFlowStageKey, string> = {
-  locate: '找播放资源',
-  acquire: '获取播放资源',
+  locate: '寻找播放资源',
+  acquire: '缓存资源到本地',
   inject: '注入播放器'
+}
+
+/**
+ * 加载提示用的「三步 + 耗时」精简版（V1.5.1）。
+ *
+ * 用户原话：「现在这个加载不用显示的这么详细了（详细放到播放状态面板中），
+ * 只用显示每一步损耗时间，同时缓存资源到本地这一步后面显示缓存流量和进度条。」
+ *
+ * 所以这里只做三件事：
+ *   1. 每一步一行：记号 + 名称 + 真实耗时（来自主进程时间戳，不跑本地计时器）；
+ *   2. 「缓存资源到本地」这一行后面挂上已缓存 MB / 总 MB、速率与进度条；
+ *   3. 失败时把原因写出来（这不是"详细"，而是用户明确要求不许静默失败）。
+ * 步骤明细（每条 step 的时间线、HTTP 状态、判定归因…）全部留在「播放流详情」面板里，
+ * 那边用的是 `PlayFlowStages` 的非 compact 版式。
+ */
+export function PlayFlowLoadingSteps({
+  flow,
+  tone = 'onVideo',
+  className = ''
+}: {
+  flow: PlayFlowSnapshot | null | undefined
+  tone?: Tone
+  className?: string
+}): React.ReactElement | null {
+  if (!flow) return null
+  const t = TONE[tone]
+  const cache = flow.cache
+  const total = cache && cache.total && cache.total > 0 ? cache.total : null
+  const percent = cache && cache.percent !== null && cache.percent !== undefined ? cache.percent : null
+  return (
+    <div className={`flex w-full flex-col gap-0.5 text-[11px] leading-relaxed ${className}`}>
+      {flow.stages.map((s) => {
+        const { mark, cls } = stageMark(s, tone)
+        const showCache = s.key === 'acquire' && cache
+        return (
+          <div key={s.key} className="flex items-center gap-1.5 whitespace-nowrap">
+            <span className={`${cls} w-3 shrink-0 text-center`}>{mark}</span>
+            <span className={`w-[7.5em] shrink-0 ${t.primary}`}>{s.label}</span>
+            <span className={`w-12 shrink-0 tabular-nums ${t.secondary}`}>
+              {s.startedAt === null ? '—' : fmtMs(s.elapsedMs)}
+            </span>
+            {showCache ? (
+              <>
+                <span className={`shrink-0 tabular-nums ${t.secondary}`}>
+                  {fmtMB(cache.received)}
+                  {total ? ` / ${fmtMB(total)}` : ''}
+                </span>
+                <span className={`shrink-0 tabular-nums ${t.secondary}`}>
+                  {cache.rateBps > 0
+                    ? cache.rateBps < 1024 * 1024
+                      ? `${Math.round(cache.rateBps / 1024)} KB/s`
+                      : `${(cache.rateBps / 1024 / 1024).toFixed(2)} MB/s`
+                    : cache.state === 'done'
+                      ? '已缓存完成'
+                      : '等待数据…'}
+                </span>
+                <span className={`block h-1 w-24 shrink-0 overflow-hidden rounded-full ${t.segIdle}`}>
+                  <span
+                    className={`block h-full rounded-full ${t.segOk}`}
+                    style={{ width: `${Math.min(100, Math.max(percent ?? (cache.state === 'done' ? 100 : 2), 1))}%` }}
+                  />
+                </span>
+                {percent !== null ? (
+                  <span className={`shrink-0 tabular-nums ${t.secondary}`}>{percent.toFixed(0)}%</span>
+                ) : null}
+              </>
+            ) : null}
+            {s.error ? (
+              <span className={`min-w-0 truncate rounded px-1 ${t.chipDanger} ${t.danger}`}>{s.error}</span>
+            ) : null}
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
 /**

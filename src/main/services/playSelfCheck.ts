@@ -4,7 +4,7 @@ import { log } from '../log'
 import { closeRuleWebview, currentRuleWebviewGen, ruleWebviewDiagnostics } from './ruleWebview'
 import { clearStreamCache, forgetStream, ruleProbeDiagnostics, stopRuleProbe } from './ruleProbe'
 import { markReset, pushStep } from './playFlow'
-import { mpvDestroy, mpvDiagnostics, mpvStreamProps } from './mpv'
+import { mpvHardDestroy, mpvDiagnostics, mpvStreamProps } from './mpv'
 
 /**
  * 在线播放自检 + 重置（v0.3.9）。
@@ -147,6 +147,16 @@ export function runPlaySelfCheck(opts: SelfCheckOptions = { reset: true }): Self
     needsReattach = true
   } else if (!engine.attached && !engine.ready) {
     findings.push(finding('engine-idle', '播放内核', 'ok', '当前没有挂载（正常：还没进播放页或已退出）'))
+  } else if (!engine.attached && engine.ready && engine.released) {
+    /*
+     * V1.5.2：内核常驻是**正常形态**，不是错配。
+     *
+     * 退出播放页后内核被刻意保留（避免 terminate_destroy 卡死），此时 attachedWin 已经清空、
+     * ready 仍为 true —— 旧判据会把它当「内核实例存在但没有挂载窗口」的异常，
+     * 于是每次重新起播都先 mpvHardDestroy 再重建：既慢，又因为脚本标记没复位而丢掉 uosc
+     * （用户看到的就是「控制栏唤不出来」）。
+     */
+    findings.push(finding('engine-idle-released', '播放内核', 'ok', '内核空闲常驻（下次起播直接复用）'))
   } else if (!engine.attached && engine.ready) {
     findings.push(
       finding(
@@ -191,7 +201,9 @@ export function runPlaySelfCheck(opts: SelfCheckOptions = { reset: true }): Self
     if (needsReattach) {
       // 先由主进程把已经死掉的内核实例销毁；重建交给渲染层（它才知道视频区域矩形）
       try {
-        mpvDestroy()
+        // V1.5.2：这里必须**真销毁**（内核挂载错配时留着也没用），
+        // 正常退出播放器走的是 mpvDestroy() 的"释放但常驻"路径。
+        mpvHardDestroy()
         engineDestroyed = true
         didReset = true
         markReset('销毁错配的播放内核实例，等待渲染层重建')
@@ -251,7 +263,8 @@ export function hardResetPlayChain(): { clearedStreams: boolean; engineDestroyed
   clearStreamCache()
   let engineDestroyed = false
   try {
-    mpvDestroy()
+    // 一键重置：同上，必须真正销毁内核，让下一次 attach 拿到干净实例
+    mpvHardDestroy()
     engineDestroyed = true
   } catch {
     /* 内核本来就没起来 */

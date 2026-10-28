@@ -1,12 +1,14 @@
 import { app } from 'electron'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import axios from 'axios'
-import type { DownloadStatus } from '@shared/types'
+import { resolveAria2Tuning, type DownloadStatus } from '@shared/types'
 import { humanSize } from '../../lib/parse'
 import { log } from '../../log'
 import { getSettings } from '../../net'
+import { currentTrackerString, refreshTrackers, trackerStatus } from './trackers'
+import type { TrackerStatus } from '@shared/types'
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -22,19 +24,11 @@ export interface Aria2Progress {
   error?: string
 }
 
-/** 公共 tracker（蜜柑种子自带的 tracker 多数已失效，补一批以加快做种者发现） */
-const PUBLIC_TRACKERS = [
-  'udp://tracker.opentrackr.org:1337/announce',
-  'udp://open.tracker.cl:1337/announce',
-  'udp://open.stealth.si:80/announce',
-  'udp://tracker.torrent.eu.org:451/announce',
-  'udp://exodus.desync.com:6969/announce',
-  'udp://tracker.openbittorrent.com:6969/announce',
-  'http://tracker.openbittorrent.com:80/announce',
-  'udp://tracker.dler.org:6969/announce',
-  'udp://explodie.org:6969/announce',
-  'udp://9.rarbg.com:2810/announce'
-].join(',')
+/**
+ * 公共 tracker 已迁到 `trackers.ts`（V1.5.2：支持社区列表自动更新 + 磁盘缓存）。
+ * 这里保留常量名只是为了不破坏可能引用它的旧代码。
+ */
+const PUBLIC_TRACKERS = ''
 
 function mapStatus(s: string): DownloadStatus {
   switch (s) {
@@ -113,6 +107,22 @@ class Aria2Client {
     const { port, secret, maxConcurrent } = this.cfg
     const downloadDir = getSettings().downloadDir || join(app.getPath('userData'), 'downloads')
     mkdirSync(downloadDir, { recursive: true })
+    /*
+     * V1.5.2「下载器加速」：按用户给的方案调 aria2 参数。
+     *
+     * · HTTP/通用：max-connection-per-server / split / min-split-size —— 对直链下载提速最明显；
+     * · BT：bt-max-peers / bt-request-peer-speed-limit / DHT+PEX+LPD / Tracker 列表；
+     * · 磁盘：prealloc（Windows 上 falloc 不可用，prealloc 等效）+ disk-cache + auto-save-interval；
+     * · DHT 持久化：dht-file-path 放到应用数据目录，长期积累节点表，磁力首次解析更快
+     *   （用户提到"提前下载热门种子帮助生成健康的 dht.dat"，这里至少保证它不会被反复丢弃）。
+     */
+    const tune = resolveAria2Tuning(this.cfg)
+    const dhtFile = join(app.getPath('userData'), 'tmp', 'aria2-dht.dat')
+    try {
+      mkdirSync(dirname(dhtFile), { recursive: true })
+    } catch {
+      /* 目录不可写时 aria2 会退回默认路径 */
+    }
     const args = [
       '--enable-rpc',
       `--rpc-listen-port=${port}`,
@@ -120,23 +130,59 @@ class Aria2Client {
       `--dir=${downloadDir}`,
       '--auto-file-renaming=false',
       '--seed-time=0',
-      '--file-allocation=none',
+      '--file-allocation=prealloc',
+      '--auto-save-interval=20',
+      `--disk-cache=${tune.diskCache}`,
       `--max-concurrent-downloads=${maxConcurrent > 0 ? maxConcurrent : 5}`,
+      `--max-connection-per-server=${tune.maxConnectionPerServer}`,
+      `--split=${tune.split}`,
+      `--min-split-size=${tune.minSplitSize}`,
+      `--lowest-speed-limit=${tune.lowestSpeedLimit}`,
+      '--timeout=30',
+      '--connect-timeout=20',
       '--continue=true',
       '--console-log-level=warn',
-      // BT 加速：蜜柑种子里自带的 tracker 常年失效，补一批公共 tracker 并开启
-      // DHT/PEX/LPD，否则会出现「任务在跑但连接数恒为 0、进度永远 0%」。
-      `--bt-tracker=${PUBLIC_TRACKERS}`,
-      '--bt-tracker-connect-timeout=10',
-      '--bt-tracker-timeout=10',
-      '--bt-max-peers=100',
+      // BT 加速：蜜柑种子里自带的 tracker 常年失效，用合并后的公共/社区列表替换
+      `--bt-tracker=${currentTrackerString()}`,
+      /*
+       * V1.5.2 修「卡在寻找做种者」（关键）：
+       *
+       * 蜜柑种子的 announce-list 里通常写死 `tr.bangumi.moe` / `t.nyaatracker.com` /
+       * `open.acgtracker.com` / `open.nyaatorrents.info` —— 前三个实测**全部超时或 0 peer**。
+       * aria2 的 multi-tracker 是按 tier 顺序 announce 的：它会先在这些死 tracker 上耗完
+       * 连接/响应超时和重试，很久之后才轮到我们追加的 `--bt-tracker`。
+       * 实测同一颗种子：不加排除 → 60 秒 `CN:0 SD:0`；加 `--bt-exclude-tracker=*`
+       * 只用我们自己的列表（含 nyaa）→ 10 秒内 `CN:17 SD:2` 并开始下载。
+       *
+       * `*` 只清空**种子里自带**的 tracker，`--bt-tracker` 追加的列表不受影响（aria2 文档明确说明）。
+       * 代价：极少数种子的私有 tracker 会被忽略 —— 蜜柑资源都是公网种子，不存在这个问题。
+       */
+      '--bt-exclude-tracker=*',
+      '--bt-tracker-connect-timeout=6',
+      '--bt-tracker-timeout=6',
+      /*
+       * announce 间隔压到 120 秒：默认跟随 tracker 返回（实测 nyaatracker 给 1800 秒），
+       * 第一轮拿到空 peer 列表后要等半小时才会重问 —— 那时界面早就一直停在「寻找做种者」。
+       */
+      '--bt-tracker-interval=120',
+      `--bt-max-peers=${tune.btMaxPeers}`,
       '--enable-dht=true',
       '--enable-dht6=false',
+      /*
+       * DHT 引导节点多给几个：aria2 默认只写一个 router.bittorrent.com，
+       * 那个地址在某些网络里不通时「DHT 全废」，只能靠 tracker —— 而蜜柑种子的 tracker 又常常是死的。
+       * 这五个节点都是公开的常用引导点，任一可达即可拉起节点表。
+       */
       '--dht-entry-point=router.bittorrent.com:6881',
+      '--dht-entry-point=router.utorrent.com:6881',
+      '--dht-entry-point=dht.transmissionbt.com:6881',
+      '--dht-entry-point=dht.libtorrent.org:25401',
+      '--dht-entry-point=dht.aelitis.com:6881',
+      `--dht-file-path=${dhtFile}`,
       '--enable-peer-exchange=true',
       '--bt-enable-lpd=true',
-      '--listen-port=6881-6999',
-      '--bt-request-peer-speed-limit=51200'
+      `--listen-port=${tune.listenPort}`,
+      `--bt-request-peer-speed-limit=${tune.btRequestPeerSpeedLimit}`
     ]
     try {
       this.proc = spawn(bin, args, { stdio: 'ignore', windowsHide: true })
@@ -159,7 +205,11 @@ class Aria2Client {
         this.started = true
         // 同步关键参数（覆盖已运行实例/残留进程的旧参数）
         await this.applyOptions()
-        log.append('info', 'aria2', `aria2c 已连接 (端口 ${port}, 并发 ${maxConcurrent})`)
+        log.append(
+          'info',
+          'aria2',
+          `aria2c 已连接 (端口 ${port}, 并发 ${maxConcurrent}, tracker ${currentTrackerString().split(',').length} 条，已排除种子内嵌 tracker)`
+        )
         return
       } catch {
         /* 继续等待 */
@@ -169,7 +219,9 @@ class Aria2Client {
   }
 
   /** 把关键参数推给当前运行的实例（含"复用了上次残留进程"的情况） */
-  private async applyOptions(): Promise<void> {    const { maxConcurrent } = this.cfg
+  private async applyOptions(): Promise<void> {
+    const { maxConcurrent } = this.cfg
+    const tune = resolveAria2Tuning(this.cfg)
     const downloadDir = getSettings().downloadDir || join(app.getPath('userData'), 'downloads')
     try {
       mkdirSync(downloadDir, { recursive: true })
@@ -181,19 +233,88 @@ class Aria2Client {
         {
           dir: downloadDir,
           'max-concurrent-downloads': String(maxConcurrent > 0 ? maxConcurrent : 5),
-          'bt-tracker': PUBLIC_TRACKERS,
+          // V1.5.2：连接/分片/低速剔除/磁盘缓存（HTTP 与 BT 都受益的几项）
+          'max-connection-per-server': String(tune.maxConnectionPerServer),
+          split: String(tune.split),
+          'min-split-size': tune.minSplitSize,
+          'lowest-speed-limit': tune.lowestSpeedLimit,
+          'disk-cache': tune.diskCache,
+          'auto-save-interval': '20',
+          // Tracker 用合并后的当前列表（社区列表 + 内置兜底）
+          'bt-tracker': currentTrackerString(),
           'enable-dht': 'true',
           'enable-peer-exchange': 'true',
           'bt-enable-lpd': 'true',
-          'bt-max-peers': '100',
+          'bt-max-peers': String(tune.btMaxPeers),
+          'bt-request-peer-speed-limit': tune.btRequestPeerSpeedLimit,
           'seed-time': '0',
           'auto-file-renaming': 'false',
-          'file-allocation': 'none'
+          'file-allocation': 'prealloc'
         }
       ])
     } catch (err) {
       log.append('warn', 'aria2', `同步 aria2 参数失败（继续使用默认值）: ${String((err as Error)?.message ?? err)}`)
     }
+    /*
+     * V1.5.2：单独再推一次「BT tracker 策略」。
+     *
+     * 为什么要单独一次：`--bt-exclude-tracker` 是修复「卡在寻找做种者」的关键（见启动参数注释），
+     * 但它是**启动参数**；如果复用的是上次残留的 aria2 进程（旧参数），exclude 不会生效。
+     * 放在独立 try 里：万一这组选项在某个版本不可热更，也只会丢这几项，不会影响上面的
+     * dir / 并发 / tracker 列表等真正重要的设置。
+     */
+    try {
+      await this.rpc('aria2.changeGlobalOption', [
+        {
+          'bt-exclude-tracker': '*',
+          'bt-tracker-interval': '120',
+          'bt-tracker-connect-timeout': '6',
+          'bt-tracker-timeout': '6'
+        }
+      ])
+    } catch (err) {
+      log.append(
+        'warn',
+        'aria2',
+        `BT tracker 策略未能热更（继续用启动参数；若是旧进程请重启应用）：${String((err as Error)?.message ?? err)}`
+      )
+    }
+    /*
+     * Tracker 刷新放后台：ensureRunning 不该为了几 KB 的列表多等一次网络。
+     * 拉到新列表后再推一次 bt-tracker（changeGlobalOption 支持热更，不需重启 aria2）。
+     */
+    void refreshTrackers()
+      .then((r) => {
+        if (r.updated) return this.pushTrackers()
+        return undefined
+      })
+      .catch(() => undefined)
+  }
+
+  /** 把当前 Tracker 列表热更到运行中的 aria2（设置页「立即更新」也走这里） */
+  private async pushTrackers(): Promise<void> {
+    if (!this.started) return
+    try {
+      await this.rpc('aria2.changeGlobalOption', [{ 'bt-tracker': currentTrackerString() }])
+      log.append('info', 'aria2', `已热更新 Tracker 列表（${currentTrackerString().split(',').length} 条），无需重启 aria2`)
+    } catch (err) {
+      log.append('warn', 'aria2', `Tracker 热更新失败：${String((err as Error)?.message ?? err)}`)
+    }
+  }
+
+  /**
+   * 设置页「立即更新 Tracker」：强制拉一次社区列表并热更到运行中的实例。
+   * 没在跑时只更新磁盘缓存，下次启动自动用新列表。
+   */
+  async refreshTrackersNow(): Promise<{ updated: boolean; status: TrackerStatus }> {
+    const r = await refreshTrackers(true)
+    if (r.updated) await this.pushTrackers()
+    return { updated: r.updated, status: trackerStatus() }
+  }
+
+  /** 当前 Tracker 状态（设置页显示条数/更新时间/错误） */
+  trackerStatus(): TrackerStatus {
+    return trackerStatus()
   }
 
   /**

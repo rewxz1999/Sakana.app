@@ -8,6 +8,7 @@ import {
   Copy,
   Download,
   FilePlay,
+  Globe2,
   Heart,
   Play,
   Rss,
@@ -166,9 +167,7 @@ export function SubjectDetailPage() {
   const [detailFailed, setDetailFailed] = useState('')
   /** 评分板块（与正文解耦：详情慢不影响评分先显示，评分慢也不影响正文） */
   const [rating, setRating] = useState<{ score: number | null; total: number } | null>(null)
-  /** 角色板块：独立请求 + 独立骨架，慢/失败都不影响其它板块 */
-  const [characters, setCharacters] = useState<CharacterItem[] | null>(null)
-  const [charactersLoading, setCharactersLoading] = useState(true)
+  /** V1.5.3：角色板块已删除（减少人物图请求），这里不再保留 characters 状态 */
   /**
    * 「更新到第几集」（v0.3.7，用户要求）。
    * 单独一个请求（分集接口），失败/取不到就是 null —— 界面据此**整行不显示**。
@@ -195,6 +194,13 @@ export function SubjectDetailPage() {
   const [fullscreen, setFullscreen] = useState(false)
   /** 本地播放选择/扫描中（按钮 loading） */
   const [localBusy, setLocalBusy] = useState(false)
+  /**
+   * 「本地播放」的两个选项（V1.5.1，用户要求）：
+   *   自行选择文件播放 / 从本地库播放（本地库没有就提示"本地库中暂未下载该番剧"）。
+   * 用一个小弹层而不是直接把按钮一分为二：详情页底部操作区已经很挤，
+   * 旧用户也习惯"点本地播放就选文件"这一下，弹层正好把新入口挂在同一处。
+   */
+  const [localMenuOpen, setLocalMenuOpen] = useState(false)
   const { favorites, toggleFavorite, toggleWatched, setWatchedAt, watchHistory } = useLibrary()
   const progressItems = useWatchProgress((s) => s.items)
   const progressLoaded = useWatchProgress((s) => s.loaded)
@@ -206,8 +212,6 @@ export function SubjectDetailPage() {
     setQuick(null)
     setDetail(null)
     setRating(null)
-    setCharacters(null)
-    setCharactersLoading(true)
     setDetailLoading(true)
     setDetailFailed('')
     setEpProgress(null)
@@ -284,29 +288,7 @@ export function SubjectDetailPage() {
   const ratingScore = rating?.score ?? view?.rating?.score ?? null
   const ratingTotal = rating?.total ?? view?.rating?.total ?? 0
 
-  /**
-   * 角色板块**延迟加载**（v1.1.4）。
-   *
-   * 为什么不等首屏一起发：角色接口在本次实测里会挂 70 秒以上（服务端慢），
-   * 和详情同时发会白占一个 S 级槽位，把番剧表的刷新挤到队尾。
-   * 首屏先出，250ms 后再补角色；用户滚到角色区时它通常已经在了。
-   */
-  useEffect(() => {
-    if (!view?.id) return
-    let alive = true
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        const r = await api.bangumi.characters(view.id)
-        if (!alive) return
-        setCharacters(r.ok ? r.data.items : [])
-        setCharactersLoading(false)
-      })()
-    }, 250)
-    return () => {
-      alive = false
-      window.clearTimeout(timer)
-    }
-  }, [view?.id])
+  // V1.5.3：角色接口调用一并删除（详情页不再加载人物介绍/人物图）
 
   // 全屏状态：原生窗口全屏（主进程事件）+ 页面级全屏（document.fullscreenElement）任一为真
   useEffect(() => {
@@ -414,6 +396,39 @@ export function SubjectDetailPage() {
         folder,
         subjectId,
         episode: target.episode ?? undefined
+      }
+    })
+  }
+
+  /**
+   * 从本地库播放（V1.5.1）。
+   *
+   * 目录推导走主进程 `library.localDir`（与下载器建目录同一份规则），
+   * 没有文件时按用户要求明确提示「本地库中暂未下载该番剧」，而不是弹一个文件夹选择框 ——
+   * 那会让用户以为"本地库"只是一个换了名字的选文件按钮。
+   */
+  const playFromLocalLibrary = async (): Promise<void> => {
+    setLocalMenuOpen(false)
+    setLocalBusy(true)
+    const r = await api.library.localDir({
+      subjectId,
+      animeTitle: view?.name_cn || view?.name || ''
+    })
+    setLocalBusy(false)
+    if (!r.ok) {
+      toast.error(r.error)
+      return
+    }
+    if (!r.data.exists || r.data.videos === 0) {
+      toast.warn('本地库中暂未下载该番剧')
+      return
+    }
+    navigate('/local-anime', {
+      state: {
+        title: playerTitle,
+        dir: r.data.dir,
+        cover: view?.images?.large ?? '',
+        subjectId
       }
     })
   }
@@ -558,7 +573,13 @@ export function SubjectDetailPage() {
                 className="w-52 shrink-0"
               >
                 <CoverImage
-                  src={view.images?.large ?? view.images?.common ?? null}
+                  /*
+                   * V1.5.2 修「详情页封面加载不出来」：卡片用的是 400px 缩放图（已缓存），
+                   * 详情页原来用 large（原尺寸），命中不了同一缓存条目，且部分网络下直连会被中断。
+                   * 头部封面实际只显示 208px 宽，用 common（400px）既清晰又直接命中缓存；
+                   * large 仍作为兜底（万一 common 缺失）。
+                   */
+                  src={view.images?.common ?? view.images?.large ?? null}
                   className="aspect-[3/4] w-full rounded-xl shadow-xl shadow-black/25"
                 />
               </motion.div>
@@ -703,52 +724,10 @@ export function SubjectDetailPage() {
             ) : null}
 
             {/*
-              角色板块（v1.1.4 新增为独立板块）。
-              为什么要单独一块：角色列表是另一个接口、生命周期与详情不同，
-              首屏不该被它拖住；它到了就追加显示，没到就显示这一块的骨架屏。
+              V1.5.3：删除「角色」板块（用户要求）。
+              角色接口一次要拉 8 张人物图，是与番剧表/详情封面抢流量的主要来源；
+              详情页只保留番剧本身的信息后，图片需求显著下降。
             */}
-            <div
-              className="mt-6 rounded-xl border border-border bg-elev1/80 p-4 backdrop-blur"
-              data-detail-section="characters"
-            >
-              <div className="mb-3 flex items-center justify-between">
-                <span className="flex items-center gap-1.5 text-sm font-semibold">
-                  <Users size={14} className="text-accent" /> 角色
-                </span>
-                {charactersLoading ? <span className="text-[11px] text-faint">加载中…</span> : null}
-              </div>
-              {charactersLoading ? (
-                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                  {Array.from({ length: 4 }).map((_, i) => (
-                    <div key={i} className="flex items-center gap-2 rounded-lg bg-elev2/40 p-2">
-                      <Sk className="h-11 w-9 shrink-0 rounded-md" />
-                      <div className="min-w-0 flex-1 space-y-1.5">
-                        <Sk className="h-2.5 w-4/5" />
-                        <Sk className="h-2 w-2/5" />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : characters && characters.length > 0 ? (
-                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                  {characters.slice(0, 8).map((c) => (
-                    <div key={`${c.id}-${c.name}`} className="flex items-center gap-2 rounded-lg bg-elev2/40 p-2">
-                      <CoverImage
-                        src={c.images?.grid ?? c.images?.small ?? c.images?.common ?? null}
-                        className="h-11 w-9 shrink-0"
-                        rounded="rounded-md"
-                      />
-                      <div className="min-w-0">
-                        <div className="line-clamp-1 text-[12px] text-text">{c.name_cn || c.name}</div>
-                        <div className="line-clamp-1 text-[10px] text-faint">{c.relation || '角色'}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="py-2 text-[11px] text-faint">暂无角色数据（数据源未返回或接口暂时不可用）</div>
-              )}
-            </div>
           </>
         ) : detailLoading ? (
           <DetailSkeleton />
@@ -772,12 +751,28 @@ export function SubjectDetailPage() {
           <Button icon={Play} onClick={() => void openRules()}>
             播放
           </Button>
+          {/*
+            V1.5.2：规则播放之外的四条附加在线路径（Apple CMS / REST / AnimePahe / AllManga）。
+            独立一个入口而不是塞进「选源-选集」面板：两者的数据形态完全不同，分开更不容易互相影响。
+          */}
+          <Button
+            variant="outline"
+            icon={Globe2}
+            title="附加在线数据源（Apple CMS / 自托管 REST / AnimePahe / AllManga）"
+            onClick={() =>
+              navigate('/online-sources', {
+                state: { keyword: view?.name_cn || view?.name || '', subjectId }
+              })
+            }
+          >
+            在线源
+          </Button>
           <Button
             variant="soft"
             icon={FilePlay}
             loading={localBusy}
-            title="选择一个本地视频文件播放（同文件夹内的其它视频会作为播放列表）"
-            onClick={() => void playLocalFile()}
+            title="本地播放：可以自己选一个文件，也可以直接播放本地库里已经下载的集数"
+            onClick={() => setLocalMenuOpen(true)}
           >
             本地播放
           </Button>
@@ -872,6 +867,34 @@ export function SubjectDetailPage() {
           navigate('/subs')
         }}
       />
+      {/* V1.5.1：本地播放的两个入口（自行选择文件 / 从本地库） */}
+      <Modal open={localMenuOpen} onClose={() => setLocalMenuOpen(false)} title="本地播放" width={420}>
+        <div className="flex flex-col gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              setLocalMenuOpen(false)
+              void playLocalFile()
+            }}
+            className="flex flex-col items-start gap-0.5 rounded-lg border border-border bg-elev2/50 px-3 py-2.5 text-left transition-colors hover:border-accent/50 hover:bg-accent-soft"
+          >
+            <span className="text-xs font-medium text-text">自行选择文件播放</span>
+            <span className="text-[11px] leading-relaxed text-faint">
+              弹窗选一个视频文件；同文件夹里的其它视频会作为播放列表
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => void playFromLocalLibrary()}
+            className="flex flex-col items-start gap-0.5 rounded-lg border border-border bg-elev2/50 px-3 py-2.5 text-left transition-colors hover:border-accent/50 hover:bg-accent-soft"
+          >
+            <span className="text-xs font-medium text-text">从本地库播放</span>
+            <span className="text-[11px] leading-relaxed text-faint">
+              直接使用「我的番剧库 → 本地库」里已下载的集数（没有下载时会提示）
+            </span>
+          </button>
+        </div>
+      </Modal>
     </div>
   )
 }

@@ -6,9 +6,11 @@ import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Readable } from 'node:stream'
 import { resolveTempMediaCacheEpisodes } from '@shared/mediaCache'
+import { resolveSniffSettings, tuneConnections, type SniffSettings } from '@shared/sniff'
 import { log } from '../log'
 import { BROWSER_UA, buildProxyAgents, getSettings } from '../net'
 import { dataPaths } from './paths'
+import { addRangeTo, availableEndOf, cachedBytesOf, nextRangeStart } from './mediaCacheCoverage'
 import { markCacheTiming, playTimingStartedAt } from './playTiming'
 
 /**
@@ -190,6 +192,43 @@ interface CacheSession {
   stallTimer: NodeJS.Timeout | null
   /** 「已完整落盘」的日志只写一次 */
   completionLogged: boolean
+  /*
+   * ── V1.5.1：Range 多连接分段下载（「嗅探设置」里的加速）──
+   *
+   * 形状：主链路负责 [0, primaryEnd)（播放器最先要的那一段，保持原来的顺序语义），
+   * 其余字节由 N-1 个 worker 各自用 Range 并行拉取、按**绝对偏移**写进同一个文件。
+   * 于是「播放起播」仍由顺序主链路保证（不会被并行打乱），而整集的落盘速度是原来的 N 倍左右。
+   *
+   * ranges 只记**已经完整落盘**的分段（半截分段不能算可用，否则播放器会读到空洞）。
+   */
+  ranges: { start: number; end: number }[]
+  /** 本次会话使用的分段数（1 = 纯单连接，没有并行） */
+  segments: number
+  /** 主链路只拉到这个位置（闭开）；null = 一直拉到文件末尾 */
+  primaryEnd: number | null
+  /** 本轮主链路是从哪个字节开始写的（收尾时要把它记成一段） */
+  primaryStart: number
+  /** 分段 worker 的取消器 */
+  segmentAbort: AbortController | null
+  /** 还在跑的分段 worker 数量（归零后统一检查是否补缺口） */
+  segmentActive: number
+  /** 是否已经有 repair 在补缺口（防止并发补同一段） */
+  repairing: boolean
+  /**
+   * 本轮从上游实际写进文件的字节数（含并行分段里"还没写完的那一段"已经落盘的部分）。
+   *
+   * 为什么需要它：进度百分比用 `cachedBytesOf`（只有**完整**分段才算缓存好），
+   * 但速率必须用这个增量 —— 否则一段 150MB 的分段完成时，进度会在一瞬间跳 150MB，
+   * 界面上就会闪出一个"几百 MB/s"的假速度。用"每写一块就+1"的计数器算速率才是真实吞吐。
+   */
+  writtenBytes: number
+  /**
+   * V1.5.1：播放器此刻正在等这一集补字节（读到还没缓存到的位置）。
+   *
+   * 由本机 HTTP 服务在"要读的位置还没有数据"时置位、读到新数据时清零。
+   * 界面拿它显示「正在加载中…」—— 这比按时间猜缓冲准确：它就是"卡在没缓存的地方"本身。
+   */
+  waitingForBytes: boolean
 }
 
 export interface TempMediaCacheStartInput {
@@ -447,6 +486,8 @@ function failSession(s: CacheSession, reason: string): void {
     return
   }
   s.state = 'failed'
+  // V1.5.1：并行分段也要一起停（否则会话失败了 worker 还在往文件里写）
+  abortSegments(s, '会话失败')
   s.error = reason
   clearStall(s)
   s.abort?.abort()
@@ -495,6 +536,8 @@ function dropSession(s: CacheSession, deleteFile: boolean): void {
   if (s.state === 'closed') return
   s.state = 'closed'
   clearStall(s)
+  // V1.5.1：先停并行分段，再关主链路（顺序反了 worker 可能还会写一次到已删文件）
+  abortSegments(s, '会话被回收')
   s.abort?.abort()
   s.abort = null
   try {
@@ -676,7 +719,10 @@ export function startTempMediaCache(input: TempMediaCacheStartInput): TempMediaC
        * 这时不能再发 Range（bytes=<total>- 会得到 416），直接按「已完整」处理，
        * 否则一份完整文件会被误判成坏源、白白触发回退。
        */
-      if (existing.received > 0 && (existing.total === null ? existing.upstreamEnded : existing.received >= existing.total)) {
+      if (
+        existing.received > 0 &&
+        (existing.total === null ? existing.upstreamEnded : availableEndOf(existing, 0) >= existing.total)
+      ) {
         existing.state = 'done'
         if (existing.total === null) existing.total = existing.received
         const fh = existing.writeFh
@@ -685,7 +731,16 @@ export function startTempMediaCache(input: TempMediaCacheStartInput): TempMediaC
         wake(existing)
         logSession(existing, 'info', `复用的临时缓存其实已完整（${fmtBytes(existing.received)}），直接只读本地文件`)
       } else {
-        // 上一轮离开这一集时暂停了后台拉取：重播时从已落盘的位置继续（源站不支持 Range 会退化为从头）
+        /*
+         * 上一轮离开这一集时暂停了后台拉取：重播时从已落盘的位置继续。
+         * V1.5.1：续传一律**回到单连接**，并丢掉内存里的分段记录 —— 分段记录只对"本次这一轮"
+         * 有效，续传时若还按它判断可用区，播放器可能读到上次没真正写完的区域。
+         */
+        abortSegments(existing, '重播/续传')
+        existing.ranges = []
+        existing.primaryEnd = null
+        existing.primaryStart = existing.received
+        existing.repairing = false
         void pullUpstream(existing, existing.received)
         logSession(existing, 'info', `复用已暂停的临时缓存并继续拉取（已落盘 ${fmtBytes(existing.received)}）`)
       }
@@ -738,7 +793,16 @@ export function startTempMediaCache(input: TempMediaCacheStartInput): TempMediaC
     upstreamEnded: false,
     lastDataAt: 0,
     stallTimer: null,
-    completionLogged: false
+    completionLogged: false,
+    ranges: [],
+    segments: 1,
+    primaryEnd: null,
+    primaryStart: 0,
+    segmentAbort: null,
+    segmentActive: 0,
+    repairing: false,
+    waitingForBytes: false,
+    writtenBytes: 0
   }
   sessions.set(id, s)
   // 计时起点：这一刻起「建会话 → 上游首字节 → 本地可播」三段才算进本轮 [play-flow] 计时
@@ -767,6 +831,8 @@ export function pauseTempMediaCache(sessionId: string): void {
   if (s.state !== 'opening' && s.state !== 'streaming') return
   s.state = 'paused'
   clearStall(s)
+  // V1.5.1：暂停时并行分段也停（下次重播会清掉内存里的分段记录，从顺序区继续）
+  abortSegments(s, '暂停')
   s.abort?.abort()
   s.abort = null
   try {
@@ -813,6 +879,10 @@ export function tempMediaCacheSnapshot(): {
     firstUpstreamByteAt: number
     firstClientByteAt: number
     error: string
+    /** V1.5.1：播放器正在等这一集补字节（界面显示「正在加载中…」） */
+    waiting: boolean
+    /** V1.5.1：本轮真实写盘字节数（速率用它算，避免分段完成时闪出假速度） */
+    written: number
   }[]
 } {
   return {
@@ -822,14 +892,20 @@ export function tempMediaCacheSnapshot(): {
     sessions: [...sessions.values()].map((s) => ({
       id: s.id,
       state: s.state,
-      received: s.received,
+      /*
+       * V1.5.1：进度条要的是"已经缓存了多少"，而不是"顺序区到哪了"。
+       * 并行分段下后半段可能先下完（顺序区还停在一半），只报 received 会让百分比看起来卡住。
+       */
+      received: cachedBytesOf(s),
       total: s.total,
       contentType: s.contentType,
       clients: s.clients,
       lastUsedAt: s.lastUsedAt,
       firstUpstreamByteAt: s.firstUpstreamByteAt,
       firstClientByteAt: s.firstClientByteAt,
-      error: s.error
+      error: s.error,
+      waiting: s.waitingForBytes,
+      written: s.writtenBytes
     }))
   }
 }
@@ -841,6 +917,7 @@ export function tempMediaCacheSnapshot(): {
  * 不少 CDN/WAF 会拒绝 "libmpv"/空 UA，表现为「地址校验能通、内核取流却播不了」。
  */
 function upstreamHeaders(s: CacheSession, range?: string): Record<string, string> {
+  const cfg = sniffSettings()
   const headers: Record<string, string> = {
     'User-Agent': s.userAgent || BROWSER_UA,
     Accept: '*/*'
@@ -848,7 +925,307 @@ function upstreamHeaders(s: CacheSession, range?: string): Record<string, string
   if (s.referer) headers.Referer = s.referer
   if (s.cookies) headers.Cookie = s.cookies
   if (range) headers.Range = range
+  /*
+   * V1.5.1「请求头伪装」（嗅探设置里可关）。
+   *
+   * 为什么需要：不少 CDN/WAF 除了 UA，还会看 Origin / Accept-Language / Sec-Fetch-* 这一组
+   * 「只有真实浏览器才会带全」的头。实测有的直链只带 UA 能过，但一旦站点侧开始按"请求特征"
+   * 限速，缺这几个头的那类请求会率先被降速或 403 —— 补齐它们的代价是零，收益是被当成真人。
+   *
+   * 注意几件事：
+   *   · `Accept-Encoding: identity` 是**必须**的：媒体字节一旦被压缩，写进缓存的就是解压前的
+   *     另一份字节，长度对不上播放器声明的内容（这条以前在响应头检查里兜底，现在请求端就拒绝）；
+   *   · Origin 由 Referer 推（同源），推不出来就不写 —— 空 Origin 比错的 Origin 更容易被拦；
+   *   · `Connection: keep-alive` 不提：Node 自己会按 Agent 设置，自己写反而可能触发 h2 拒绝。
+   */
+  if (cfg.headerSpoof) {
+    headers['Accept-Language'] = 'zh-CN,zh;q=0.9,en;q=0.8'
+    headers['Accept-Encoding'] = 'identity'
+    headers['Sec-Fetch-Dest'] = 'video'
+    headers['Sec-Fetch-Mode'] = 'no-cors'
+    headers['Sec-Fetch-Site'] = 'cross-site'
+    if (s.referer) {
+      try {
+        headers.Origin = new URL(s.referer).origin
+      } catch {
+        /* Referer 不是合法 URL 时不写 Origin */
+      }
+    }
+  }
   return headers
+}
+
+/** 当前的嗅探设置（每次现读：用户改完设置不用重开会话就生效） */
+function sniffSettings(): SniffSettings {
+  return resolveSniffSettings(getSettings().sniff)
+}
+
+/* ───────────────────────── V1.5.1：Range 多连接分段 ───────────────────────── */
+
+/** 分段下载的最小文件体积（再小就单连接：多开只会多几个请求） */
+const SEGMENT_MIN_BYTES = 8 * 1024 * 1024
+/** 分段边界对齐到 1MiB：一是好看，二是避免最后一段小到没有意义 */
+const SEGMENT_ALIGN = 1024 * 1024
+
+/*
+ * 「已缓存区间」的三个判定（availableEndOf / cachedBytesOf / addRangeTo / nextRangeStart）
+ * 全部在 `mediaCacheCoverage.ts` 里，是**不依赖 Electron 的纯函数**，可以脱离播放链路跑断言。
+ * 这里保留一个 addRange 包装，因为写完之后必须 wake() 等待中的客户端；
+ * 其余三个直接用导入的实现（CacheSession 结构上满足 CoverageState）。
+ */
+
+/** 记一段已完成并唤醒等待中的读方 */
+function addRange(s: CacheSession, start: number, end: number): void {
+  addRangeTo(s, start, end)
+  wake(s)
+}
+
+/** 自适应并发：上一次分段任务的表现决定这一次开几条连接（用户可关） */
+let adaptiveConnections = 0
+
+/** 本次会话实际使用的分段数：基准值 + 自适应偏移，夹在合法区间内 */
+function planConnections(cfg: SniffSettings): number {
+  const base = cfg.connections
+  if (!cfg.adaptive) return base
+  if (adaptiveConnections <= 0) return base
+  return Math.min(8, Math.max(2, adaptiveConnections))
+}
+
+/** 分段任务结束后的统计（用于下一轮自适应；纯内存，不落盘） */
+const segmentStats = { ok: 0, failed: 0, bytes: 0, ms: 0 }
+
+function resetSegmentStats(): void {
+  segmentStats.ok = 0
+  segmentStats.failed = 0
+  segmentStats.bytes = 0
+  segmentStats.ms = 0
+}
+
+/**
+ * 决定本次会话要不要并行分段，并把 worker 拉起来。
+ *
+ * 只在这一刻判定一次：响应头已经拿到（知道总长）、文件已经以 `w+` 打开（不会被再次截断）、
+ * 且这是从头开始的第一次拉取。任何一条不满足就保持单连接 —— 复用的旧会话/续传路径不参与，
+ * 免得"一半顺序区 + 一半分段"让可用区间变得难以推理。
+ */
+function maybeStartSegments(s: CacheSession): void {
+  void (async () => {
+    if (s.segments > 1) return
+    const cfg = sniffSettings()
+    if (!cfg.multiConnection) return
+    if (s.total === null || s.total < SEGMENT_MIN_BYTES || s.total < cfg.minFileMB * 1024 * 1024) return
+    if (s.primaryStart !== 0 || s.received !== 0) return
+    const k = planConnections(cfg)
+    if (k < 2) return
+    // 分段边界按 MiB 对齐，并保证每段至少有 SEGMENT_MIN_BYTES/k 的大小
+    const per = Math.max(SEGMENT_ALIGN, Math.ceil(s.total / k / SEGMENT_ALIGN) * SEGMENT_ALIGN)
+    if (per <= 0 || per >= s.total) return
+    resetSegmentStats()
+    s.segments = k
+    s.primaryEnd = Math.min(s.total, per)
+    s.primaryStart = 0
+    s.segmentAbort = new AbortController()
+    let started = 0
+    for (let i = 1; i < k; i++) {
+      const start = i * per
+      if (start >= s.total) break
+      const end = Math.min(s.total, start + per)
+      s.segmentActive += 1
+      started += 1
+      void runSegment(s, start, end)
+    }
+    if (started === 0) {
+      s.segments = 1
+      s.primaryEnd = null
+      return
+    }
+    logSession(
+      s,
+      'info',
+      `启用 Range 多连接分段下载：${started + 1} 条连接（主链路 ${fmtBytes(s.primaryEnd ?? 0)}，其余并行，` +
+        `文件 ${fmtBytes(s.total)}）`
+    )
+  })()
+}
+
+/**
+ * 一个分段 worker：用 Range 拉 [start,end) 并在**绝对偏移**处写盘。
+ *
+ * 与主链路的隔离：worker 只碰自己那一段，失败也只是"这一段没下来"，
+ * 由 repair 用单连接补齐（见 repairGaps）—— 绝不因为并行失败影响正在播放的顺序区。
+ */
+async function runSegment(s: CacheSession, start: number, end: number): Promise<void> {
+  const signal = s.segmentAbort?.signal
+  if (!signal) return
+  const t0 = Date.now()
+  let written = 0
+  let res: AxiosResponse
+  try {
+    res = await axios.get(s.directUrl, {
+      timeout: UPSTREAM_HEADER_TIMEOUT_MS,
+      responseType: 'stream',
+      maxRedirects: 5,
+      validateStatus: () => true,
+      decompress: false,
+      headers: upstreamHeaders(s, `bytes=${start}-${end - 1}`),
+      signal,
+      netBypass: true,
+      ...buildProxyAgents(getSettings().proxy)
+    })
+  } catch (err) {
+    segmentSettled(s, false, 0, 0, `请求失败：${shortError(err)}`)
+    return
+  }
+  const stream = res.data as Readable
+  if (res.status !== 206) {
+    try {
+      stream?.destroy()
+    } catch {
+      /* ignore */
+    }
+    /*
+     * 200 = 源站忽略了 Range。这时**不能再并行**：继续拉会把整份文件重复写进各段。
+     * 收掉所有 worker，让主链路继续按顺序拉完（功能不受影响，只是没有加速）。
+     */
+    segmentSettled(s, false, 0, 0, `源站不支持 Range（HTTP ${res.status}）`)
+    abortSegments(s, '源站不支持 Range，改用单连接')
+    return
+  }
+  let fh: FileHandle | null = null
+  try {
+    fh = await openFile(s.file, 'r+')
+    let pos = start
+    for await (const chunk of stream as AsyncIterable<Buffer>) {
+      if (s.state === 'paused' || s.state === 'closed' || s.state === 'failed' || signal.aborted) break
+      const remain = end - pos
+      if (remain <= 0) break
+      const buf = chunk.length > remain ? chunk.subarray(0, remain) : chunk
+      let offset = 0
+      while (offset < buf.length) {
+        const r = await fh.write(buf, offset, buf.length - offset, pos + offset)
+        if (!r.bytesWritten) throw new Error('磁盘写入 0 字节')
+        offset += r.bytesWritten
+      }
+      pos += buf.length
+      written = pos - start
+      s.writtenBytes += buf.length
+      s.lastDataAt = Date.now()
+      wake(s)
+    }
+    if (pos >= end) {
+      addRange(s, start, end)
+      segmentSettled(s, true, written, Date.now() - t0)
+    } else {
+      segmentSettled(s, false, written, Date.now() - t0, `提前结束（${fmtBytes(pos - start)}/${fmtBytes(end - start)}）`)
+    }
+  } catch (err) {
+    if (s.state === 'paused' || s.state === 'closed' || s.state === 'failed' || signal.aborted) {
+      // 暂停/关闭导致的写入中断不算失败（文件留着下次继续）
+      segmentSettled(s, false, written, Date.now() - t0, '会话已暂停/关闭')
+    } else {
+      segmentSettled(s, false, written, Date.now() - t0, shortError(err))
+    }
+  } finally {
+    if (fh) void fh.close().catch(() => undefined)
+    try {
+      stream?.destroy()
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/** 一个分段 worker 收尾：记统计、减计数，全部结束后检查缺口 */
+function segmentSettled(s: CacheSession, ok: boolean, bytes: number, ms: number, why?: string): void {
+  if (ok) {
+    segmentStats.ok += 1
+    segmentStats.bytes += bytes
+    segmentStats.ms += ms
+  } else {
+    segmentStats.failed += 1
+    if (why && !/会话已暂停|闭/.test(why)) logSession(s, 'warn', `分段下载未完成：${why}；该段将由单连接补齐`)
+  }
+  s.segmentActive = Math.max(0, s.segmentActive - 1)
+  if (s.segmentActive > 0) return
+  const cfg = sniffSettings()
+  if (cfg.adaptive) {
+    const avg = segmentStats.ms > 0 ? (segmentStats.bytes / segmentStats.ms) * 1000 : 0
+    adaptiveConnections = tuneConnections(s.segments, {
+      ok: segmentStats.ok,
+      failed: segmentStats.failed,
+      avgBytesPerSec: avg
+    })
+  }
+  repairGaps(s)
+}
+
+/** 取消所有分段 worker（暂停/回收/失败时调用） */
+function abortSegments(s: CacheSession, why: string): void {
+  if (!s.segmentAbort) return
+  try {
+    s.segmentAbort.abort()
+  } catch {
+    /* ignore */
+  }
+  s.segmentAbort = null
+  s.segmentActive = 0
+  if (s.segments > 1) logSession(s, 'info', `已停止 Range 分段下载（${why}）`)
+  s.segments = 1
+}
+
+/**
+ * 补缺口：并行分段可能因为源站抖动少下一段。
+ *
+ * 做法：把「从顺序区末尾到下一个已完成段起点」这一段交给**原来的单连接拉取**，
+ * 拉到边界即停，收尾时 addRange 合并，再决定要不要继续补下一段（见 finishUpstream）。
+ * 这样即使并行全部失败，最终仍然是一份完整文件（只是慢一点），不会留下永久空洞。
+ *
+ * 为什么一次只补一段而不是 while 循环：`pullUpstream` 是**事件驱动**的，
+ * 它在挂好监听后就返回了，真正写完要靠流的 'end'。用 while 循环会在第一段还没写完时
+ * 就启动第二轮，两个写偏移互相覆盖 —— 文件直接烂掉。
+ */
+function repairGaps(s: CacheSession): void {
+  if (s.repairing) return
+  if (s.state !== 'streaming' || s.total === null) return
+  if (s.segmentActive > 0) return
+  // 主链路还在跑（worker 先结束）：等它停到 primaryEnd 后由 finishUpstream 再调这里
+  if (s.upstream && !s.upstreamEnded) return
+  const from = availableEndOf(s, 0)
+  if (from >= s.total) {
+    markDone(s)
+    return
+  }
+  const next = nextRangeStart(s, from)
+  if (next !== null && next <= from) return
+  s.repairing = true
+  s.segmentAbort = null
+  s.segments = 1
+  s.primaryStart = from
+  s.primaryEnd = next
+  logSession(
+    s,
+    'info',
+    `补拉缺口：${fmtBytes(from)} → ${next === null ? '文件末尾' : fmtBytes(next)}（单连接）`
+  )
+  void pullUpstream(s, from)
+}
+
+/** 收尾：整份文件已经齐了 */
+function markDone(s: CacheSession): void {
+  if (s.state !== 'streaming') return
+  s.state = 'done'
+  clearStall(s)
+  const fh = s.writeFh
+  s.writeFh = null
+  if (fh) void fh.close().catch(() => undefined)
+  s.abort = null
+  s.upstream = null
+  if (s.total === null) s.total = s.received
+  wake(s)
+  if (!s.completionLogged) {
+    s.completionLogged = true
+    logSession(s, 'info', `临时缓存已完整落盘（${fmtBytes(s.received)}，本次播放可直接从磁盘读取）`)
+  }
 }
 
 /* ───────────────────────── 上游拉取 → 写盘 ───────────────────────── */
@@ -864,6 +1241,8 @@ function upstreamHeaders(s: CacheSession, range?: string): Record<string, string
 async function pullUpstream(s: CacheSession, fromByte: number): Promise<void> {
   if (s.state === 'failed' || s.state === 'done' || s.state === 'closed') return
   s.state = 'opening'
+  // V1.5.1：本轮吞吐从 0 起算（续传/补拉时旧值会让速率首帧出现一个巨大的假峰值）
+  s.writtenBytes = 0
   s.abort = new AbortController()
   const headers = upstreamHeaders(s, fromByte > 0 ? `bytes=${fromByte}-` : undefined)
 
@@ -996,6 +1375,7 @@ async function pullUpstream(s: CacheSession, fromByte: number): Promise<void> {
     }
     s.writeFh = fh
     s.state = 'streaming'
+    s.primaryStart = writeFrom
     startStallWatch(s)
     wake(s)
     logSession(
@@ -1004,6 +1384,8 @@ async function pullUpstream(s: CacheSession, fromByte: number): Promise<void> {
       `上游已响应（HTTP ${status}，${s.total ? `总长 ${fmtBytes(s.total)}` : '总长未知'}，` +
         `响应头 ${Date.now() - requestStartedAt}ms 到达）：开始写盘`
     )
+    // V1.5.1：文件已按 w+ 打开（不会被再次截断），这时才允许并行分段写同一文件
+    maybeStartSegments(s)
   } catch (err) {
     failSession(s, `写盘失败（无法打开临时文件）：${shortError(err)}`)
     return
@@ -1018,10 +1400,26 @@ async function pullUpstream(s: CacheSession, fromByte: number): Promise<void> {
     try {
       while (queue.length > 0) {
         if (s.state !== 'streaming') return
-        const chunk = queue.shift() as Buffer
+        let chunk = queue.shift() as Buffer
         queueBytes -= chunk.length
         const fh = s.writeFh
         if (!fh) return
+        /*
+         * V1.5.1：主链路只负责到 primaryEnd（并行模式下是第一段）。
+         * 到点后立刻收尾：丢掉落进队列的多余字节，它们属于别的分段，会由对应 worker 补齐 ——
+         * 继续写下去就会把 worker 写的同一块区域覆盖掉（内容一样但白耗流量与磁盘）。
+         */
+        const limit = s.primaryEnd
+        if (limit !== null) {
+          const remain = limit - writeFrom
+          if (remain <= 0) {
+            queue.length = 0
+            queueBytes = 0
+            endPrimary(s)
+            return
+          }
+          if (chunk.length > remain) chunk = chunk.subarray(0, remain)
+        }
         /*
          * 常规文件一般一次 write 就写完整块，但 FileHandle.write 允许只写一部分；
          * 这里按实际写入字节推进，避免「少写一块」在文件里留下空洞（媒体文件会因此解不出来）。
@@ -1034,6 +1432,8 @@ async function pullUpstream(s: CacheSession, fromByte: number): Promise<void> {
         }
         writeFrom += chunk.length
         s.received = writeFrom
+        // V1.5.1：真实吞吐计数（进度条百分比不用它，速率用它，见 writtenBytes 的说明）
+        s.writtenBytes += chunk.length
         // 写盘也算「有进展」：磁盘慢导致的背压不该被上游停滞看门狗误判成上游死了
         s.lastDataAt = Date.now()
         wake(s)
@@ -1085,6 +1485,11 @@ async function pullUpstream(s: CacheSession, fromByte: number): Promise<void> {
   })
 
   stream.on('error', (err: Error) => {
+    /*
+     * V1.5.1：主链路在 primaryEnd 主动 destroy 时会触发一次 error（ERR_STREAM_DESTROYED）。
+     * 那是我们自己掐的，不是上游故障 —— 当成失败就会让整集回退直连，白扔掉已经缓存好的部分。
+     */
+    if (s.upstreamEnded || s.state !== 'streaming') return
     failSession(s, `上游中断：${shortError(err)}`)
   })
 }
@@ -1092,6 +1497,27 @@ async function pullUpstream(s: CacheSession, fromByte: number): Promise<void> {
 /** 上游读完且队列排空：落盘完成 */
 function finishUpstream(s: CacheSession): void {
   if (s.state !== 'streaming') return
+  /*
+   * V1.5.1：并行模式下主链路是**主动停在 primaryEnd** 的（见 endPrimary），
+   * 此时 received < total 是正常现象，不能当成"上游提前结束"判失败。
+   * 把它记成一段已完成，剩下的交给 worker；worker 都结束后 repairGaps 决定是收尾还是补缺口。
+   */
+  if (s.primaryEnd !== null) {
+    /*
+     * 只登记**真的写到了**的位置：源站可能提前结束（received < primaryEnd），
+     * 这时把整段记成"已完成"会让播放器读到不存在的字节（文件里是空洞）。
+     */
+    addRange(s, s.primaryStart, Math.min(s.received, s.primaryEnd))
+    s.repairing = false
+    if (s.segmentActive > 0) return
+    if (s.total !== null && availableEndOf(s, 0) >= s.total) {
+      markDone(s)
+      return
+    }
+    // 还有缺口：接着补下一段（每次补一段，补完会再回到这里）
+    repairGaps(s)
+    return
+  }
   if (s.received === 0) {
     // 200 + 立即 EOF 也是「失效直链」的一种形状：没有字节可播，按失败回退直连
     failSession(s, '上游连接结束但一个字节都没有返回')
@@ -1106,19 +1532,24 @@ function finishUpstream(s: CacheSession): void {
     failSession(s, `上游提前结束（只收到 ${fmtBytes(s.received)} / ${fmtBytes(s.total)}）`)
     return
   }
-  s.state = 'done'
-  clearStall(s)
-  const fh = s.writeFh
-  s.writeFh = null
-  if (fh) void fh.close().catch(() => undefined)
-  s.abort = null
-  s.upstream = null
-  if (s.total === null) s.total = s.received
-  wake(s)
-  if (!s.completionLogged) {
-    s.completionLogged = true
-    logSession(s, 'info', `临时缓存已完整落盘（${fmtBytes(s.received)}，本次播放可直接从磁盘读取）`)
+  markDone(s)
+}
+
+/**
+ * 主链路到达 primaryEnd：停掉上游、丢掉剩余队列，让收尾逻辑把这一段登记完成。
+ *
+ * 为什么必须先 `destroy()` 再交给 finishUpstream：不掐掉上游的话，'end' 事件永远不会来，
+ * 队列虽然空着也会一直挂着 streaming，界面就会一直显示"还在缓存"。
+ */
+function endPrimary(s: CacheSession): void {
+  if (s.upstreamEnded) return
+  s.upstreamEnded = true
+  try {
+    ;(s.upstream as Readable)?.destroy()
+  } catch {
+    /* ignore */
   }
+  s.upstream = null
 }
 
 function totalFromHeaders(headers: Record<string, unknown>, status: number, fromByte: number): number | null {
@@ -1289,7 +1720,12 @@ async function serveClient(s: CacheSession, req: IncomingMessage, res: ServerRes
     }
   }
 
-  if (total !== null && start - s.received > UNCACHED_JUMP_BYTES) {
+  /*
+   * V1.5.1：判断"要不要改走上游直供"时先看**可用区间**（顺序区 + 并行分段），
+   * 只有确实没有这段数据、且离顺序区很远时才去问源站 —— 否则并行已经下好的段
+   * 还要再向源站拉一遍，白耗流量还更慢。
+   */
+  if (total !== null && availableEndOf(s, start) <= start && start - s.received > UNCACHED_JUMP_BYTES) {
     /*
      * 播放器要的位置远在已缓存区之后：不再等顺序缓存爬过去，直接向源站要这一段。
      * 典型场景就是非 faststart 的 MP4（moov 在尾部）与用户拖到很后面的进度条 ——
@@ -1431,15 +1867,29 @@ async function streamCachedBytes(
   try {
     while (!res.destroyed && !res.writableEnded) {
       if (end !== null && pos > end) break
-      const available = s.received - pos
+      /*
+       * V1.5.1：可用区间 = 顺序区 + 已完成的并行分段（availableEndOf 会跨过相邻段但**不跨缺口**）。
+       * 之前只看 s.received，并行下好的段会被当成"还没缓存"，播放器只好干等。
+       */
+      const available = availableEndOf(s, pos) - pos
       if (available <= 0) {
-        if (s.state === 'done') break // 正常结束：下面统一 end()
+        /*
+         * V1.5.1：播放器正卡在还没缓存到的位置 —— 置位给界面显示「正在加载中…」。
+         * 一旦读到数据（下面的分支）立刻清零，所以这个标记永远不会"卡住不消失"。
+         */
+        s.waitingForBytes = true
+        if (s.state === 'done') {
+          s.waitingForBytes = false
+          break // 正常结束：下面统一 end()
+        }
         if (s.state === 'failed' || s.state === 'closed' || s.state === 'paused') {
           // 缓存坏了/被回收：截断响应，让内核报错并走播放层的回退流程，而不是永远等下去
+          s.waitingForBytes = false
           res.destroy()
           return
         }
         if (Date.now() - lastProgressAt > CLIENT_STALL_DROP_MS) {
+          s.waitingForBytes = false
           logSession(s, 'warn', '播放器等待的位置超过 60 秒仍未缓存到，已断开本次连接（内核会重试/换候选）')
           res.destroy()
           return
@@ -1447,6 +1897,7 @@ async function streamCachedBytes(
         await waitForChange(s)
         continue
       }
+      s.waitingForBytes = false
       const want = Math.min(READ_CHUNK, available, end === null ? READ_CHUNK : end - pos + 1)
       if (want <= 0) break
       const chunk = Buffer.allocUnsafe(want)

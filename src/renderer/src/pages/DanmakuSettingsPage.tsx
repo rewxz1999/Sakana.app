@@ -5,11 +5,7 @@ import { DEFAULT_DANMAKU_SETTINGS, resolveDanmakuSettings } from '@shared/types'
 import { api } from '@/lib/api'
 import { useSettings, toast } from '@/stores/app'
 import { useSourceCatalog } from '@/components/danmaku/useSourceCatalog'
-import { DanmakuSourcesCard } from '@/components/danmaku/DanmakuSourcesCard'
-import { DanmakuBoxCard } from '@/components/danmaku/DanmakuBoxCard'
 import { DanmakuLibraryCard } from '@/components/danmaku/DanmakuLibraryCard'
-import { DanmakuFetchLogCard } from '@/components/danmaku/DanmakuFetchLogCard'
-import { DanmakuEnabledSourcesCard } from '@/components/danmaku/DanmakuEnabledSourcesCard'
 import { Button, Input } from '@/components/ui'
 import { Card, SubPage } from '@/components/SettingsShell'
 
@@ -66,29 +62,32 @@ export function DanmakuSettingsPage() {
         </Button>
       }
     >
-      <Card title="渲染方式" desc="两种方式用的是同一份弹幕数据（季集判定与多来源合并都由应用完成）">
-        <Row
-          label="由谁绘制"
-          desc="内置画布与控制栏同层，几乎不吃性能；mpv 插件用字幕层渲染，自带样式/搜索菜单"
-        >
-          <Pill active={d.renderer !== 'uosc'} onClick={() => patch({ renderer: 'canvas' })}>
-            内置画布
-          </Pill>
-          <Pill active={d.renderer === 'uosc'} onClick={() => patch({ renderer: 'uosc' })}>
-            mpv 插件（uosc_danmaku）
-          </Pill>
-        </Row>
-        <div className="border-t border-border pt-2.5 text-[11px] leading-relaxed text-faint">
-          选择「mpv 插件」后，进入播放器时应用会把这一集的弹幕交给内置的 <code className="font-mono">uosc_danmaku</code>{' '}
-          插件渲染（附带 uosc 菜单）：画面上的弹幕由 mpv 的字幕层绘制，
-          播放器控制栏的「弹幕设置」里会多出一行<b>插件菜单</b>（搜索弹幕 / 弹幕样式 / 源延迟 / 总菜单）。
-          改动在<b>下次进入播放器</b>时生效（插件随播放内核一起加载）。
-          插件取不到弹幕时会自动回落到内置画布，不会出现「两边都没有」。
+      <Card title="渲染与缓存" desc="V1.5.2 起画布弹幕已删除，弹幕只由 uosc_danmaku 插件渲染">
+        <div className="flex flex-col gap-2.5">
+          <div className="rounded-lg border border-accent/30 bg-accent-soft px-3 py-2.5 text-[11px] leading-relaxed text-accent">
+            现在只有一套渲染：<b>uosc_danmaku（mpv 插件）</b>。它走 mpv 的 ASS 渲染管线，
+            滚动比原来的网页画布顺得多；画布那条路已经整段删除。
+          </div>
+          <Toggle
+            label="60fps 平滑"
+            desc="开启 mpv 的 fps 滤镜，让弹幕与画面一起按 60fps 渲染（插件官方推荐；老显卡可关）"
+            value={d.uoscFpsSmooth !== false}
+            onChange={(v) => patch({ uoscFpsSmooth: v })}
+          />
+          <Toggle
+            label="缓存弹幕到本地"
+            desc="同一集第二次播放直接读缓存，不再请求 danmu_api；同时让插件把收到的弹幕另存一份"
+            value={d.cacheToLocal !== false}
+            onChange={(v) => patch({ cacheToLocal: v })}
+          />
+          <div className="border-t border-border pt-2.5 text-[11px] leading-relaxed text-faint">
+            数据源固定为<b>你自建的 danmu_api</b>（设置里仍可填自定义地址覆盖）。获取链路是
+            「danmu_api → 本地缓存 → 注入 uosc_danmaku」，不再经过巴哈 / 弹幕盒子 / 直链这些旧接口。
+          </div>
         </div>
       </Card>
 
-      {/* ---------------- V1.2：启用源 + 四项样式设置 ---------------- */}
-      <DanmakuEnabledSourcesCard catalog={catalog} />
+      {/* ---------------- V1.2：四项样式设置（外部源卡片 V1.5.2 已删除） ---------------- */}
 
       <Card
         title="弹幕设置（样式）"
@@ -137,11 +136,9 @@ export function DanmakuSettingsPage() {
           </Button>
         </Row>
       </Card>
-      <DanmakuSourcesCard catalog={catalog} />
-      <DanmakuBoxCard />
+      {/* V1.5.2：外部弹幕源与「弹幕盒子」下载已删除（统一由 danmu_api 提供）。
+          保留本地弹幕库（缓存浏览/清理），它仍然对应「缓存到本地」这项能力。 */}
       <DanmakuLibraryCard catalog={catalog} />
-      {/* v1.1.2：每次去数据源要弹幕的记录（排障用，默认折叠） */}
-      <DanmakuFetchLogCard />
 
       <Card title="显示" desc="影响画面上的弹幕观感（区域/速度/字号/时序在上一张卡片）">
         <Toggle label="显示弹幕" desc="关闭后完全不绘制弹幕（数据仍会匹配）" value={d.enabled} onChange={(v) => patch({ enabled: v })} />
@@ -310,14 +307,13 @@ export function DanmakuSettingsPage() {
 
       <Card title="说明" desc="关于弹幕来源与加载顺序">
         <div className="text-[11px] leading-relaxed text-faint">
-          链路是「弹幕源 → 获取器 → 本地缓存 → 集成器 → 播放器」：每个源各自搜索、取该集、
-          写成带来源名的缓存文件；集成器再按「时间 + 正文」去重、按时间排序后交给播放器。
+          V1.5.2 起链路简化为「danmu_api → 本地缓存 → uosc_danmaku 插件」：
+          进播放器时先查本地缓存（命中就直接用，不发任何请求），没有缓存才向 danmu_api 请求一次。
+          拿到之后由应用把这一集的弹幕合并、写成 B 站格式 XML 交给插件渲染，同时写进本地缓存；
+          同一集第二次播放网络请求为 0。
           <div className="mt-1.5">
-            进播放器时的顺序：<b className="text-dim">先查每个启用源 + 内置弹弹play 的本地缓存</b>
-            （命中就直接用，不发请求）→ 缓存缺失的部分才并行请求。第一段先上屏，第二段回来后再合并，
-            所以"快"和"源一定要被调用"同时成立。播放器状态区会写明
-            <b className="text-dim">每个源各多少条、哪些来自缓存</b>；全部失败时「显示弹幕获取器记录」里
-            能看到每个源各自的原因（未匹配 / 下载失败 / 格式不支持）。
+            旧的巴哈姆特 / 弹幕盒子 / 直链等获取方式已经整体删除，设置页也不再出现它们的开关
+            —— 避免"某个源失效导致弹幕时有时无"。
           </div>
         </div>
       </Card>

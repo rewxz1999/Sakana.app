@@ -8,7 +8,7 @@ import { allowMediaRoot } from './media'
 import { galToolsGet, galToolsSet } from './galgameTools'
 import { dataPaths } from './paths'
 
-type SaveSettings = { downloadDir?: string; screenshotDir?: string }
+type SaveSettings = { downloadDir?: string; screenshotDir?: string; saveDirsConfigured?: boolean }
 
 function getSaveSettings(): SaveSettings {
   return store.get<SaveSettings>('settings', {})
@@ -116,7 +116,10 @@ export function setSaveDirs(patch: Partial<SaveDirsInfo>): SaveDirsInfo {
     // 新目录要立刻加进自定义协议白名单，否则列表/播放会 403
     allowMediaRoot(dir)
   }
-  if (Object.keys(next).length > 0) patchSaveSettings(next)
+  if (Object.keys(next).length > 0) {
+    // V1.5.1：用户一旦自己改过保存目录，启动时就不再提醒（需求里的"已经配置过了保存地址"）
+    patchSaveSettings({ ...next, saveDirsConfigured: true })
+  }
 
   // 下载中：把新目录推给运行中的 aria2（失败只记日志，不影响设置已保存）
   void aria2.refreshDir().catch((err) => {

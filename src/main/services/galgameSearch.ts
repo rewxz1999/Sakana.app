@@ -276,8 +276,30 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 }
 
 /**
+ * V1.5.2：只返回**站点清单**（不联网）。
+ *
+ * 用户要求把 galgame 库的搜索改成"选站点 → 输入名字 → 跳转"，不再统计各站结果数量：
+ * 统计本身要并发打 7 个站点，既慢又容易被站点限流，而结果数量对用户其实没有价值。
+ * 这里只暴露 key/name/host，URL 由 `galSiteSearchUrl` 用同一份 pageUrl 规则生成，
+ * 避免渲染层自己再抄一遍各站点的搜索路径。
+ */
+export function galSiteList(): { key: string; name: string; host: string }[] {
+  return SITES.map((s) => ({ key: s.key, name: s.name, host: s.host }))
+}
+
+/** 某个站点的搜索页地址；站点不存在返回 null。关键词为空时返回站点首页/搜索页兜底。 */
+export function galSiteSearchUrl(key: string, keyword: string): string | null {
+  const site = SITES.find((s) => s.key === key)
+  if (!site) return null
+  return site.pageUrl(cleanKeyword(keyword))
+}
+
+/**
  * 并行查询 7 个资源站点的「结果数量」。永不抛错：
  * 单站异常 → count=null + countKind='none' + note（原因）。
+ *
+ * @deprecated V1.5.2：界面已改为"选站点直接跳转"，不再调用本函数。
+ * 保留实现是为了自检脚本/将来做"站点可用性检测"时还有现成的探测逻辑。
  */
 export async function galSearchSites(keyword: string): Promise<GalSiteSearchResult[]> {
   const kw = cleanKeyword(keyword)

@@ -17,8 +17,7 @@ import type {
   DanmakuComment,
   DanmakuLibraryInfo,
   DanmakuLibraryItem,
-  DanmakuFetchRecord,
-  DanmakuLoadResult,
+  DanmakuFetchRecord,  DanmakuLoadResult,
   DanmakuMatch,
   DanmakuProgressSnapshot,
   DanmakuRuntimeStats,
@@ -36,14 +35,24 @@ import type {
   GalMemRecent,
   GalRecentShot,
   GalBgmSaved,
+  GalExtractAllResult,
+  GalExtractPreview,
+  GalResourcesResult,
   GalUnpackSummary,
   GalSiteSearchResult,
   GalToolsConfig,
   ImageDataUrlResult,
   LiveStartResult,
   LocalDirInfo,
+  LocalLibraryItem,
   LocalTargetInput,
   LocalVideoFile,
+  OnlineEpisodeItem,
+  OnlineResolveResult,
+  OnlineSearchItem,
+  OnlineSourceAvailability,
+  OnlineSourceId,
+  OnlineSourceMeta,
   NetPriority,
   RatingResult,
   LogEntry,
@@ -79,12 +88,15 @@ import type {
   SubscribeAndDownloadResult,
   Subscription,
   ToolImportReport,
+  TrackerStatus,
   ToolMeta,
   ToolRunResult,
+  TrafficSnapshot,
   UpdateInstallState,
   UpdateInfo,
   YmgalCandidate
 } from './types'
+import type { CacheDbEntrySummary } from './cachePolicy'
 
 export type ApiResult<T> = { ok: true; data: T } | { ok: false; error: string }
 
@@ -395,6 +407,11 @@ export interface SakanaApi {
   }
   bangumi: {
     /**
+     * V1.5.1：切换数据源模式并立即生效（官方直连 / 内置反代）。
+     * 设置页与启动询问弹窗共用；主进程会同步写回 settings.bangumiOfficial。
+     */
+    setSource(official: boolean): Promise<ApiResult<{ official: boolean }>>
+    /**
      * 番剧表。`force` = 主动刷新；`opts.allowRefresh` = 允许顺带后台更新一次
      * （V1.2.3：只有番剧表页挂载与手动刷新会传 true，其余调用一律吃缓存 ——
      *  避免为了首页推荐之类的需求白打一次 38 秒的 `/calendar`）。
@@ -542,6 +559,13 @@ export interface SakanaApi {
     qbitStatus(): Promise<ApiResult<QbitStatus>>
     /** 由应用启动 qBittorrent 并等 WebUI 就绪（含超时/失败的中文原因） */
     qbitLaunch(): Promise<ApiResult<{ ok: boolean; message: string }>>
+    /**
+     * V1.5.2：aria2 Tracker 列表状态（条数 / 上次更新时间 / 失败原因）。
+     * 列表来源是社区维护的 ngosang/trackerslist，磁盘缓存 3 天，失败继续用旧列表。
+     */
+    trackerStatus(): Promise<ApiResult<TrackerStatus>>
+    /** 立即拉取并热更 Tracker（changeGlobalOption，无需重启 aria2） */
+    trackerUpdate(): Promise<ApiResult<{ updated: boolean; status: TrackerStatus }>>
     onChanged(cb: (tasks: DownloadTask[]) => void): () => void
   }
   rules: {
@@ -1054,6 +1078,14 @@ export interface SakanaApi {
         fallback?: number
       }>
     >
+    /**
+     * V1.5.2：全部提取前的预览（候选数量）。界面在 >30 张时先弹「提取需要时间，确认？」。
+     */
+    extractPreview(exePath: string, kind: '立绘' | 'cg' | 'bgm'): Promise<ApiResult<GalExtractPreview>>
+    /** V1.5.2：**全部**提取（不再有候选数量上限），只写 <保存根目录>/<游戏名>/{立绘,cg,bgm}/ */
+    extractAll(exePath: string, gameName: string, kind: '立绘' | 'cg' | 'bgm'): Promise<ApiResult<GalExtractAllResult>>
+    /** V1.5.2：列出最近解包/提取的资源（立绘/CG/bgm/文本），供「查看最近解包资源」面板展示 */
+    resources(gameId: string, gameName: string): Promise<ApiResult<GalResourcesResult>>
     /** V1.1：手动刷新当前 BGM 识别（跳过 2 秒轮询，立刻重扫） */
     refreshBgm(gameId: string): Promise<ApiResult<{ ok: boolean; error: string }>>
     /** v0.3.9：最近保存的 BGM（卡片右键菜单「最近保存的 bgm」） */
@@ -1063,7 +1095,14 @@ export interface SakanaApi {
     recentShots(): Promise<ApiResult<GalRecentShot[]>>
     /** 某款游戏自己的截图（只读该游戏的截图子目录） */
     listShots(gameName: string): Promise<ApiResult<GalRecentShot[]>>
-    /** 按游戏名统计各资源站的搜索结果数量（只回数量 + 跳转链接，不回传站点内容） */
+    /**
+     * V1.5.2：galgame 资源站清单（只读本地常量，不联网）。
+     * 界面用它渲染搜索框左边的站点选择；默认选中 galgamex。
+     */
+    sites(): Promise<ApiResult<{ key: string; name: string; host: string }[]>>
+    /** V1.5.2：按站点生成搜索页地址（关键词为空时返回站点搜索页兜底） */
+    siteUrl(key: string, keyword: string): Promise<ApiResult<string | null>>
+    /** @deprecated V1.5.2：界面已改为"选站点直接跳转"，不再统计数量 */
     searchSites(keyword: string): Promise<ApiResult<GalSiteSearchResult[]>>
     onEvent(cb: (ev: GalEvent) => void): () => void
   }
@@ -1227,8 +1266,50 @@ export interface SakanaApi {
     info(): Promise<ApiResult<CacheInfo>>
     clear(): Promise<ApiResult<{ bytes: number }>>
     junkClear(): Promise<ApiResult<number>>
-    /** 设置自定义缓存目录（''=恢复默认 userData/cache），主进程会 mkdir -p */
+    /** 设置自定义缓存目录（''=恢复默认 <数据根>/cache），主进程会 mkdir -p */
     setDir(dir: string): Promise<ApiResult<{ dir: string }>>
+    /**
+     * V1.5.1 本地缓存数据库：分项占用（图片 / 番剧信息 / 番剧缓存），只读磁盘统计。
+     */
+    dbStats(): Promise<ApiResult<CacheDbStats>>
+    /** 最近加载过的条目（设置页列表，按最近访问倒序） */
+    dbEntries(limit?: number): Promise<ApiResult<CacheDbEntrySummary[]>>
+    /** 立即按保留策略清理一次（忽略 6 小时间隔） */
+    dbPrune(): Promise<ApiResult<CacheDbPruneResult>>
+    /** 忘掉单个条目（删信息 + 删图片 + 删索引），用于列表里的「移除」 */
+    dbForget(id: number): Promise<ApiResult<{ info: number; images: number }>>
+  }
+  library: {
+    /** V1.5.1 本地库：扫描下载目录，返回已下载的番剧与集数（纯文件系统，不联网） */
+    local(): Promise<ApiResult<LocalLibraryItem[]>>
+    /**
+     * 详情页「本地播放 → 从本地库播放」：
+     * 按条目/标题解析本地目录，返回是否存在、有没有可播视频（规则与下载器一致）。
+     */
+    localDir(input: {
+      subjectId?: number | null
+      animeTitle?: string
+    }): Promise<ApiResult<{ dir: string; exists: boolean; videos: number }>>
+  }
+  online: {
+    /**
+     * V1.5.2：附加在线数据源（Apple CMS / 自托管 REST / AnimePahe / AllManga）。
+     * `sources()` 返回四个源的元信息与可用性（纯本地判断，不联网）。
+     */
+    sources(): Promise<ApiResult<{ meta: OnlineSourceMeta[]; availability: OnlineSourceAvailability[] }>>
+    search(source: OnlineSourceId, keyword: string): Promise<ApiResult<OnlineSearchItem[]>>
+    episodes(source: OnlineSourceId, item: OnlineSearchItem): Promise<ApiResult<OnlineEpisodeItem[]>>
+    /** 解析出可播放地址（m3u8/mp4）；AllManga 目前会明确报“解析步骤未实现” */
+    resolve(
+      source: OnlineSourceId,
+      item: OnlineSearchItem,
+      ep: OnlineEpisodeItem
+    ): Promise<ApiResult<OnlineResolveResult>>
+  }
+  /** V1.5.3：数据源流量监控（纯内存统计，2 秒轮询一次即可） */
+  traffic: {
+    snapshot(): Promise<ApiResult<TrafficSnapshot>>
+    reset(): Promise<ApiResult<boolean>>
   }
   saveDirs: {
     info(): Promise<ApiResult<SaveDirsInfo>>
@@ -1262,6 +1343,47 @@ export interface CacheInfo {
   bytes: number
   dir: string
   custom: boolean
+}
+
+/**
+ * 本地缓存数据库的占用统计（V1.5.1）。
+ *
+ * 三个分类就是用户点名的三项：图片 / 番剧信息 / 番剧缓存。
+ * 另外单独给出索引体积，方便排查"为什么统计值和目录大小对不上"
+ * （索引是派生的，但它确实占磁盘）。
+ */
+export interface CacheDbStats {
+  /** 缓存根目录（绝对路径） */
+  root: string
+  /** 图片缓存：cache/img */
+  images: { bytes: number; files: number }
+  /** 番剧信息：条目详情/角色/评分/集数 JSON */
+  info: { bytes: number; files: number; subjects: number }
+  /** 番剧缓存：番剧表/季度/搜索等列表 JSON（不含索引） */
+  lists: { bytes: number; files: number }
+  /** 索引文件本身 */
+  index: { bytes: number }
+  total: number
+  /** 索引里被收藏的条目数 */
+  favorites: number
+  /** 被屏蔽/拉黑、已停止加载的条目数 */
+  blocked: number
+  /** 已过期但还没到清理时机的条目数（界面给一句提示用） */
+  expiredSubjects: number
+  /** 上次清理时间（毫秒时间戳，从未清理为 null） */
+  lastPruneAt: number | null
+}
+
+/** 一次缓存清理的结果（cache:db-prune） */
+export interface CacheDbPruneResult {
+  /** 清理掉的条目信息数量 */
+  subjects: number
+  /** 删除的图片数量 */
+  images: number
+  /** 删除的列表缓存数量 */
+  lists: number
+  /** 释放的字节数 */
+  freedBytes: number
 }
 
 export type SettingsPatch = Partial<AppSettings>

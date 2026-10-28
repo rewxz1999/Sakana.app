@@ -19,7 +19,7 @@ import {
   Trash2,
   X
 } from 'lucide-react'
-import type { GalGame, GalSiteSearchResult } from '@shared/types'
+import type { GalGame } from '@shared/types'
 import { useGal } from '@/stores/galgame'
 import { toast } from '@/stores/app'
 import { api } from '@/lib/api'
@@ -28,9 +28,8 @@ import {
   Cover,
   EngineBadge,
   fmtPlay,
-  GalBgmModal,
-  GalBgmSavedModal,
   GalUnpackModal,
+  GalResourcesModal,
   GalContextMenu,
   GalDetailView,
   GalShotsModal,
@@ -54,7 +53,8 @@ import { GalgameImmersivePage } from './GalgameImmersivePage'
  * - 卡片右上角相机按钮：只看这款游戏自己的截图目录
  * - 右键菜单：启动 / 月幕搜详情 / 设置自定义封面 / 打开游戏目录 / 最近截图 / 标记玩完 / 恢复数据源图片 / 删除
  *   （按要求去掉了「自定义背景图」——背景图只属于沉浸模式）
- * - 顶部搜索：输入游戏名 → 7 个资源站并行统计结果数量 + 跳转链接（只回数量，绝不回传站点内容）
+ * - 顶部搜索（V1.5.2）：选择资源站 → 输入名字 → 在系统浏览器打开该站的搜索页；
+ *   只提供站点跳转，不做结果数量统计、不抓取站点内容。
  */
 export function GalgameLibraryPage() {
   const { games, running, loaded, importing, load, startLive, importGame, removeGame, toggleFinished, launch } = useGal()
@@ -63,16 +63,55 @@ export function GalgameLibraryPage() {
   const [menu, setMenu] = useState<GalMenuState | null>(null)
   const [shotsGame, setShotsGame] = useState<GalGame | null>(null)
   const [ymgalGame, setYmgalGame] = useState<GalGame | null>(null)
-  const [bgmGame, setBgmGame] = useState<GalGame | null>(null)
-  const [bgmSavedGame, setBgmSavedGame] = useState<GalGame | null>(null)
+  // V1.5.2：查看最近解包资源（立绘/CG/BGM/文本，在应用内查看）
+  const [resGame, setResGame] = useState<GalGame | null>(null)
+  // V1.5.2：内存读取 BGM 已取消（用户要求从 galgame 助手中删除），对应两个弹窗状态一并移除
   const [unpackGame, setUnpackGame] = useState<GalGame | null>(null)
   const [removing, setRemoving] = useState<GalGame | null>(null)
 
-  // 站点搜索统计
+  /*
+   * V1.5.2：站点跳转式搜索（用户要求）。
+   *
+   * 以前是"输入名字 → 并行统计 7 个资源站的结果数量"，慢且容易被站点限流；
+   * 用户的原话是「不需要统计结果了，自行选择站点后输入 galgame 名字再跳转」。
+   * 现在只有：站点下拉（默认 GalgameX）+ 搜索框 + 「前往站点搜索」按钮。
+   */
   const [keyword, setKeyword] = useState('')
-  const [searching, setSearching] = useState(false)
-  const [siteResults, setSiteResults] = useState<GalSiteSearchResult[] | null>(null)
-  const [searchedKeyword, setSearchedKeyword] = useState('')
+  const [sites, setSites] = useState<{ key: string; name: string; host: string }[]>([])
+  const [siteKey, setSiteKey] = useState('galgamex')
+
+  // 站点清单来自主进程的同一份常量（不联网）；默认选中 GalgameX
+  useEffect(() => {
+    void api.gal.sites().then((r) => {
+      if (r.ok && r.data.length > 0) {
+        setSites(r.data)
+        if (!r.data.some((s) => s.key === siteKey)) setSiteKey(r.data[0].key)
+      }
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  /** 打开选中站点的搜索页（关键词为空时打开站点搜索页本身） */
+  const openSiteSearch = useCallback(
+    async (raw?: string) => {
+      const kw = String(raw ?? keyword).trim()
+      if (!kw && raw === undefined) {
+        toast.warn('请先输入 galgame 名字')
+        return
+      }
+      const r = await api.gal.siteUrl(siteKey, kw)
+      if (!r.ok) {
+        toast.error(r.error)
+        return
+      }
+      if (!r.data) {
+        toast.error('这个站点暂时没有可用的搜索地址')
+        return
+      }
+      openExternal(r.data)
+    },
+    [keyword, siteKey]
+  )
 
   const finishedCount = useMemo(() => games.filter((g) => g.finished).length, [games])
   const runningCount = useMemo(() => games.filter((g) => running[g.id]).length, [games, running])
@@ -104,42 +143,18 @@ export function GalgameLibraryPage() {
   )
 
   // ---------------- 站点搜索 ----------------
+  // （V1.5.2：旧的"并行统计 7 个站点的结果数量"已删除，改为选站点直接跳转）
 
-  const runSiteSearch = useCallback(async (kw: string) => {
-    const q = kw.trim()
-    if (!q) return
-    setSearching(true)
-    setSiteResults(null)
-    setSearchedKeyword(q)
-    const r = await api.gal.searchSites(q)
-    setSearching(false)
-    if (r.ok) {
-      setSiteResults(r.data)
-      const unknown = r.data.filter((x) => x.countKind === 'none').length
-      if (unknown === r.data.length) toast.warn('所有站点都无法统计，请直接点「前往搜索」')
-    } else {
-      toast.error(r.error)
-      setSiteResults([])
-    }
-  }, [])
-
-  /** 详情/右键菜单里的「资源站搜索」：把这款游戏的名字塞进顶部搜索并立刻统计 */
+  /** 详情/右键菜单里的「资源站搜索」：把游戏名填进搜索框并直接跳转到选中站点 */
   const searchForGame = useCallback(
     (game: GalGame) => {
       const kw = game.titleCn || game.title
       setKeyword(kw)
       setImmersive(false)
-      void runSiteSearch(kw)
+      void openSiteSearch(kw)
     },
-    [runSiteSearch]
+    [openSiteSearch]
   )
-
-  /** 数量文案：分页总数才叫「约 N 个结果」，只数得清首屏就明说「首屏 N 个」，数不出来就直说 */
-  const countText = (r: GalSiteSearchResult): string => {
-    if (r.countKind === 'none' || r.count === null) return '无法统计（前往站点搜索）'
-    if (r.count === 0) return '未找到结果'
-    return r.countKind === 'total' ? `约 ${r.count} 个结果` : `首屏 ${r.count} 个`
-  }
 
   // ---------------- 封面 / 背景图 ----------------
 
@@ -198,10 +213,19 @@ export function GalgameLibraryPage() {
     const items: GalMenuItem[] = [
       { key: 'launch', icon: Play, label: running[g.id] ? '游戏中' : '启动游戏', group: '常用', onSelect: () => void onLaunch(g) },
       { key: 'ymgal', icon: Search, label: '从月幕galgame中搜索详情', group: '常用', onSelect: () => setYmgalGame(g) },
-      { key: 'bgm', icon: Music, label: '查看最近识别的 bgm 名称（可复制）', group: '常用', onSelect: () => setBgmGame(g) },
-      { key: 'bgmSaved', icon: Download, label: '最近保存的 bgm', group: '常用', onSelect: () => setBgmSavedGame(g) },
+      // V1.5.2：内存读 BGM 功能已删除（用户要求），这里不再提供「查看最近识别的 bgm」入口
       { key: 'sites', icon: ExternalLink, label: '在资源站搜索该游戏', group: '常用', onSelect: () => searchForGame(g) },
       { key: 'unpack', icon: PackageOpen, label: '解包（引擎检测 / 曲名映射 / 立绘 CG）', group: '工具', onSelect: () => setUnpackGame(g) },
+      {
+        key: 'resources',
+        icon: FolderOpen,
+        label: '查看最近解包资源（在应用中查看）',
+        group: '常用',
+        onSelect: () => {
+          setMenu(null)
+          setResGame(g)
+        }
+      },
       { key: 'cover', icon: ImageIcon, label: '设置自定义封面', group: '工具', onSelect: () => void setCustomCover(g) },
       { key: 'folder', icon: FolderOpen, label: '打开游戏目录', group: '工具', onSelect: () => void openFolder(g) },
       { key: 'shots', icon: Camera, label: '最近截图', group: '常用', onSelect: () => setShotsGame(g) }
@@ -275,94 +299,51 @@ export function GalgameLibraryPage() {
         <div className="shrink-0 px-5 pb-2 text-[11px] text-faint">导入第一款游戏后即可进入沉浸模式。</div>
       ) : null}
 
-      {/* 顶部搜索：统计各资源站的结果数量（只显示数量 + 跳转链接） */}
+      {/*
+        V1.5.2：站点跳转式搜索（用户要求）。
+        顶部先声明「只提供站点跳转，不提供下载」，然后左侧选站点、右侧输名字、点按钮跳转。
+        这里刻意**不再显示任何结果数量**：统计需要并发打 7 个站点，既慢又容易被限流，
+        而用户要的只是"去那个站点搜索"。
+      */}
       <div className="shrink-0 px-5">
+        <div className="mb-2 flex items-start gap-1.5 rounded-lg border border-border bg-elev1/60 px-3 py-2 text-[11px] leading-relaxed text-faint">
+          <ExternalLink size={12} className="mt-0.5 shrink-0 text-accent" />
+          <span>
+            本应用<b className="text-dim">只提供资源站跳转</b>，不提供 galgame 下载、也不抓取资源站内容。
+            搜索会在系统浏览器里打开你选择的站点。
+          </span>
+        </div>
         <div className="flex flex-wrap items-center gap-2">
-          <div className="relative w-full max-w-md">
+          {/* 站点选择放在搜索框左边（默认 GalgameX） */}
+          <select
+            value={siteKey}
+            onChange={(e) => setSiteKey(e.target.value)}
+            title="选择要跳转的资源站"
+            className="h-9 shrink-0 rounded-lg border border-border bg-elev1 px-2 text-xs text-text outline-none transition-colors focus:border-accent"
+          >
+            {sites.length === 0 ? <option value="galgamex">GalgameX</option> : null}
+            {sites.map((s) => (
+              <option key={s.key} value={s.key}>
+                {s.name}
+              </option>
+            ))}
+          </select>
+          <div className="relative min-w-[200px] flex-1 max-w-md">
             <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint" />
             <Input
               value={keyword}
               onChange={(e) => setKeyword(e.target.value)}
-              placeholder="输入游戏名，统计各资源站有多少结果（不显示站点内容）"
+              placeholder="输入 galgame 名字，按回车直接去站点搜索"
               className="pl-8"
               onKeyDown={(e) => {
-                if (e.key === 'Enter') void runSiteSearch(keyword)
+                if (e.key === 'Enter') void openSiteSearch()
               }}
             />
           </div>
-          <Button icon={Search} loading={searching} onClick={() => void runSiteSearch(keyword)}>
-            统计结果数量
+          <Button icon={ExternalLink} onClick={() => void openSiteSearch()}>
+            前往站点搜索
           </Button>
-          {siteResults || searching ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              icon={X}
-              onClick={() => {
-                setSiteResults(null)
-                setSearchedKeyword('')
-              }}
-            >
-              收起
-            </Button>
-          ) : null}
         </div>
-
-        {/* 结果面板：7 个站点各一行，数量 + 跳转链接 */}
-        {searching || siteResults ? (
-          <div className="mt-3 rounded-xl border border-border bg-elev1 p-3">
-            <div className="mb-2 flex items-center justify-between gap-2">
-              <div className="text-xs font-semibold">
-                「{searchedKeyword}」在各资源站的结果数量
-                <span className="ml-2 font-normal text-faint">只统计数量，不抓取站点内容</span>
-              </div>
-              {searching ? (
-                <span className="inline-flex items-center gap-1.5 text-[11px] text-faint">
-                  <Spinner size={12} /> 正在并行统计 7 个站点…
-                </span>
-              ) : null}
-            </div>
-            <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
-              {siteResults && siteResults.length === 0 && !searching ? (
-                <div className="rounded-lg border border-border bg-elev2/40 px-3 py-2 text-[11px] text-faint">
-                  统计失败（主进程没有返回结果），可稍后重试，或点站点直接去搜。
-                </div>
-              ) : searching && !siteResults
-                ? SITE_PLACEHOLDERS.map((s) => (
-                    <div
-                      key={s.key}
-                      className="flex items-center justify-between gap-2 rounded-lg border border-border bg-elev2/40 px-3 py-2"
-                    >
-                      <div className="min-w-0">
-                        <div className="truncate text-xs font-medium">{s.name}</div>
-                        <div className="truncate text-[10px] text-faint">{s.host}</div>
-                      </div>
-                      <Spinner size={13} />
-                    </div>
-                  ))
-                : (siteResults ?? []).map((r) => (
-                    <div
-                      key={r.key}
-                      className="flex items-center justify-between gap-2 rounded-lg border border-border bg-elev2/40 px-3 py-2"
-                    >
-                      <div className="min-w-0">
-                        <div className="truncate text-xs font-medium">{r.name}</div>
-                        <div className="truncate text-[10px] text-faint">
-                          {r.host} · <span title={r.note}>{countText(r)}</span>
-                        </div>
-                      </div>
-                      <Button variant="outline" size="sm" icon={ExternalLink} onClick={() => openExternal(r.url)}>
-                        前往搜索
-                      </Button>
-                    </div>
-                  ))}
-            </div>
-            <div className="mt-2 text-[10px] leading-relaxed text-faint">
-              「约 N 个结果」来自站点自己的总数；「首屏 N 个」只数得清站点返回的首页清单；
-              需要 JS、被 Cloudflare 拦截或证书过期的站点会显示「无法统计」，可直接点「前往搜索」。
-            </div>
-          </div>
-        ) : null}
       </div>
 
       {/* 卡片网格 */}
@@ -502,10 +483,10 @@ export function GalgameLibraryPage() {
       {/* 月幕搜索弹窗 */}
       <GalYmgalSearchModal game={ymgalGame} onClose={() => setYmgalGame(null)} onApplied={load} />
 
-      {/* 最近识别 BGM 面板（只读内存识别） */}
-      <GalBgmModal game={bgmGame} onClose={() => setBgmGame(null)} />
-      <GalBgmSavedModal game={bgmSavedGame} onClose={() => setBgmSavedGame(null)} />
+      {/* 最近识别 BGM 面板已随内存读 BGM 功能一起删除（V1.5.2） */}
       <GalUnpackModal game={unpackGame} onClose={() => setUnpackGame(null)} />
+      {/* V1.5.2：最近解包资源（立绘/CG/BGM/文本，在应用内查看） */}
+      <GalResourcesModal game={resGame} onClose={() => setResGame(null)} />
 
       {/* 移除确认 */}
       <ConfirmModal
@@ -524,13 +505,3 @@ export function GalgameLibraryPage() {
   )
 }
 
-/** 搜索中占位行（顺序与主进程 SITES 一致，用户能一眼看出在等哪些站点） */
-const SITE_PLACEHOLDERS = [
-  { key: 'inarigal', name: '稻荷acg', host: 'inarigal.com' },
-  { key: 'kungal', name: '鲲gal', host: 'kungal.com' },
-  { key: 'galgamex', name: 'GalgameX', host: 'galgamex.net' },
-  { key: 'shinnku', name: '真红小站', host: 'shinnku.com' },
-  { key: 'touchgal', name: 'TouchGal', host: 'touchgal.us' },
-  { key: 'nekogal', name: 'NekoGAL', host: 'nekogal.com' },
-  { key: 'acgfav', name: '绮梦 ACG', host: 'acgfav.com' }
-]

@@ -17,11 +17,21 @@ import {
   X,
   type LucideIcon
 } from 'lucide-react'
-import type { GalBgmSaved, GalGame, GalMemRecent, GalRecentShot, GalUnpackSummary, YmgalCandidate } from '@shared/types'
+import type {
+  GalBgmSaved,
+  GalGame,
+  GalMemRecent,
+  GalRecentShot,
+  GalResourceFolder,
+  GalResourcesResult,
+  GalUnpackSummary,
+  YmgalCandidate
+} from '@shared/types'
 import { toast } from '@/stores/app'
 import { api } from '@/lib/api'
 import { imgUrl, localImgUrl, timeAgo } from '@/lib/format'
-import { Badge, Button, Input, Modal, Spinner } from '@/components/ui'
+import { Badge, Button, ConfirmModal, EmptyState, Input, Modal, Spinner } from '@/components/ui'
+import { CoverImage } from '@/components/CoverImage'
 
 /**
  * galgame 两个视图（卡片库 / 沉浸模式）共用的零件。
@@ -1020,6 +1030,12 @@ export function GalUnpackModal({ game, onClose }: { game: GalGame | null; onClos
   const [summary, setSummary] = useState<GalUnpackSummary | null>(null)
   const [busy, setBusy] = useState('')
   const [imgResult, setImgResult] = useState('')
+  /*
+   * V1.5.2：超过 30 张时先确认。
+   * 用户要求「不再有候选，全部提取到文件夹；图片太多（>30）提醒确认，提取需要时间」。
+   * 确认框独立于提取按钮：预览数量由主进程算（不读档案正文，很快），确认后才真正开始。
+   */
+  const [confirmKind, setConfirmKind] = useState<{ kind: '立绘' | 'cg' | 'bgm'; count: number } | null>(null)
 
   const loadStatus = useCallback(async (): Promise<void> => {
     if (!game) return
@@ -1052,10 +1068,39 @@ export function GalUnpackModal({ game, onClose }: { game: GalGame | null; onClos
     )
   }
 
-  const runExtract = async (kind: '立绘' | 'cg'): Promise<void> => {
+  /**
+   * V1.5.2：全部提取（无候选上限）。
+   *
+   * 流程：预览数量 → 0 就如实说「没有可提取的」；>30 弹确认（提取几百张图确实要等）；
+   * 其余直接开跑。提取期间按钮显示 loading，并把「正在提取…可能需要一点时间」写进结果区。
+   */
+  const runExtractAll = async (kind: '立绘' | 'cg' | 'bgm'): Promise<void> => {
     if (!game) return
+    setBusy(`preview-${kind}`)
+    const preview = await api.gal.extractPreview(game.exePath ?? '', kind)
+    setBusy('')
+    if (!preview.ok) {
+      toast.error(preview.error)
+      return
+    }
+    if (preview.data.candidates === 0) {
+      setImgResult(`${kind}：${preview.data.hint}`)
+      toast.warn(preview.data.hint)
+      return
+    }
+    if (preview.data.candidates > 30) {
+      setConfirmKind({ kind, count: preview.data.candidates })
+      return
+    }
+    await doExtractAll(kind)
+  }
+
+  const doExtractAll = async (kind: '立绘' | 'cg' | 'bgm'): Promise<void> => {
+    if (!game) return
+    setConfirmKind(null)
     setBusy(kind)
-    const r = await api.gal.extractImages(game.id, game.exePath ?? '', game.title, kind, 12)
+    setImgResult(`${kind}：正在全部提取…（文件较多时需要一点时间，请稍候）`)
+    const r = await api.gal.extractAll(game.exePath ?? '', game.title, kind)
     setBusy('')
     if (!r.ok) {
       toast.error(r.error)
@@ -1066,13 +1111,17 @@ export function GalUnpackModal({ game, onClose }: { game: GalGame | null; onClos
       toast.error(r.data.error)
       return
     }
-    // 立绘的主路径是"按坐标表合成"；回退路径（整身碎片）也要如实说清楚，不能让用户以为都是合成图
-    const extra =
-      kind === '立绘'
-        ? `（加合成 ${r.data.composed ?? 0} 张${r.data.fallback ? ` · 回退整身碎片 ${r.data.fallback} 张` : ''} · 候选姿势 ${r.data.candidates}）`
-        : `（候选 ${r.data.candidates}）`
-    setImgResult(`${kind}：写出 ${r.data.count} 张${extra} → ${r.data.dir}`)
-    toast.success(`${kind}已提取 ${r.data.count} 张`)
+    const skipped = r.data.skipped ? ` · 跳过（已存在/读取失败）${r.data.skipped}` : ''
+    setImgResult(`${kind}：写出 ${r.data.count} 个文件（候选 ${r.data.candidates}${skipped}）→ ${r.data.dir}`)
+    if (r.data.count === 0) {
+      toast.warn(
+        r.data.skipped
+          ? `${kind}：没有新文件（${r.data.skipped} 个已存在或档案读不出）`
+          : `${kind}：没有写出文件（候选 ${r.data.candidates}）`
+      )
+    } else {
+      toast.success(`${kind}已全部提取：${r.data.count} 个文件`)
+    }
   }
 
   return (
@@ -1100,11 +1149,14 @@ export function GalUnpackModal({ game, onClose }: { game: GalGame | null; onClos
           <Button variant="outline" size="sm" loading={busy === 'unpack'} onClick={() => void runUnpack(true)}>
             清掉缓存重新解包
           </Button>
-          <Button variant="outline" size="sm" loading={busy === '立绘'} onClick={() => void runExtract('立绘')}>
-            提取立绘
+          <Button variant="outline" size="sm" loading={busy === '立绘'} onClick={() => void runExtractAll('立绘')}>
+            {busy === 'preview-立绘' ? '统计中…' : '提取全部立绘'}
           </Button>
-          <Button variant="outline" size="sm" loading={busy === 'cg'} onClick={() => void runExtract('cg')}>
-            提取 CG
+          <Button variant="outline" size="sm" loading={busy === 'cg'} onClick={() => void runExtractAll('cg')}>
+            {busy === 'preview-cg' ? '统计中…' : '提取全部 CG'}
+          </Button>
+          <Button variant="outline" size="sm" loading={busy === 'bgm'} onClick={() => void runExtractAll('bgm')}>
+            {busy === 'preview-bgm' ? '统计中…' : '提取全部 BGM'}
           </Button>
         </div>
 
@@ -1143,6 +1195,150 @@ export function GalUnpackModal({ game, onClose }: { game: GalGame | null; onClos
           把 visible 的碎片逐层叠成整身立绘，再裁掉四周空白。该作没有可读坐标表时，
           自动回退成「提取整身底图碎片」，并在上面的结果里写明是哪一种。
         </div>
+        {/* V1.5.2：>30 张时确认（提取需要时间） */}
+        <ConfirmModal
+          open={!!confirmKind}
+          title="全部提取"
+          message={`共检测到 ${confirmKind?.count ?? 0} 个${confirmKind?.kind === 'bgm' ? ' BGM' : '图片'}文件。全部提取需要一些时间（只读游戏档案、只写 Sakana 自己的目录，不会改动游戏），确定开始？`}
+          confirmText="开始提取"
+          onConfirm={() => {
+            const k = confirmKind?.kind
+            if (k) void doExtractAll(k)
+            else setConfirmKind(null)
+          }}
+          onClose={() => setConfirmKind(null)}
+        />
+      </div>
+    </Modal>
+  )
+}
+
+// ---------------- 最近解包资源（V1.5.2） ----------------
+
+/**
+ * 「查看最近解包资源（在应用中查看）」。
+ *
+ * 用户要求：右键菜单「常用」里能直接看解包/提取出来的东西，而不是只能开文件夹。
+ * 这里按四个分类展示：立绘 / CG / BGM / 文本（文本来自解包产物，其余来自保存目录）。
+ * 所有文件都是**我们自己的产物**，只读列表 + 打开文件/目录，不会再碰游戏档案。
+ */
+export function GalResourcesModal({ game, onClose }: { game: GalGame | null; onClose: () => void }) {
+  const [data, setData] = useState<GalResourcesResult | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [tab, setTab] = useState<'立绘' | 'cg' | 'bgm' | '文本'>('立绘')
+
+  const load = useCallback(async (): Promise<void> => {
+    if (!game) return
+    setLoading(true)
+    const r = await api.gal.resources(game.id, game.title)
+    setLoading(false)
+    if (!r.ok) {
+      toast.error(r.error)
+      return
+    }
+    setData(r.data)
+  }, [game])
+
+  useEffect(() => {
+    if (!game) return
+    setData(null)
+    void load()
+  }, [game, load])
+
+  const folder: GalResourceFolder | null = data?.folders.find((f) => f.kind === tab) ?? null
+
+  const openPath = async (p: string): Promise<void> => {
+    const r = await api.app.openPath(p)
+    if (!r.ok) toast.error(r.error)
+    else if (r.data) toast.error(r.data)
+  }
+
+  return (
+    <Modal open={!!game} onClose={onClose} width={720} title={`最近解包资源 · ${game?.title ?? ''}`}>
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          {(['立绘', 'cg', 'bgm', '文本'] as const).map((k) => {
+            const f = data?.folders.find((x) => x.kind === k)
+            return (
+              <button
+                key={k}
+                onClick={() => setTab(k)}
+                className={`rounded-lg border px-3 py-1.5 text-xs transition-colors ${
+                  tab === k ? 'border-accent bg-accent-soft font-semibold text-accent' : 'border-border text-dim hover:border-accent/50'
+                }`}
+              >
+                {k === 'bgm' ? 'BGM' : k}
+                {f ? <span className="ml-1 text-[10px] text-faint">{f.total}</span> : null}
+              </button>
+            )
+          })}
+          <span className="ml-auto flex items-center gap-1.5">
+            <Button size="sm" variant="ghost" icon={RefreshCw} loading={loading} onClick={() => void load()}>
+              刷新
+            </Button>
+            {folder ? (
+              <Button size="sm" variant="outline" icon={FolderOpen} onClick={() => void openPath(folder.dir)}>
+                打开文件夹
+              </Button>
+            ) : null}
+          </span>
+        </div>
+
+        {loading && !data ? (
+          <div className="flex items-center justify-center gap-2 py-12 text-xs text-faint">
+            <Spinner size={14} /> 正在读取…
+          </div>
+        ) : !folder ? (
+          <EmptyState icon={PackageOpen} title="还没有资源" desc="先在上面的「解包」里提取立绘/CG/BGM，再回来看。" />
+        ) : folder.total === 0 ? (
+          <EmptyState
+            icon={PackageOpen}
+            title={`还没有提取过${tab === 'bgm' ? ' BGM' : tab}`}
+            desc={
+              tab === '文本'
+                ? '解包产物里没有文本类文件（或还没解包）。'
+                : `点「解包」面板里的「提取全部${tab === '立绘' ? '立绘' : tab === 'cg' ? ' CG' : ' BGM'}」后，这里会列出全部文件。`
+            }
+          />
+        ) : (
+          <>
+            <div className="text-[11px] break-all text-faint">{folder.dir}</div>
+            {tab === '立绘' || tab === 'cg' ? (
+              <div className="grid max-h-[46vh] grid-cols-4 gap-2 overflow-y-auto pr-1 sm:grid-cols-6">
+                {folder.files.map((f) => (
+                  <button
+                    key={f.path}
+                    title={`${f.name}（点击打开）`}
+                    onClick={() => void openPath(f.path)}
+                    className="group overflow-hidden rounded-lg border border-border bg-elev2/40 transition-colors hover:border-accent"
+                  >
+                    <CoverImage src={f.path} className="aspect-[3/4] w-full" rounded="" alt={f.name} />
+                    <div className="truncate px-1.5 py-1 text-[10px] text-faint group-hover:text-dim">{f.name}</div>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="flex max-h-[46vh] flex-col gap-1 overflow-y-auto pr-1">
+                {folder.files.map((f) => (
+                  <button
+                    key={f.path}
+                    onClick={() => void openPath(f.path)}
+                    title={f.path}
+                    className="flex items-center gap-2 rounded-lg border border-border bg-elev2/40 px-2.5 py-1.5 text-left text-[11px] transition-colors hover:border-accent"
+                  >
+                    <span className="min-w-0 flex-1 truncate">{f.name}</span>
+                    <span className="shrink-0 text-[10px] text-faint">{(f.size / 1024).toFixed(0)} KB</span>
+                  </button>
+                ))}
+              </div>
+            )}
+            {folder.files.length < folder.total ? (
+              <div className="text-[10px] text-faint">
+                仅列出前 {folder.files.length} 个（共 {folder.total} 个），其余请打开文件夹查看。
+              </div>
+            ) : null}
+          </>
+        )}
       </div>
     </Modal>
   )

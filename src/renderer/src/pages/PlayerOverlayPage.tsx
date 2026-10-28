@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Cast, TriangleAlert, X } from 'lucide-react'
-import type { OverlayAction, OverlayDanmaku, OverlayEpisodes, OverlayState } from '@shared/api'
+import type { OverlayAction, OverlayEpisodes, OverlayState } from '@shared/api'
 import type { CastDevice, CastReceiverInfo, PlayFlowSnapshot, SubjectDetail } from '@shared/types'
+import { useSettings } from '@/stores/app'
 import { api } from '@/lib/api'
 import { StreamInfoModal } from '@/components/StreamInfoModal'
-import { PlayFlowAcquireSteps, PlayFlowCacheLine, PlayFlowStages, flowHeadline, reasonLabel } from '@/components/PlayFlowProgress'
+import { PlayFlowLoadingSteps, PlayFlowStages, flowHeadline, reasonLabel } from '@/components/PlayFlowProgress'
 import { CoverImage } from '@/components/CoverImage'
-import { DanmakuLayer } from '@/components/DanmakuLayer'
 
 /**
  * 播放器悬浮窗（v1.1.4 起**不再画控制栏**）
@@ -379,29 +379,15 @@ function Chip({
   )
 }
 
-/** 弹幕区域：视频矩形往里收，避开顶部标题栏与底部控制栏（v0.2.8） */
-const DANMAKU_TOP_GAP = 58
-const DANMAKU_BOTTOM_GAP_VISIBLE = 104
-const DANMAKU_BOTTOM_GAP_HIDDEN = 26
-
-function danmakuRect(
-  state: OverlayState,
-  controlsVisible: boolean
-): { x: number; y: number; width: number; height: number } {
-  const r =
-    state.videoRect ??
-    ({ x: 0, y: 56, width: window.innerWidth, height: Math.max(120, window.innerHeight - 112) } as const)
-  const bottomGap = controlsVisible ? DANMAKU_BOTTOM_GAP_VISIBLE : DANMAKU_BOTTOM_GAP_HIDDEN
-  return {
-    x: r.x,
-    y: r.y + DANMAKU_TOP_GAP,
-    width: r.width,
-    height: Math.max(80, r.height - DANMAKU_TOP_GAP - bottomGap)
-  }
-}
-
 export default function PlayerOverlay(): React.ReactElement {
   const [state, setState] = useState<OverlayState | null>(null)
+  /*
+   * V1.5.2：缓冲提示要贴在**控制栏上沿**，而控制栏高度随「图标大小」变化
+   * （uosc 的 controls_size，16 边距 + size + 22 进度条 + 20 间距）。这里读一次设置，
+   * 让提示条的 bottom 跟着 size 走，避免用户把图标调大后提示压在按钮上。
+   */
+  const { settings } = useSettings()
+  const uoscBarSize = Math.min(56, Math.max(32, Number(settings.uoscAppearance?.size) || 42))
   /**
    * 播放过程进度（v1.1：悬浮窗自己按秒拉）。
    *
@@ -457,6 +443,16 @@ export default function PlayerOverlay(): React.ReactElement {
   const waitStart = flow?.running && flow.startedAt > 0 ? flow.startedAt : observedAt
   const waitedSec = waitStart ? Math.max(0, Math.floor((nowMs - waitStart) / 1000)) : 0
   /**
+   * 播放中「读到还没缓存到的位置」时的缓冲提示（V1.5.1，用户要求）。
+   *
+   * 用户原话：「如果播放中播放到没有缓存到的资源，就显示正在加载中。」
+   *
+   * 判据来自**本机缓存服务自己**：播放器读到的位置还没有字节时，mediaCache 会把会话的
+   * `waitingForBytes` 置位（见 streamCachedBytes），`flow.cache.waiting` 原样带上来。
+   * 这比"按时间猜缓冲"准确 —— 它就是"卡在没缓存的地方"这件事本身。
+   */
+  const cacheWaiting = !!state?.playing && flow?.cache?.waiting === true
+  /**
    * 本窗口的角色（v0.3.9 第三轮拆窗口）：主进程用 `#/overlay?part=ui|danmaku` 加载两块窗口，
    * 这里按 part 决定渲染哪一半 —— 弹幕窗口只画弹幕，UI 窗口画控制栏与所有面板。
    */
@@ -473,8 +469,6 @@ export default function PlayerOverlay(): React.ReactElement {
     return () => window.clearInterval(t)
   }, [isDanmakuPart, waitingForPicture])
   const [episodes, setEpisodes] = useState<OverlayEpisodes | null>(null)
-  /** v0.2.8：弹幕数据与设置（由播放页推送，换集/改设置时更新） */
-  const [danmaku, setDanmaku] = useState<OverlayDanmaku | null>(null)
   const [visible, setVisible] = useState(false)
   /**
    * 「疑似点击击穿」自救浮层（v0.3.6）。
@@ -1239,8 +1233,6 @@ export default function PlayerOverlay(): React.ReactElement {
 
   // 选集数据（低频）：由播放页单独推送
   useEffect(() => api.overlay.onEpisodes(setEpisodes), [])
-  // 弹幕数据（v0.2.8，低频）：同样由播放页推送
-  useEffect(() => api.overlay.onDanmaku(setDanmaku), [])
 
   // ---------------- 投屏（v0.3.8） ----------------
 
@@ -1530,33 +1522,11 @@ export default function PlayerOverlay(): React.ReactElement {
       {isDanmakuPart ? (
         <>
           {/*
-           * 弹幕窗口（v0.3.9 第三轮拆出来的那一块）：**只画弹幕**。
-           * 这块窗口铺满主窗口、永远 `setIgnoreMouseEvents(true, {forward:true})`
-           * （由 playerOverlay.ts 设一次，此后绝不切换）—— 于是"要不要吃鼠标"不再有运行期决策。
-           * 为什么弹幕必须单独一块窗口：控制栏那块窗口用 setShape 限定可点区域，而 setShape 同时裁剪绘制，
-           * 铺满画面中部的弹幕会被裁没。
-           *
-           * v1.5 需求 ②：**画面出来之前不渲染弹幕层**。
-           * 判据是 `state.hasPicture`（= 主进程 mpvHasPicture：内核首帧 width>0），不是 playing/time。
-           * 这是内置画布这条路；uosc_danmaku 插件那条路在渲染层管不到，
-           * 由主进程在首帧前拒绝注入（见 mpv.ts 的 mpvPushDanmakuFile），两条路因此同时被门控。
-           * 画面出现后这个条件自然成立，弹幕从当前时间继续（画布会按 time 重新定位，不会从头补画）。
-           */}
-          {state && state.hasPicture === true && danmaku && danmaku.settings.enabled && danmaku.comments.length > 0 && !danmaku.pluginActive ? (
-            <DanmakuLayer
-              comments={danmaku.comments}
-              settings={danmaku.settings}
-              time={state.current}
-              playing={state.playing}
-              rect={danmakuRect(state, visible)}
-              scale={window.devicePixelRatio || 1}
-              /*
-               * 第二道门（v1.5）：即使将来有人把这个组件挂到别的分支上，
-               * 只要 active=false 就只清画布、不画任何一条弹幕。
-               */
-              active={state.hasPicture === true}
-            />
-          ) : null}
+            V1.5.2：**画布弹幕已整体删除**（用户要求只保留 uosc_danmaku 渲染）。
+            原因：画布是一条 requestAnimationFrame 循环 + 逐条文字绘制，滚动观感明显不如
+            插件（ASS 渲染、由 mpv 的渲染管线绘制）；用户实测"滚动卡、费眼"。
+            现在弹幕只由 uosc_danmaku 画，这一层窗口只承担加载卡与缓冲提示。
+          */}
           {/*
             ── v0.3.9 第六轮修订：加载/过程进度卡搬到**穿透层**（弹幕窗口）来画 ──
             
@@ -1621,15 +1591,12 @@ export default function PlayerOverlay(): React.ReactElement {
                           : '正在准备播放…'}
                     </span>
                     {/* 三阶段过程进度：全屏下这是唯一能看出「卡在哪一步」的地方（含已收字节/速率） */}
-                    <PlayFlowStages flow={flow} tone="onVideo" />
                     {/*
-                      V2.0：加载卡上要能直接看到「访问播放页 → 识别视频流 → 缓存到本地」
-                      三步、以及**实时 KB/s、已缓存 MB / 总 MB、百分比**。
-                      数据全部来自主进程快照（flow.metrics 与 flow.cache），没有本地计时器，
-                      所以数字是真的在动；没有启动缓存时这一行不渲染（不编假进度）。
+                      V1.5.1：加载卡**只显示三步 + 每步耗时**，缓存那一步带流量与进度条。
+                      步骤明细（每条 step、HTTP 状态、判定归因）全部搬到「播放流详情」面板，
+                      用户原话「这个加载不用显示的这么详细了（详细放到播放状态面板中）」。
                     */}
-                    <PlayFlowAcquireSteps flow={flow} tone="onVideo" />
-                    <PlayFlowCacheLine flow={flow} tone="onVideo" />
+                    <PlayFlowLoadingSteps flow={flow} tone="onVideo" />
                     {flow?.reason === 'slow' ? (
                       <div className="text-[11px] text-amber-300">
                         资源获取速度过慢，仍在继续等待（有数据在动就不结束）
@@ -1640,6 +1607,47 @@ export default function PlayerOverlay(): React.ReactElement {
                     ) : null}
                   </>
                 )}
+              </div>
+            </div>
+          ) : null}
+          {/*
+            V1.5.1：播放中读到了还没缓存到的位置 → 「正在加载中…」。
+            V1.5.2：位置改到**播放控制栏顶部中间**（用户要求）——贴着 uosc 控制栏上沿居中，
+            不再飘在画面下部中间。uosc 的底部栏高度 ≈ 边距 16 + 按钮 42 + 进度条 22 + 间距 20
+            （见 resources/mpv-config/script-opts/uosc.conf.base），所以这里用 bottom-[104px]；
+            数值再乘 UI 缩放由 CSS 自然处理，视觉上就压在控制栏顶边上方一点点。
+          */}
+          {!waitingForPicture && cacheWaiting && flow?.cache ? (
+            <div
+              className="pointer-events-none absolute inset-x-0 z-20 flex justify-center"
+              /*
+               * 控制栏总高 = controls_margin 16 + controls_size + 进度条间距 20 + 进度条 22；
+               * 这里再留 6px 呼吸，视觉上就贴在控制栏“顶部中间”。
+               */
+              style={{ bottom: `${16 + uoscBarSize + 20 + 22 + 6}px` }}
+            >
+              <div className="flex items-center gap-2 rounded-full border border-white/10 bg-black/65 px-3.5 py-1.5 text-[11px] text-white/90 shadow-lg backdrop-blur-md">
+                <span className="h-2 w-2 animate-pulse rounded-full bg-amber-300" />
+                <span className="font-medium">正在加载中…</span>
+                <span className="tabular-nums text-white/70">
+                  已缓存 {(flow.cache.received / 1024 / 1024).toFixed(1)} MB
+                  {flow.cache.total ? ` / ${(flow.cache.total / 1024 / 1024).toFixed(1)} MB` : ''}
+                  {flow.cache.rateBps > 0
+                    ? ` · ${
+                        flow.cache.rateBps < 1024 * 1024
+                          ? `${Math.round(flow.cache.rateBps / 1024)} KB/s`
+                          : `${(flow.cache.rateBps / 1024 / 1024).toFixed(2)} MB/s`
+                      }`
+                    : ''}
+                </span>
+                {flow.cache.percent !== null && flow.cache.percent !== undefined ? (
+                  <span className="block h-1 w-16 overflow-hidden rounded-full bg-white/20">
+                    <span
+                      className="block h-full rounded-full bg-amber-300"
+                      style={{ width: `${Math.min(100, Math.max(2, flow.cache.percent))}%` }}
+                    />
+                  </span>
+                ) : null}
               </div>
             </div>
           ) : null}

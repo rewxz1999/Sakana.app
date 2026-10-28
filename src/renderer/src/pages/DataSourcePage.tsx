@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react'
-import { Check, CirclePlus, Database, Link2, Save, Trash2, WifiOff } from 'lucide-react'
+import { Activity, Check, CirclePlus, Database, Link2, Save, Trash2, WifiOff } from 'lucide-react'
 import type { AppSettings } from '@shared/types'
 import { api } from '@/lib/api'
 import { useSettings } from '@/stores/app'
 import { toast } from '@/stores/app'
-import { Button, Input } from '@/components/ui'
+import { Button, Input, Switch } from '@/components/ui'
 import { Card, SubPage } from '@/components/SettingsShell'
 
 function derive(settings: AppSettings): { main: string; mirrors: string[] } {
@@ -116,11 +116,92 @@ export function DataSourcePage() {
       title="数据源配置"
       desc="内置双反代与镜像站；API 地址可改，地址与密钥默认隐藏"
       actions={
-        <Button size="sm" icon={Save} onClick={doSave}>
-          保存
-        </Button>
+        <>
+          {/* V1.5.3：流量监控单独一页（需要横向空间画折线），从数据源页也开一个入口 */}
+          <Button
+            size="sm"
+            variant="ghost"
+            icon={Activity}
+            onClick={() => void api.window.openSmall('/traffic', { width: 980, height: 720, title: '流量监控' })}
+          >
+            流量监控
+          </Button>
+          <Button size="sm" icon={Save} onClick={doSave}>
+            保存
+          </Button>
+        </>
       }
     >
+      <Card title="网络环境" desc="能否直连 bangumi 主站，决定 API 与图片走官方还是内置反代">
+        <div className="flex flex-col gap-2.5">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {(
+              [
+                {
+                  on: true,
+                  title: '官方直连',
+                  desc: '自己开了代理 / 网络能通 bgm.tv：API 与图片都用官方'
+                },
+                {
+                  on: false,
+                  title: '内置反代',
+                  desc: '直连不通：API 与图片都走应用内置的反向代理'
+                }
+              ] as const
+            ).map((opt) => {
+              const active = (settings.bangumiOfficial === true) === opt.on
+              return (
+                <button
+                  key={opt.title}
+                  type="button"
+                  onClick={() => {
+                    // 渲染层保存设置 + 通知主进程立即切换（两层都要改，见 ipc 的 bgmSetSource）
+                    save({ bangumiOfficial: opt.on })
+                    void api.bangumi.setSource(opt.on).then((r) => {
+                      if (!r.ok) toast.error(r.error)
+                      else toast.success(`数据源已切换为${opt.on ? '官方直连' : '内置反代'}`)
+                    })
+                  }}
+                  className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
+                    active ? 'border-accent/50 bg-accent-soft' : 'border-border bg-elev2/50 hover:border-accent/30'
+                  }`}
+                >
+                  <div className={`text-xs font-medium ${active ? 'text-accent' : 'text-text'}`}>
+                    {opt.title}
+                    {active ? <Check size={12} className="ml-1 inline align-[-1px]" /> : null}
+                  </div>
+                  <div className="mt-0.5 text-[11px] leading-relaxed text-faint">{opt.desc}</div>
+                </button>
+              )
+            })}
+          </div>
+          <label className="flex items-center justify-between gap-3 border-t border-border pt-2.5">
+            <span className="min-w-0 flex-1">
+              <span className="block text-xs text-dim">每次启动询问网络环境</span>
+              <span className="mt-0.5 block text-[11px] text-faint">
+                换网络（开关代理）后不用手动改这里；关掉后启动时不再弹窗，按当前选择工作
+              </span>
+            </span>
+            <Switch
+              checked={settings.askBangumiSourceOnStart !== false}
+              onChange={(v) => save({ askBangumiSourceOnStart: v })}
+            />
+          </label>
+          <label className="flex items-center justify-between gap-3 border-t border-border pt-2.5">
+            <span className="min-w-0 flex-1">
+              <span className="block text-xs text-dim">每次启动提醒保存位置</span>
+              <span className="mt-0.5 block text-[11px] text-faint">
+                关掉后启动时不再提醒截图 / 番剧文件 / galgame 截图的保存目录
+              </span>
+            </span>
+            <Switch
+              checked={settings.askSaveDirsOnStart !== false}
+              onChange={(v) => save({ askSaveDirsOnStart: v, saveDirsConfigured: !v })}
+            />
+          </label>
+        </div>
+      </Card>
+
       <Card title="默认数据源" desc="两套自建反代平级，按当前在途请求数自动分担">
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between rounded-lg border border-accent/30 bg-accent-soft px-3 py-2.5">

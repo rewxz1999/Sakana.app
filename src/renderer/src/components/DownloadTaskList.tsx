@@ -78,7 +78,9 @@ export function TaskRow({ task }: { task: DownloadTask }) {
           {task.episode != null ? ` · 第${task.episode}集` : ''}
           {task.group ? ` · ${task.group}` : ''}
           {/* 标注任务实际交给哪个下载器（双下载器模式下一眼看出分配结果；老任务没有 engine 则不显示） */}
-          {task.engine ? ` · ${task.engine === 'qbit' ? 'qBittorrent' : 'aria2'}` : ''}
+          {task.engine
+            ? ` · ${task.engine === 'qbit' ? 'qBittorrent' : task.engine === 'transmission' ? 'Transmission' : 'aria2'}`
+            : ''}
         </div>
         {!done ? (
           <div className="mt-1.5 flex items-center gap-2">

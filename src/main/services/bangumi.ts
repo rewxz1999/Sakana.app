@@ -1,4 +1,3 @@
-import { app } from 'electron'
 import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -27,9 +26,14 @@ import { log } from '../log'
 import { beginNetTrace, type NetPriority } from '../net-priority'
 import { BROWSER_UA, buildProxyAgents, chromiumGetText, getSettings, streamGetText } from '../net'
 import { store } from '../store'
+import { cacheRoot } from './cacheRoot'
+import { imageCacheFileNames, imageCacheStems } from './bangumiImageUrl'
+import { setImageNameResolver } from './cacheDb'
+import { isSubjectBlocked, noteCacheFile, noteSubjectTags, recordListSubjects, recordSeasonItems, subjectBlockReason } from './cacheDb'
 import {
   authHeadersFor,
   beginEndpointRequest,
+  bangumiSourceIsOfficial,
   builtInImgOrigin,
   endpointLabelOf,
   isBuiltInBangumiApi,
@@ -37,6 +41,17 @@ import {
   orderBangumiEndpoints,
   resolveBangumiEndpoints
 } from './bangumiProxy'
+import { ONLINE_IMG_443, onlineApiText } from './onlineDb'
+
+/**
+ * 最近一个周三 00:00 的时间戳（V1.5.3：番剧表每周三自动更新一次）。
+ * 用本地时区：用户说的「每周三」就是自己日历上的周三。
+ */
+function lastWednesdayMs(): number {
+  const now = new Date()
+  const diff = (now.getDay() - 3 + 7) % 7
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate() - diff, 0, 0, 0, 0).getTime()
+}
 import { parseCalendar, parseRatingOnly, parseSearchPage, parseSubjectPage } from './bangumiHtml'
 import {
   anilistSearchAnime,
@@ -89,6 +104,8 @@ function prefetchCovers(days: CalendarDay[]): void {
       const urls: string[] = []
       for (const day of days) {
         for (const item of day.items ?? []) {
+          // V1.5.1：被屏蔽/拉黑的条目**停止加载**，连封面预取也不做（预取是纯流量，最该省）
+          if (isSubjectBlocked(Number(item.id))) continue
           const u = item.images?.common ?? item.images?.large ?? item.images?.medium
           if (u) urls.push(u)
           if (urls.length >= 18) break
@@ -349,6 +366,13 @@ function isCustomApiBase(mirror: string): boolean {
  * 这里统一按 URL 主机名判断，并显式认下配置过的自建反代。
  */
 function isApiMirror(mirror: string): boolean {
+  /*
+   * V1.5.3：在线库返回的是**标准 v0 JSON**，它不是「反代基址」，但语义与 API 镜像完全相同。
+   * 不认这个标签的后果（真机踩到）：在线库明明取到了 JSON，解析却按 HTML 走 →
+   * 详情页「解析失败」，番剧表的 `/calendar` 也解析为空。所有按 mirror 分支的地方共用这里，
+   * 所以只需在这里认一次。
+   */
+  if (mirror === 'online-db') return true
   if (isCustomApiBase(mirror)) return true
   try {
     return isApiHost(new URL(mirror).hostname)
@@ -424,6 +448,12 @@ export function rewriteImageUrl(url: string, width = 400): string {
   if (!url) return url
   const custom = (getSettings().bangumiCustomImg ?? '').trim().replace(/\/+$/, '')
   /*
+   * V1.5.1：直连官方模式 → 图片也直连官方图床（用户原话「包括图片」）。
+   * 只有用户自己填了**第三方**图片反代时才继续改写（那是他的显式选择，
+   * 也说明他连官方图床同样不通，需要走自己的图片站）。
+   */
+  if (bangumiSourceIsOfficial() && !(custom && !isBuiltInBangumiHost(custom))) return url
+  /*
    * V1.4 修「番剧表封面全空」：
    *
    * 上一版假设"新反代在 API 响应里直接返回它自己的图片域名"，于是没填自定义图片反代时**原样返回**。
@@ -443,18 +473,38 @@ export function rewriteImageUrl(url: string, width = 400): string {
     }
   }
   if (!base) {
-    const builtIn = builtInImgOrigin()
-    if (!builtIn) return url
+    /*
+     * V1.5.3：默认改写到**在线图床**（443），失败时取图侧会再换 8443。
+     * 旧内置图片反代仍保留给"用户显式填了内置地址"的场景；这里只改默认兜底目标。
+     */
     try {
-      base = new URL(builtIn)
+      base = new URL(ONLINE_IMG_443)
     } catch {
-      return url
+      const builtIn = builtInImgOrigin()
+      if (!builtIn) return url
+      base = new URL(builtIn)
     }
   }
   try {
     const u = new URL(url)
-    // 只改 bgm 系图床（含镜像站图床），其它地址（含反代自己已带 /r/ 的地址）保持原样
-    if (!isBangumiImageHost(u.hostname)) return url
+    /*
+     * V1.5.2 修「详情页封面出不来」：
+     *
+     * 缓存里的条目 JSON 是**过去**写入的，里面可能还留着旧图片反代的域名
+     * （实测：缓存详情里的封面仍指向我们**上一代**的图片反代地址，而番剧表用的是当前域名）。
+     * `isBangumiImageHost` 只认官方/镜像图床，认不出"我们自己的旧反代域名"，
+     * 于是这条地址被原样返回 → 旧域名已失效 → 详情页封面 404/超时，
+     * 而卡片用的是新域名（正常）—— 这就是"同一张图，列表能看、详情看不到"的真正原因。
+     *
+     * 判据：**路径是 `/pic/cover/...` 就当成封面**（不管域名是谁），
+     * 去掉它可能带的前缀（`/img`、旧域名自带的 `/img`）与 `/r/<宽>/`，再用**当前**图片站重建。
+     * 这样旧缓存会在第一次取图时自动迁移到现在的域名，之后命中新缓存。
+     */
+    const coverMatch = /^(?:.*?)(\/pic\/cover\/.*)$/i.exec(u.pathname)
+    const knownHost = isBangumiImageHost(u.hostname)
+    if (!knownHost && !coverMatch) return url
+    // 已识别为封面时以 `/pic/cover/` 之后的路径为准（剥掉旧反代的 `/img`、`/r/400` 等前缀）
+    const originalPath = coverMatch ? coverMatch[1] : u.pathname
     /*
      * 注意：这里不能再写 `const base = new URL(custom)`（会遮蔽上面算好的 base）。
      * custom 为空时 new URL('') 抛错，被 catch 吞掉后直接 return url，
@@ -462,7 +512,7 @@ export function rewriteImageUrl(url: string, width = 400): string {
      */
     const prefix = base.pathname.replace(/\/+$/, '') // 例如 "/img"
     // 已经是缩放路径就不要重复加前缀
-    const path = width <= 0 || /^\/r\/\d+\//.test(u.pathname) ? u.pathname : `/r/${width}${u.pathname}`
+    const path = width <= 0 || /^\/r\/\d+\//.test(originalPath) ? originalPath : `/r/${width}${originalPath}`
     return `${base.origin}${prefix}${path}${u.search}`
   } catch {
     return url
@@ -470,8 +520,13 @@ export function rewriteImageUrl(url: string, width = 400): string {
 }
 
 /** 去掉缩放前缀（`/img/r/400/pic/…` → `/img/pic/…`）：缩放路径万一不可用时的兜底 */
-export function unresizedImageUrl(url: string): string {
-  if (!url) return url
+export function unresizedImageUrl(url: string): string {  if (!url) return url
+  /*
+   * V1.5.1：直连官方模式下图片根本没被改写，也就没有缩放前缀要去掉 —— 原样返回。
+   * 注意这里不能落回下面的 origin 判断：官方模式下 origin 为空串，最终也会 return url，
+   * 但显式写出来是为了让"官方模式不动图片地址"这条规则一眼可见。
+   */
+  if (bangumiSourceIsOfficial()) return url
   /*
    * 与 rewriteImageUrl 同一套基准：用户没填第三方图床时，用内置图片站判定。
    * 过去这里在 custom 为空时直接原样返回 —— 于是"缩放路径失败 → 改取原图"这条兜底
@@ -497,6 +552,26 @@ export function unresizedImageUrl(url: string): string {
   if (!origin) return url
   if (!url.startsWith(origin)) return url
   return url.replace(/\/r\/\d+\//, '/')
+}
+
+/**
+ * 一张原始图片在磁盘缓存里可能对应的文件名 hash（V1.5.1）。
+ *
+ * 缓存数据库靠它把"收藏番剧的封面"映射到 `cache/img` 里的真实文件：
+ * 收藏的图永久保留、过期档位的图按计划删除都建立在这个映射上。
+ * 改写规则只在这里算（`rewriteImageUrl` 的三种宽度变体），
+ * hash 算法在 bangumiImageUrl 里只有一份 —— 两边不会各自演化出不同的文件名。
+ */
+export function cachedImageStems(rawUrl: string): string[] {
+  if (!rawUrl) return []
+  const sized = rewriteImageUrl(rawUrl, 400)
+  const original = rewriteImageUrl(rawUrl, 0)
+  const names = imageCacheFileNames({
+    raw: rawUrl,
+    sized,
+    original: unresizedImageUrl(original) || original
+  })
+  return imageCacheStems(names)
 }
 
 /**
@@ -556,8 +631,9 @@ class BangumiService {
    * 与「设置 → 缓存设置」中的缓存目录保持一致。
    */
   private get cacheDir(): string {
-    const custom = getSettings().cacheDir?.trim()
-    const dir = join(custom || join(app.getPath('userData'), 'cache'), 'bangumi')
+    // V1.5.1：统一走 cacheRoot()（默认 <数据根>/cache），与图片缓存、设置页统计/清理同一个目录。
+    // 以前默认拼的是 userData/cache —— 设置页既统计不到、也清不掉这里的数据。
+    const dir = join(cacheRoot(), 'bangumi')
     try {
       mkdirSync(dir, { recursive: true })
     } catch {
@@ -571,6 +647,14 @@ class BangumiService {
   init(): void {
     mkdirSync(this.cacheDir, { recursive: true })
     this.migrateMirrors()
+    /*
+     * V1.5.1：把「原始图片地址 → 磁盘缓存文件名」的推算交给缓存数据库。
+     *
+     * 用注入而不是静态 import：cacheDb 需要 bangumi 的改写规则，而本文件又要用到 cacheDb 的记账，
+     * 两边静态互相 import 就成了循环依赖（打包成 CJS 后容易出现"某个导出是 undefined"的怪问题）。
+     * 这里注入一次，缓存数据库全生命周期都能用，且依赖方向始终是单向的。
+     */
+    setImageNameResolver(cachedImageStems)
     /*
      * 启动时把「实际会用哪种数据源」写进运行日志。
      * 只写类型与数量，**绝不写地址**：内置反代地址与 PSK 是用户要求隐藏的红线，
@@ -757,12 +841,17 @@ class BangumiService {
      * 但实测 stat 本身就要 ~0.05ms，把「读缓存快」的优势吃掉了一半。
      */
     const hit = this.l1.get(key)
-    if (hit) return hit.entry as CacheEntry<T>
+    if (hit) {
+      // V1.5.1：命中即"真的被加载过"，更新缓存数据库里的访问时间（保留计时的唯一基准）
+      noteCacheFile(key)
+      return hit.entry as CacheEntry<T>
+    }
     const f = join(this.cacheDir, `${key}.json`)
     try {
       const st = statSync(f)
       const entry = JSON.parse(readFileSync(f, 'utf-8')) as CacheEntry<T>
       this.l1.set(key, { mtimeMs: st.mtimeMs, size: st.size, entry: entry as CacheEntry<unknown> })
+      noteCacheFile(key)
       return entry
     } catch {
       return null
@@ -775,6 +864,8 @@ class BangumiService {
       const f = join(this.cacheDir, `${key}.json`)
       const entry: CacheEntry<T> = { fetchedAt: Date.now(), data }
       writeFileSync(f, JSON.stringify(entry), 'utf-8')
+      // V1.5.1：写盘即登记（含从数据里抽出的封面/角色图地址，供图片保留策略使用）
+      noteCacheFile(key, data)
       // 写盘后同步一级缓存：否则紧接着的读取还要再解析一遍刚写下去的内容
       try {
         const st = statSync(f)
@@ -982,6 +1073,28 @@ class BangumiService {
      * 否则两个并发调用会分别选中两个端点，等于既没单飞、又把同一份数据要了两遍。
      */
     const endpoints = resolveBangumiEndpoints(getSettings().bangumiCustomApi)
+    /*
+     * V1.5.3：在线数据库优先。
+     *
+     * 实测（2026-10）：在线库实现了官方 v0 的 `/v0/subjects/<id>` 与 `/v0/calendar`，
+     * **但不实现旧反代那个没有 v0 前缀的 `/calendar`** —— 那是两套约定，不是同一个路由；
+     * 季度检索用的 `/v0/subjects?type=…` 在它上面也是 404（只实现了按 id 取详情）。
+     * 所以这里只挑它确实实现的两种形状：
+     *   · `/v0/calendar`；
+     *   · `/v0/subjects/<数值 id>`（详情 / 评分）。
+     * 其余路径直接交给旧反代 —— 每个必 404 的请求都要多一次往返，季度检索一次就有 3 个月份。
+     * 成功即返回；失败/404 原样回退，行为与没有在线库时一致。
+     */
+    const onlineEligible = paths.api === '/v0/calendar' || /^\/v0\/subjects\/\d+$/.test(paths.api)
+    if (onlineEligible) {
+      try {
+        // 83KB 的 /calendar 给 12 秒；单条详情 8 秒足够，超时就回退旧反代（不给用户多等）
+        const online = await onlineApiText(paths.api, paths.api === '/v0/calendar' ? 12000 : 8000)
+        if (online) return { text: online.text, mirror: 'online-db' }
+      } catch {
+        /* 回退反代 */
+      }
+    }
     if (endpoints.length > 0) {
       const logicalKey = `bgm:${paths.customApi ?? paths.api}`
       try {
@@ -1393,6 +1506,7 @@ class BangumiService {
         const days = await this.fetchCalendarFromSource()
         this.writeCache('calendar', days)
         this.calendarSessionFresh = true
+        this.noteCalendar(days)
         const count = days.reduce((n, d) => n + d.items.length, 0)
         log.append('info', 'bangumi', `番剧表后台更新完成：${count} 部，用时 ${Date.now() - t0}ms`)
         this.emitCalendar({ fromCache: false, fetchedAt: Date.now(), days })
@@ -1433,6 +1547,26 @@ class BangumiService {
   }
 
   /**
+   * V1.5.1：番剧表（当季新番表）里出现过的条目登记进缓存数据库。
+   *
+   * 为什么必须在"每次真的拿到当季列表"时都调：缓存数据库靠这份登记判断
+   * 「这部番属于当季档（保留一个季度）」还是「只是临时加载过（7 天）」。
+   * 漏调一次，那批番的封面就会被当成无主图片、在下次清理时删掉 ——
+   * 用户看到的是「番剧表封面每次都要重新加载」。
+   */
+  private noteCalendar(days: CalendarDay[] | null | undefined): void {
+    if (!Array.isArray(days) || days.length === 0) return
+    const items: { id?: unknown; name?: unknown; name_cn?: unknown; images?: unknown }[] = []
+    for (const day of days) {
+      for (const item of day.items ?? []) {
+        items.push(item as unknown as { id?: unknown; name?: unknown; name_cn?: unknown; images?: unknown })
+      }
+    }
+    if (items.length === 0) return
+    recordListSubjects(items, 'current')
+  }
+
+  /**
    * 取番剧表。
    *
    * V1.2.3（用户要求）：**只在"打开番剧表"和"主动点刷新"时才联网**，其余调用一律吃缓存。
@@ -1464,10 +1598,14 @@ class BangumiService {
      * 手动刷新（force）仍然前台等网络 —— 用户点了「刷新」就是要看到新数据/失败提示。
      */
     if (!force && cache) {
-      const refreshing = !this.calendarSessionFresh && opts.allowRefresh === true
+      // V1.5.3：每周三自动更新一次（用户手动刷新不受限）
+      const weeklyDue = cache.fetchedAt < lastWednesdayMs()
+      const refreshing = (!this.calendarSessionFresh && opts.allowRefresh === true) || (weeklyDue && opts.allowRefresh === true)
       if (refreshing) this.refreshCalendarInBackground()
       // V1.4：命中缓存也顺手预热首屏封面（多数时候缓存里已有图，这一步几乎零成本）
       void prefetchCovers(cache.data)
+      // V1.5.1：缓存命中也算"当季番剧表被加载过"——封面已经在用，图片该按当季档位保护
+      this.noteCalendar(cache.data)
       return { fromCache: true, refreshing, fetchedAt: cache.fetchedAt, days: cache.data }
     }
     /*
@@ -1482,6 +1620,7 @@ class BangumiService {
       log.append('info', 'bangumi', '手动刷新：先返回缓存，后台更新完成后自动推送')
       this.refreshCalendarInBackground()
       void prefetchCovers(cache.data)
+      this.noteCalendar(cache.data)
       return { fromCache: true, refreshing: true, fetchedAt: cache.fetchedAt, days: cache.data }
     }
     try {
@@ -1490,6 +1629,7 @@ class BangumiService {
       this.calendarSessionFresh = true
       // V1.4：数据一到就开始预热首屏封面，等渲染层要图时多数已命中磁盘缓存
       void prefetchCovers(days)
+      this.noteCalendar(days)
       return { fromCache: false, fetchedAt: Date.now(), days }
     } catch (err) {
       const error: SourceError =
@@ -1563,11 +1703,13 @@ class BangumiService {
     if (!force) {
       if (cache) {
         this.refreshSeasonInBackground(y, season, key, priority)
+        this.noteSeason(y, season, cache.data)
         return { year: y, season, fromCache: true, stale: true, fetchedAt: cache.fetchedAt, items: cache.data }
       }
       const monthCached = this.cachedSeasonMonths(y, season)
       if (monthCached.items.length > 0) {
         this.refreshSeasonInBackground(y, season, key, priority)
+        this.noteSeason(y, season, monthCached.items)
         return {
           year: y,
           season,
@@ -1587,6 +1729,7 @@ class BangumiService {
        * 月份级缓存已经在 fetchSeasonMonth 里各自写好，完整时才合并落整季键。
        */
       if (complete && items.length > 0) this.writeCache(key, items)
+      this.noteSeason(y, season, items)
       return {
         year: y,
         season,
@@ -1657,6 +1800,20 @@ class BangumiService {
       }
     }
     return items
+  }
+
+  /**
+   * V1.5.1：季度列表（历史表 / 季度预览）里出现过的条目登记进缓存数据库。
+   *
+   * 当季 → 按"当季"档（图片保护一个季度）；往季 → 只登记历史表成员资格（15 天档）。
+   * 判定用的是"这个季度是不是当前季度"，所以番剧表过季之后，那批条目会自动按历史表口径清理 ——
+   * 正是用户要求的「番剧表过季后自动清理」。
+   */
+  private noteSeason(year: number, season: number, items: readonly SeasonItem[] | null | undefined): void {
+    if (!Array.isArray(items) || items.length === 0) return
+    const month = monthsOfSeason(season)[0]
+    if (!Number.isFinite(month)) return
+    recordSeasonItems(year, month, items)
   }
 
   /** 从「月份级缓存」拼出一份列表（只取仍在 TTL 内的；拼不出来时返回空） */
@@ -1803,6 +1960,15 @@ class BangumiService {
     const fallbackMalId = malIdFromFallbackId(id)
     if (fallbackMalId) return await this.subjectByMalId(fallbackMalId)
     /*
+     * V1.5.1：被屏蔽 / 拉黑的条目**停止加载**（用户要求）。
+     * 这里在入口处直接返回"没有数据 + 原因"，既不回源、也不再复用缓存 ——
+     * 否则屏蔽只是"番剧表里不显示"，详情页仍会照常打 API、照常把缓存写回来。
+     */
+    const blockedReason = subjectBlockReason(id)
+    if (blockedReason) {
+      return { fromCache: false, data: null, error: makeSourceError('PARSE', `该条目已被屏蔽（${blockedReason}），停止加载`, ['blocked']) }
+    }
+    /*
      * v0.2.7：缓存键加版本后缀 —— 详情映射补了 date/platform/total_episodes，
      * 沿用旧键会让用户一直看到「缺上映日期」的历史缓存。
      * 现在再进一位到 subject3-：自建反代此前命中旧版 API 形态（无 infobox/tags/platform），
@@ -1839,6 +2005,16 @@ class BangumiService {
     try {
       const detail = await this.fetchSubject(id, priority)
       this.writeCache(key, detail)
+      /*
+       * V1.5.1：详情到手的这一刻才真正知道标签 —— 顺手做一次屏蔽判定。
+       * 命中就立刻把这条的信息删掉并停止后续加载（用户要求"被屏蔽/拉黑就停止加载"）。
+       * 只在这里判定：详情是唯一带 tags 的数据源，番剧表/历史表的列表项没有标签。
+       */
+      try {
+        noteSubjectTags(id, (detail as { tags?: { name?: string }[] }).tags?.map((t) => String(t.name ?? '')) ?? [])
+      } catch {
+        /* 屏蔽判定失败不影响详情返回 */
+      }
       // 刚拿到的详情里就带着评分：顺手写进 6 小时那份缓存，避免下次再为评分多打一次请求
       this.noteRating(id, detail.rating)
       return { fromCache: false, data: detail }
@@ -1860,6 +2036,8 @@ class BangumiService {
    * 没有缓存时返回 null，页面显示骨架屏，**不与网络请求耦合**。
    */
   subjectCached(id: number): CachedSubjectResult {
+    // V1.5.1：被屏蔽/拉黑 → 连缓存都不再返回（"停止加载"包括停止复用）
+    if (subjectBlockReason(id)) return { data: null, fetchedAt: null }
     if (malIdFromFallbackId(id)) {
       const mal = malIdFromFallbackId(id)!
       const c = this.readCache<SubjectDetail>(`jikan-subject-${mal}`)
@@ -1910,6 +2088,8 @@ class BangumiService {
     if (!Number.isFinite(sid) || sid <= 0) {
       return { score: null, total: 0, fetchedAt: null, fromCache: false }
     }
+    // V1.5.1：被屏蔽/拉黑的条目停止加载（评分也属于"条目信息"）
+    if (isSubjectBlocked(sid)) return { score: null, total: 0, fetchedAt: null, fromCache: false }
     const key = `rating-${sid}`
     const cache = this.readCache<{ score: number | null; total: number }>(key)
     /*
@@ -2113,6 +2293,8 @@ class BangumiService {
     const sid = Math.trunc(Number(id))
     // 负数 id = Jikan/AniList 兜底条目，bangumi 这边必然 404，直接不给（界面据此隐藏这一行）
     if (!Number.isFinite(sid) || sid <= 0) return null
+    // V1.5.1：被屏蔽/拉黑的条目停止加载
+    if (isSubjectBlocked(sid)) return null
     const key = `episodes-${sid}`
     const cache = this.readCache<EpisodeProgress>(key)
     if (cache && Date.now() - cache.fetchedAt < TTL_EPISODES) return cache.data
@@ -2452,6 +2634,10 @@ class BangumiService {
       }
     }
     const key = `chars-${id}`
+    // V1.5.1：被屏蔽/拉黑的条目停止加载（角色图也算条目信息）
+    if (isSubjectBlocked(id)) {
+      return { subjectId: id, items: [], source: 'v0', fromCache: false }
+    }
     const cache = this.readCache<{ items: CharacterItem[]; source: CharactersResult['source'] }>(key)
     if (cache && Date.now() - cache.fetchedAt < TTL_CHARACTERS) {
       return { subjectId: id, items: cache.data.items, source: cache.data.source, fromCache: true }

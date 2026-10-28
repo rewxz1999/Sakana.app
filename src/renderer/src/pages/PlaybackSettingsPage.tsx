@@ -91,7 +91,22 @@ export function PlaybackSettingsPage() {
   }
 
   const dual = settings.downloader.dual
-  const downloaderLabel = dual ? '双下载器（aria2 + qBittorrent）' : settings.downloader.type === 'qbit' ? '外部 qBittorrent' : '内置 aria2'
+  const engineName = (e: 'aria2' | 'qbit' | 'transmission'): string =>
+    e === 'aria2' ? 'aria2' : e === 'qbit' ? 'qBittorrent' : 'Transmission'
+  const dualPair = (() => {
+    const picked = (settings.downloader.dualEngines ?? []).filter(
+      (e): e is 'aria2' | 'qbit' | 'transmission' => e === 'aria2' || e === 'qbit' || e === 'transmission'
+    )
+    const uniq = [...new Set(picked)]
+    return uniq.length === 2 ? uniq : (['aria2', 'qbit'] as ('aria2' | 'qbit' | 'transmission')[])
+  })()
+  const downloaderLabel = dual
+    ? `双下载器（${dualPair.map(engineName).join(' + ')}）`
+    : settings.downloader.type === 'qbit'
+      ? '外部 qBittorrent'
+      : settings.downloader.type === 'transmission'
+        ? '外部 Transmission'
+        : '内置 aria2'
 
   return (
     <SubPage
@@ -181,7 +196,7 @@ export function PlaybackSettingsPage() {
       </Card>
 
       <p className="text-center text-[11px] text-faint">
-        播放画质（Anime4K 超分）、音频、画面比例与播放内核在「播放器设置」里；FFmpeg 路径在「测试性设置」里；
+        播放画质（Anime4K 超分）、音频、画面比例与播放内核在「播放器设置」里；FFmpeg 路径在「高级设置」里；
         快捷键在「快捷键」里；弹幕在「弹幕设置」里。
       </p>
     </SubPage>

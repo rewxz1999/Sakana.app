@@ -159,8 +159,34 @@ export function AboutPage() {
         ) : null}
       </div>
 
+      {/* V1.5.3 更新摘要 */}
+      <Card title="V1.5.3 更新" desc="本版的主要改动（详细说明见项目交接文档）">
+        <ul className="ml-4 list-disc space-y-1 text-[11px] leading-relaxed text-dim">
+          <li>新增「数据源流量监控」：按番剧数据 / 封面图片 / 蜜柑 / 弹幕 / 站点分类统计请求数与流量，附最近 30 分钟的速率折线图（设置 → 数据与存储）。</li>
+          <li>图片跨页面复用 + 更长缓存：主进程内存 LRU + ETag/304 + 30 天浏览器缓存头；图片保留期拉长到 30 / 60 / 180 天（收藏永久）。</li>
+          <li>本地库播放第 N 集后，观看进度按真实集数 N 更新（不再用文件列表下标），本地番剧详情可标记已看集数。</li>
+          <li>番剧表改用在线库的 <code>/v0/calendar</code>（在线库不提供旧反代那个没有 <code>/v0</code> 前缀的 <code>/calendar</code> 别名）；在线库超时自动回退旧反代。</li>
+          <li>清理界面与注释里的测试性表述；在线数据源页面不再标注「实验功能」。</li>
+        </ul>
+      </Card>
+
+      {/* V1.5.2 更新摘要（用户要求更新关于页） */}
+      <Card title="V1.5.2 更新" desc="上一版的主要改动">
+        <ul className="ml-4 list-disc space-y-1 text-[11px] leading-relaxed text-dim">
+          <li>播放器：「正在加载中」挪到控制栏顶部；删除画布弹幕，只保留 uosc_danmaku（新增 60fps 平滑）；修复退出播放器偶发卡死（内核改为常驻复用）。</li>
+          <li>控制栏图标换成 Material Symbols Rounded（68 个常用图标），并可调图标大小 / 圆角 / 配色。</li>
+          <li>弹幕源：改用自建 danmu_api（地址口令已隐藏），继续保留本地缓存。</li>
+          <li>下载：aria2 按加速方案调优（连接数/分片/磁盘缓存），Tracker 列表自动更新；新增 Transmission 作为第三个引擎，双下载器支持三选二。</li>
+          <li>图片：Bangumi 图床连续失败时自动改用 AniList / Jikan / Kitsu 的封面。</li>
+          <li>在线播放：新增四条附加在线数据源（Apple CMS / 自托管 REST / AnimePahe / AllManga），入口在条目详情页「在线源」。</li>
+          <li>galgame：取消内存读取 BGM；截图更快；搜索改为“选站点 → 跳转”（默认 GalgameX）。</li>
+          <li>我的番剧库：本地库详情页复用番剧详情数据（评分/标签/简介）。</li>
+          <li>截图写入剪贴板时保留原有文本内容；修复新建推荐表「添加作品」面板不显示。</li>
+        </ul>
+      </Card>
+
       {/* 数据来源 */}
-      <Card title="数据来源" desc="番剧数据与 galgame 数据来源">
+      <Card title="数据来源" desc="番剧数据、弹幕与 galgame 数据来源">
         <Row label="当前数据源">
           {mainSource}
           {customApi ? '（默认数据源）' : '（默认数据源 · 双端点分担）'}
@@ -170,9 +196,13 @@ export function AboutPage() {
         <div className="border-t border-border" />
         <Row label="番剧数据">Bangumi（番剧表 / 条目详情 / 搜索 / 封面图片）</Row>
         <div className="border-t border-border" />
+        <Row label="图片备用源">AniList / Jikan（MyAnimeList）/ Kitsu —— 仅在 Bangumi 图片多次失败时启用</Row>
+        <div className="border-t border-border" />
+        <Row label="弹幕">自建 danmu_api（dandanplay 兼容接口）+ 本地缓存</Row>
+        <div className="border-t border-border" />
         <Row label="galgame 数据">月幕 galgame（ymgal.games）、VNDB</Row>
         <div className="border-t border-border" />
-        <Row label="资源站">蜜柑计划（订阅 / 下载资源）</Row>
+        <Row label="资源站">蜜柑计划（订阅 / 下载资源）；galgame 仅提供站点跳转（默认 GalgameX）</Row>
       </Card>
 
       {/* 目录 */}
@@ -206,9 +236,12 @@ export function AboutPage() {
         <div className="border-t border-border" />
         <AssetItem name="FFmpeg（转码 / 在线流中转）" ok={assets?.ffmpeg ?? null} />
         <div className="border-t border-border" />
-        <AssetItem name="aria2c（内置下载器）" ok={assets?.aria2 ?? null} />
+        <AssetItem name="aria2c（内置下载器 · 已调优）" ok={assets?.aria2 ?? null} />
+        <div className="border-t border-border" />
+        <Row label="uosc + uosc_danmaku">随播放器配置分发（Lua，无需安装）</Row>
         <p className="mt-2 text-[11px] leading-relaxed text-faint">
           未内置时可在「播放器设置」「下载器配置」中填写自行安装的路径。
+          qBittorrent / Transmission 是外部下载器，需要自行安装后通过 WebUI / RPC 连接。
         </p>
       </Card>
 

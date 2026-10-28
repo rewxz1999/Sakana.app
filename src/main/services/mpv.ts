@@ -8,7 +8,7 @@ import type { OverlayAction } from '@shared/api'
 import type { DanmakuSettings } from '@shared/types'
 import { anime4kChain } from '@shared/anime4k'
 import { themePalette, resolveThemeId } from '@shared/themePalette'
-import { buildUoscColorLine, renderUoscConf } from '@shared/uoscTheme'
+import { buildUoscColorLine, renderUoscConf, resolveUoscAppearance, type UoscAppearance } from '@shared/uoscTheme'
 import { BROWSER_UA, getSettings } from '../net'
 import { danmakuApiBase } from './danmaku'
 import { beginStage, failStageAndEnd, endFlow, flowDetail, flowRunning, pushStep, setMetrics, snapshot as flowSnapshot, succeedStage } from './playFlow'
@@ -101,6 +101,21 @@ interface MpvNative {
 let native: MpvNative | null = null
 let attachedWin: BrowserWindow | null = null
 let ready = false
+/**
+ * V1.5.2：内核是否处于「已释放但没销毁」的状态（离开播放页时）。
+ *
+ * 为什么要有这个状态：真机日志证明 `mpv_terminate_destroy()` 会**无限期阻塞**主线程
+ * （日志停在 `已发 stop`，后面再也没有 `内核 destroy 完成`，Windows 直接判 AppHang）。
+ * 它内部要等 demuxer / 解码 / 音频设备线程退出，而这些线程可能正卡在一条慢速网络流上，
+ * 外部没有任何办法给它设超时（同步 N-API 调用）。
+ *
+ * 所以退出播放器不再销毁内核，只做"释放"：停播放、藏起画面、停所有定时器、清会话状态。
+ * 下一次进播放页直接复用同一个内核（`create()` 在实例已存在时只更新尺寸），
+ * 既彻底消除卡死，也顺便省掉一次 libmpv 初始化（实测进播放页更快）。
+ */
+let engineReleased = false
+/** 内核创建时用的 uosc 外观标识（主题|预设|圆角）：变了要提示"重启后生效" */
+let engineVariant = ''
 let timeTimer: NodeJS.Timeout | null = null
 let lastPlaying = false
 let lastLength = 0
@@ -1318,9 +1333,14 @@ export function uoscPluginAvailable(): boolean {
   return bundledMpvConfigDir() !== ''
 }
 
-/** 弹幕插件模式是否生效：用户在设置里选了 uosc 渲染，且内置插件存在 */
+/** 弹幕插件模式是否生效（V1.5.2：画布弹幕已删除，插件可用时**只有**这一种渲染方式） */
 export function uoscDanmakuRequested(): boolean {
-  return getSettings().danmaku?.renderer === 'uosc' && uoscPluginAvailable()
+  /*
+   * 用户原话：「如果是画布我们就取消画布弹幕吧，只使用 uosc_danmaku」，
+   * 并明确「最终还是要删除画布弹幕」。所以这里不再看 `danmaku.renderer` 设置：
+   * 插件存在 → 用插件；插件缺失 → 没有弹幕（而不是退回一个滚动卡顿的画布）。
+   */
+  return uoscPluginAvailable()
 }
 
 /**
@@ -1349,8 +1369,22 @@ let lastUoscConfTheme = ''
 /** 上一次实际生效的 config-dir（可能是安装目录，也可能是临时镜像目录） */
 let runtimeUoscConfDir = ''
 
+/**
+ * 当前设置对应的 uosc「外观标识」：主题 | 预设 | 圆角。
+ *
+ * 单独抽出来是因为它有两个用途：决定要不要重写 uosc.conf（prepareUoscConf），
+ * 以及判断运行中的内核是不是按旧外观启动的（V1.5.2 内核常驻后，uosc 只在加载时读一次配置，
+ * 外观变了没法热更，只能提示下次启动生效）。
+ */
+function uoscVariantKey(): string {
+  const s = store.get<Record<string, unknown>>('settings', {})
+  const themeId = resolveThemeId(s.theme)
+  const app = resolveUoscAppearance(s.uoscAppearance)
+  return `${themeId}|${app.preset}|${app.radius}|${app.size}`
+}
+
 /** 从模板拼出完整的 uosc.conf 内容；模板读不到时返回 null（调用方保持现状） */
-function buildUoscConfContent(cfgDir: string, themeId: string): string | null {
+function buildUoscConfContent(cfgDir: string, themeId: string, appearance: UoscAppearance): string | null {
   const optsDir = join(cfgDir, 'script-opts')
   let template = ''
   try {
@@ -1374,7 +1408,7 @@ function buildUoscConfContent(cfgDir: string, themeId: string): string | null {
    * 这样自检脚本可以在 Node 里跑同一份映射，把生成后的 color= 行贴进报告，
    * 不必为了验证颜色去启动整个 Electron。
    */
-  return renderUoscConf(template, themeId)
+  return renderUoscConf(template, themeId, appearance)
 }
 
 /**
@@ -1419,17 +1453,28 @@ function mirrorMpvConfig(cfgDir: string, confContent: string): string {
  *   ③ 连临时目录都写不了 → 保持现有 uosc.conf（仓库预置的是落日色兜底）并记 error。
  */
 function prepareUoscConf(cfgDir: string): string {
+  /*
+   * V1.5.2：外观标识统一由 uoscVariantKey() 计算（它同时也是"内核是不是旧外观"的判据）。
+   * 只比主题的话，用户改了外观预设/圆角后要等重启应用才生效。
+   */
+  const variantKey = uoscVariantKey()
   const themeId = resolveThemeId(store.get<Record<string, unknown>>('settings', {}).theme)
-  if (themeId === lastUoscConfTheme && runtimeUoscConfDir) return runtimeUoscConfDir
-  const content = buildUoscConfContent(cfgDir, themeId)
+  const appearance = resolveUoscAppearance(store.get<Record<string, unknown>>('settings', {}).uoscAppearance)
+  if (variantKey === lastUoscConfTheme && runtimeUoscConfDir) return runtimeUoscConfDir
+  const content = buildUoscConfContent(cfgDir, themeId, appearance)
   if (!content) return cfgDir
   const colorLine = `color=${buildUoscColorLine(themeId)}`
   const bundledConf = join(cfgDir, 'script-opts', 'uosc.conf')
   try {
     writeFileSync(bundledConf, content, 'utf8')
-    lastUoscConfTheme = themeId
+    lastUoscConfTheme = variantKey
     runtimeUoscConfDir = cfgDir
-    log.append('info', 'mpv', `[uosc] 控制栏配色已按主题「${themePalette(themeId).label}」生成：${colorLine}`)
+    log.append(
+      'info',
+      'mpv',
+      `[uosc] 控制栏外观已生成：${appearance.preset}（圆角 ${appearance.radius}px）` +
+        (appearance.preset === 'follow' ? `，配色摘自主题「${themePalette(themeId).label}」：${colorLine}` : '')
+    )
     return cfgDir
   } catch (err) {
     log.append(
@@ -1440,12 +1485,12 @@ function prepareUoscConf(cfgDir: string): string {
   }
   try {
     const mirrored = mirrorMpvConfig(cfgDir, content)
-    lastUoscConfTheme = themeId
+    lastUoscConfTheme = variantKey
     runtimeUoscConfDir = mirrored
     log.append(
       'info',
       'mpv',
-      `[uosc] 已改用临时配置目录（配色仍按主题「${themePalette(themeId).label}」生效）：${mirrored}`
+      `[uosc] 已改用临时配置目录（外观 ${appearance.preset} / 圆角 ${appearance.radius}px 仍生效）：${mirrored}`
     )
     return mirrored
   } catch (err) {
@@ -1880,13 +1925,33 @@ function uoscScriptOpts(): string {
   opts.push(`uosc_danmaku-history_path=${slashPath(stateFile)}`)
   if (d) {
     if (typeof d.opacity === 'number') opts.push(`uosc_danmaku-opacity=${clamp01(d.opacity)}`)
-    // 内置画布的字号是 CSS px（默认 22），插件的 fontsize 是 ASS 单位（1080p 下默认 50）
+    // 字号：设置项是 CSS px（默认 22），插件的 fontsize 是 ASS 单位（1080p 下默认 50）
     if (typeof d.fontSize === 'number') opts.push(`uosc_danmaku-fontsize=${Math.round(d.fontSize * 2.2)}`)
     if (typeof d.maxCount === 'number' && d.maxCount > 0) opts.push(`uosc_danmaku-max_screen_danmaku=${d.maxCount}`)
     if (typeof d.speedSec === 'number' && d.speedSec > 0) opts.push(`uosc_danmaku-scrolltime=${d.speedSec}`)
     if (typeof d.area === 'number') opts.push(`uosc_danmaku-displayarea=${clamp01(d.area)}`)
     if (d.showTop === false && d.showBottom === false && d.showScroll === false) {
       opts.push('uosc_danmaku-opacity=0')
+    }
+    /*
+     * V1.5.2：滚动平滑（用户反馈「弹幕滚动有点卡、费眼」）。
+     *
+     * uosc_danmaku 的 README 给的方案就是 `vf_fps=yes`（加载 mpv 的 fps 滤镜，把画面与弹幕
+     * 一起提到 60fps 渲染）。画布弹幕删掉之后，弹幕的顺畅度完全由插件决定；
+     * 这个选项是官方推荐、且只在插件渲染时生效，所以默认开启（设置里仍可关掉）。
+     * 注意 fps 滤镜会多占一点 GPU —— 老显卡上如果反而更卡，可以在弹幕设置里关闭。
+     */
+    if (d.uoscFpsSmooth !== false) {
+      opts.push('uosc_danmaku-vf_fps=yes')
+      opts.push('uosc_danmaku-fps=60/1.001')
+    }
+    /*
+     * 本地缓存（用户要求保留）：插件在拿到弹幕时把 XML 存到指定目录，
+     * 下次同一集可以直接用（plugin 的 save_danmaku 会在 `immediately_save_danmaku`
+     * 与退出时写盘）。路径给到缓存根下，和应用自己的弹幕缓存放在一起，方便统一清理。
+     */
+    if (d.cacheToLocal !== false && cfgDir) {
+      opts.push('uosc_danmaku-save_danmaku=yes')
     }
     const words = (d.blockWords ?? '')
       .split(/[,，\n]/)
@@ -2856,7 +2921,17 @@ export function mpvRevealUoscUi(): boolean {
       'timeline,controls,volume,top_bar'
     ])
     ok = a || b
-    if (!ok) log.append('warn', 'mpv', '唤出 uosc 控制栏被拒（flash-ui 与 flash-elements 都没成功）')
+    if (!ok) {
+      /*
+       * V1.5.2：把"uosc 到底还在不在"的现场一并打出来。
+       * 之前只有一句"被拒"，无法区分是 uosc 没加载、加载到另一个内核、还是命令通道坏了。
+       */
+      log.append(
+        'warn',
+        'mpv',
+        `唤出 uosc 控制栏被拒（flash-ui 与 flash-elements 都没成功；uoscBarLoaded=${uoscBarLoaded} ctrl=${uoscCtrlLoaded} danmaku=${uoscDanmakuLoaded} attached=${attachedWin !== null} released=${engineReleased}）`
+      )
+    }
     return ok
   } catch (err) {
     log.append('warn', 'mpv', `唤出 uosc 控制栏异常: ${String((err as Error)?.message ?? err)}`)
@@ -3007,6 +3082,20 @@ export function mpvScreenshotToFile(file: string, mode: 'video' | 'subtitles' = 
 export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean; message: string } {
   const mod = loadNative()
   if (!mod) return { ok: false, message: '未找到 libmpv 运行时或原生插件（请运行 npm run libmpv:fetch）' }
+  /*
+   * V1.5.2：内核常驻 —— 先记下这次是「新建」还是「复用」。
+   * 复用路径下 `mod.create()` 只更新尺寸（addon.cc 的 g_created 分支），
+   * 所以任何会话级状态都必须在这里自己复位，不能指望重新初始化。
+   */
+  const wasAlive = ready && native !== null
+  const variantNow = uoscVariantKey()
+  if (wasAlive && engineVariant && engineVariant !== variantNow) {
+    log.append(
+      'warn',
+      'mpv',
+      '控制栏外观（主题/预设/圆角）已修改：uosc 只在加载时读一次 uosc.conf，新外观将在下次启动应用后生效'
+    )
+  }
   currentBounds = toPhysical(win, bounds)
   const bili = biliDanmakuConfig()
   // 两件不同的事：控制栏交给 uosc（默认开）／弹幕交给 uosc_danmaku 插件（设置里选）
@@ -3177,6 +3266,24 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
     log.append('error', 'mpv', `libmpv 初始化失败: ${mod.lastError()}`)
     return { ok: false, message: mod.lastError() || 'libmpv 初始化失败' }
   }
+  if (wasAlive) {
+    /*
+     * 复用常驻内核：把画面重新显示出来，并记住"已重新挂上"。
+     * 目标窗口正常情况下就是同一个主窗口（离开播放页不会销毁主窗口），
+     * 所以视频子窗口与父窗口句柄都还有效；万一主窗口换过（托盘重建等极端情况），
+     * addon 会沿用旧的 g_child —— 那种情况下画面可能不出现，日志里会留下上面这行"复用"。
+     */
+    try {
+      mod.setVisible(true)
+    } catch {
+      /* 显示失败不影响后续 loadfile，下一次 resize/raise 会再纠正 */
+    }
+    engineReleased = false
+    log.append('info', 'mpv', '复用常驻的 libmpv 实例（退出播放时不再销毁内核，避免 terminate_destroy 卡死主进程）')
+  } else {
+    // 新实例：记下它启动时用的外观，供下次 attach 判断"外观是否已变"
+    engineVariant = variantNow
+  }
   /*
    * B 站弹幕脚本用**运行时命令**加载：libmpv 不接受 `script` 选项（见 biliDanmakuConfig 注释）。
    * 一次实例只加载一次 —— create() 在实例已存在时只更新尺寸，重复加载会出现两份脚本、
@@ -3202,6 +3309,40 @@ export function mpvAttach(win: BrowserWindow, bounds: MpvBounds): { ok: boolean;
    * v0.3.6：cfgDir 现在**无条件存在**，所以要显式判断「用户到底要不要 uosc」，
    * 否则默认关闭 uosc 的机器上会被塞进一套用不上的控制栏（还会抢走鼠标）。
    */
+  /*
+   * V1.5.2 自愈：`uoscBarLoaded` 只表示「我们曾经成功 load-script 过」。
+   *
+   * 内核被真正销毁并重建（自检重置 / 一键排障 / 崩溃恢复）后，新内核里其实什么都没有；
+   * 如果标记还残留，下面的 `!uoscBarLoaded` 就会跳过重新加载 ——
+   * 于是 uosc 不在内核里，`flash-ui` / `flash-elements` 全被拒，用户看到「控制栏唤不出来」。
+   * 这里探活一次（script-message-to 在脚本不存在时返回 false，已用 .e2e/probe 验证），
+   * 只有真的活着才继续相信标记。
+   */
+  if (uoscBarLoaded) {
+    let alive = false
+    try {
+      alive = mod.command(['script-message-to', 'uosc', '__sakana_alive__'])
+    } catch {
+      alive = false
+    }
+    if (!alive) {
+      log.append('warn', 'mpv', 'uosc 标记为已加载但内核里找不到它（内核被重建过）→ 复位标记并重新加载控制栏')
+      uoscBarLoaded = false
+      uoscDanmakuLoaded = false
+      uoscCtrlLoaded = false
+    }
+  } else if (uoscDanmakuLoaded) {
+    let alive = false
+    try {
+      alive = mod.command(['script-message-to', 'uosc_danmaku', '__sakana_alive__'])
+    } catch {
+      alive = false
+    }
+    if (!alive) {
+      log.append('warn', 'mpv', 'uosc_danmaku 标记为已加载但内核里找不到它 → 复位标记并重新加载')
+      uoscDanmakuLoaded = false
+    }
+  }
   if (cfgDir && !uoscBarLoaded && (wantUoscBar || wantUoscDanmaku)) {
     loadUoscPlugins(mod, cfgDir, wantUoscDanmaku, wantUoscBar, thumbfastScript)
   }
@@ -3338,6 +3479,14 @@ export function mpvDiagnostics(): {
   ready: boolean
   attached: boolean
   attachedDestroyed: boolean
+  /**
+   * V1.5.2：内核是否处于「已释放但常驻」状态（退出播放页后的正常形态）。
+   *
+   * 自检必须区分两种 `!attached && ready`：
+   *   · released=true  → 正常：内核留着等下一次复用（不应销毁，否则每次起播都要重建，慢且丢脚本）；
+   *   · released=false → 异常：内核还活着却没有宿主窗口（历史上会导致"有声音没画面"）。
+   */
+  released: boolean
   hasBounds: boolean
   surfaceVisible: boolean
   hasPicture: boolean
@@ -3360,6 +3509,7 @@ export function mpvDiagnostics(): {
      * 用户看到的就是「有声音没画面」或「操作没反应」。
      */
     attachedDestroyed: !!attachedWin && attachedWin.isDestroyed(),
+    released: engineReleased,
     hasBounds: currentBounds !== null,
     surfaceVisible,
     hasPicture: lastHadPicture,
@@ -4026,49 +4176,55 @@ export function mpvNotifyLayout(): void {
   }
 }
 
+/**
+ * 离开播放器：**释放**内核而不是销毁它（V1.5.2）。
+ *
+ * 历史教训（真机日志，用户贴过两次）：
+ *   1.3.x 里这里直接 `native.destroy()` → `mpv_terminate_destroy()` 等线程收尾，
+ *   播放中退出时它可能无限期阻塞 → Windows 判 AppHang，窗口"加载后卡死"。
+ *   1.3.2 把销毁挪到 setTimeout(0) 也没用：卡住的仍然是主线程，只是晚了一拍。
+ *
+ * 现在改成"释放"：
+ *   · `stop` 停播放 → 隐藏视频子窗口 → 停掉所有定时器与 watch；
+ *   · **不调用 terminate_destroy**，也不复位脚本加载标记（脚本还在这个内核里）；
+ *   · 下次进播放页 `mpvAttach` 会复用同一个内核（`create()` 只更新尺寸），
+ *     顺带省掉一次 libmpv 初始化。
+ *
+ * 代价与取舍：uosc 只在加载时读一次 `uosc.conf`，所以改主题/外观预设**需要重启应用**才生效
+ * （attach 时会检测并写一条警告，界面上也有对应说明）。这个代价远小于"退出播放卡死"。
+ *
+ * 仍然保留原函数名：调用方（IPC、before-quit、自检脚本）不需要跟着改。
+ */
 export function mpvDestroy(): void {
-  /*
-   * V1.3.1：退出链路插桩（真机 AppHang，Event 1002，1.2.5 / 1.2.9 / 1.3.0 都中招）。
-   *
-   * 为什么必须在**每一步之间**打点：Windows 判定"无响应"的依据是主线程 5 秒没处理窗口消息，
-   * 而这里连续做了「停计时器 → 停各种 watch → destroy 内核 → 清状态」几件同步事，
-   * 任何一件卡住，外部都只看到"整个窗口卡死"，看不出是哪一件。
-   * 每一行都带相对开始时的毫秒数；下次卡住时，**最后一行就是卡住的那一步**。
-   */
   const t0 = Date.now()
   const mark = (step: string): void => log.append('info', 'exit', `+${Date.now() - t0}ms ${step}`)
-  mark('开始销毁播放器')
+  mark('开始释放播放器')
   stopTimePump()
   mark('已停时间泵')
   stopRaiseWatch()
   stopCursorWatch()
   stopThumbfastStatusWatch?.()
   mark('已停各种 watch（raise/cursor/thumbfast）')
+  /*
+   * 注意：这里**不再**复位 biliScriptLoaded / uoscBarLoaded / uoscDanmakuLoaded /
+   * uoscCtrlLoaded。内核是常驻的，脚本还在里面；清成 false 会在下次 attach 时重复 load-script，
+   * 结果是两个 uosc 控制栏、两份弹幕插件（历史上踩过这个坑）。
+   */
   surfaceVisible = true
-  biliScriptLoaded = false
-  /* v1.2.1：实例销毁后 VO 窗口随之消失，输入窗口缓存作废（新实例会重新找/重新启用） */
+  /* 释放后 VO 子窗口被隐藏，输入窗口缓存作废（重新挂上时由 250ms 泵重新找） */
   inputHwnd = 0
   inputHwndEnabled = false
   inputCheckAt = 0
   inputLastFailure = ''
-  // 三个 uosc 相关的标记都要复位：实例销毁后脚本也随之消失，
-  // 保留为 true 会让「动作回传」「弹幕插件渲染」在下一个实例上误判成可用。
-  uoscBarLoaded = false
-  uoscDanmakuLoaded = false
-  uoscCtrlLoaded = false
   lastUoscBarJson = ''
   lastUoscStatusPushAt = 0
-  // 画质设置的指纹也要复位：实例没了，新实例必须被重新设置一次（哪怕设置值没变）
+  // 画质/音量/音频指纹复位：下次 attach 必须重新下发一次（内核还在，但会话状态清空了）
   lastEnhanceKey = ''
   lastVolume = -1
-  /*
-   * 音频指纹同样要复位（v0.3.6）：滤镜链挂在实例上，实例销毁后什么都不剩，
-   * 指纹还是旧值的话新实例不会再应用一次 —— 表现就是「第二次进播放器音效没了」。
-   */
   try {
     audioResetHook?.()
   } catch {
-    /* 复位失败不影响销毁流程 */
+    /* 复位失败不影响释放流程 */
   }
   latestPluginDanmakuFile = ''
   injectedForPath = ''
@@ -4081,48 +4237,77 @@ export function mpvDestroy(): void {
     }
     mark('已发 stop')
     /*
-     * V1.3.2：内核销毁**挪到下一轮事件循环**。
-     *
-     * 真机日志（用户贴的）：
-     *   [exit] +0ms 开始销毁播放器
-     *   [exit] +0ms 已停时间泵
-     *   [exit] +0ms 已停各种 watch（raise/cursor/thumbfast）
-     *   ← 到这里就断了，`内核 destroy 完成` 再也没出现
-     * 也就是**卡在 native.destroy() 这一句**（libmpv 释放时在等网络/解码线程收尾），
-     * 而它是同步调用，主线程被它按住的这几秒里窗口消息没人处理 → Windows 判 AppHang 直接杀掉。
-     *
-     * 现在把销毁放到 setTimeout(0)：先把退出流程（关窗口、清状态）交给下一轮事件循环跑完，
-     * 重建时窗口已经收起来了，再让 libmpv 在自己那一下里慢慢收尾。
-     * **这不是把问题藏起来**：日志里仍然会打 `内核 destroy 完成 +Nms`，N 就是它真实的耗时，
-     * 下一次要是还卡，这个数字会告诉我们它到底卡多久。
+     * 隐藏视频输出窗口：不销毁内核的话，子窗口会留在原位，
+     * 退出播放页后会在主界面中间盖一块黑色矩形。
+     * 用 setVisible(false)（addon 里是 ShowWindow/hide），下次 attach 再显示。
      */
-    const inst = native
-    native = null
-    setTimeout(() => {
-      const tDestroy = Date.now()
-      try {
-        inst.destroy()
-      } catch {
-        /* ignore */
-      }
-      log.append('info', 'mpv', 'libmpv 已销毁')
-      log.append('info', 'exit', `+${Date.now() - tDestroy}ms 内核 destroy 完成（异步执行）`)
-    }, 0)
+    try {
+      native.setVisible(false)
+    } catch {
+      /* ignore */
+    }
+    mark('已收起画面（内核保留）')
   }
-  ready = false
   attachedWin = null
   lastPlaying = false
   lastLength = 0
   lastEof = false
-  /*
-   * v1.5：销毁后「有没有画面」必须是 false。
-   * 以前这里没复位（它只在 loadSource 里被清），销毁后如果还有人读这份状态
-   * （自检、旧渲染层的迟到轮询），会得到"有画面"的假读数，弹幕/控制栏门控跟着失效。
-   */
   lastHadPicture = false
-  // v1.3：内核销毁后「当前候选」的计量与交接队列都不再有意义
+  // 当前候选的计量与交接队列都不再有意义
   candidateLoadedAt = 0
   candidateBytesBase = 0
   boostSwapped = false
   resetHandoff()
+  /*
+   * 标记为"已释放但内核还活着"：下一次 attach 走复用路径。
+   * 注意 `ready` 保持 true —— 内核句柄有效，命令仍然可用（只是处于 idle）。
+   */
+  engineReleased = ready && native !== null
+  mark(engineReleased ? '释放完成（内核常驻，未销毁）' : '释放完成（没有活动内核）')
+}
+
+/**
+ * 真正销毁内核（只给自检/排障用）。
+ *
+ * 为什么不给正常退出路径用：`terminate_destroy` 是同步阻塞调用，播放中退出时可能卡死主线程。
+ * 这里保留它是为了自检脚本能验证"销毁路径本身"（例如 `SAKANA_MPV_FORCE_DESTROY=1`），
+ * 以及将来做"空闲时重建内核"时有一个明确的入口。
+ */
+export function mpvDestroyEngine(): void {
+  if (!native) return
+  const inst = native
+  native = null
+  ready = false
+  engineReleased = false
+  engineVariant = ''
+  /*
+   * V1.5.2 修：**必须复位"脚本已加载"标记**。
+   *
+   * 内核常驻后这些标记只在 `mpvDestroy()` 里被刻意保留（脚本真的还在内核里）；
+   * 但一旦内核被**真正销毁**（自检重置 / 一键排障），新内核里什么都没有 ——
+   * 标记不复位就会导致下一次 attach 跳过 load-script：没有 uosc、没有桥接脚本、
+   * 没有弹幕插件。用户看到的就是「控制栏唤不出来、flash-ui/flash-elements 都被拒」。
+   */
+  biliScriptLoaded = false
+  uoscBarLoaded = false
+  uoscDanmakuLoaded = false
+  uoscCtrlLoaded = false
+  const t = Date.now()
+  try {
+    inst.destroy()
+  } catch {
+    /* ignore */
+  }
+  log.append('info', 'mpv', `libmpv 已销毁（显式调用，耗时 ${Date.now() - t}ms）`)
+}
+
+/**
+ * 强制重建内核（自带排障用）：先释放（停播放、收画面），再真正销毁。
+ *
+ * 只有"内核挂载错配 / 一键重置播放链路"这类**本来就没有正常播放**的场景才用它 ——
+ * 正常退出播放器一律走 `mpvDestroy()`（常驻复用），否则会重新引入 terminate_destroy 卡死。
+ */
+export function mpvHardDestroy(): void {
+  mpvDestroy()
+  mpvDestroyEngine()
 }

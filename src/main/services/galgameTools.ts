@@ -96,13 +96,9 @@ function overlayHtml(): string {
   .rbtn:hover{background:rgba(255,255,255,.20)}
 </style></head>
 <body>
-  <button id="btn" title="galgame 助手（读取 BGM / 截图）">🎮</button>
+  <button id="btn" title="galgame 助手（截图）">🎮</button>
   <div id="panel">
     <div id="menu">
-      <button class="item" id="bgmItem"><span class="ic">🎵</span>读取 BGM</button>
-      <div class="divider"></div>
-      <button class="item" id="refreshItem"><span class="ic">🔄</span>手动刷新（立刻重扫）</button>
-      <div class="divider"></div>
       <button class="item" id="shotItem"><span class="ic">📷</span>截图</button>
     </div>
     <div id="result">
@@ -169,8 +165,11 @@ function overlayHtml(): string {
       else openPanel()
     })
 
-    /* 读取 BGM 之后多一个「保存这首」：把这首从游戏档案里只读提取到本地（不修改游戏目录） */
-    document.getElementById('bgmItem').addEventListener('click', async function () {
+    /* V1.5.2：内存读 BGM 功能已删除（用户要求），这两个按钮与对应逻辑一并移除。
+       DOM 上不再有 bgmItem / refreshItem，下面的监听改为「有元素才绑定」，
+       避免 getElementById 返回 null 时抛错把后面截图按钮的脚本一起打断。 */
+    var bgmItemEl = document.getElementById('bgmItem')
+    if (bgmItemEl) bgmItemEl.addEventListener('click', async function () {
       showResult('BGM 识别', '正在识别…', '', null, false)
       saveBtn.style.display = 'none'
       var r = null
@@ -192,10 +191,9 @@ function overlayHtml(): string {
       }
     })
 
-    /* 手动刷新：跳过 2 秒轮询，立刻重扫一次内存（切场景后想马上看到结果时用）。
-       refreshBgm 现在会**等这一轮扫描结束**再返回，所以这里不用再"猜一个延迟"——
-       刷新完直接读，拿到的就是新结果，面板上会带「识别于 N 秒前」。 */
-    document.getElementById('refreshItem').addEventListener('click', async function () {
+    /* 手动刷新（V1.5.2：仅供旧的 BGM 面板使用，按钮已移除；有元素才绑定） */
+    var refreshItemEl = document.getElementById('refreshItem')
+    if (refreshItemEl) refreshItemEl.addEventListener('click', async function () {
       showResult('BGM 识别（已刷新）', '正在刷新…', '正在重扫游戏内存', null, false)
       var rr = null
       try { rr = await window.sakana.gal.refreshBgm('') } catch (e) { rr = null }
@@ -383,10 +381,15 @@ async function captureGameWindow(): Promise<Buffer> {
   const run = galRunningInfo()
   if (!run) throw new Error('未检测到正在运行的 galgame，请先启动游戏')
 
-  const title =
-    run.lastTitle ||
-    (await galReadWindowTitle(run.pid)).trim() ||
-    run.gameTitle
+  /*
+   * V1.5.2：截图卡顿优化之一 —— **不再在截图路径里 spawn PowerShell 读窗口标题**。
+   *
+   * 原来是 `run.lastTitle || await readWindowTitle(pid) || gameTitle`，而 readWindowTitle 会起一个
+   * powershell.exe（超时 3 秒）。正常有 2 秒轮询时 lastTitle 是有值的，但刚启动游戏/轮询没回来时
+   * 就会走这条慢路径 —— 用户感知就是"按截图卡几秒"。这里直接用轮询值或游戏名，
+   * 匹配失败时下面的名称兜底逻辑仍然会再试一次。
+   */
+  const title = run.lastTitle || run.gameTitle
 
   const primary = screen.getPrimaryDisplay()
   const scale = primary.scaleFactor || 1
@@ -394,9 +397,21 @@ async function captureGameWindow(): Promise<Buffer> {
     width: Math.round(primary.size.width * scale),
     height: Math.round(primary.size.height * scale)
   }
+  /*
+   * V1.5.2：截图卡顿优化之二 —— 限制缩略图上限。
+   *
+   * `desktopCapturer.getSources` 会按 thumbnailSize **逐个窗口**渲染缩略图；在 2K/4K 屏幕上
+   * 传全屏物理分辨率（例如 3840×2160）意味着每次截图都要渲染十几张超大位图，这是卡顿主因。
+   * 游戏窗口绝大多数不超过 1080p（窗口化的 galgame 通常 1280×720 / 1600×900），
+   * 所以上限收到 1920×1080：1080p 以内**完全无损**，只有 4K 游戏会被缩到 1080p。
+   */
+  const thumbSize = {
+    width: Math.min(size.width, 1920),
+    height: Math.min(size.height, 1080)
+  }
   const sources = await desktopCapturer.getSources({
     types: ['window'],
-    thumbnailSize: size,
+    thumbnailSize: thumbSize,
     fetchWindowIcons: false
   })
 
@@ -548,7 +563,12 @@ export async function galScreenshotNow(): Promise<string> {
   const wasVisible = !!win && win.isVisible()
   if (wasVisible) win.hide()
   try {
-    await sleep(200)
+    /*
+     * V1.5.2：200ms → 100ms。
+     * 隐藏悬浮窗到真正被系统重绘需要一帧多一点，100ms（约 6 帧）足够；
+     * 原来 200ms 是纯等待，占用户感知延迟的一大截。
+     */
+    await sleep(100)
     const png = await captureGameWindow()
     /*
      * 命名规则（V1.1 统一布局）：`<根目录>/<游戏名>/截图/<游戏名>_<时间>.png`。
@@ -562,10 +582,12 @@ export async function galScreenshotNow(): Promise<string> {
     writeFileSync(file, png)
     log.append('info', 'gal', `游戏窗口截图已保存: ${file}`)
     /*
-     * v0.3.6「快速粘贴」：与播放器截图走**同一个**收尾函数（copyScreenshotIfEnabled），
-     * 保证两个截图入口行为一致（都要按设置写剪贴板、都不抛异常）。
+     * V1.5.2：剪贴板复制**不再阻塞截图返回**。
+     *
+     * 写剪贴板要先快照（读一次整个剪贴板，可能含大图）再原子写，慢的时候几百毫秒；
+     * 而截图本身已经存盘成功、用户要的是"按下就有反馈"。所以后台做，失败只进日志。
      */
-    await copyScreenshotIfEnabled(file)
+    void copyScreenshotIfEnabled(file)
     maybeShowSaveHint()
     return file
   } finally {

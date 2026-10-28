@@ -54,18 +54,15 @@ function dirFileCount(dir: string): number {
 
 type CacheSettings = { cacheDir?: string }
 
-/** 缓存根目录：settings.cacheDir 优先，留空回退**安装目录**下的 cache（v0.2.9 最后更新） */
-export function cacheRoot(): string {
-  const s = store.get<CacheSettings>('settings', {})
-  const custom = (s.cacheDir ?? '').trim()
-  return custom || dataPaths().cache
-}
+/*
+ * V1.5.1：缓存根目录改为**唯一来源**（见 services/cacheRoot.ts）。
+ * 以前这里是"设置页看到的目录"，而图片/条目 JSON 实际写在 userData/cache —— 两个目录，
+ * 于是「缓存占用」永远偏小、点「清除本地缓存数据」也清不掉真正的图片。
+ * 现在统计、清理、图片写入、条目 JSON 写入全部走同一个函数。
+ */
+import { cacheRoot, cacheRootIsCustom } from './cacheRoot'
 
-/** 是否使用用户自定义缓存目录（false = 默认「安装目录/cache」） */
-export function cacheRootIsCustom(): boolean {
-  const s = store.get<CacheSettings>('settings', {})
-  return (s.cacheDir ?? '').trim().length > 0
-}
+export { cacheRoot, cacheRootIsCustom }
 
 /**
  * 参与缓存统计/清理的目录：

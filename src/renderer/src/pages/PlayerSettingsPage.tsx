@@ -14,6 +14,8 @@ import {
   anime4kChain,
   type Anime4kMode
 } from '@shared/anime4k'
+// V1.5.1：控制栏外观预设（与主进程生成 uosc.conf 用的是同一份）
+import { UOSC_APPEARANCES, resolveUoscAppearance } from '@shared/uoscTheme'
 /*
  * 音频设置（v0.3.6）：`EQ_PRESETS` / `EQ_BANDS` / `resolveAudioSettings` 与主进程用的是
  * **同一份** `@shared/audio` —— 界面上显示的段数、默认值、收窄规则都与真正下发给 mpv 的一致，
@@ -223,7 +225,7 @@ export function PlayerSettingsPage() {
 
   /*
    * v0.3.9：投屏（含手动连接 / 双端同步 / 接收端下载）整块搬到了独立的
-   * `/cast-settings`「投屏设置」；FFmpeg 与控制栏搬到了 `/experimental-settings`「测试性设置」；
+   * `/cast-settings`「投屏设置」；FFmpeg 与控制栏搬到了 `/experimental-settings`「高级设置」；
    * B 站弹幕搬到了「弹幕设置」；快捷键入口本就在「快捷键」里（本页不再内嵌那一大段面板）。
    * 本页只保留用户点名的五块：播放器内核 / 超分辨率 / 音频 / 画面比例 / 内置组件。
    */
@@ -240,7 +242,7 @@ export function PlayerSettingsPage() {
     void detect()
   }, [])
 
-  // v0.3.9：FFmpeg 的下载链接卡片已经搬到「测试性设置」，这里只剩内置组件卡片里的那一个链接
+  // v0.3.9：FFmpeg 的下载链接卡片已经搬到「高级设置」，这里只剩内置组件卡片里的那一个链接
   const ffmpegBuiltin: boolean | null = assets ? assets.ffmpeg : null
 
   // libmpv 可用（运行时 + 原生插件都在）——VLC 内核已删除，这里只用于提示是否缺运行时
@@ -276,6 +278,8 @@ export function PlayerSettingsPage() {
    * 所以滑杆显示 3 集时，磁盘上就一定按 3 集淘汰。
    */
   const tempCacheEpisodes = resolveTempMediaCacheEpisodes(settings.tempMediaCacheEpisodes)
+  // V1.5.1：控制栏外观（缺省 Catppuccin Mocha + 12px；收窄规则与主进程完全一致）
+  const uoscAppearance = resolveUoscAppearance(settings.uoscAppearance)
 
   return (
     <SubPage
@@ -288,6 +292,109 @@ export function PlayerSettingsPage() {
         </Button>
       }
     >
+      {/*
+        V1.5.1：控制栏外观（配色预设 + 圆角）。
+        用户要求「控制按钮图标不够美观，看看有没有认可度高的图标」，并点名了
+        Catppuccin for uosc / hikari / Glass UI 等项目 —— 我们取的是它们**认可度最高的配色与造型**，
+        不整包替换 uosc（那些是整套配置或 fork，会覆盖掉我们自己的按钮桥接脚本）。
+        改完下一次起播生效（主进程 prepareUoscConf 会按 主题+预设+圆角 重新生成 uosc.conf）。
+      */}
+      <Card title="控制栏外观" desc="配色预设与圆角；改完下一次起播生效">
+        <div className="flex flex-col gap-3">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {UOSC_APPEARANCES.map((preset) => {
+              const active = uoscAppearance.preset === preset.id
+              return (
+                <button
+                  key={preset.id}
+                  type="button"
+                  onClick={() => save({ uoscAppearance: { ...settings.uoscAppearance, preset: preset.id } })}
+                  className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
+                    active ? 'border-accent/50 bg-accent-soft' : 'border-border bg-elev2/50 hover:border-accent/30'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className={`text-xs font-medium ${active ? 'text-accent' : 'text-text'}`}>{preset.label}</span>
+                    <span className="flex shrink-0 items-center gap-1">
+                      {preset.swatch.map((color) => (
+                        <span
+                          key={color}
+                          className="h-3 w-3 rounded-full border border-black/20"
+                          style={{ backgroundColor: color }}
+                        />
+                      ))}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-[11px] leading-relaxed text-faint">{preset.desc}</div>
+                </button>
+              )
+            })}
+          </div>
+
+          <div className="border-t border-border pt-3">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-xs text-text">圆角</span>
+              <span className="text-[11px] tabular-nums text-accent">{uoscAppearance.radius}px</span>
+            </div>
+            <div className="mt-2 flex items-center gap-1.5">
+              {[0, 4, 8, 12, 16, 20].map((r) => (
+                <button
+                  key={r}
+                  type="button"
+                  onClick={() => save({ uoscAppearance: { ...settings.uoscAppearance, radius: r } })}
+                  className={`h-7 min-w-[34px] rounded-md border px-2 text-[11px] tabular-nums transition-colors ${
+                    uoscAppearance.radius === r
+                      ? 'border-accent bg-accent-soft font-semibold text-accent'
+                      : 'border-border text-dim hover:border-accent/50'
+                  }`}
+                >
+                  {r}
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 text-[11px] leading-relaxed text-faint">
+              uosc 的圆角是全局的：控制栏按钮、菜单、提示框会一起变圆。图标字体在 V1.5.2 已换成
+              <b className="text-dim">Material Symbols Rounded</b>（68 个常用图标，其余字形与 ligature 名保持不变，uosc 无需改动），
+              并把语义写不直白的几个指定成更明确的字形：选集=片库、线路=双向箭头、画质=HDR、
+              截图=屏幕快门、退出=登出。字体来源与重建脚本见
+              <code>resources/mpv-config/fonts/README.md</code>。
+            </p>
+          </div>
+
+          <div className="border-t border-border pt-3">
+            {/*
+              V1.5.2：图标大小。uosc 的图标是按按钮直径等比画的（controls_size），
+              所以调这一个值同时改变「图标观感」与点击热区，不需要换字体。
+              为什么没直接换图标字体：本版运行环境拿不到可再分发的图标字体文件（无二进制下载），
+              与其塞一个来路不明的字体，不如把 uosc 自己的 Material Symbols 调到位。
+            */}
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-xs text-text">图标大小（按钮直径）</span>
+              <span className="text-[11px] tabular-nums text-accent">{uoscAppearance.size}px</span>
+            </div>
+            <div className="mt-2 flex items-center gap-1.5">
+              {[32, 36, 42, 48, 56].map((size) => (
+                <button
+                  key={size}
+                  type="button"
+                  onClick={() => save({ uoscAppearance: { ...settings.uoscAppearance, size } })}
+                  className={`h-7 min-w-[34px] rounded-md border px-2 text-[11px] tabular-nums transition-colors ${
+                    uoscAppearance.size === size
+                      ? 'border-accent bg-accent-soft font-semibold text-accent'
+                      : 'border-border text-dim hover:border-accent/50'
+                  }`}
+                >
+                  {size}
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 text-[11px] leading-relaxed text-faint">
+              直径变大时图标同步变大、间距保持不变；42 是 V1.5.1 起的默认值。改完下一次起播生效（需重启应用才稳）。
+            </p>
+          </div>
+        </div>
+      </Card>
+
       {/*
         播放器内核（v0.2.9）：VLC 内核已整体删除，这里不再让用户选内核，
         只显示当前内核状态 —— 免得留一个「选了也没用」的开关。

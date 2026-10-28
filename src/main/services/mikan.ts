@@ -1,9 +1,9 @@
-import axios from 'axios'
 import type { DownloadTask, MikanItem, MikanSearchResult, SubUpdateCheck, Subscription } from '@shared/types'
 import { parseEpisode, parseGroup, parseResolution, humanSize } from '../lib/parse'
 import { log } from '../log'
-import { BROWSER_UA, buildProxyAgents, getSettings } from '../net'
 import { store } from '../store'
+// V1.5.2：蜜柑请求统一走 mikanHttp（请求头伪装 + 退避重试 + 单飞 + 短缓存）
+import { mikanGetText } from './mikanHttp'
 import {
   buildBangumiRssUrl,
   fetchOfficialFeed,
@@ -246,15 +246,15 @@ class MikanService {
   async search(keyword: string): Promise<MikanSearchResult> {
     try {
       const url = `${MIKAN_BASE}/RSS/Search?searchstr=${encodeURIComponent(keyword)}`
-      const res = await axios.get(url, {
-        timeout: 15000,
-        responseType: 'text',
-        headers: { 'User-Agent': BROWSER_UA },
-        ...buildProxyAgents(getSettings().proxy)
-      })
+      /*
+       * V1.5.2：改走 mikanHttp（请求头伪装 + 指数退避重试 + 单飞 + 60s 结果缓存）。
+       * 用户反馈「蜜柑搜索容易超时」：原来这里是一发定胜负的裸 axios 请求，
+       * 网络抖一下就 15 秒干等，且切页/重试会反复打同一个关键词。
+       */
+      const text = await mikanGetText(url, 'mikan')
       // RSS 解析统一走 mikanFeed.parseFeed：官方订阅 feed 与搜索 feed 的字段语义完全一致，
       // 两处各写一份解析必然漂移（历史上 guid 的 `[object Object]` 坑就出在这里）
-      return { items: parseFeed(res.data as string).map(toMikanItem) }
+      return { items: parseFeed(text).map(toMikanItem) }
     } catch (err) {
       const e = err as { message?: string }
       const msg = e?.message ?? String(err)

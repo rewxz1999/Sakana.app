@@ -11,7 +11,28 @@ import { store } from '../../store'
 import { aria2, type Aria2Progress } from './aria2'
 import { qbit, type QbitProgress } from './qbit'
 import { ensureQbitForDownload } from './qbitLauncher'
+import { transmission, type TransmissionProgress } from './transmission'
 import { maybeShowSaveHint } from '../onboarding'
+
+/** V1.5.2：三个可选下载引擎 */
+export type DownloadEngine = 'aria2' | 'qbit' | 'transmission'
+
+const ALL_ENGINES: DownloadEngine[] = ['aria2', 'qbit', 'transmission']
+
+/**
+ * 当前启用的引擎列表：单引擎 1 个；双下载器模式取用户选的两项（非法/不足回落到 aria2+qbit）。
+ * 双下载器「三选二」的语义只在这里落地，调度/轮询都按这份列表走。
+ */
+function enabledEngines(): DownloadEngine[] {
+  const s = getSettings()
+  if (!s.downloader.dual) return [s.downloader.type]
+  const picked = (s.downloader.dualEngines ?? []).filter((e): e is DownloadEngine =>
+    ALL_ENGINES.includes(e as DownloadEngine)
+  )
+  const uniq = [...new Set(picked)]
+  if (uniq.length === 2) return uniq
+  return ['aria2', 'qbit']
+}
 
 const ACTIVE_STATUSES: DownloadStatus[] = ['queued', 'parsing', 'torrent', 'downloading', 'paused', 'seeding']
 
@@ -56,6 +77,13 @@ class DownloadManager {
   private timer: NodeJS.Timeout | null = null
   /** 轮询互斥：避免上一轮未结束时又起一轮（并发 patch 同一任务） */
   private polling = false
+  /**
+   * V1.5.2：已经为「长时间 0 对端」记录过警告的任务。
+   *
+   * 用户报「经常卡在寻找做种者」——界面会给提示，但日志里没有证据无法定位是
+   * 「tracker 没 peer」还是「DHT 没响应」。这里每个任务只记一条，避免刷屏。
+   */
+  private noPeerWarned = new Set<string>()
 
   private tasks(): DownloadTask[] {
     return store.get<DownloadTask[]>('downloads', [])
@@ -140,45 +168,62 @@ class DownloadManager {
   }
 
   /** 任务实际使用的下载器（双下载器模式下任务自带 engine 标记） */
-  private engineOf(task?: DownloadTask): 'aria2' | 'qbit' {
+  private engineOf(task?: DownloadTask): DownloadEngine {
     if (task?.engine) return task.engine
     const s = getSettings()
     return s.downloader.type
   }
 
-  /** 双下载器模式：把新任务分配给当前进行中任务较少的下载器（均衡分配加速下载） */
-  private assignEngine(): 'aria2' | 'qbit' {
+  /** 双下载器模式：把新任务分配给当前进行中任务较少的引擎（均衡分配加速下载） */
+  private assignEngine(): DownloadEngine {
     const s = getSettings()
     if (!s.downloader.dual) return s.downloader.type
+    const pool = enabledEngines()
     const tasks = this.tasks()
-    const count = (e: 'aria2' | 'qbit'): number =>
+    const count = (e: DownloadEngine): number =>
       tasks.filter((t) => t.engine === e && ACTIVE_STATUSES.includes(t.status)).length
-    return count('aria2') <= count('qbit') ? 'aria2' : 'qbit'
+    // 数量相同时按 pool 顺序（默认 aria2 优先），与旧行为一致
+    return [...pool].sort((a, b) => count(a) - count(b))[0] ?? 'aria2'
   }
 
   async test(): Promise<{ ok: boolean; message: string }> {
     const s = getSettings()
     try {
       if (s.downloader.dual) {
+        const engines = enabledEngines()
         const results: string[] = []
-        try {
-          await aria2.ensureRunning()
-          results.push(`aria2 v${await aria2.getVersion()}`)
-        } catch (err) {
-          results.push(`aria2 失败: ${String((err as { message?: string })?.message ?? err)}`)
+        for (const e of engines) {
+          if (e === 'aria2') {
+            try {
+              await aria2.ensureRunning()
+              results.push(`aria2 v${await aria2.getVersion()}`)
+            } catch (err) {
+              results.push(`aria2 失败: ${String((err as { message?: string })?.message ?? err)}`)
+            }
+          } else if (e === 'qbit') {
+            try {
+              results.push(`qBittorrent ${await qbit.test()}`)
+            } catch (err) {
+              results.push(`qBittorrent 失败: ${String((err as { message?: string })?.message ?? err)}`)
+            }
+          } else {
+            const ping = await transmission.ping()
+            results.push(ping.reachable ? `Transmission ${ping.version ?? '已连接'}` : `Transmission 失败: ${ping.error}`)
+          }
         }
-        try {
-          results.push(`qBittorrent ${await qbit.test()}`)
-        } catch (err) {
-          results.push(`qBittorrent 失败: ${String((err as { message?: string })?.message ?? err)}`)
-        }
-        const allOk = results.every((r) => !r.includes('失败'))
-        return { ok: allOk, message: `双下载器：${results.join('；')}` }
+        // 双下载器模式下"有一个能用"就不算全盘失败：任务会被调度到可用的那一个
+        const okCount = results.filter((r) => !r.includes('失败')).length
+        return { ok: okCount > 0, message: `双下载器：${results.join('；')}` }
       }
       if (s.downloader.type === 'aria2') {
         await aria2.ensureRunning()
         const v = await aria2.getVersion()
         return { ok: true, message: `aria2 RPC 已连接 (v${v})` }
+      }
+      if (s.downloader.type === 'transmission') {
+        const ping = await transmission.ping()
+        if (!ping.reachable) throw new Error(ping.error ?? '连不上 Transmission')
+        return { ok: true, message: `Transmission 已连接（${ping.version ?? '未知版本'}）` }
       }
       const v = await qbit.test()
       return { ok: true, message: `qBittorrent 已连接（${v}）` }
@@ -190,7 +235,7 @@ class DownloadManager {
 
   async add(input: AddDownloadInput): Promise<DownloadTask> {
     const settings = getSettings()
-    let engine: 'aria2' | 'qbit' = settings.downloader.dual ? this.assignEngine() : settings.downloader.type
+    let engine: DownloadEngine = settings.downloader.dual ? this.assignEngine() : settings.downloader.type
     /*
      * 外部 qBittorrent 不归应用管，它没在运行的话任务一个也下不动。
      * 添加前先确认可用性（必要时弹一次授权框、由应用把它拉起来，见 qbitLauncher）：
@@ -199,8 +244,24 @@ class DownloadManager {
      */
     if (engine === 'qbit') {
       const ensured = await ensureQbitForDownload()
-      engine = ensured.engine
+      engine = ensured.engine as DownloadEngine
       if (ensured.note) log.append('info', 'download', ensured.note)
+    }
+    /*
+     * V1.5.2：Transmission 同理 —— 连不上时不能留一条 0% 的任务。
+     * 双下载器模式下自动改用 aria2；只有"仅 Transmission"模式才报错（由界面 toast 原因）。
+     */
+    if (engine === 'transmission') {
+      const ping = await transmission.ping()
+      if (!ping.reachable) {
+        const note = `Transmission 不可用（${ping.error ?? '连不上'}）`
+        if (settings.downloader.dual) {
+          log.append('warn', 'download', `${note}，本任务改用内置 aria2`)
+          engine = 'aria2'
+        } else {
+          throw new Error(`${note}：请在「下载器配置」里检查 RPC 地址/账号，或先启动 Transmission`)
+        }
+      }
     }
     const task: DownloadTask = {
       id: randomUUID(),
@@ -268,8 +329,14 @@ class DownloadManager {
     } else {
       const url = task.torrentUrl || task.magnet
       if (!url) throw new Error('资源缺少磁力链接或种子地址')
-      const hash = await qbit.add(url, dir)
-      this.patch(id, { downloaderId: hash, status: 'downloading' })
+      if (this.engineOf(task) === 'transmission') {
+        // V1.5.2：Transmission 的 torrent-add 直接吃磁力/种子 URL（不需要先下种子文件）
+        const hash = await transmission.add(url, dir)
+        this.patch(id, { downloaderId: hash, status: 'downloading' })
+      } else {
+        const hash = await qbit.add(url, dir)
+        this.patch(id, { downloaderId: hash, status: 'downloading' })
+      }
     }
   }
 
@@ -282,7 +349,9 @@ class DownloadManager {
       return false
     }
     try {
-      if (this.engineOf(task) === 'aria2') await aria2.pause(task.downloaderId)
+      const engine = this.engineOf(task)
+      if (engine === 'aria2') await aria2.pause(task.downloaderId)
+      else if (engine === 'transmission') await transmission.pause(task.downloaderId)
       else await qbit.pause(task.downloaderId)
       this.patch(id, { status: 'paused' })
       return true
@@ -301,7 +370,9 @@ class DownloadManager {
       return false
     }
     try {
-      if (this.engineOf(task) === 'aria2') await aria2.unpause(task.downloaderId)
+      const engine = this.engineOf(task)
+      if (engine === 'aria2') await aria2.unpause(task.downloaderId)
+      else if (engine === 'transmission') await transmission.resume(task.downloaderId)
       else await qbit.resume(task.downloaderId)
       this.patch(id, { status: 'downloading' })
       return true
@@ -331,7 +402,9 @@ class DownloadManager {
       if (opts.detach === false || !task.downloaderId) continue
       if (!['done', 'error'].includes(task.status)) cancelled += 1
       try {
-        if (this.engineOf(task) === 'aria2') await aria2.remove(task.downloaderId)
+        const engine = this.engineOf(task)
+        if (engine === 'aria2') await aria2.remove(task.downloaderId)
+        else if (engine === 'transmission') await transmission.remove(task.downloaderId)
         else await qbit.remove(task.downloaderId)
       } catch (err) {
         log.append('warn', 'download', `移除下载器任务失败: ${String(err)}`)
@@ -413,6 +486,56 @@ class DownloadManager {
           void this.renameDone(task)
           // 必须先落盘再同步订阅：syncSubscriptionOnDone 内部按任务列表统计未完成任务数，
           // 顺序反了会把刚完成的这个任务仍算作"进行中"，订阅状态永远停留在 updating。
+          this.patch(task.id, patch)
+          this.syncSubscriptionOnDone({ ...task, ...patch })
+        } else {
+          this.patch(task.id, patch)
+          /*
+           * V1.5.2：BT 任务 60 秒还没有任何对端 → 记一条「为什么」。
+           *
+           * 实测（本机，蜜柑 2024 年老番第 12 集）：四个不同字幕组的种子都是
+           * `CN:0 SD:0` 持续 60 秒；同机用 Ubuntu ISO 测是 44 个对端 / 8MB/s，
+           * 且 nyaatracker 返回 `0 peers`、DHT 引导节点超时 —— 说明资源确实没有做种者，
+           * 不是下载器坏了。把它写进日志，用户报「卡住」时能直接区分两种情况。
+           */
+          if (
+            (st.status === 'downloading' || st.status === 'queued') &&
+            (st.peers ?? 0) === 0 &&
+            (st.progress ?? 0) <= 0 &&
+            Date.now() - task.addedAt > 60_000 &&
+            !this.noPeerWarned.has(task.id)
+          ) {
+            this.noPeerWarned.add(task.id)
+            log.append(
+              'warn',
+              'download',
+              `BT 任务 60 秒内 0 对端（做种者 0）：${task.name}｜tracker 可能只回了空 peer 列表，且 DHT 没找到节点；` +
+                `若同类资源都能下（可用热门种子自测），说明该资源当前无做种者，建议换字幕组/等做种`
+            )
+          }
+        }
+      } else if (this.engineOf(task) === 'transmission') {
+        /*
+         * V1.5.2：Transmission 的完成判定与 qb 同口径：
+         * 做种态算完成；"下载完但被设置为停止"（percentDone=1 且 status=stopped）也算完成。
+         */
+        const st: TransmissionProgress | null = await transmission.status(task.downloaderId!)
+        if (!st) continue
+        const patch: Partial<DownloadTask> = {
+          progress: Math.round(st.progress),
+          speed: st.speed,
+          peers: st.peers,
+          seeders: st.seeders,
+          eta: st.eta,
+          size: st.size,
+          status: st.status,
+          error: st.error
+        }
+        const finished = st.status === 'seeding' || (st.progress >= 99.5 && st.status === 'paused')
+        if (finished && task.status !== 'seeding' && task.status !== 'done') {
+          patch.status = 'done'
+          patch.progress = 100
+          patch.finishedAt = Date.now()
           this.patch(task.id, patch)
           this.syncSubscriptionOnDone({ ...task, ...patch })
         } else {

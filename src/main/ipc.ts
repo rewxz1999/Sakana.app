@@ -27,6 +27,7 @@ import type {
 import type { SaveDirsInfo } from '@shared/api'
 import { safeName } from './lib/parse'
 import { log } from './log'
+import { setOfficialBangumiSource } from './services/bangumiProxy'
 import { getSettings } from './net'
 import { store } from './store'
 import { bangumi } from './services/bangumi'
@@ -113,6 +114,10 @@ import { clearFetchLog, readFetchLog } from './services/danmakuFetchLog'
 // v0.3.0：Jikan（MAL）作为角色立绘的备用数据源（带 3 次/秒、60 次/分钟节流）
 import { jikanCharactersByTitle } from './services/jikan'
 import { saveDirsInfo, setSaveDirs } from './services/saveDirs'
+// V1.5.1 本地库（下载目录扫描 / 按条目解析本地目录）
+import { localDirForSubject, scanLocalLibrary } from './services/localLibrary'
+// V1.5.2 附加在线数据源
+import { ONLINE_SOURCES, onlineEpisodes, onlineResolve, onlineSearch, onlineSourceAvailability } from './services/onlineSources'
 import { ffmpegExe, inspectMedia, startLive, startLiveUrl, stopLive } from './services/transcode'
 import {
   engineAddSubtitleFile,
@@ -162,12 +167,14 @@ import {
 import {
   galMemExtractImages,
   galMemForceRefresh,
+  galSaveRootDir,
   galMemRecent,
   galMemSaveBgm,
   galMemSavedBgm,
   galMemUnpack,
   galMemUnpackStatus
 } from './services/galgameMem'
+import { galExtractAll, galExtractPreview, galListResources } from './services/galResources'
 import {
   galListShots,
   galOverlayResize,
@@ -180,7 +187,7 @@ import {
   galToolsInit,
   galToolsSet
 } from './services/galgameTools'
-import { galSearchSites } from './services/galgameSearch'
+import { galSearchSites, galSiteList, galSiteSearchUrl } from './services/galgameSearch'
 import { statExportImage } from './services/statExport'
 import { exportCardImage } from './services/cardExport'
 import { applyStatAction, readStatData, statWatchProgressFor } from './services/statStore'
@@ -188,6 +195,10 @@ import { listStatShots, statShotsDirToOpen } from './services/statShots'
 import { maybeShowSaveHint } from './services/onboarding'
 import { ensureSaveDirs } from './services/saveDirs'
 import { clearCache, clearJunk, getCacheBytes, importShowcaseImages, pickDirectory, setCacheDir } from './services/settingsExt'
+// V1.5.1 本地缓存数据库（统计 / 立即清理 / 移除条目 / 清缓存时重置索引）
+import { cacheDbEntries, cacheDbStats, flushCacheDb, forgetSubject, pruneCacheDbNow, resetCacheDb } from './services/cacheDb'
+// V1.5.3 数据源流量监控（本次运行的内存计数）
+import { resetTraffic, trafficSnapshot } from './services/traffic'
 
 function focused(): BrowserWindow | undefined {
   // focusedOrMain 会排除离屏取数窗口：否则对话框可能被挂到一个不可见的窗口上
@@ -418,6 +429,18 @@ export function registerIpc(): void {
   })
 
   // ---------- bangumi 数据源 ----------
+  /*
+   * V1.5.1：切换数据源模式（官方直连 / 内置反代）。
+   * 两层都要改：网络层的模块级开关（立即生效）+ settings（下次启动自动应用）。
+   * 只改设置不切开关 = 用户点了没反应；只切开关不写设置 = 重启后又变回去。
+   */
+  ipcMain.handle(CH.bgmSetSource, (_e, official: boolean) => {
+    const on = official === true
+    setOfficialBangumiSource(on)
+    store.set('settings', { ...store.get<Record<string, unknown>>('settings', {}), bangumiOfficial: on })
+    log.append('info', 'startup', `数据源已切换为${on ? '官方直连' : '内置反代'}（设置页）`)
+    return { official: on }
+  })
   ipcMain.handle(CH.bgmCalendar, (_e, force?: boolean, opts?: { allowRefresh?: boolean }) =>
     bangumi.calendar(!!force, { allowRefresh: opts?.allowRefresh === true })
   )
@@ -607,6 +630,14 @@ export function registerIpc(): void {
   ipcMain.handle(CH.qbitStatus, () => qbitStatus())
   /** 手动启动：拉起 qb 并等 WebUI 就绪（失败/超时回中文原因） */
   ipcMain.handle(CH.qbitLaunch, () => launchQbitAndWait())
+  /*
+   * V1.5.2：aria2 Tracker 列表（下载器加速）。
+   *
+   * 状态是纯本地读（磁盘缓存 + 内置列表），不会因为打开设置页就联网；
+   * 「立即更新」才会拉社区列表并通过 changeGlobalOption 热更到运行中的 aria2。
+   */
+  ipcMain.handle(CH.dlTrackerStatus, () => aria2.trackerStatus())
+  ipcMain.handle(CH.dlTrackerUpdate, () => aria2.refreshTrackersNow())
 
   // ---------- 本地资源（自动推导下载目录 / 删除本地资源 / 只删下载记录） ----------
   /** 卡片上的「本地播放」先问这里：目录自动推导，不再弹文件夹选择框 */
@@ -1031,8 +1062,23 @@ export function registerIpc(): void {
     return r.file
   })
   ipcMain.handle(CH.playerDetach, () => {
-    // 异步销毁：内核的 stop/destroy 可能阻塞主进程（表现为退出播放时界面卡死）
-    setImmediate(() => engineDetach())
+    /*
+     * 异步释放（V1.5.2 起「释放」= 停播放 + 收画面，内核常驻不销毁）。
+     *
+     * 仍然放到 setImmediate：退出流程里还有关窗口等一堆事，让本帧先跑完再来收内核状态，
+     * 用户看到的是"窗口立刻回来"，而不是"点了退出先卡一下"。
+     * 顺便打一行耗时：如果哪天又出现退出卡顿，日志能直接指出是不是这一步。
+     */
+    setImmediate(() => {
+      const t = Date.now()
+      try {
+        engineDetach()
+      } catch (err) {
+        log.append('warn', 'exit', `播放器释放失败（忽略）：${String((err as Error)?.message ?? err)}`)
+      }
+      const ms = Date.now() - t
+      log.append(ms > 300 ? 'warn' : 'info', 'exit', `播放器释放完成（${ms}ms，内核常驻未销毁）`)
+    })
     return true
   })
   ipcMain.handle(CH.playerNotifyLayout, (_e, bounds?: { x: number; y: number; width: number; height: number }) => {
@@ -1435,6 +1481,41 @@ export function registerIpc(): void {
       return galMemExtractImages(String(gameId ?? ''), String(gameName ?? ''), dirname(exe), kind, limit ?? 12)
     }
   )
+  /*
+   * V1.5.2：全部提取 + 资源查看。
+   *
+   * 与旧 `galExtractImages` 的区别：
+   *   · 旧接口带 limit（默认 12），是"候选预览"时代的产物；
+   *   · 新接口**不设张数上限**（只在界面侧对 >30 张先弹确认），并把 BGM 也纳入；
+   *   · 全部只读游戏档案、只写 `<保存根目录>/<游戏名>/{立绘,cg,bgm}`。
+   */
+  ipcMain.handle(CH.galExtractPreview, (_e, exePath: string, kind: '立绘' | 'cg' | 'bgm') => {
+    const exe = String(exePath ?? '')
+    if (!exe) return { kind, candidates: 0, hint: '这款游戏没有记录 exe 路径，无法定位资源档案' }
+    return galExtractPreview(dirname(exe), kind)
+  })
+  ipcMain.handle(
+    CH.galExtractAll,
+    async (_e, exePath: string, gameName: string, kind: '立绘' | 'cg' | 'bgm') => {
+      const exe = String(exePath ?? '')
+      if (!exe) {
+        return { ok: false, kind, count: 0, candidates: 0, dir: '', error: '这款游戏没有记录 exe 路径，无法定位资源档案', skipped: 0 }
+      }
+      return galExtractAll({
+        gameDir: dirname(exe),
+        rootDir: galSaveRootDir(),
+        gameName: String(gameName ?? ''),
+        kind
+      })
+    }
+  )
+  ipcMain.handle(CH.galResources, (_e, gameId: string, gameName: string) =>
+    galListResources({
+      gameId: String(gameId ?? ''),
+      rootDir: galSaveRootDir(),
+      gameName: String(gameName ?? '')
+    })
+  )
   // V1.1：悬浮球「手动刷新」——跳过 2 秒轮询，立刻重扫当前场景（等这一轮扫完再返回，避免拿到旧值）
   ipcMain.handle(CH.galMemRefresh, async (_e, gameId?: string) => {
     const id = String(gameId ?? '') || galRunningInfo()?.gameId || ''
@@ -1447,6 +1528,9 @@ export function registerIpc(): void {
   ipcMain.handle(CH.galListShots, (_e, gameName: string) => galListShots(String(gameName ?? '')))
   // 站点搜索统计：并行查 7 个资源站，只回「数量 + 跳转链接」，绝不回传站点内容
   ipcMain.handle(CH.galSearchSites, (_e, keyword: string) => galSearchSites(String(keyword ?? '')))
+  // V1.5.2：站点清单与按站点生成搜索地址（纯本地常量，不联网）
+  ipcMain.handle(CH.galSiteList, () => galSiteList())
+  ipcMain.handle(CH.galSiteUrl, (_e, key: string, keyword: string) => galSiteSearchUrl(String(key ?? ''), String(keyword ?? '')))
   // 统计工具：导出列表为图片（自选保存位置 + 勾选要导出的字段）
   ipcMain.handle(CH.statExportImage, (_e, listId: string, opts?: StatExportOptions) =>
     statExportImage(String(listId ?? ''), opts)
@@ -1498,17 +1582,61 @@ export function registerIpc(): void {
   ipcMain.handle(CH.cacheClear, () => {
     // v1.1.4：清磁盘缓存的同时清掉主进程内存里的 L1（否则同一会话仍会读到已删除的旧数据）
     bangumi.clearMemoryCache()
+    // V1.5.1：索引也一起重置 —— 否则「清除缓存」之后索引里还留着一堆指向已删除文件的记录，
+    // 设置页会显示"有 N 部番的缓存"，但磁盘上一个字节都没有。
+    resetCacheDb()
     return clearCache()
   })
   ipcMain.handle(CH.junkClear, () => clearJunk())
-  // 自定义缓存目录：保存并 mkdir -p（'' = 恢复默认 userData/cache）
+  // 自定义缓存目录：保存并 mkdir -p（'' = 恢复默认 <数据根>/cache）
   ipcMain.handle(CH.cacheSetDir, (_e, dir: string) => setCacheDir(dir))
+  // V1.5.1 本地缓存数据库
+  ipcMain.handle(CH.cacheDbStats, () => cacheDbStats())
+  ipcMain.handle(CH.cacheDbEntries, (_e, limit?: number) => cacheDbEntries(Number(limit) || 30))
+  ipcMain.handle(CH.cacheDbPrune, () => pruneCacheDbNow())
+  ipcMain.handle(CH.cacheDbForget, (_e, id: number) => forgetSubject(Number(id)))
+  // V1.5.3：数据源流量监控（快照 / 清空）
+  ipcMain.handle(CH.trafficSnapshot, () => trafficSnapshot())
+  ipcMain.handle(CH.trafficReset, () => {
+    resetTraffic()
+    return true
+  })
   ipcMain.handle(CH.galDirsGet, () => ({ dir: galToolsGet().dir }))
   ipcMain.handle(CH.galDirsSet, (_e, dir: string) => {
     galToolsSet({ dir })
     return { dir }
   })
   ipcMain.handle(CH.pickDir, async (_e, defaultPath?: string) => pickDirectory(defaultPath))
+  ipcMain.handle(CH.libraryLocal, () => scanLocalLibrary())
+  /*
+   * V1.5.2：附加在线数据源（Apple CMS / REST / AnimePahe / AllManga）。
+   * 全部按「失败抛错 → preload 包装成 { ok:false, error }」的既有约定，界面直接 toast 原因。
+   */
+  ipcMain.handle(CH.onlineSourcesList, () => ({
+    meta: ONLINE_SOURCES,
+    availability: onlineSourceAvailability()
+  }))
+  ipcMain.handle(CH.onlineSearch, (_e, source: string, keyword: string) =>
+    onlineSearch(source as Parameters<typeof onlineSearch>[0], String(keyword ?? ''))
+  )
+  ipcMain.handle(CH.onlineEpisodes, (_e, source: string, item: unknown) =>
+    onlineEpisodes(source as Parameters<typeof onlineEpisodes>[0], item as Parameters<typeof onlineEpisodes>[1])
+  )
+  ipcMain.handle(CH.onlineResolve, (_e, source: string, item: unknown, ep: unknown) =>
+    onlineResolve(
+      source as Parameters<typeof onlineResolve>[0],
+      item as Parameters<typeof onlineResolve>[1],
+      ep as Parameters<typeof onlineResolve>[2]
+    )
+  )
+  ipcMain.handle(
+    CH.libraryLocalDir,
+    (_e, input: { subjectId?: number | null; animeTitle?: string } | null | undefined) =>
+      localDirForSubject({
+        subjectId: Number(input?.subjectId) || null,
+        animeTitle: typeof input?.animeTitle === 'string' ? input.animeTitle : ''
+      })
+  )
   ipcMain.handle(CH.saveDirsInfo, () => saveDirsInfo())
   // 保存目录改动立即生效（建目录 + 同步运行中的下载器 + 媒体白名单）
   ipcMain.handle(CH.saveDirsSet, (_e, patch: Partial<SaveDirsInfo>) => setSaveDirs(patch ?? {}))
@@ -1788,6 +1916,8 @@ export function registerIpc(): void {
   app.on('before-quit', () => {
     galgameService.shutdown()
     store.flushAll()
+    // V1.5.1：缓存索引是独立文件（不走 store），退出前必须自己落盘
+    flushCacheDb()
     galToolsCleanup()
   })
 }

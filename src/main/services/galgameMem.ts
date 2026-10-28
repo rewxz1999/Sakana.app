@@ -490,6 +490,11 @@ function galRootDir(): string {
   return join(app.getPath('userData'), 'screenshots', 'galgame')
 }
 
+/** V1.5.2：给「全部提取 / 查看资源」用的保存根目录（与截图、曲名同一套目录约定） */
+export function galSaveRootDir(): string {
+  return galRootDir()
+}
+
 export function galMemStop(gameId: string): void {
   const sess = sessions.get(gameId)
   if (!sess) return

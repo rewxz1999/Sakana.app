@@ -21,6 +21,8 @@ export const CH = {
 
   // bangumi 数据源
   bgmCalendar: 'bgm:calendar',
+  /** V1.5.1：切换数据源模式（官方直连 / 内置反代），立即生效并写回设置 */
+  bgmSetSource: 'bgm:set-source',
   bgmSubject: 'bgm:subject',
   /** v1.1.4：只读缓存的详情快照（详情页首屏先画这个，绝不联网） */
   bgmSubjectCached: 'bgm:subject-cached',
@@ -64,6 +66,24 @@ export const CH = {
   dlTest: 'dl:test',
   /** 推导某番剧的本地目录（自动用下载目录，不再让用户选文件夹） */
   dlLocalDir: 'dl:local-dir',
+  /** V1.5.2：aria2 Tracker 列表状态 / 立即更新（下载器加速） */
+  dlTrackerStatus: 'dl:tracker-status',
+  dlTrackerUpdate: 'dl:tracker-update',
+  /**
+   * V1.5.1 本地库：扫描「番剧视频资源保存文件夹」，列出已下载的番剧与集数。
+   * 纯文件系统读，不产生网络请求。
+   */
+  libraryLocal: 'library:local',
+  /** 详情页「本地播放 → 从本地库播放」：按条目/标题解析本地目录并告诉界面有没有文件 */
+  libraryLocalDir: 'library:local-dir',
+  /** V1.5.2 附加在线数据源：列表/搜索/集数/解析播放地址 */
+  onlineSourcesList: 'online:sources',
+  onlineSearch: 'online:search',
+  onlineEpisodes: 'online:episodes',
+  onlineResolve: 'online:resolve',
+  /** V1.5.3：数据源流量监控快照 / 清空（流量统计只存在本次运行的内存里） */
+  trafficSnapshot: 'traffic:snapshot',
+  trafficReset: 'traffic:reset',
   /** 删除本地资源：磁盘文件 + 对应下载记录（不可撤销） */
   dlDeleteLocal: 'dl:delete-local',
   /** 只删下载记录，不删文件（下载列表综合卡片用） */
@@ -376,6 +396,12 @@ export const CH = {
   galUnpackStatus: 'gal:unpack-status',
   /** V1.1：立绘 / CG 提取（只写自己的保存目录） */
   galExtractImages: 'gal:extract-images',
+  /** V1.5.2：全部提取预览（候选数量；>30 张由界面确认） */
+  galExtractPreview: 'gal:extract-preview',
+  /** V1.5.2：全部提取（立绘 / CG / BGM） */
+  galExtractAll: 'gal:extract-all',
+  /** V1.5.2：列出最近解包/提取的资源（在应用内查看） */
+  galResources: 'gal:resources',
   /** V1.1：手动刷新当前 BGM 识别（跳过轮询） */
   galMemRefresh: 'gal:mem-refresh',
   galRecentShots: 'gal:recent-shots',
@@ -383,6 +409,9 @@ export const CH = {
   galListShots: 'gal:list-shots',
   /** 按游戏名统计各资源站的搜索结果数量（只回数量 + 跳转链接，不回传站点内容） */
   galSearchSites: 'gal:search-sites',
+  /** V1.5.2：galgame 资源站清单（不联网）与按站点生成搜索地址 */
+  galSiteList: 'gal:site-list',
+  galSiteUrl: 'gal:site-url',
   evGal: 'ev:gal',
 
   // 统计工具（v0.2：主进程为唯一写入方——get 拉全量，apply 发一个动作，改完广播 ev:stat）
@@ -423,6 +452,11 @@ export const CH = {
   cacheClear: 'cache:clear',
   junkClear: 'cache:junk-clear',
   cacheSetDir: 'cache:set-dir',
+  // V1.5.1 本地缓存数据库：统计 / 最近条目 / 立即清理 / 移除单个条目
+  cacheDbStats: 'cache:db-stats',
+  cacheDbEntries: 'cache:db-entries',
+  cacheDbPrune: 'cache:db-prune',
+  cacheDbForget: 'cache:db-forget',
   galDirsGet: 'gal:dirs-get',
   galDirsSet: 'gal:dirs-set',
   pickDir: 'dialog:pick-dir',

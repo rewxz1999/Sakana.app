@@ -1,6 +1,7 @@
 import 'axios'
 import type { NetPriority } from '@shared/types'
 import { log } from './log'
+import { recordTraffic } from './services/traffic'
 
 export type { NetPriority }
 
@@ -231,6 +232,17 @@ export function beginNetTrace(level: NetPriority, label: string): (status: numbe
     const rec: NetTraceRecord = { level, label, ms, status, bytes, waitMs: 0, at }
     traceRecent.push(rec)
     if (traceRecent.length > TRACE_KEEP) traceRecent.splice(0, traceRecent.length - TRACE_KEEP)
+    /*
+     * 流量监控（V1.5.3）：这里拿到的是**响应体精确字节数**（调用方自己数的），
+     * 比 axios 拦截器按 Content-Length 估的更准，所以 bangumi 这条链路以这里为准，
+     * net.ts 的 axios 记账会跳过「番剧数据」类别，避免同一次请求算两遍。
+     */
+    recordTraffic({
+      source: 'bangumi',
+      bytes,
+      requests: 1,
+      errors: status === 'error' || (typeof status === 'number' && status >= 400) ? 1 : 0
+    })
     /*
      * 单条请求日志：接口标签 + 状态 + 大小 + 耗时 + 总数。
      * 只报**总在途 / 执行 / 排队**，不再出现 S/A/B 这类分级统计（分级已废弃）。

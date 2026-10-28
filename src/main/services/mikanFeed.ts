@@ -24,12 +24,13 @@
 //      `<div class="subgroup-text" id="<subgroupId>">`，其内第一个
 //      `/Home/PublishGroup/<组ID>` 链接的文本就是字幕组名。
 
-import axios from 'axios'
 import type { Subscription } from '@shared/types'
 import { XMLParser } from 'fast-xml-parser'
 import { parseEpisode, parseGroup, parseResolution, humanSize } from '../lib/parse'
 import { log } from '../log'
-import { BROWSER_UA, buildProxyAgents, getFeedBase, getSettings, setFeedBase } from '../net'
+import { getFeedBase, setFeedBase } from '../net'
+// V1.5.2：蜜柑 HTTP 统一入口（请求头伪装 / 退避重试 / 单飞 / 短缓存）
+import { mikanGetText } from './mikanHttp'
 import { matchesSubGroup, normGroup } from '@shared/subgroup'
 import { baseSearchKeyword, parseTitleSeason, sameBase } from '@shared/titleSeason'
 
@@ -71,14 +72,13 @@ export interface ResolvedSubFeed {
 // ---------------------------------------------------------------------------
 
 function getText(url: string): Promise<string> {
-  return axios
-    .get(url, {
-      timeout: 15000,
-      responseType: 'text',
-      headers: { 'User-Agent': BROWSER_UA, Accept: '*/*' },
-      ...buildProxyAgents(getSettings().proxy)
-    })
-    .then((res) => String(res.data ?? ''))
+  /*
+   * V1.5.2：统一走 mikanHttp —— 请求头伪装（Accept/Referer/Sec-Fetch-*）、
+   * 429/5xx/连接重置的指数退避重试、同一 URL 单飞、60 秒结果缓存都在那里实现。
+   * 订阅更新检测会对同一部番连发搜索页/番剧页/RSS 好几条请求，单飞 + 缓存能把
+   * 实际请求数砍掉一半以上，也正是用户要求"减少蜜柑限流"的落点。
+   */
+  return mikanGetText(url, 'mikan')
 }
 
 /**

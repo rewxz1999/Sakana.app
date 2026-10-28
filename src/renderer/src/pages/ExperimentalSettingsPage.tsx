@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { FlaskConical, RefreshCw } from 'lucide-react'
+import { RefreshCw, SlidersHorizontal } from 'lucide-react'
 import type { PlayerAssets } from '@shared/api'
 import { api } from '@/lib/api'
 import { useSettings } from '@/stores/app'
@@ -8,14 +8,15 @@ import { Button, Input } from '@/components/ui'
 import { AssetLink, Card, SubPage } from '@/components/SettingsShell'
 
 /**
- * 测试性设置（/experimental-settings，v0.3.9 新增的设置项）。
+ * 高级设置（/experimental-settings，v0.3.9 新增的设置项）。
  *
  * 用户原话：「FFmpeg 和播放器控制栏板块则放入测试性设置选项中」。
+ * V1.5.3 起页面对外改叫「高级设置」：这两块不是试用品，只是平时不用动、出问题时才来改。
  *
  * 为什么这两块适合放一起：它们的共同点是「平时不用动，出问题时才来改」——
  * FFmpeg 是转码兜底/在线流中转的可执行文件路径（正常用户用内置的那份就够），
  * 播放器控制栏则在 v1.1.4 固定成 uosc（旧自绘栏已剥离，这里只留说明，不再提供切换开关）。
- * 放在普通设置项里只会让「想调画质 / 音量」的人多滚两屏，所以单独归到「测试性」区域。
+ * 放在普通设置项里只会让「想调画质 / 音量」的人多滚两屏，所以单独归到「高级」区域。
  *
  * 设置字段 `settings.uoscControlBar` 还保留在类型里（旧 settings.json 兼容），
  * 但主进程与渲染层都已不再读它 —— 详见 shared/types.ts 的字段注释。
@@ -39,9 +40,9 @@ export function ExperimentalSettingsPage() {
 
   return (
     <SubPage
-      icon={FlaskConical}
-      title="测试性设置"
-      desc="实验性与排障用的开关：FFmpeg 路径、播放器控制栏实现。普通使用不需要改这里"
+      icon={SlidersHorizontal}
+      title="高级设置"
+      desc="进阶与排障用的选项：FFmpeg 路径、播放器控制栏实现。普通使用不需要改这里"
       maxWidth="max-w-2xl"
       actions={
         <Button size="sm" variant="outline" icon={RefreshCw} loading={checking} onClick={() => void detect()}>
@@ -102,7 +103,7 @@ export function ExperimentalSettingsPage() {
       </Card>
 
       {/* ---------------- 为什么在这里 ---------------- */}
-      <Card title="说明" desc="为什么这些项被归为「测试性」">
+      <Card title="说明" desc="为什么这些项被归为「高级」">
         <div className="text-[11px] leading-relaxed text-faint">
           1. 两者都有<b>可用性够好的默认值</b>：FFmpeg 用内置那份；控制栏从 v1.1.4 起固定用 uosc，
           不再提供切换。

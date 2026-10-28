@@ -15,6 +15,8 @@ import { CharacterGridPage } from '@/pages/CharacterGridPage'
 import { CustomHistoryPage } from '@/pages/CustomHistoryPage'
 import { SettingsPage } from '@/pages/SettingsPage'
 import { SubjectDetailPage } from '@/pages/SubjectDetailPage'
+import { LocalAnimePage } from '@/pages/LocalAnimePage'
+import { OnlineSourcesPage } from '@/pages/OnlineSourcesPage'
 import { PlayerPage } from '@/pages/PlayerPage'
 import { default as PlayerOverlayPage } from '@/pages/PlayerOverlayPage'
 import { RulesPage } from '@/pages/RulesPage'
@@ -35,6 +37,7 @@ import { ScheduleBlacklistPage } from '@/pages/ScheduleBlacklistPage'
 import { ScheduleBlocklistPage } from '@/pages/ScheduleBlocklistPage'
 // v0.3.9 补充更新：在线播放设置（加速器档位 / 实时状态 / 优化记录与对比图）独立成设置项
 import { StreamBoostSettingsPage } from '@/pages/StreamBoostSettingsPage'
+import { SniffSettingsPage } from '@/pages/SniffSettingsPage'
 // v0.3.4：番剧表设置（分级标签屏蔽 + 黑名单），从设置总览进入
 import { ScheduleSettingsPage } from '@/pages/ScheduleSettingsPage'
 import { CacheSettingsPage } from '@/pages/CacheSettingsPage'
@@ -48,6 +51,8 @@ import { UpdatePage } from '@/pages/UpdatePage'
 import { LogsPage } from '@/pages/LogsPage'
 import { AboutPage } from '@/pages/AboutPage'
 import { SaveDirsPage } from '@/pages/SaveDirsPage'
+// V1.5.3：数据源流量监控（折线图）
+import { TrafficPage } from '@/pages/TrafficPage'
 import { api } from '@/lib/api'
 import { useShell } from '@/stores/shell'
 
@@ -57,6 +62,7 @@ const SMALL_WINDOW_TITLES: Record<string, string> = {
   '/rules': '规则管理',
   '/shortcuts': '播放器快捷键',
   '/datasource': '数据源配置',
+  '/traffic': '流量监控',
   '/logs': '运行日志',
   '/about': '关于 Sakana',
   '/save-dirs': '文件保存配置',
@@ -66,8 +72,10 @@ const SMALL_WINDOW_TITLES: Record<string, string> = {
   // v0.3.9：设置项重新排布拆出的窗口
   '/playback-settings': '下载与播放',
   '/stream-boost-settings': '在线播放设置',
+  // V1.5.1：嗅探设置（多连接分段/请求头伪装/自适应 + 原来的加速模块）
+  '/sniff-settings': '嗅探设置',
   '/cast-settings': '投屏设置',
-  '/experimental-settings': '测试性设置',
+  '/experimental-settings': '高级设置',
   '/schedule-blacklist': '黑名单',
   '/schedule-blocklist': '屏蔽表',
   '/cache-settings': '缓存设置',
@@ -125,6 +133,8 @@ function AnimatedRoutes() {
         <Route path="/settings" element={<PageTransition><SettingsPage /></PageTransition>} />
         <Route path="/rules" element={<PageTransition><RulesPage /></PageTransition>} />
         <Route path="/datasource" element={<PageTransition><DataSourcePage /></PageTransition>} />
+        {/* V1.5.3：数据源流量监控（从设置 → 数据与存储进入） */}
+        <Route path="/traffic" element={<PageTransition><TrafficPage /></PageTransition>} />
         <Route path="/stattool" element={<PageTransition><StatToolPage /></PageTransition>} />
         <Route path="/shortcuts" element={<PageTransition><ShortcutsPage /></PageTransition>} />
         <Route path="/downloader-config" element={<PageTransition><DownloaderConfigPage /></PageTransition>} />
@@ -133,10 +143,12 @@ function AnimatedRoutes() {
         <Route path="/schedule-settings" element={<PageTransition><ScheduleSettingsPage /></PageTransition>} />
         <Route path="/cache-settings" element={<PageTransition><CacheSettingsPage /></PageTransition>} />
         <Route path="/danmaku-settings" element={<PageTransition><DanmakuSettingsPage /></PageTransition>} />
-        {/* v0.3.9：设置项重新排布拆出的独立设置项（下载与播放 / 投屏 / 测试性 / 黑名单 / 屏蔽表） */}
+        {/* v0.3.9：设置项重新排布拆出的独立设置项（下载与播放 / 投屏 / 高级 / 黑名单 / 屏蔽表） */}
         <Route path="/playback-settings" element={<PageTransition><PlaybackSettingsPage /></PageTransition>} />
         {/* v0.3.9 补充更新：在线播放设置（入口在设置总览「播放与下载」区域那一行） */}
         <Route path="/stream-boost-settings" element={<PageTransition><StreamBoostSettingsPage /></PageTransition>} />
+        {/* V1.5.1：嗅探设置（取代「在线播放设置」入口，原加速模块并入本页） */}
+        <Route path="/sniff-settings" element={<PageTransition><SniffSettingsPage /></PageTransition>} />
         <Route path="/cast-settings" element={<PageTransition><CastSettingsPage /></PageTransition>} />
         <Route path="/experimental-settings" element={<PageTransition><ExperimentalSettingsPage /></PageTransition>} />
         <Route path="/schedule-blacklist" element={<PageTransition><ScheduleBlacklistPage /></PageTransition>} />
@@ -150,6 +162,10 @@ function AnimatedRoutes() {
         {/* v0.2.12：独立的更新窗口（可视化进度界面，由 app.updateOpenWindow() 打开） */}
         <Route path="/update" element={<UpdatePage />} />
         <Route path="/subject/:id" element={<PageTransition><SubjectDetailPage /></PageTransition>} />
+        {/* V1.5.1：本地库条目详情（只看磁盘上已有的集，没有在线播放入口） */}
+        <Route path="/local-anime" element={<PageTransition><LocalAnimePage /></PageTransition>} />
+        {/* V1.5.2：附加在线数据源（Apple CMS / REST / AnimePahe / AllManga） */}
+        <Route path="/online-sources" element={<PageTransition><OnlineSourcesPage /></PageTransition>} />
         <Route path="/player" element={<PlayerRoute />} />
         <Route path="/overlay" element={<PlayerOverlayPage />} />
         <Route path="/tray" element={<TrayPanelPage />} />

@@ -245,12 +245,21 @@ local function update_buttons(force)
   }
 
   -- 选集 / 线路：没有剧集数据就隐藏（本地单文件播放本来就没有「集」可切）
+  --
+  -- V1.5.1 图标整理（用户反馈「控制按钮图标不够美观，看看有没有认可度高的图标」）：
+  -- 全部换成 **Material Symbols 官方图标名**（uosc 自带的就是这套字体，已确认字形都存在），
+  -- 并用"语义更直白"的换掉了几个容易看错的：
+  --   playlist_play → video_library（片库/选集，比一个播放三角更直观）
+  --   hd → swap_horiz（线路"切换"）
+  --   auto_awesome/movie_filter → hdr_on/hdr_off（画质档位，与"超分/高清"语义一致）
+  --   photo_camera → screenshot_monitor（截图，屏幕+快门，比单个相机清楚）
+  --   exit_to_app → logout（退出播放）
   ctrl_button {
-    name = 'sakana-episodes', icon = 'playlist_play', tooltip = '选集',
+    name = 'sakana-episodes', icon = 'video_library', tooltip = '选集',
     action = has_episodes and { 'menu', 'episodes' } or nil, hide = not has_episodes,
   }
   ctrl_button {
-    name = 'sakana-line', icon = 'hd', tooltip = '线路切换',
+    name = 'sakana-line', icon = 'swap_horiz', tooltip = '线路切换',
     action = #lines > 1 and { 'menu', 'lines' } or nil, hide = #lines < 2,
   }
 
@@ -303,7 +312,7 @@ local function update_buttons(force)
   local a4k_short = A4K_SHORT[a4k_mode] or a4k_mode
   ctrl_button {
     name = 'sakana-a4k',
-    icon = a4k_on and 'auto_awesome' or 'movie_filter',
+    icon = a4k_on and 'hdr_on' or 'hdr_off',
     tooltip = '画质（Anime4K 超分）：' .. (a4k_on and ('模式 ' .. a4k_short) or '已关闭'),
     action = { 'menu', 'quality' },
     badge = a4k_on and a4k_short or '关',
@@ -325,12 +334,12 @@ local function update_buttons(force)
     tooltip = '播放状态（线路 / 画质 / 缓冲 / 网络 / 丢帧 / 投屏）',
     action = { 'menu', 'status' },
   }
-  ctrl_button { name = 'sakana-snapshot', icon = 'photo_camera', tooltip = '截图', action = { 'snapshot' } }
+  ctrl_button { name = 'sakana-snapshot', icon = 'screenshot_monitor', tooltip = '截图', action = { 'snapshot' } }
   ctrl_button {
     name = 'sakana-fullscreen', icon = fullscreen and 'fullscreen_exit' or 'fullscreen',
     tooltip = fullscreen and '退出全屏' or '全屏播放', action = { 'toggle-fullscreen' }, active = fullscreen,
   }
-  ctrl_button { name = 'sakana-exit', icon = 'exit_to_app', tooltip = '退出播放', action = { 'exit' } }
+  ctrl_button { name = 'sakana-exit', icon = 'logout', tooltip = '退出播放', action = { 'exit' } }
 
   -- 按钮清单/版本写成只读属性（主进程日志与 API 自检读它）
   publish_stats()

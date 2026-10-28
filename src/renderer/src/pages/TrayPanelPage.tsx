@@ -46,7 +46,11 @@ export function TrayPanelPage() {
           <span>🐟</span>
           <span className="text-[13px] font-semibold">Sakana</span>
           <span className="text-[10px] text-faint">
-            {settings.downloader.type === 'aria2' ? 'aria2' : 'qBittorrent'}
+            {settings.downloader.type === 'aria2'
+              ? 'aria2'
+              : settings.downloader.type === 'transmission'
+                ? 'Transmission'
+                : 'qBittorrent'}
           </span>
         </div>
         <button
