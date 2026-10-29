@@ -1,8 +1,11 @@
 import { useEffect, useState } from 'react'
 import {
+  Activity,
   Archive,
   Database,
+  Download,
   FolderOpen,
+  Gamepad2,
   HardDrive,
   Image as ImageIcon,
   ListTree,
@@ -10,7 +13,7 @@ import {
   RotateCcw,
   Trash2
 } from 'lucide-react'
-import type { CacheDbStats, CacheInfo } from '@shared/api'
+import type { CacheDbStats, CacheInfo, StorageBreakdown } from '@shared/api'
 import { CACHE_TIER_LABEL, cachePolicyRows, type CacheDbEntrySummary } from '@shared/cachePolicy'
 import { api } from '@/lib/api'
 import { useSettings } from '@/stores/app'
@@ -61,6 +64,7 @@ export function CacheSettingsPage() {
   const { settings, save } = useSettings()
   const [info, setInfo] = useState<CacheInfo | null>(null)
   const [stats, setStats] = useState<CacheDbStats | null>(null)
+  const [storage, setStorage] = useState<StorageBreakdown | null>(null)
   const [entries, setEntries] = useState<CacheDbEntrySummary[]>([])
   const [busy, setBusy] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
@@ -70,11 +74,17 @@ export function CacheSettingsPage() {
 
   const refresh = async (): Promise<void> => {
     setRefreshing(true)
-    const [i, s, e] = await Promise.all([api.cache.info(), api.cache.dbStats(), api.cache.dbEntries(20)])
+    const [i, s, e, st] = await Promise.all([
+      api.cache.info(),
+      api.cache.dbStats(),
+      api.cache.dbEntries(20),
+      api.cache.storage()
+    ])
     setRefreshing(false)
     if (i.ok) setInfo(i.data)
     if (s.ok) setStats(s.data)
     if (e.ok) setEntries(e.data)
+    if (st.ok) setStorage(st.data)
   }
 
   useEffect(() => {
@@ -115,6 +125,14 @@ export function CacheSettingsPage() {
   const openDir = async (): Promise<void> => {
     if (!info?.dir) return
     const r = await api.app.openPath(info.dir)
+    if (!r.ok) toast.error(r.error)
+    else if (r.data) toast.error(r.data)
+  }
+
+  /** 打开存储占用里某一项的目录（路径由主进程给出，渲染层不自己拼） */
+  const openStorage = async (path: string): Promise<void> => {
+    if (!path) return
+    const r = await api.app.openPath(path)
     if (!r.ok) toast.error(r.error)
     else if (r.data) toast.error(r.data)
   }
@@ -206,6 +224,88 @@ export function CacheSettingsPage() {
             旧位置（老版本的 userData/cache）里的图片与条目缓存，会在启动时自动搬进新目录，不会丢。
           </p>
         </div>
+      </Card>
+
+      {/* 存储占用（V1.5.4：下载 / 截图 / galgame 解包 / 运行缓存） */}
+      <Card
+        title="存储占用"
+        desc="除本地缓存数据库之外，应用还会占用这些目录；点「打开」可直接定位"
+      >
+        {!storage ? (
+          <p className="text-[11px] text-faint">正在统计目录大小…（下载目录较大时需要几秒）</p>
+        ) : (
+          <div className="flex flex-col">
+            {(
+              [
+                {
+                  key: 'downloads' as const,
+                  label: '下载到本地的番剧',
+                  desc: '下载根目录（按番剧名分子文件夹）',
+                  icon: Download
+                },
+                {
+                  key: 'screenshots' as const,
+                  label: '番剧截图',
+                  desc: '播放器截图保存在的目录',
+                  icon: ImageIcon
+                },
+                {
+                  key: 'galgameShots' as const,
+                  label: 'Galgame 截图',
+                  desc: 'galgame 助手 / 沉浸模式截图目录',
+                  icon: Gamepad2
+                },
+                {
+                  key: 'galgameUnpack' as const,
+                  label: 'Galgame 解包数据',
+                  desc: '解包产物（立绘 / CG / 文本 / BGM）',
+                  icon: Archive
+                },
+                {
+                  key: 'runtime' as const,
+                  label: '应用运行缓存',
+                  desc: '边下边播临时媒体、弹幕临时文件与 Chromium 缓存',
+                  icon: Activity
+                }
+              ] as const
+            ).map((row) => {
+              const Icon = row.icon
+              const bytes = storage[row.key]
+              return (
+                <div key={row.key} className="flex items-center gap-3 border-t border-border py-2 first:border-t-0">
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-elev2 text-dim">
+                    <Icon size={13} />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-baseline gap-x-2">
+                      <span className="text-xs text-text">{row.label}</span>
+                      <span className="text-sm font-semibold tabular-nums text-accent">{fmtBytes(bytes)}</span>
+                    </div>
+                    <div className="mt-0.5 truncate text-[10px] text-faint" title={storage.paths[row.key]}>
+                      {row.desc} · {storage.paths[row.key] || '未配置'}
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={FolderOpen}
+                    onClick={() => void openStorage(storage.paths[row.key])}
+                  >
+                    打开
+                  </Button>
+                </div>
+              )
+            })}
+            <div className="mt-1 flex items-center justify-between border-t border-border pt-2.5 text-xs">
+              <span className="text-dim">以上五项合计</span>
+              <span className="font-semibold tabular-nums">{fmtBytes(storage.total)}</span>
+            </div>
+            <div className="mt-1 flex items-center justify-between text-[11px] text-faint">
+              <span>业务缓存（图片 / 番剧信息 / 列表）</span>
+              <span className="tabular-nums">{fmtBytes(storage.cacheRoot)}</span>
+            </div>
+          </div>
+        )}
       </Card>
 
       {/* 本地缓存数据库占用 */}

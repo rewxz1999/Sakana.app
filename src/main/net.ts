@@ -345,7 +345,16 @@ const keepAliveHttp = new http.Agent({
 
 /** 给调用方拿一份 keep-alive agent（未启用代理时用；启用了代理则走代理 agent） */
 export function buildKeepAliveAgents(): Partial<AxiosRequestConfig> {
-  return { httpAgent: keepAliveHttp, httpsAgent: keepAliveHttps }
+  /*
+   * `proxy: false` 是必须的（V1.5.4）。
+   *
+   * `systemProxyConfig()` 会把系统代理写进 `HTTP(S)_PROXY` 环境变量（给 uosc_danmaku 的 curl 用），
+   * 而 axios 1.x 默认会读这两个环境变量、再自己建一个隧道代理；
+   * 我们又显式传了 httpsAgent，于是同一条请求可能被套两层代理 ——
+   * 真机表现就是 danmu_api 的 `Client network socket disconnected before secure TLS connection was established`。
+   * 显式关掉 axios 的 env 代理，让「用哪个代理」只由 `proxyForUrl` + 这里的 agent 决定。
+   */
+  return { httpAgent: keepAliveHttp, httpsAgent: keepAliveHttps, proxy: false }
 }
 
 export interface StreamGetOptions {
@@ -523,11 +532,17 @@ export async function chromiumGetText(
  */
 let sysProxyCache: { at: number; cfg: ProxyConfig | null } | null = null
 
-export function systemProxyConfig(): ProxyConfig | null {
+export function systemProxyConfig(force = false): ProxyConfig | null {
   const now = Date.now()
-  if (sysProxyCache && now - sysProxyCache.at < 5 * 60 * 1000) return sysProxyCache.cfg
+  if (!force && sysProxyCache && now - sysProxyCache.at < 5 * 60 * 1000) return sysProxyCache.cfg
   let cfg: ProxyConfig | null = null
-  const env = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
+  /*
+   * force=true 用于「代理连接被拒」后的重新探测：此时环境变量已经被我们自己写成旧端口，
+   * 继续以 env 优先会一直拿到同一份失效配置；强制这一次只读注册表。
+   */
+  const env = force
+    ? ''
+    : process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
   const fromEnv = (raw: string): ProxyConfig | null => {
     try {
       const u = new URL(raw.includes('://') ? raw : `http://${raw}`)
@@ -644,7 +659,7 @@ export function buildProxyAgents(proxy: ProxyConfig): Partial<AxiosRequestConfig
   try {
     const agent =
       proxy.type === 'socks5' ? new SocksProxyAgent(url) : new HttpsProxyAgent(url)
-    return { httpAgent: agent, httpsAgent: agent }
+    return { httpAgent: agent, httpsAgent: agent, proxy: false }
   } catch (err) {
     console.error('[net] 代理配置无效:', err)
     return buildKeepAliveAgents()

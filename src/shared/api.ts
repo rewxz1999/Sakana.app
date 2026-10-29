@@ -1278,6 +1278,8 @@ export interface SakanaApi {
     dbPrune(): Promise<ApiResult<CacheDbPruneResult>>
     /** 忘掉单个条目（删信息 + 删图片 + 删索引），用于列表里的「移除」 */
     dbForget(id: number): Promise<ApiResult<{ info: number; images: number }>>
+    /** V1.5.4：各类存储占用（下载 / 番剧截图 / galgame 截图 / 解包数据 / 运行缓存） */
+    storage(force?: boolean): Promise<ApiResult<StorageBreakdown>>
   }
   library: {
     /** V1.5.1 本地库：扫描下载目录，返回已下载的番剧与集数（纯文件系统，不联网） */
@@ -1343,6 +1345,35 @@ export interface CacheInfo {
   bytes: number
   dir: string
   custom: boolean
+}
+
+/** 各类存储占用（V1.5.4，缓存设置里的「存储占用」卡片） */
+export interface StorageBreakdown {
+  /** 下载到本地的番剧（下载根目录） */
+  downloads: number
+  /** 番剧截图目录 */
+  screenshots: number
+  /** galgame 截图目录 */
+  galgameShots: number
+  /** galgame 解包数据（userData/cache/galgame-unpack） */
+  galgameUnpack: number
+  /** 应用运行缓存：临时媒体 / 临时文件 / Chromium 缓存 */
+  runtime: number
+  /** 业务缓存根（图片 / 条目 / 列表，即缓存数据库目录） */
+  cacheRoot: number
+  /** 前五项之和（不含 cacheRoot，后者在缓存数据库分项里单独展示） */
+  total: number
+  /** 统计时刻（同一结果缓存 30 秒） */
+  measuredAt: number
+  /** 各项对应的目录（界面上「打开」用；不包含内部地址） */
+  paths: {
+    downloads: string
+    screenshots: string
+    galgameShots: string
+    galgameUnpack: string
+    runtime: string
+    cacheRoot: string
+  }
 }
 
 /**

@@ -89,6 +89,13 @@ async function main() {
   const versionFile = JSON.parse(
     require('node:fs').readFileSync(join(__dirname, '..', 'version.json'), 'utf8')
   )
+  /**
+   * 测试版（V1.5.4）：version.json 里 `prerelease: true` 时，Release 标成预发布，
+   * 标题带「（测试版）」。这样更新器按既有的 prerelease 规则不会把它推给稳定版用户
+   * （见 services/updater.ts 对预发布版本的过滤）。
+   */
+  const isPrerelease = versionFile.prerelease === true
+  const releaseName = `Sakana ${tag}${isPrerelease ? '（测试版）' : ''}`
   const assetPath = arg('--asset', join(__dirname, '..', 'release', `Sakana-${version}-setup.exe`))
   if (!existsSync(assetPath)) throw new Error(`安装包不存在：${assetPath}（先运行 npm run dist）`)
   const assetName = basename(assetPath)
@@ -132,20 +139,20 @@ async function main() {
       body: JSON.stringify({
         tag_name: tag,
         target_commitish: 'main',
-        name: `Sakana ${tag}`,
+        name: releaseName,
         body: notes,
         draft: false,
-        prerelease: false
+        prerelease: isPrerelease
       })
     })
-    console.log(`已创建 release ${tag}（id=${release.id}）`)
-  } else if (release.body !== notes) {
-    // 复用旧 release 时把说明同步成最新的（否则补丁信息写不进去）
+    console.log(`已创建 release ${tag}（id=${release.id}${isPrerelease ? '，测试版' : ''}）`)
+  } else if (release.body !== notes || release.prerelease !== isPrerelease || release.name !== releaseName) {
+    // 复用旧 release 时同步说明与测试版标记
     release = await api(tok, `/repos/${REPO}/releases/${release.id}`, {
       method: 'PATCH',
-      body: JSON.stringify({ body: notes })
+      body: JSON.stringify({ body: notes, name: releaseName, prerelease: isPrerelease })
     })
-    console.log('已更新 release 说明')
+    console.log('已更新 release 说明 / 测试版标记')
   }
 
   // 待上传附件（顺序：安装包 → 补丁）

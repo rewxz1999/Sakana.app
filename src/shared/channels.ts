@@ -457,6 +457,8 @@ export const CH = {
   cacheDbEntries: 'cache:db-entries',
   cacheDbPrune: 'cache:db-prune',
   cacheDbForget: 'cache:db-forget',
+  /** V1.5.4：各类存储占用（下载/截图/解包/运行缓存） */
+  cacheStorage: 'cache:storage',
   galDirsGet: 'gal:dirs-get',
   galDirsSet: 'gal:dirs-set',
   pickDir: 'dialog:pick-dir',

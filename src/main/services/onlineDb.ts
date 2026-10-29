@@ -58,8 +58,8 @@ export async function onlineApiText(
 ): Promise<{ text: string; base: string } | null> {
   if (!path.startsWith('/')) return null
   for (const base of [ONLINE_API_443, ONLINE_API_8443]) {
-    // 与 bangumi 的 `/calendar` 同口径记账：在线库流量算「番剧数据」（不再走旧反代那条日志标签）
-    const done = beginNetTrace('A', path)
+    // 与 bangumi 的 `/calendar` 同口径记账：在线库流量算「番剧数据」，细分来源记 online
+    const done = beginNetTrace('A', path, 'online')
     const url = `${base}${path}`
     try {
       const res = await axios.get(url, {

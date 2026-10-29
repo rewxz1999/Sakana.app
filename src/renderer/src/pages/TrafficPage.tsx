@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, Clock3, Database, Eraser, RefreshCw } from 'lucide-react'
-import type { TrafficSnapshot, TrafficSourceId } from '@shared/types'
+import type { TrafficDetailId, TrafficSnapshot, TrafficSourceId } from '@shared/types'
 import { api } from '@/lib/api'
 import { toast } from '@/stores/app'
 import { Button } from '@/components/ui'
@@ -24,6 +24,21 @@ const SOURCE_COLOR: Record<TrafficSourceId, string> = {
   mikan: '#fbbf24',
   danmaku: '#f472b6',
   site: '#a78bfa'
+}
+
+/** 番剧数据细分来源的配色（与上面主来源区分，但保持同一色系） */
+const DETAIL_COLOR: Record<TrafficDetailId, string> = {
+  api: '#60a5fa',
+  online: '#22d3ee',
+  mirror: '#818cf8',
+  official: '#38bdf8'
+}
+
+const DETAIL_HINT: Record<TrafficDetailId, string> = {
+  api: '内置双反代或自定义 API 反代',
+  online: '在线数据库（详情 / 番剧表日历优先走它）',
+  mirror: '网页镜像站（反代不可用时的兜底）',
+  official: 'Bangumi 官方原站（直连模式）'
 }
 
 const SOURCE_HINT: Record<TrafficSourceId, string> = {
@@ -365,6 +380,7 @@ export function TrafficPage() {
     return last.totalBytes / Math.max(1, snapshot.bucketMs / 1000)
   })()
   const totalShare = Math.max(1, snapshot?.totals.bytes ?? 0)
+  const detailTotal = Math.max(1, (snapshot?.details ?? []).reduce((n, d) => n + d.bytes, 0))
 
   return (
     <SubPage
@@ -413,6 +429,54 @@ export function TrafficPage() {
           </div>
         </div>
       </div>
+
+      {/* V1.5.4：番剧数据来源细分（API 反代 / 在线库 / 镜像站 / 官方原站） */}
+      <Card
+        title="番剧数据来源"
+        desc="按实际出站请求细分流量；在线库与旧反代的流量分开看，便于判断该优化哪一条链路"
+      >
+        {snapshot ? (
+          <div className="flex flex-col">
+            {snapshot.details.map((d) => {
+              const share = (d.bytes / detailTotal) * 100
+              return (
+                <div key={d.id} className="flex items-center gap-3 border-t border-border py-2 first:border-t-0">
+                  <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: DETAIL_COLOR[d.id] }} />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-baseline gap-x-2">
+                      <span className="text-xs text-text">{d.label}</span>
+                      <span className="text-sm font-semibold tabular-nums" style={{ color: DETAIL_COLOR[d.id] }}>
+                        {fmtBytes(d.bytes)}
+                      </span>
+                      <span className="text-[10px] text-faint">{DETAIL_HINT[d.id]}</span>
+                    </div>
+                    <div className="mt-1 flex items-center gap-2">
+                      <span className="h-1 flex-1 overflow-hidden rounded-full bg-elev3">
+                        <span
+                          className="block h-full rounded-full"
+                          style={{ width: `${Math.min(100, share)}%`, background: DETAIL_COLOR[d.id] }}
+                        />
+                      </span>
+                      <span className="w-10 text-right text-[10px] tabular-nums text-faint">
+                        {d.bytes > 0 ? `${share.toFixed(1)}%` : '—'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="w-24 shrink-0 text-right text-[10px] leading-relaxed text-faint tabular-nums">
+                    <div>{d.requests.toLocaleString()} 次请求</div>
+                    {d.errors > 0 ? <div className="text-warn">{d.errors} 次失败</div> : <div>无失败</div>}
+                  </div>
+                </div>
+              )
+            })}
+            {snapshot.details.every((d) => d.requests === 0) ? (
+              <p className="pt-1 text-[10px] text-faint">还没有番剧数据请求：打开番剧表或条目详情后这里会开始统计。</p>
+            ) : null}
+          </div>
+        ) : (
+          <p className="text-[11px] text-faint">正在读取统计数据…</p>
+        )}
+      </Card>
 
       <Card
         title="流量折线"

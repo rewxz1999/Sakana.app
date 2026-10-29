@@ -4,15 +4,16 @@ import {
   Ban,
   Camera,
   Cast,
-  CirclePlay,
   CircleCheck,
   Database,
   Download,
   ExternalLink,
   FileText,
+  FlaskConical,
   FolderOpen,
   Gamepad2,
   Gauge,
+  Globe2,
   HardDrive,
   Rocket,
   Info,
@@ -22,8 +23,6 @@ import {
   MonitorPlay,
   RefreshCw,
   ScrollText,
-  ShieldOff,
-  SlidersHorizontal,
   Wifi,
   WifiOff
 } from 'lucide-react'
@@ -73,7 +72,7 @@ const UPDATE_REPO_URL = `https://github.com/${UPDATE_REPO_SLUG}`
  *
  * 为什么不在挂载时自动检查：主进程启动后 8 秒已自动检查过一次，页面再触发一次纯属浪费。
  */
-function UpdateSection({ version }: { version: string }) {
+function UpdateSection({ version, children }: { version: string; children?: React.ReactNode }) {
   // null = 本次进入设置页后还没有手动检查过（此时不展示「已是最新版本」以免误导）
   const [info, setInfo] = useState<UpdateInfo | null>(null)
   const [checking, setChecking] = useState(false)
@@ -149,8 +148,8 @@ function UpdateSection({ version }: { version: string }) {
 
   return (
     <Section
-      title="软件更新"
-      desc={`应用启动时会自动检查一次；更新包来自 GitHub Releases（${UPDATE_REPO_SLUG}），有增量补丁时只需下载变化的文件即可在应用内一键更新。`}
+      title="关于sakana"
+      desc={`软件更新、运行日志与应用信息；更新包来自 GitHub Releases（${UPDATE_REPO_SLUG}）`}
     >
       <div className="flex flex-col gap-3">
         {/* 当前版本 + 手动检查入口 */}
@@ -256,6 +255,7 @@ function UpdateSection({ version }: { version: string }) {
           </div>
         ) : null}
       </div>
+      {children ? <div className="mt-2 flex flex-col">{children}</div> : null}
     </Section>
   )
 }
@@ -291,129 +291,18 @@ export function SettingsPage() {
 
       <div className="mt-4 flex flex-col gap-4 pb-10">
         {/*
-          v0.3.9 结构性调整（用户原话：「由于播放设置中的设置项太多，我决定重新排布」）。
-          设置总览按**区域**分组，每个区域与每个入口都有一句中文说明它管什么：
+          V1.5.4 设置重排（用户指定顺序）：
+          外观 → 番剧表与过滤 → 播放 → 下载 → 嗅探规则 → 数据与存储 → 测试 → 关于sakana。
 
-          · 播放与下载：播放器设置（内核/超分/音频/画面比例/内置组件）+ 播放与下载（行为开关）
-            + 下载器配置 + 快捷键 + 规则管理。原来「快捷键」面板内嵌在播放器设置页底部，
-            现在只保留独立的「快捷键」设置项；
-          · 弹幕：弹幕设置（v0.3.9 把 B 站弹幕从播放器设置并入）
-          · 投屏：投屏设置（v0.3.9 从播放器设置拆出的独立项）
-          · 番剧表与过滤：番剧表设置 + 黑名单 + 屏蔽表（v0.3.9 把后两者从番剧表设置里拆出来，
-            整个区域**与外观分开**，不再挂在外观下面）
-          · 外观：只剩主题配色
-          · 高级：FFmpeg 与控制栏（v0.3.9 从播放器设置拆出）
+          · 播放 = 播放器（含播放行为）+ 弹幕 + 投屏 + 快捷键；原「下载与播放」页删除；
+          · 下载 = 下载器配置；嗅探规则 = 嗅探设置 + 规则管理；
+          · 屏蔽表并入「番剧表设置」，总览里不再单独占一行；
+          · 原「高级」删除，改为「测试」：FFmpeg/控制栏 + 4 个附加在线源；
+          · 网络与 Galgame 放在「数据与存储」里（都属于应用数据/保存位置）；
+          · 「关于sakana」= 软件更新 + 运行日志 + 关于（关于页本身不再放更新记录）。
 
-          注意：所有设置字段名都没动（settings.json 里仍是 ffmpegPath / uoscControlBar /
-          castStrategy / hlsAdFilter / biliDanmaku …），老用户升级后设置原样生效，只是位置变了。
+          所有设置字段名未变，老 settings.json 升级后原样生效，只是入口位置变了。
         */}
-
-        {/* 播放与下载 */}
-        <Section title="播放与下载" desc="播放内核与画质音质、播放行为、在线播放加速、下载器、快捷键与在线播放规则">
-          <div className="flex flex-col">
-            <OpenRow
-              icon={MonitorPlay}
-              title="播放器设置"
-              desc="播放内核（libmpv）、Anime4K 超分辨率、音频（音量增益/均衡器/压缩）、画面比例、内置组件"
-              onOpen={() => openSmall('/player-settings', 700, 620, '播放器设置')}
-            />
-            <RowDivider />
-            {/*
-              说明文字要点名关键功能：设置总览是唯一的入口清单，
-              清单上看不到「超分」「广告过滤」这些词，用户就会以为功能没了（v0.3.2 踩过这个坑）。
-            */}
-            <OpenRow
-              icon={CirclePlay}
-              title="下载与播放"
-              desc="播放行为开关（在线播放剔除贴片广告、截图后自动复制到剪贴板）与下载 / 缓存目录现状"
-              onOpen={() => openSmall('/playback-settings', 700, 620, '下载与播放')}
-            />
-            <RowDivider />
-            {/*
-              V1.5.1：原来的「在线播放设置」升级成「嗅探设置」——
-              用户要求「设置中增加嗅探设置，并说明采用了什么技术，原先的加速模块也放到这个设置中」。
-              入口只保留这一行，加速器的档位/实时状态/优化记录都并入那一页。
-            */}
-            <OpenRow
-              icon={Gauge}
-              title="嗅探设置"
-              desc="取流加速技术说明与开关（Range 多连接分段 / 自适应并发 / 请求头伪装），以及在线播放加速档位、实时速率与对比记录"
-              onOpen={() => openSmall('/sniff-settings', 720, 680, '嗅探设置')}
-            />
-            <RowDivider />
-            <OpenRow
-              icon={Download}
-              title="下载器配置"
-              desc="内置 aria2 / 外部 qBittorrent / 双下载器，参数与连接测试"
-              onOpen={() => openSmall('/downloader-config', 720, 600, '下载器配置')}
-            />
-            <RowDivider />
-            <OpenRow
-              icon={Keyboard}
-              title="快捷键"
-              desc="播放器的播放/暂停、快进、音量、选集、截屏、退出等键位，可逐个自定义"
-              onOpen={() => openSmall('/shortcuts', 640, 620, '快捷键')}
-            />
-            <RowDivider />
-            <OpenRow
-              icon={ScrollText}
-              title="规则管理"
-              desc="播放规则（Kazumi 风格：XPath / API），支持从 Kazumi 规则仓库导入"
-              onOpen={() => openSmall('/rules', 800, 600, '规则管理')}
-            />
-          </div>
-        </Section>
-
-        {/* 弹幕 */}
-        <Section title="弹幕" desc="弹幕显示效果、渲染方式，以及 B 站弹幕（yt-dlp + biliass）">
-          <div className="flex flex-col">
-            <OpenRow
-              icon={MessagesSquare}
-              title="弹幕设置"
-              desc="显示选项、屏蔽词、弹幕数据源（巴哈姆特 / 弹幕盒子 / 直链）、本地弹幕库管理与 B 站弹幕脚本"
-              // V1.1：加了数据源集合器与弹幕库表格，560 高度塞不下，窗口放大一档
-              onOpen={() => openSmall('/danmaku-settings', 900, 760, '弹幕设置')}
-            />
-          </div>
-        </Section>
-
-        {/* 投屏 */}
-        <Section title="投屏" desc="投到电视（DLNA）或安卓接收端，以及双端同步">
-          <div className="flex flex-col">
-            <OpenRow
-              icon={Cast}
-              title="投屏设置"
-              desc="传输策略（自动 / 直连 / 中转 / 转码）、手动连接移动端、双端同步与接收端下载"
-              onOpen={() => openSmall('/cast-settings', 700, 620, '投屏设置')}
-            />
-          </div>
-        </Section>
-
-        {/* 番剧表与过滤（v0.3.9：与外观区域分开，黑名单/屏蔽表成为独立设置项） */}
-        <Section title="番剧表与过滤" desc="番剧表这条线：屏蔽总览、按具体番剧的黑名单与按标签的屏蔽表">
-          <div className="flex flex-col">
-            <OpenRow
-              icon={ListFilter}
-              title="番剧表设置"
-              desc="本周会被屏蔽多少部、按什么原因屏蔽，以及下面两个子设置项的总览"
-              onOpen={() => openSmall('/schedule-settings', 720, 640, '番剧表设置')}
-            />
-            <RowDivider />
-            <OpenRow
-              icon={Ban}
-              title="黑名单"
-              desc="针对某一部具体番剧的屏蔽清单（优先级最高），从本周番剧表点选加入或移出"
-              onOpen={() => openSmall('/schedule-blacklist', 720, 640, '黑名单')}
-            />
-            <RowDivider />
-            <OpenRow
-              icon={ShieldOff}
-              title="屏蔽表"
-              desc="按标签 / 关键词批量屏蔽（一~三级分级标签 + 四级自定义关键词），只作用于番剧表"
-              onOpen={() => openSmall('/schedule-blocklist', 720, 640, '屏蔽表')}
-            />
-          </div>
-        </Section>
 
         {/* 外观 */}
         <Section title="外观" desc="应用整体配色方案">
@@ -440,17 +329,90 @@ export function SettingsPage() {
           </div>
         </Section>
 
-        {/* 高级 */}
-        <Section title="高级" desc="进阶与排障用的选项，普通使用不需要改（放这里是为了不干扰日常设置）">
+        {/* 番剧表与过滤 */}
+        <Section title="番剧表与过滤" desc="番剧表这条线：屏蔽总览、按具体番剧的黑名单与按标签的屏蔽表（屏蔽表在番剧表设置里）">
           <div className="flex flex-col">
             <OpenRow
-              icon={SlidersHorizontal}
-              title="高级设置"
-              desc="FFmpeg 路径（转码兜底 / 在线流中转）与播放器控制栏实现（应用控制栏 / mpv uosc）"
-              onOpen={() => openSmall('/experimental-settings', 700, 620, '高级设置')}
+              icon={ListFilter}
+              title="番剧表设置"
+              desc="本周会被屏蔽多少部、按什么原因屏蔽，以及屏蔽表 / 黑名单两个子设置"
+              onOpen={() => openSmall('/schedule-settings', 720, 640, '番剧表设置')}
+            />
+            <RowDivider />
+            <OpenRow
+              icon={Ban}
+              title="黑名单"
+              desc="针对某一部具体番剧的屏蔽清单（优先级最高），从本周番剧表点选加入或移出"
+              onOpen={() => openSmall('/schedule-blacklist', 720, 640, '黑名单')}
             />
           </div>
         </Section>
+
+        {/* 播放 */}
+        <Section title="播放" desc="播放内核与画质音质、播放行为、弹幕、投屏与快捷键">
+          <div className="flex flex-col">
+            <OpenRow
+              icon={MonitorPlay}
+              title="播放器设置"
+              desc="播放内核（libmpv）、Anime4K 超分辨率、音频、画面比例、内置组件与播放行为（贴片广告/截图复制）"
+              onOpen={() => openSmall('/player-settings', 700, 680, '播放器设置')}
+            />
+            <RowDivider />
+            <OpenRow
+              icon={MessagesSquare}
+              title="弹幕设置"
+              desc="danmu_api 弹幕的显示选项、样式、屏蔽词、获取记录、本地弹幕库与 B 站弹幕脚本"
+              onOpen={() => openSmall('/danmaku-settings', 900, 760, '弹幕设置')}
+            />
+            <RowDivider />
+            <OpenRow
+              icon={Cast}
+              title="投屏设置"
+              desc="传输策略（自动 / 直连 / 中转 / 转码）、手动连接移动端、双端同步与接收端下载"
+              onOpen={() => openSmall('/cast-settings', 700, 620, '投屏设置')}
+            />
+            <RowDivider />
+            <OpenRow
+              icon={Keyboard}
+              title="快捷键"
+              desc="播放器的播放/暂停、快进、音量、选集、截屏、退出等键位，可逐个自定义"
+              onOpen={() => openSmall('/shortcuts', 640, 620, '快捷键')}
+            />
+          </div>
+        </Section>
+
+        {/* 下载 */}
+        <Section title="下载" desc="下载器与下载行为">
+          <div className="flex flex-col">
+            <OpenRow
+              icon={Download}
+              title="下载器配置"
+              desc="内置 aria2 / 外部 qBittorrent / Transmission，参数、连接测试、Tracker 与加速选项"
+              onOpen={() => openSmall('/downloader-config', 720, 600, '下载器配置')}
+            />
+          </div>
+        </Section>
+
+        {/* 嗅探规则 */}
+        <Section title="嗅探规则" desc="取流加速与在线播放规则">
+          <div className="flex flex-col">
+            <OpenRow
+              icon={Gauge}
+              title="嗅探设置"
+              desc="取流加速技术说明与开关（Range 多连接分段 / 自适应并发 / 请求头伪装），以及加速档位与实时速率"
+              onOpen={() => openSmall('/sniff-settings', 720, 680, '嗅探设置')}
+            />
+            <RowDivider />
+            <OpenRow
+              icon={ScrollText}
+              title="规则管理"
+              desc="播放规则（Kazumi 风格：XPath / API），支持从 Kazumi 规则仓库导入"
+              onOpen={() => openSmall('/rules', 800, 600, '规则管理')}
+            />
+          </div>
+        </Section>
+
+
 
         {/* 数据与存储 */}
         <Section title="数据与存储" desc="数据源、文件保存位置与缓存目录">
@@ -479,117 +441,123 @@ export function SettingsPage() {
             <OpenRow
               icon={HardDrive}
               title="缓存设置"
-              desc={`图片 / 封面 / 条目缓存目录与清理 · 当前 ${
+              desc={`缓存数据库与存储占用（下载 / 截图 / 解包 / 运行缓存）· 当前 ${
                 cacheBytes == null ? '计算中…' : fmtBytes(cacheBytes)
               }`}
-              onOpen={() => openSmall('/cache-settings', 640, 560, '缓存设置')}
+              onOpen={() => openSmall('/cache-settings', 720, 760, '缓存设置')}
             />
-          </div>
-        </Section>
 
-        {/* Galgame */}
-        <Section title="Galgame" desc="游戏信息检测与galgame 助手">
-          <div className="flex flex-col gap-3">
-            <div className="flex items-center justify-between gap-3">
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2 text-xs text-dim">
-                  <Gamepad2 size={13} className="text-accent" />
-                  游戏信息检测
-                </div>
-                <div className="mt-0.5 text-[11px] leading-relaxed text-faint">
-                  开启后启动游戏时自动启用检测（不再弹窗询问）；通过系统读取游戏窗口标题记录进度（支线/章节），不开启则仅统计游玩时长
-                </div>
-              </div>
-              <Switch checked={settings.galgameDetect} onChange={(v) => save({ galgameDetect: v })} />
-            </div>
-            <RowDivider />
-            {/*
-              V1.5.2：内存识别 BGM / 章节已取消（用户要求从 galgame 助手中删除）。
-              这里不再提供开关；老设置文件里的 galgameMemRead 字段保留但主进程不再读取。
-            */}
-            <div className="flex items-center justify-between gap-3">
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2 text-xs text-dim">
-                  <Gamepad2 size={13} className="text-accent" />
-                  内存识别 BGM / 章节（已移除）
-                </div>
-                <div className="mt-0.5 text-[11px] leading-relaxed text-faint">
-                  V1.5.2 起不再读取游戏内存（避免扫描带来的卡顿）。解包、立绘 / CG / 文本 / 音乐提取仍在「Galgame 工具」里，
-                  走的是游戏文件与封包，不依赖内存扫描。
-                </div>
-              </div>
-              <span className="shrink-0 rounded-full bg-elev2 px-2 py-0.5 text-[10px] text-faint">已移除</span>
-            </div>
-            <RowDivider />
-            <OpenRow
-              icon={Camera}
-              title="Galgame 工具（galgame 助手）"
-              desc="游戏内截图快捷键、保存位置与悬浮拍摄按钮"
-              onOpen={() => openSmall('/galgame/tools', 680, 600, 'Galgame 工具')}
-            />
-          </div>
-        </Section>
-
-        {/* 网络 */}
-        <Section title="网络" desc="设置 HTTP / SOCKS 代理，用于访问 bangumi 主站或蜜柑计划">
-          <div className="flex flex-col gap-3">
-            <div className="flex items-center justify-between">
-              <span className="flex items-center gap-2 text-xs text-dim">
-                {settings.proxy.enabled ? <Wifi size={13} className="text-ok" /> : <WifiOff size={13} className="text-faint" />}
-                启用代理
-              </span>
-              <Switch
-                checked={settings.proxy.enabled}
-                onChange={(v) => saveDeep((s) => ({ ...s, proxy: { ...s.proxy, enabled: v } }))}
-              />
-            </div>
-            {settings.proxy.enabled ? (
-              <div className="grid grid-cols-4 gap-2.5">
-                <Select
-                  value={settings.proxy.type}
-                  onChange={(e) => saveDeep((s) => ({ ...s, proxy: { ...s.proxy, type: e.target.value as 'http' | 'socks5' } }))}
-                >
-                  <option value="http">HTTP</option>
-                  <option value="socks5">SOCKS5</option>
-                </Select>
-                <Input
-                  className="col-span-2"
-                  placeholder="主机 127.0.0.1"
-                  value={settings.proxy.host}
-                  onChange={(e) => saveDeep((s) => ({ ...s, proxy: { ...s.proxy, host: e.target.value } }))}
-                />
-                <Input
-                  type="number"
-                  placeholder="端口"
-                  value={settings.proxy.port}
-                  onChange={(e) => saveDeep((s) => ({ ...s, proxy: { ...s.proxy, port: Number(e.target.value) || 0 } }))}
+            {/* 网络（代理） */}
+            <div className="mt-3 border-t border-border pt-3">
+              <div className="flex items-center justify-between">
+                <span className="flex items-center gap-2 text-xs font-semibold text-text">
+                  {settings.proxy.enabled ? <Wifi size={13} className="text-ok" /> : <WifiOff size={13} className="text-faint" />}
+                  网络代理
+                </span>
+                <Switch
+                  checked={settings.proxy.enabled}
+                  onChange={(v) => saveDeep((s) => ({ ...s, proxy: { ...s.proxy, enabled: v } }))}
                 />
               </div>
-            ) : null}
+              <div className="mt-1 text-[11px] leading-relaxed text-faint">
+                用于访问 bangumi 主站、danmu_api 等境外服务；不开时跟随系统代理。
+              </div>
+              {settings.proxy.enabled ? (
+                <div className="mt-2 grid grid-cols-4 gap-2.5">
+                  <Select
+                    value={settings.proxy.type}
+                    onChange={(e) => saveDeep((s) => ({ ...s, proxy: { ...s.proxy, type: e.target.value as 'http' | 'socks5' } }))}
+                  >
+                    <option value="http">HTTP</option>
+                    <option value="socks5">SOCKS5</option>
+                  </Select>
+                  <Input
+                    className="col-span-2"
+                    placeholder="主机 127.0.0.1"
+                    value={settings.proxy.host}
+                    onChange={(e) => saveDeep((s) => ({ ...s, proxy: { ...s.proxy, host: e.target.value } }))}
+                  />
+                  <Input
+                    type="number"
+                    placeholder="端口"
+                    value={settings.proxy.port}
+                    onChange={(e) => saveDeep((s) => ({ ...s, proxy: { ...s.proxy, port: Number(e.target.value) || 0 } }))}
+                  />
+                </div>
+              ) : null}
+            </div>
+
+            {/* Galgame */}
+            <div className="mt-3 border-t border-border pt-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-text">
+                    <Gamepad2 size={13} className="text-accent" />
+                    Galgame 游戏信息检测
+                  </div>
+                  <div className="mt-0.5 text-[11px] leading-relaxed text-faint">
+                    开启后启动游戏时自动启用检测（不再弹窗询问）；通过系统窗口标题记录进度，不开启则仅统计游玩时长
+                  </div>
+                </div>
+                <Switch checked={settings.galgameDetect} onChange={(v) => save({ galgameDetect: v })} />
+              </div>
+              <div className="mt-2 flex items-center justify-between gap-3 border-t border-border pt-2">
+                <div className="min-w-0 flex-1">
+                  <div className="text-[11px] text-dim">内存识别 BGM / 章节（已移除）</div>
+                  <div className="mt-0.5 text-[10px] leading-relaxed text-faint">
+                    V1.5.2 起不再读取游戏内存；解包、立绘 / CG / 文本 / 音乐提取仍在 Galgame 工具里。
+                  </div>
+                </div>
+                <span className="shrink-0 rounded-full bg-elev2 px-2 py-0.5 text-[10px] text-faint">已移除</span>
+              </div>
+              <div className="mt-2 border-t border-border pt-2">
+                <OpenRow
+                  icon={Camera}
+                  title="Galgame 工具"
+                  desc="游戏内截图快捷键、保存位置与悬浮拍摄按钮"
+                  onOpen={() => openSmall('/galgame/tools', 680, 600, 'Galgame 工具')}
+                />
+              </div>
+            </div>
           </div>
         </Section>
 
-        {/* 软件更新（紧跟「诊断与关于」之上，与「关于」信息相邻） */}
-        <UpdateSection version={appVersion} />
-
-        {/* 诊断与关于 */}
-        <Section title="诊断与关于" desc="运行日志与应用信息">
+        {/* 测试 */}
+        <Section title="测试" desc="仍处于测试阶段的功能与排障选项（普通使用不需要改）">
           <div className="flex flex-col">
             <OpenRow
-              icon={FileText}
-              title="运行日志"
-              desc="网络请求失败、下载器异常等错误记录，可复制用于反馈"
-              onOpen={() => openSmall('/logs', 760, 560, '运行日志')}
+              icon={FlaskConical}
+              title="测试设置"
+              desc="FFmpeg 路径（转码兜底 / 在线流中转）与播放器控制栏实现"
+              onOpen={() => openSmall('/experimental-settings', 700, 620, '测试设置')}
             />
             <RowDivider />
             <OpenRow
-              icon={Info}
-              title="关于 Sakana"
-              desc="版本、数据来源、目录与内置组件信息"
-              onOpen={() => openSmall('/about', 620, 680, '关于 Sakana')}
+              icon={Globe2}
+              title="在线数据源"
+              desc="4 条附加在线路径（Apple CMS / 自托管 REST / AnimePahe / AllManga），可填接口与查看各源能力"
+              onOpen={() => openSmall('/online-sources', 980, 760, '在线数据源')}
             />
           </div>
         </Section>
+
+        {/* 关于sakana：软件更新 + 运行日志 + 关于 */}
+        <UpdateSection version={appVersion}>
+          <RowDivider />
+          <OpenRow
+            icon={FileText}
+            title="运行日志"
+            desc="网络请求失败、下载器异常等错误记录，可复制用于反馈"
+            onOpen={() => openSmall('/logs', 760, 560, '运行日志')}
+          />
+          <RowDivider />
+          <OpenRow
+            icon={Info}
+            title="关于 Sakana"
+            desc="版本、数据来源、目录与内置组件信息"
+            onOpen={() => openSmall('/about', 620, 680, '关于 Sakana')}
+          />
+        </UpdateSection>
 
         {/* 底部信息 */}
         <div className="flex flex-col items-center gap-1 pb-2 pt-1 text-center text-[11px] text-faint">

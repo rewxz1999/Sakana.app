@@ -405,7 +405,9 @@ const api: SakanaApi = {
     dbStats: () => call(CH.cacheDbStats),
     dbEntries: (limit) => call(CH.cacheDbEntries, limit),
     dbPrune: () => call(CH.cacheDbPrune),
-    dbForget: (id) => call(CH.cacheDbForget, id)
+    dbForget: (id) => call(CH.cacheDbForget, id),
+    // V1.5.4：下载/截图/解包/运行缓存的占用
+    storage: (force) => call(CH.cacheStorage, force)
   },
   online: {
     sources: () => call(CH.onlineSourcesList),

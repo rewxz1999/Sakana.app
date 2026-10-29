@@ -159,12 +159,24 @@ export async function fallbackCoverForSubject(subjectId: number): Promise<Fallba
       try {
         const r = await withSlot(() => withTimeout(attempt.fn(), 9000, attempt.name))
         if (r) {
-          log.append('info', 'img', `bangumi 图片多次不可用，已改用 ${r.source} 的封面（条目 #${id}）`)
+          log.appendThrottled(
+            'img-fallback-hit',
+            'info',
+            'img',
+            `bangumi 图片多次不可用，已改用 ${r.source} 的封面（条目 #${id}）`,
+            120_000
+          )
           cache.set(id, { at: Date.now(), result: r })
           return r
         }
       } catch (err) {
-        log.append('warn', 'img', `${attempt.name} 封面兜底失败（条目 #${id}）：${String((err as Error)?.message ?? err).slice(0, 90)}`)
+        log.appendThrottled(
+          `img-fallback-fail-${attempt.name}`,
+          'warn',
+          'img',
+          `${attempt.name} 封面兜底失败（条目 #${id}）：${String((err as Error)?.message ?? err).slice(0, 90)}`,
+          60_000
+        )
       }
     }
     // 负结果也缓存：避免同一部番的两三张图反复把三个源打一遍

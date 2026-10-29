@@ -1392,9 +1392,8 @@ export const DEFAULT_DANMAKU_SETTINGS: DanmakuSettings = {
   // v1.1：默认**开启**自动加载（用户要求「进播放器时启用的数据源自动开始找弹幕」），
   // 集合器一开始是空的，所以开着也不会产生任何请求 —— 用户加了源才生效。
   autoSources: true,
-  // V1.2：用户点名「默认启用巴哈姆特」。弹幕盒子只收录 2019–2021 的存档，新番基本搜不到，
-  // 所以默认只开巴哈；需要老番存档的可以自己打开弹幕盒子。
-  enabledSources: ['bahamut'],
+  // V1.5.4：外部弹幕源已全部删除，只剩 danmu_api。这里保留空数组只为兼容旧设置文件。
+  enabledSources: [],
   errorToleranceMs: 100,
   specialScale: 1,
   specialDurationSec: 4,
@@ -1426,18 +1425,22 @@ export function resolveDanmakuSettings(raw: Partial<DanmakuSettings> | undefined
     shadow: raw.shadow === true,
     blockWords: typeof raw.blockWords === 'string' ? raw.blockWords : d.blockWords,
     autoSources: raw.autoSources !== false,
-    // 集合器：只保留结构像样的条目（id/adapter 必须有，否则适配器无法执行）
-    sources: (Array.isArray(raw.sources) ? raw.sources : []).filter(
-      (s): s is DanmakuSource => !!s && typeof s.id === 'string' && typeof s.adapter === 'string'
-    ),
+    /*
+     * V1.5.4：外部弹幕源已删除（包括用户历史里配置的 E站/巴哈/弹幕盒子规则）。
+     * 不再把它们读回内存 —— 否则设置里看着"已经删了"，主进程却还留着旧配置。
+     * 字段本身保留仅为旧 settings.json 反序列化兼容。
+     */
+    sources: [],
     libraryDir: typeof raw.libraryDir === 'string' ? raw.libraryDir : '',
     /*
      * V1.2：启用弹幕源。历史设置里没有这个字段（undefined）时用默认的「巴哈姆特」；
      * 用户显式清空（[]）则尊重清空（不会每次启动又把巴哈加回来）。
      */
-    enabledSources: Array.isArray(raw.enabledSources)
-      ? raw.enabledSources.filter((s): s is DanmakuFetcherId => s === 'bahamut' || s === 'danmubox' || s === 'link')
-      : [...(d.enabledSources ?? ['bahamut'])],
+    /*
+     * V1.5.4：外部源已删除，历史设置里的 bahamut/danmubox/link 不再下发。
+     * 保留字段与空数组是为了旧 settings.json 能正常反序列化。
+     */
+    enabledSources: [],
     errorToleranceMs: Math.min(1000, Math.max(10, num(raw.errorToleranceMs, d.errorToleranceMs ?? 100))),
     specialScale: Math.min(2, Math.max(0.6, num(raw.specialScale, d.specialScale ?? 1))),
     specialDurationSec: Math.min(10, Math.max(1, num(raw.specialDurationSec, d.specialDurationSec ?? 4)))
@@ -3407,6 +3410,18 @@ export interface TrafficSourceStat {
   cacheBytes: number
 }
 
+/** 番剧数据的细分来源（V1.5.4）：API 反代 / 在线库 / 镜像站 / 官方原站 */
+export type TrafficDetailId = 'api' | 'online' | 'mirror' | 'official'
+
+/** 番剧数据按细分来源的累计值 */
+export interface TrafficDetailStat {
+  id: TrafficDetailId
+  label: string
+  requests: number
+  bytes: number
+  errors: number
+}
+
 /** 折线图的一个时间桶（默认 30 秒一桶） */
 export interface TrafficBucket {
   /** 桶起点（毫秒时间戳） */
@@ -3433,6 +3448,8 @@ export interface TrafficSnapshot {
     cacheBytes: number
   }
   sources: TrafficSourceStat[]
+  /** 番剧数据细分来源（API / 在线库 / 镜像站 / 官方），用于「番剧数据来源」模块 */
+  details: TrafficDetailStat[]
   /** 按时间升序；最后一个桶是当前这一刻 */
   series: TrafficBucket[]
 }

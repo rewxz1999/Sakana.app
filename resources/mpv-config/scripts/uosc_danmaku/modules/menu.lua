@@ -1229,6 +1229,41 @@ mp.register_script_message("setup-danmaku-style", function(query, text)
     end
 end)
 
+--[[
+ Sakana 扩展（V1.5.4）：由应用直接下发弹幕样式，不走 uosc 菜单。
+
+ 为什么需要它：应用的设置页改了字号/透明度/速度等之后，插件这边读到的还是启动时的
+ `script-opts`，而内核现在是常驻复用的（改设置不会重建 mpv 实例），于是"改了没反应"。
+ `setup-danmaku-style` 是给菜单输入框用的（只认字符串且在范围内，否则会弹菜单），
+ 不适合程序化批量下发；这里加一个直给 key/value 的入口，按插件里的真实类型写回。
+
+ 支持所有 options 表里已声明的键（fontsize / scrolltime / fixtime / opacity /
+ displayarea / outline / shadow / bold / max_screen_danmaku / merge_tolerance …）。
+ 写入后调用 load_danmaku(true, true) 重新渲染当前这一集的弹幕。
+]]
+mp.register_script_message("sakana-apply-style", function(json)
+    local event = utils.parse_json(json)
+    if event == nil then return end
+    local changed = false
+    for key, value in pairs(event) do
+        local current = options[key]
+        if current ~= nil then
+            if type(current) == "boolean" then
+                options[key] = (value == true or value == "true" or value == 1 or value == "1")
+            elseif type(current) == "number" then
+                local n = tonumber(value)
+                if n ~= nil then options[key] = n end
+            else
+                options[key] = tostring(value)
+            end
+            changed = true
+        end
+    end
+    if changed then
+        pcall(load_danmaku, true, true)
+    end
+end)
+
 mp.register_script_message('setup-danmaku-source', function(json)
     local event = utils.parse_json(json)
     if event.type == 'activate' then

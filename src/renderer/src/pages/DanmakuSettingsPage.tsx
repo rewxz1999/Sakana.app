@@ -5,6 +5,7 @@ import { DEFAULT_DANMAKU_SETTINGS, resolveDanmakuSettings } from '@shared/types'
 import { api } from '@/lib/api'
 import { useSettings, toast } from '@/stores/app'
 import { useSourceCatalog } from '@/components/danmaku/useSourceCatalog'
+import { DanmakuFetchLogCard } from '@/components/danmaku/DanmakuFetchLogCard'
 import { DanmakuLibraryCard } from '@/components/danmaku/DanmakuLibraryCard'
 import { Button, Input } from '@/components/ui'
 import { Card, SubPage } from '@/components/SettingsShell'
@@ -45,7 +46,7 @@ export function DanmakuSettingsPage() {
     <SubPage
       icon={MessageSquare}
       title="弹幕设置"
-      desc="链路：弹幕源 → 获取器 → 本地缓存 → 集成器（多源合并）→ 播放器。进播放器先查缓存，没缓存才按优先级并行请求；默认启用巴哈姆特"
+      desc="链路：danmu_api → 本地缓存 → uosc_danmaku 插件。进播放器先查缓存，没缓存才向 danmu_api 请求；请求失败/超时会写入获取记录"
       maxWidth="max-w-2xl"
       actions={
         <Button
@@ -82,7 +83,7 @@ export function DanmakuSettingsPage() {
           />
           <div className="border-t border-border pt-2.5 text-[11px] leading-relaxed text-faint">
             数据源固定为<b>你自建的 danmu_api</b>（设置里仍可填自定义地址覆盖）。获取链路是
-            「danmu_api → 本地缓存 → 注入 uosc_danmaku」，不再经过巴哈 / 弹幕盒子 / 直链这些旧接口。
+            「danmu_api → 本地缓存 → 注入 uosc_danmaku」，不再请求其他弹幕站点。
           </div>
         </div>
       </Card>
@@ -112,14 +113,14 @@ export function DanmakuSettingsPage() {
             </Pill>
           ))}
         </Row>
-        <Row label="弹幕字体大小" desc="字号（px）；顶部/底部弹幕另受「特殊弹幕调整」的倍率影响">
+        <Row label="弹幕字体大小" desc="字号（px）；顶部/底部弹幕与滚动弹幕共用同一字号">
           {[16, 18, 20, 22, 26, 30, 34].map((n) => (
             <Pill key={n} active={d.fontSize === n} onClick={() => patch({ fontSize: n })}>
               {n}
             </Pill>
           ))}
         </Row>
-        <Row label="弹幕时序" desc="弹幕相对画面的偏移（正数 = 弹幕提前出现）；两种渲染方式共用">
+        <Row label="弹幕时序" desc="弹幕相对画面的偏移（正数 = 弹幕提前出现）">
           {[-2000, -1000, -500, 0, 500, 1000, 2000].map((ms) => (
             <Pill key={ms} active={d.offsetMs === ms} onClick={() => patch({ offsetMs: ms })}>
               {ms === 0 ? '0' : `${ms > 0 ? '+' : ''}${(ms / 1000).toFixed(1)}s`}
@@ -139,6 +140,8 @@ export function DanmakuSettingsPage() {
       {/* V1.5.2：外部弹幕源与「弹幕盒子」下载已删除（统一由 danmu_api 提供）。
           保留本地弹幕库（缓存浏览/清理），它仍然对应「缓存到本地」这项能力。 */}
       <DanmakuLibraryCard catalog={catalog} />
+      {/* V1.5.4：恢复「弹幕获取记录」——之前只保留了组件、没有挂回设置页 */}
+      <DanmakuFetchLogCard />
 
       <Card title="显示" desc="影响画面上的弹幕观感（区域/速度/字号/时序在上一张卡片）">
         <Toggle label="显示弹幕" desc="关闭后完全不绘制弹幕（数据仍会匹配）" value={d.enabled} onChange={(v) => patch({ enabled: v })} />
@@ -148,17 +151,6 @@ export function DanmakuSettingsPage() {
               {n}
             </Pill>
           ))}
-        </Row>
-        <Row label="显示类型" desc="按弹幕位置分类过滤">
-          <Pill active={d.showScroll} onClick={() => patch({ showScroll: !d.showScroll })}>
-            滚动
-          </Pill>
-          <Pill active={d.showTop} onClick={() => patch({ showTop: !d.showTop })}>
-            顶部
-          </Pill>
-          <Pill active={d.showBottom} onClick={() => patch({ showBottom: !d.showBottom })}>
-            底部
-          </Pill>
         </Row>
         <Row label="不透明度">
           {[0.4, 0.6, 0.8, 0.9, 1].map((n) => (
@@ -175,23 +167,16 @@ export function DanmakuSettingsPage() {
 
       <Card
         title="详细弹幕设置"
-        desc="排障与精细控制：误差、特殊弹幕、获取器记录、缓存目录、本地弹幕查看/删除、获取规则、启用源"
+        desc="排障与精细控制：去重误差、特殊弹幕停留、获取记录与本地缓存入口"
       >
-        <Row label="弹幕误差" desc="多源合并时，时间相差多少毫秒以内算同一条（越大去重越狠；默认 100ms）">
+        <Row label="弹幕误差" desc="合并去重时，时间相差多少毫秒以内算同一条（越大去重越狠；默认 100ms）">
           {[50, 100, 200, 300, 500].map((ms) => (
             <Pill key={ms} active={d.errorToleranceMs === ms} onClick={() => patch({ errorToleranceMs: ms })}>
               {ms}ms
             </Pill>
           ))}
         </Row>
-        <div className="border-t border-border pt-2.5 text-[11px] font-medium text-dim">特殊弹幕调整</div>
-        <Row label="特殊弹幕字号" desc="顶部/底部弹幕相对普通弹幕的倍率（特殊弹幕不滚动，太大容易挡画面）">
-          {[0.8, 0.9, 1, 1.1, 1.2, 1.4].map((n) => (
-            <Pill key={n} active={Math.abs((d.specialScale ?? 1) - n) < 0.01} onClick={() => patch({ specialScale: n })}>
-              ×{n}
-            </Pill>
-          ))}
-        </Row>
+        <div className="border-t border-border pt-2.5 text-[11px] font-medium text-dim">特殊弹幕</div>
         <Row label="特殊弹幕停留" desc="顶部/底部弹幕在画面上停留几秒">
           {[2, 3, 4, 5, 6].map((n) => (
             <Pill key={n} active={d.specialDurationSec === n} onClick={() => patch({ specialDurationSec: n })}>
@@ -202,21 +187,13 @@ export function DanmakuSettingsPage() {
         {/* 下面这些是"入口说明"：真正的控件在对应的卡片里（保持一个功能只有一个实现） */}
         <div className="mt-2 flex flex-col gap-1.5 border-t border-border pt-2.5 text-[11px] leading-relaxed text-faint">
           <div>
-            <b className="text-dim">显示弹幕获取器记录</b>：见上方「显示弹幕获取器记录」卡片 —— 每次去哪个源、用什么关键词、
-            花了多久、拿到多少条/为什么没拿到，都在那里。
+            <b className="text-dim">弹幕获取记录</b>：见下方「显示弹幕获取器记录」卡片 —— 每次向 danmu_api 请求用了什么关键词、
+            花了多久、拿到多少条/为什么没拿到，都在那里；请求超时也会如实记一条。
           </div>
           <div>
-            <b className="text-dim">选择弹幕数据缓存文件夹</b> / <b className="text-dim">在应用内查看本地弹幕</b> /{' '}
-            <b className="text-dim">选择本地弹幕删除</b>：见上方「本地弹幕缓存」卡片（文件按
+            <b className="text-dim">缓存目录 / 查看本地弹幕 / 删除</b>：见「本地弹幕缓存」卡片（文件按
             <code className="mx-1 font-mono">&lt;缓存根&gt;/弹幕/&lt;番剧名&gt;/第01集-&lt;源名&gt;.xml</code>
-            存放，文件名带来源名）。
-          </div>
-          <div>
-            <b className="text-dim">为弹幕获取器添加新的弹幕规则</b>：见上方「弹幕获取规则」卡片（可加巴哈反代、
-            弹幕盒子、直链模板，并逐条真测试）。
-          </div>
-          <div>
-            <b className="text-dim">选择启用弹幕源</b>：本页最上面的「选择启用弹幕源」，默认只启用巴哈姆特动画疯。
+            存放）。
           </div>
         </div>
       </Card>
@@ -312,8 +289,9 @@ export function DanmakuSettingsPage() {
           拿到之后由应用把这一集的弹幕合并、写成 B 站格式 XML 交给插件渲染，同时写进本地缓存；
           同一集第二次播放网络请求为 0。
           <div className="mt-1.5">
-            旧的巴哈姆特 / 弹幕盒子 / 直链等获取方式已经整体删除，设置页也不再出现它们的开关
-            —— 避免"某个源失效导致弹幕时有时无"。
+            danmu_api 是唯一弹幕数据源（地址在代码里以混淆形式保存，设置里也可填自定义地址覆盖）。
+            请求走系统代理（应用代理未启用时自动探测）；单次请求超时会自动换 Chromium 网络栈再试一次，
+            仍失败会写进「弹幕获取记录」，不会再出现「界面只报超时、看不到原因」。
           </div>
         </div>
       </Card>

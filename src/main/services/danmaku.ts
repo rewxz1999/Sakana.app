@@ -11,8 +11,9 @@ import type {
 } from '@shared/types'
 import { resolveDanmakuSettings } from '@shared/types'
 import { log } from '../log'
-import { buildProxyAgents, getSettings, proxyForUrl } from '../net'
+import { buildProxyAgents, chromiumGetText, getSettings, proxyForUrl, systemProxyConfig } from '../net'
 import { readCachedSource, writeCachedSource } from './danmakuCache'
+import { appendFetchRecord } from './danmakuFetchLog'
 import { builtInDanmuApiBase } from './danmakuApiConfig'
 import { integrateDanmaku, type DanmakuBatch } from './danmakuIntegrator'
 import { progressBegin, progressDone, progressFail, progressStep } from './danmakuProgress'
@@ -53,12 +54,20 @@ const TTL_COMMENTS = 7 * 24 * 3600 * 1000
  * `/search/episodes` 与 `/bangumi/{id}` 可能现场抓源，给 10 秒 —— 但**失败就走兜底**，
  * 不再像以前那样 3 次重试 × 12 秒把一次弹幕匹配拖到半分钟。
  */
-const SEARCH_TIMEOUT_MS = 8000
-const EPISODE_TIMEOUT_MS = 10000
+/**
+ * V1.5.4：超时整体放宽一档。
+ *
+ * 真机实测（走系统代理）：danmu_api 的 `/search/anime` 冷启动要 10~11 秒，
+ * 原来的 8 秒必然超时；后续请求 1~6 秒，但偶发到 10 秒以上。
+ * 所以搜索给 20 秒、取集 15 秒、评论 25 秒 —— 宁可慢一点，也不要每次都判定失败。
+ * 15 秒还没结果时会自动换 Chromium 网络栈再试一次（见 `get`），两条栈的代理路径不同。
+ */
+const SEARCH_TIMEOUT_MS = 20000
+const EPISODE_TIMEOUT_MS = 15000
 /** 同一集最多合并多少个来源（弹幕库同一集常有 youku/bilibili/tencent 等多份） */
-const MERGE_SOURCES = 3
+const MERGE_SOURCES = 2
 /** 合并时最多等多久（毫秒）：超时先用已到的来源，慢的来源继续在后台写缓存 */
-const MERGE_DEADLINE_MS = 7000
+const MERGE_DEADLINE_MS = 12000
 /** 合并后的弹幕条数上限：避免单集几万条撑爆 IPC 与渲染 */
 const MAX_COMMENTS = 8000
 
@@ -113,18 +122,25 @@ function authHeaders(path: string): Record<string, string> {
   return headers
 }
 
-async function get<T>(path: string, timeoutMs = 12000): Promise<T> {
+async function get<T>(path: string, timeoutMs = 20000): Promise<T> {
   const url = `${baseUrl()}${path}`
+  const headers = authHeaders(path)
   /*
    * 弹幕接口会**限流**（实测并发几个请求就出现 429）。
    * 429 / 5xx 属于一过性错误，隔一会儿重试；其它错误直接抛。
    */
   let lastErr: unknown = null
+  const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const res = await axios.get<T>(url, {
         timeout: timeoutMs,
-        headers: authHeaders(path),
+        headers,
+        /*
+         * 弹幕是用户正在等的那一路，排进全局外网队列只会让它和番剧表/封面抢位置；
+         * 与播放链路的媒体请求同理，直接绕过队列。
+         */
+        netBypass: true,
         // V1.5.2：应用代理未启用时，境外接口（如 danmu_api 的 vercel 域名）自动走系统代理
         ...buildProxyAgents(proxyForUrl(url))
       })
@@ -133,8 +149,51 @@ async function get<T>(path: string, timeoutMs = 12000): Promise<T> {
       lastErr = err
       const status = (err as { response?: { status?: number } })?.response?.status ?? 0
       if (status === 429 || status >= 500) {
-        await new Promise((r) => setTimeout(r, 500 + attempt * 700))
+        // 429 给后端一点恢复时间：实测并发 3 路评论时很容易撞上，500ms 太短
+        await wait(1200 + attempt * 1800)
         continue
+      }
+      /*
+       * V1.5.4：node 这条栈超时/被重置时，换 Chromium 网络栈再试一次。
+       *
+       * 真机上的典型现象：同一个 danmu_api 地址，node + HttpsProxyAgent 冷启动 10+ 秒甚至超时，
+       * 而 Chromium（系统代理）的连接池/HTTP2 已经热了，往往一两秒就回来。
+       * 两条栈走的是同一份系统代理设置，只是 HTTP 实现不同 —— 这不是绕过网络限制。
+       * 只有「超时 / 连接重置 / 网络不可达」才换栈：404/401 这类确定性错误换栈也没用。
+       */
+      const code = String((err as { code?: string })?.code ?? '')
+      const msg = String((err as Error)?.message ?? err)
+      const retryableTransport =
+        /timeout|timed out|aborted|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|socket hang up|ERR_NETWORK|ERR_CONNECTION/i.test(
+          `${code} ${msg}`
+        )
+      /*
+       * 代理软件（Clash 等）换端口 / 重启后，进程里的 5 分钟缓存会继续指向旧端口，
+       * 表现就是 `connect ECONNREFUSED 127.0.0.1:xxxx` 一直失败。这里强制重读注册表，
+       * 探测到新地址就重试一次（应用代理是用户在设置里显式填的，不覆盖）。
+       */
+      if (/ECONNREFUSED|ECONNRESET/i.test(`${code} ${msg}`) && !getSettings().proxy.enabled && attempt === 0) {
+        const refreshed = systemProxyConfig(true)
+        if (refreshed?.enabled) {
+          log.append('info', 'danmaku', '系统代理连接被拒，已重新探测系统代理并重试')
+          await wait(400)
+          continue
+        }
+        log.append('warn', 'danmaku', '系统代理连接被拒，且系统里没有可用的代理；danmu_api 需要代理才能访问')
+      }
+      if (retryableTransport && attempt === 0) {
+        try {
+          const text = await chromiumGetText(url, Math.min(timeoutMs, 20000), headers)
+          const parsed = JSON.parse(text) as T
+          log.append('info', 'danmaku', `danmu_api 的 node 请求失败，改用 Chromium 网络栈取到数据: ${path.split('?')[0]}`)
+          return parsed
+        } catch (err2) {
+          log.append(
+            'warn',
+            'danmaku',
+            `danmu_api 的 Chromium 兜底也失败: ${String((err2 as Error)?.message ?? err2).slice(0, 100)}`
+          )
+        }
       }
       throw err
     }
@@ -651,7 +710,7 @@ export async function fetchDanmaku(episodeId: number, useCache = true): Promise<
     if (cached) return cached
   }
   const path = `/api/v2/comment/${episodeId}?withRelated=true&chConvert=0`
-  const data = await get<{ comments?: { p?: string; m?: string }[] }>(path, 20000)
+  const data = await get<{ comments?: { p?: string; m?: string }[] }>(path, 25000)
   const list = Array.isArray(data?.comments) ? data.comments : []
   const out: DanmakuComment[] = []
   for (const c of list) {
@@ -1049,10 +1108,28 @@ async function loadBuiltinBatch(
   episode: number,
   opts: DanmakuLoadOptions
 ): Promise<DanmakuBatch | null> {
+  const startedAt = Date.now()
+  /** 写一条获取记录（V1.5.4：danmu_api 是唯一数据源，记录也只记它） */
+  const record = (ok: boolean, count: number, detail: string, keyword = kw): void => {
+    appendFetchRecord({
+      at: Date.now(),
+      trigger: 'play',
+      title: kw,
+      episode,
+      sourceId: 'builtin',
+      sourceName: 'danmu_api',
+      keyword,
+      ok,
+      count,
+      ms: Date.now() - startedAt,
+      detail
+    })
+  }
   if (opts.force !== true) {
     const hit = readCachedSource(kw, episode, BUILTIN_SOURCE_NAME)
     if (hit) {
       progressDone('builtin', BUILTIN_SOURCE_NAME, 1, 1, `内置弹弹play 命中本地缓存（${hit.comments.length} 条）`)
+      record(true, hit.comments.length, `本地缓存命中（未发网络请求）`)
       return {
         sourceId: 'builtin',
         sourceName: BUILTIN_SOURCE_NAME,
@@ -1072,10 +1149,12 @@ async function loadBuiltinBatch(
   } catch (err) {
     const msg = String((err as Error)?.message ?? err)
     progressFail('builtin', BUILTIN_SOURCE_NAME, 1, 2, '内置弹弹play 取弹幕失败', msg)
+    record(false, 0, `请求失败：${msg.slice(0, 160)}`)
     throw err
   }
   if (!r || r.comments.length === 0) {
     progressFail('builtin', BUILTIN_SOURCE_NAME, 2, 2, '内置弹弹play 没有匹配到弹幕', '该番剧/集在弹弹play 弹幕库里没有条目')
+    record(false, 0, '没有匹配到该番剧/集（搜索或取集返回空）')
     return null
   }
   progressStep('builtin', BUILTIN_SOURCE_NAME, 2, 2, `正在写入内置弹幕缓存（${r.comments.length} 条）…`)
@@ -1088,6 +1167,12 @@ async function loadBuiltinBatch(
     comments: r.comments
   })
   progressDone('builtin', BUILTIN_SOURCE_NAME, 2, 2, `内置弹弹play 取到 ${r.comments.length} 条`)
+  record(
+    true,
+    r.comments.length,
+    `命中「${r.animeTitle} · ${r.episodeTitle}」${saved ? '（已写入本地缓存）' : ''}`,
+    r.matchedBy || kw
+  )
   return {
     sourceId: 'builtin',
     sourceName: BUILTIN_SOURCE_NAME,

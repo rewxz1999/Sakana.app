@@ -382,6 +382,24 @@ function isApiMirror(mirror: string): boolean {
 }
 
 /**
+ * 把一次 bangumi 请求归到「API 反代 / 镜像站 / 官方原站」（V1.5.4 流量细分）。
+ *
+ * 在线库不走这里（它有独立的 onlineApiText 记账，detail 固定为 online）。
+ * 只用于统计展示，不参与任何请求决策。
+ */
+function trafficDetailForUrl(url: string): 'api' | 'mirror' | 'official' {
+  const pool = resolveBangumiEndpoints(getSettings().bangumiCustomApi)
+  const hit = pool.find((ep) => url.startsWith(ep.baseUrl))
+  if (hit) return hit.id === 'official' ? 'official' : 'api'
+  try {
+    if (isApiHost(new URL(url).hostname)) return 'official'
+  } catch {
+    /* 解析失败按镜像处理 */
+  }
+  return 'mirror'
+}
+
+/**
  * 搜索关键词变体（v0.2.12）。
  *
  * 起因：用户搜「little busters」搜不到，但 Bangumi 网页能搜到。
@@ -933,8 +951,9 @@ class BangumiService {
      */
     const level: NetPriority = meta.priority ?? 'A'
     const label = meta.tag ?? safePathLabel(url)
+    const detail = trafficDetailForUrl(url)
     const traced = async <T>(fn: () => Promise<T>, bytesOf: (v: T) => number): Promise<T> => {
-      const done = beginNetTrace(level, label)
+      const done = beginNetTrace(level, label, detail)
       try {
         const v = await fn()
         done(200, bytesOf(v))

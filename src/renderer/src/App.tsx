@@ -29,8 +29,7 @@ import { GalgameToolsPage } from '@/pages/GalgameToolsPage'
 import { DownloadDetailPage } from '@/pages/DownloadDetailPage'
 import { DownloaderConfigPage } from '@/pages/DownloaderConfigPage'
 import { PlayerSettingsPage } from '@/pages/PlayerSettingsPage'
-// v0.3.9：设置项重新排布后新拆出的五个小窗口（设置总览里都有入口，不存在有路由没入口的孤儿页）
-import { PlaybackSettingsPage } from '@/pages/PlaybackSettingsPage'
+// v0.3.9：设置项重新排布后新拆出的几个小窗口（设置总览里都有入口，不存在有路由没入口的孤儿页）
 import { CastSettingsPage } from '@/pages/CastSettingsPage'
 import { ExperimentalSettingsPage } from '@/pages/ExperimentalSettingsPage'
 import { ScheduleBlacklistPage } from '@/pages/ScheduleBlacklistPage'
@@ -70,12 +69,12 @@ const SMALL_WINDOW_TITLES: Record<string, string> = {
   '/player-settings': '播放器设置',
   '/schedule-settings': '番剧表设置',
   // v0.3.9：设置项重新排布拆出的窗口
-  '/playback-settings': '下载与播放',
   '/stream-boost-settings': '在线播放设置',
   // V1.5.1：嗅探设置（多连接分段/请求头伪装/自适应 + 原来的加速模块）
   '/sniff-settings': '嗅探设置',
   '/cast-settings': '投屏设置',
-  '/experimental-settings': '高级设置',
+  '/experimental-settings': '测试设置',
+  '/online-sources': '在线数据源',
   '/schedule-blacklist': '黑名单',
   '/schedule-blocklist': '屏蔽表',
   '/cache-settings': '缓存设置',
@@ -143,8 +142,8 @@ function AnimatedRoutes() {
         <Route path="/schedule-settings" element={<PageTransition><ScheduleSettingsPage /></PageTransition>} />
         <Route path="/cache-settings" element={<PageTransition><CacheSettingsPage /></PageTransition>} />
         <Route path="/danmaku-settings" element={<PageTransition><DanmakuSettingsPage /></PageTransition>} />
-        {/* v0.3.9：设置项重新排布拆出的独立设置项（下载与播放 / 投屏 / 高级 / 黑名单 / 屏蔽表） */}
-        <Route path="/playback-settings" element={<PageTransition><PlaybackSettingsPage /></PageTransition>} />
+        {/* v0.3.9 拆出的独立设置项；V1.5.4 起「下载与播放」页已删除（播放行为并入播放器设置） */}
+
         {/* v0.3.9 补充更新：在线播放设置（入口在设置总览「播放与下载」区域那一行） */}
         <Route path="/stream-boost-settings" element={<PageTransition><StreamBoostSettingsPage /></PageTransition>} />
         {/* V1.5.1：嗅探设置（取代「在线播放设置」入口，原加速模块并入本页） */}

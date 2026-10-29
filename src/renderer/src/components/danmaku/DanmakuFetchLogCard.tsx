@@ -7,18 +7,15 @@ import { Card } from '@/components/SettingsShell'
 import { Badge, Button, Spinner } from '@/components/ui'
 
 /**
- * 「弹幕数据源获取记录」（V1.1.2，用户要求）。
+ * 「弹幕获取记录」（V1.1.2 新增，V1.5.4 恢复入口）。
  *
- * ## 为什么要有这一块
+ * 用户的场景是「播放时没看到弹幕，设置里也说不清到底有没有去要过」。
+ * 这条链在此之前是完全**黑**的：界面只显示"这批弹幕来自哪里"，
+ * 而"这一集到底有没有去要过、用的哪个关键词、要了多久、为什么没要到"一个都看不到。
  *
- * 用户的场景是「在设置里测试巴哈姆特，搜《败犬女主太多了》《学生会也有洞》都能搜到，
- * 但实际播放时却没看到从数据源拿到的弹幕」。数据源那条链在此之前是完全**黑**的：
- * 界面只显示"这批弹幕来自哪里"，而"这一集到底有没有去要过、用的哪个关键词、要了多久、
- * 为什么没要到"一个都看不到 —— 只能靠猜（我第一轮就猜错了方向）。
- *
- * 所以这里把每一次尝试原样列出来，尤其是**关键词**那一栏：
- * 巴哈姆特只认番剧的**日文名/繁体名**，如果记录里显示去搜的是简体中文名，
- * 那就一眼能看出问题出在"别名没带上"，而不是"源坏了"。
+ * 所以这里把每一次尝试原样列出来，尤其是**关键词 / 耗时 / 失败原因**：
+ * 现在数据源只有 danmu_api，超时是常见失败原因，记录里能直接看出是
+ * 搜不到条目、bangumi 接口失败，还是评论接口超时。
  *
  * 记录由主进程在每次加载弹幕时写入（`danmakuFetchLog.ts`），只留最近 200 条。
  * 这一块默认折叠：它是排障用的，平时不该占地方。
@@ -77,9 +74,9 @@ export function DanmakuFetchLogCard(): React.JSX.Element {
       </div>
       {!open ? (
         <div className="text-[11px] leading-relaxed text-faint">
-          播放时如果没看到数据源的弹幕，先看这里：
-          <span className="text-dim">关键词</span>那一栏如果是简体中文名，说明这次没带上日文/繁体别名
-          （巴哈姆特只认日文名与繁体名），而不是源本身有问题。
+          播放时如果没看到弹幕，先看这里：<span className="text-dim">关键词</span>是这次实际拿去搜索的词，
+          <span className="text-dim">耗时</span>能看出是不是卡在 danmu_api 的超时上，
+          <span className="text-dim">详情</span>会写清楚失败发生在搜索、取集还是评论接口。
         </div>
       ) : (
         <div className="space-y-2">
@@ -97,7 +94,7 @@ export function DanmakuFetchLogCard(): React.JSX.Element {
             </div>
           ) : records.length === 0 ? (
             <div className="py-4 text-center text-xs text-faint">
-              还没有记录。进播放器播一集，或在上面的数据源里点「测试」，这里就会出现条目。
+              还没有记录。进播放器播一集，这里就会按搜索 / 取集 / 评论三个阶段出现条目。
             </div>
           ) : (
             <div className="max-h-72 overflow-y-auto rounded-lg border border-border">

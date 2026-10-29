@@ -1,4 +1,11 @@
-import type { TrafficBucket, TrafficSnapshot, TrafficSourceId, TrafficSourceStat } from '@shared/types'
+import type {
+  TrafficBucket,
+  TrafficDetailId,
+  TrafficDetailStat,
+  TrafficSnapshot,
+  TrafficSourceId,
+  TrafficSourceStat
+} from '@shared/types'
 
 /**
  * 数据源流量监控（V1.5.3）。
@@ -36,6 +43,16 @@ export const TRAFFIC_SOURCE_LABEL: Record<TrafficSourceId, string> = {
 
 export const TRAFFIC_SOURCE_ORDER: TrafficSourceId[] = ['bangumi', 'image', 'mikan', 'danmaku', 'site']
 
+/** 番剧数据细分的显示名（V1.5.4） */
+export const TRAFFIC_DETAIL_LABEL: Record<TrafficDetailId, string> = {
+  api: 'API 反代',
+  online: '在线数据库',
+  mirror: '镜像站',
+  official: '官方原站'
+}
+
+export const TRAFFIC_DETAIL_ORDER: TrafficDetailId[] = ['api', 'online', 'mirror', 'official']
+
 interface Counter {
   requests: number
   bytes: number
@@ -63,6 +80,8 @@ function emptyBucket(at: number): TrafficBucket {
 const startedAt = Date.now()
 const totals: Counter = emptyCounter()
 const perSource = new Map<TrafficSourceId, Counter>()
+/** 番剧数据的细分来源（只统计 source=bangumi 的事件） */
+const perDetail = new Map<TrafficDetailId, Counter>()
 const buckets: TrafficBucket[] = []
 
 /** URL → 来源。由 trafficSources 在启动时注入（那边知道各数据源的真实地址，traffic 本身不碰地址） */
@@ -109,6 +128,8 @@ function ensureBuckets(now: number): TrafficBucket {
 export interface TrafficEvent {
   /** 来源；不确定时传 URL，让分类器判断 */
   source?: TrafficSourceId
+  /** 番剧数据的细分来源（可选；只有 bangumi 来源会用到） */
+  detail?: TrafficDetailId
   url?: string
   /** 本次请求实际收发的字节数（收不到就传 0，请求数照记） */
   bytes?: number
@@ -152,6 +173,17 @@ export function recordTraffic(event: TrafficEvent): void {
   totals.cacheHits += cacheHits
   totals.cacheBytes += cacheBytes
 
+  if (source === 'bangumi' && event.detail) {
+    let det = perDetail.get(event.detail)
+    if (!det) {
+      det = emptyCounter()
+      perDetail.set(event.detail, det)
+    }
+    det.requests += requests
+    det.bytes += bytes
+    det.errors += errors
+  }
+
   const bucket = ensureBuckets(now)
   bucket.bySource[source] = (bucket.bySource[source] ?? 0) + bytes
   bucket.totalBytes += bytes
@@ -173,6 +205,16 @@ export function trafficSnapshot(now = Date.now()): TrafficSnapshot {
       cacheBytes: c.cacheBytes
     }
   })
+  const details: TrafficDetailStat[] = TRAFFIC_DETAIL_ORDER.map((id) => {
+    const c = perDetail.get(id) ?? emptyCounter()
+    return {
+      id,
+      label: TRAFFIC_DETAIL_LABEL[id],
+      requests: c.requests,
+      bytes: c.bytes,
+      errors: c.errors
+    }
+  })
   return {
     startedAt,
     now,
@@ -180,6 +222,7 @@ export function trafficSnapshot(now = Date.now()): TrafficSnapshot {
     windowMs: TRAFFIC_BUCKET_MS * TRAFFIC_BUCKETS,
     totals: { ...totals },
     sources,
+    details,
     series: buckets.map((b) => ({ at: b.at, totalBytes: b.totalBytes, totalRequests: b.totalRequests, bySource: { ...b.bySource } }))
   }
 }
@@ -192,6 +235,7 @@ export function resetTraffic(): void {
   totals.cacheHits = 0
   totals.cacheBytes = 0
   perSource.clear()
+  perDetail.clear()
   buckets.length = 0
   ensureBuckets(Date.now())
 }

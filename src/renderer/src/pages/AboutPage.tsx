@@ -13,7 +13,7 @@ import appIcon from '@/assets/app-icon.png'
 import deepseekThanks from '@/assets/deepseek-1.png'
 
 /** 版本号兜底（正常情况下由主进程 app.getVersion() 提供，避免多处硬编码漂移） */
-const APP_VERSION_FALLBACK = '0.2.7'
+const APP_VERSION_FALLBACK = '1.5.4'
 
 /**
  * 项目作者（v0.2.12）。
@@ -151,7 +151,10 @@ export function AboutPage() {
           onError={onIconError}
         />
         <div className="text-base font-bold">Sakana</div>
-        <div className="text-xs text-faint">版本 v{version}</div>
+        <div className="text-xs text-faint">
+          版本 v{version}
+          <span className="ml-2 rounded-full bg-warn/15 px-1.5 py-0.5 text-[10px] text-warn">测试版</span>
+        </div>
         <div className="text-[11px] text-faint">番剧管理及播放桌面客户端</div>
         {/* 项目作者：用户要求「不需要太显眼」，所以只放一行浅色小字；未配置就整行不渲染 */}
         {PROJECT_AUTHOR ? (
@@ -159,34 +162,8 @@ export function AboutPage() {
         ) : null}
       </div>
 
-      {/* V1.5.3 更新摘要 */}
-      <Card title="V1.5.3 更新" desc="本版的主要改动（详细说明见项目交接文档）">
-        <ul className="ml-4 list-disc space-y-1 text-[11px] leading-relaxed text-dim">
-          <li>新增「数据源流量监控」：按番剧数据 / 封面图片 / 蜜柑 / 弹幕 / 站点分类统计请求数与流量，附最近 30 分钟的速率折线图（设置 → 数据与存储）。</li>
-          <li>图片跨页面复用 + 更长缓存：主进程内存 LRU + ETag/304 + 30 天浏览器缓存头；图片保留期拉长到 30 / 60 / 180 天（收藏永久）。</li>
-          <li>本地库播放第 N 集后，观看进度按真实集数 N 更新（不再用文件列表下标），本地番剧详情可标记已看集数。</li>
-          <li>番剧表改用在线库的 <code>/v0/calendar</code>（在线库不提供旧反代那个没有 <code>/v0</code> 前缀的 <code>/calendar</code> 别名）；在线库超时自动回退旧反代。</li>
-          <li>清理界面与注释里的测试性表述；在线数据源页面不再标注「实验功能」。</li>
-        </ul>
-      </Card>
-
-      {/* V1.5.2 更新摘要（用户要求更新关于页） */}
-      <Card title="V1.5.2 更新" desc="上一版的主要改动">
-        <ul className="ml-4 list-disc space-y-1 text-[11px] leading-relaxed text-dim">
-          <li>播放器：「正在加载中」挪到控制栏顶部；删除画布弹幕，只保留 uosc_danmaku（新增 60fps 平滑）；修复退出播放器偶发卡死（内核改为常驻复用）。</li>
-          <li>控制栏图标换成 Material Symbols Rounded（68 个常用图标），并可调图标大小 / 圆角 / 配色。</li>
-          <li>弹幕源：改用自建 danmu_api（地址口令已隐藏），继续保留本地缓存。</li>
-          <li>下载：aria2 按加速方案调优（连接数/分片/磁盘缓存），Tracker 列表自动更新；新增 Transmission 作为第三个引擎，双下载器支持三选二。</li>
-          <li>图片：Bangumi 图床连续失败时自动改用 AniList / Jikan / Kitsu 的封面。</li>
-          <li>在线播放：新增四条附加在线数据源（Apple CMS / 自托管 REST / AnimePahe / AllManga），入口在条目详情页「在线源」。</li>
-          <li>galgame：取消内存读取 BGM；截图更快；搜索改为“选站点 → 跳转”（默认 GalgameX）。</li>
-          <li>我的番剧库：本地库详情页复用番剧详情数据（评分/标签/简介）。</li>
-          <li>截图写入剪贴板时保留原有文本内容；修复新建推荐表「添加作品」面板不显示。</li>
-        </ul>
-      </Card>
-
       {/* 数据来源 */}
-      <Card title="数据来源" desc="番剧数据、弹幕与 galgame 数据来源">
+      <Card title="数据来源" desc="番剧数据、图片、弹幕与 galgame 数据来源（界面不显示内部地址）">
         <Row label="当前数据源">
           {mainSource}
           {customApi ? '（默认数据源）' : '（默认数据源 · 双端点分担）'}
@@ -194,15 +171,21 @@ export function AboutPage() {
         <div className="border-t border-border" />
         <Row label="镜像站数量">{mirrorCount} 个{customApi ? '（反代取不到数据时可手动切换）' : ''}</Row>
         <div className="border-t border-border" />
-        <Row label="番剧数据">Bangumi（番剧表 / 条目详情 / 搜索 / 封面图片）</Row>
+        <Row label="番剧数据">
+          Bangumi：优先在线数据库（详情 / 番剧表日历），失败回退内置双反代或自定义反代；镜像站作为兜底
+        </Row>
         <div className="border-t border-border" />
-        <Row label="图片备用源">AniList / Jikan（MyAnimeList）/ Kitsu —— 仅在 Bangumi 图片多次失败时启用</Row>
+        <Row label="封面图片">在线图床（443 优先，失败换 8443）→ 内置图片反代；连续失败时用 AniList / Jikan / Kitsu 兜底</Row>
         <div className="border-t border-border" />
-        <Row label="弹幕">自建 danmu_api（dandanplay 兼容接口）+ 本地缓存</Row>
+        <Row label="弹幕">自建 danmu_api（dandanplay 兼容接口）+ 本地缓存；只使用这一个弹幕源</Row>
         <div className="border-t border-border" />
-        <Row label="galgame 数据">月幕 galgame（ymgal.games）、VNDB</Row>
+        <Row label="附加在线源">
+          Apple CMS 采集站 / 自托管 REST / AnimePahe / AllManga（仍属测试功能，入口在「测试」设置与条目详情页）
+        </Row>
         <div className="border-t border-border" />
-        <Row label="资源站">蜜柑计划（订阅 / 下载资源）；galgame 仅提供站点跳转（默认 GalgameX）</Row>
+        <Row label="galgame 数据">月幕 galgame（ymgal.games）、VNDB；搜索只提供站点跳转</Row>
+        <div className="border-t border-border" />
+        <Row label="资源站">蜜柑计划（订阅 / 下载资源）</Row>
       </Card>
 
       {/* 目录 */}
@@ -231,17 +214,18 @@ export function AboutPage() {
 
       {/* 内置组件 */}
       <Card title="内置组件" desc="随安装包一同分发，无需额外安装">
-        <AssetItem name="libmpv（播放内核 / 默认推荐）" ok={assets?.mpv ?? null} />
-        <div className="border-t border-border" />
+        <AssetItem name="libmpv（播放内核）" ok={assets?.mpv ?? null} />
         <div className="border-t border-border" />
         <AssetItem name="FFmpeg（转码 / 在线流中转）" ok={assets?.ffmpeg ?? null} />
         <div className="border-t border-border" />
         <AssetItem name="aria2c（内置下载器 · 已调优）" ok={assets?.aria2 ?? null} />
         <div className="border-t border-border" />
-        <Row label="uosc + uosc_danmaku">随播放器配置分发（Lua，无需安装）</Row>
+        <Row label="uosc + uosc_danmaku">随播放器配置分发（Lua 控制栏 + 弹幕插件，含 Material Symbols 图标字体）</Row>
+        <div className="border-t border-border" />
+        <Row label="Anime4K 着色器">随包分发的官方 GLSL 着色器链（超分辨率 / 画质增强）</Row>
         <p className="mt-2 text-[11px] leading-relaxed text-faint">
-          未内置时可在「播放器设置」「下载器配置」中填写自行安装的路径。
-          qBittorrent / Transmission 是外部下载器，需要自行安装后通过 WebUI / RPC 连接。
+          外部组件需要自行安装：qBittorrent / Transmission（通过 WebUI / RPC 连接），
+          以及可选的 yt-dlp + biliass（B 站弹幕脚本）。设置页会给出各自的配置位置。
         </p>
       </Card>
 

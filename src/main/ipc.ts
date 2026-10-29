@@ -81,7 +81,7 @@ import {
   type CastAction
 } from './services/cast'
 import { closeRuleWebview, currentRuleWebviewGen, openRuleWebview, setRuleWebviewBounds } from './services/ruleWebview'
-import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested, mpvApplyVideoEnhance, anime4kAvailable, anime4kShaderFiles, mpvRevealUoscUi, uoscBridgeStats, mpvSendScriptMessage } from './services/mpv'
+import { mpvRuntimeAvailable, mpvSetDanmakuSource, mpvPushDanmakuFile, uoscDanmakuRequested, mpvOpenDanmakuMenu, mpvSetUoscDanmakuVisible, mpvClearUoscDanmakuSource, mpvPushDanmakuDelay, uoscDanmakuActive, mpvUoscDanmakuLoaded, mpvPluginDanmakuPending, mpvPushUoscBar, uoscControlBarActive, uoscControlBarRequested, mpvApplyVideoEnhance, mpvApplyDanmakuStyle, anime4kAvailable, anime4kShaderFiles, mpvRevealUoscUi, uoscBridgeStats, mpvSendScriptMessage } from './services/mpv'
 // v0.3.7：画面子窗口诊断（查「正在播放但没有画面」）
 import { mpvDiagnosticBounds, mpvDumpWindows, mpvHitTest, mpvInputWindowState, mpvRaiseStats, mpvSurfaceInfo } from './services/mpv'
 import { buildStreamInfo } from './services/playerInfo'
@@ -199,6 +199,8 @@ import { clearCache, clearJunk, getCacheBytes, importShowcaseImages, pickDirecto
 import { cacheDbEntries, cacheDbStats, flushCacheDb, forgetSubject, pruneCacheDbNow, resetCacheDb } from './services/cacheDb'
 // V1.5.3 数据源流量监控（本次运行的内存计数）
 import { resetTraffic, trafficSnapshot } from './services/traffic'
+// V1.5.4 存储占用（下载 / 截图 / 解包 / 运行缓存）
+import { storageBreakdown } from './services/storageUsage'
 
 function focused(): BrowserWindow | undefined {
   // focusedOrMain 会排除离屏取数窗口：否则对话框可能被挂到一个不可见的窗口上
@@ -424,6 +426,11 @@ export function registerIpc(): void {
        * `applyAudio()` 内部有指纹去重，连续拖动不会反复重建滤镜链（那会听得见断音）。
        */
       applyAudio()
+      /*
+       * V1.5.4：弹幕样式同样是运行期状态（内核常驻，插件只在加载时读一次 script-opts）。
+       * 在这里统一下发一次，用户在弹幕设置里改字号/透明度/速度能当场看到变化。
+       */
+      mpvApplyDanmakuStyle()
     }
     return true
   })
@@ -1595,6 +1602,8 @@ export function registerIpc(): void {
   ipcMain.handle(CH.cacheDbEntries, (_e, limit?: number) => cacheDbEntries(Number(limit) || 30))
   ipcMain.handle(CH.cacheDbPrune, () => pruneCacheDbNow())
   ipcMain.handle(CH.cacheDbForget, (_e, id: number) => forgetSubject(Number(id)))
+  // V1.5.4：各类存储占用（下载 / 截图 / 解包 / 运行缓存）
+  ipcMain.handle(CH.cacheStorage, (_e, force?: boolean) => storageBreakdown(force === true))
   // V1.5.3：数据源流量监控（快照 / 清空）
   ipcMain.handle(CH.trafficSnapshot, () => trafficSnapshot())
   ipcMain.handle(CH.trafficReset, () => {

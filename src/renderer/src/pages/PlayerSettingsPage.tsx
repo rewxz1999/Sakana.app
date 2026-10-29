@@ -285,13 +285,38 @@ export function PlayerSettingsPage() {
     <SubPage
       icon={MonitorPlay}
       title="播放器设置"
-      desc="播放内核、本地临时缓存（边下边播）、Anime4K 超分辨率、音频（音质调控）、画面比例与内置组件；FFmpeg 与快捷键等已拆到同区域下的其它设置项"
+      desc="播放内核、播放行为、本地临时缓存（边下边播）、Anime4K 超分辨率、音频（音质调控）、画面比例与内置组件"
       actions={
         <Button size="sm" variant="outline" icon={RefreshCw} loading={checking} onClick={() => void detect()}>
           重新检测
         </Button>
       }
     >
+      {/* 播放行为（V1.5.4 从「下载与播放」页搬入） */}
+      <Card title="播放行为" desc="只影响播放时的行为，不改画质与音质（画质/音频在下方）">
+        <div className="flex flex-col">
+          <div className="flex items-start justify-between gap-3 border-t border-border py-2.5 first:border-t-0">
+            <div className="min-w-0">
+              <div className="text-xs font-semibold text-text">在线播放剔除贴片广告</div>
+              <div className="mt-0.5 text-[11px] leading-relaxed text-faint">
+                HLS 在线播放时按分片节奏剔除贴片广告（默认开启）。只删被 #EXT-X-DISCONTINUITY 夹住的 4~60 秒短区段，
+                判据不足时完全不改、直接回源原始播放列表，不会误删正片
+              </div>
+            </div>
+            <Switch checked={settings.hlsAdFilter !== false} onChange={(v) => save({ hlsAdFilter: v })} />
+          </div>
+          <div className="flex items-start justify-between gap-3 border-t border-border py-2.5">
+            <div className="min-w-0">
+              <div className="text-xs font-semibold text-text">截图后自动复制到剪贴板</div>
+              <div className="mt-0.5 text-[11px] leading-relaxed text-faint">
+                在聊天/文档里直接 Ctrl+V 就能粘贴，同时进入 Win+V 剪贴板历史。应用会把原有文本/富文本一起写进剪贴板，
+                但截图本身仍会替换剪贴板里的图片内容
+              </div>
+            </div>
+            <Switch checked={settings.screenshotClipboard !== false} onChange={(v) => save({ screenshotClipboard: v })} />
+          </div>
+        </div>
+      </Card>
       {/*
         V1.5.1：控制栏外观（配色预设 + 圆角）。
         用户要求「控制按钮图标不够美观，看看有没有认可度高的图标」，并点名了
@@ -920,7 +945,7 @@ export function PlayerSettingsPage() {
         {/*
           ⑤ 音色响应曲线。
           v0.3.9：「截图后自动复制到剪贴板」原在本卡片最下面，但它跟音频毫无关系，
-          已搬到「下载与播放」设置项（播放/截图行为那一段）。
+          已搬到本页顶部的「播放行为」卡片（播放/截图行为）。
         */}
         <RowDivider />
         <div className="py-2">

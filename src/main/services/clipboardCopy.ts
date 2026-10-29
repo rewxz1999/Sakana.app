@@ -82,13 +82,22 @@ function looksLikeImage(buf: Buffer, mime: string): boolean {
 /** 剪贴板快照（失败时用来原样放回去） */
 interface ClipSnapshot {
   text: string
+  /**
+   * 原剪贴板的富文本格式（V1.5.4）。
+   *
+   * 只保留 `text/plain` 时，用户从浏览器复制的「带格式文字」/ 从 Word 复制的富文本
+   * 会退化成纯文本；文件列表（text/uri-list）也会整个丢掉。
+   * 这里把所有能读到的文本类 mime 原样存下来，写截图时一起放进同一个 ClipboardItem，
+   * 让粘贴方仍能按原来的格式取内容。
+   */
+  rich: Record<string, string>
   /** 用 ArrayBuffer 而不是 Uint8Array：TS 里只有 ArrayBuffer 能直接当 BlobPart */
   images: { mime: string; buffer: ArrayBuffer }[]
 }
 
-/** 把当前剪贴板内容读成"可复原"的形式（文本 + 图片字节） */
+/** 把当前剪贴板内容读成"可复原"的形式（文本 + 富文本 + 图片字节） */
 async function snapshotClipboard(): Promise<ClipSnapshot> {
-  const snap: ClipSnapshot = { text: '', images: [] }
+  const snap: ClipSnapshot = { text: '', rich: {}, images: [] }
   try {
     snap.text = await clipboard.readText()
   } catch {
@@ -98,17 +107,41 @@ async function snapshotClipboard(): Promise<ClipSnapshot> {
     const items = await clipboard.read()
     for (const it of items) {
       for (const t of it.types ?? []) {
-        if (!t.startsWith('image/')) continue
+        if (t.startsWith('image/')) {
+          try {
+            const blob = (await it.getType(t)) as Blob
+            snap.images.push({ mime: t, buffer: await blob.arrayBuffer() })
+          } catch {
+            /* 单个类型读不出来就跳过，不影响其它内容 */
+          }
+          continue
+        }
+        /*
+         * 富文本：只收字符串型 mime。跳过 text/plain（已有 snap.text）与
+         * 可能很大的未知二进制类型；HTML/RTF/URI 列表都不大。
+         */
+        if (!t.startsWith('text/') || t === 'text/plain') continue
         try {
-          const blob = (await it.getType(t)) as Blob
-          snap.images.push({ mime: t, buffer: await blob.arrayBuffer() })
+          // 不同 Electron 版本对 text/* 可能返回 string 或 Blob，这里两种都接住
+          const value = (await it.getType(t)) as unknown
+          if (typeof value === 'string' && value.length > 0 && value.length < 512 * 1024) {
+            snap.rich[t] = value
+          } else if (
+            value &&
+            typeof value === 'object' &&
+            'text' in value &&
+            typeof (value as Blob).text === 'function'
+          ) {
+            const blob = value as Blob
+            if (blob.size > 0 && blob.size < 512 * 1024) snap.rich[t] = await blob.text()
+          }
         } catch {
-          /* 单个类型读不出来就跳过，不影响其它内容 */
+          /* 单个格式读不出来就跳过 */
         }
       }
     }
   } catch {
-    /* 读不到图片就当没有 */
+    /* 读不到富文本就当没有 */
   }
   return snap
 }
@@ -153,6 +186,8 @@ async function restoreClipboard(snap: ClipSnapshot): Promise<boolean> {
      */
     const payload: Record<string, Blob | string> = {}
     if (snap.images.length > 0) payload[snap.images[0].mime] = new Blob([snap.images[0].buffer], { type: snap.images[0].mime })
+    // 富文本先放，text/plain 放最后（同一个 ClipboardItem 里多格式共存）
+    for (const [mime, value] of Object.entries(snap.rich)) payload[mime] = value
     if (snap.text) payload['text/plain'] = snap.text
     if (Object.keys(payload).length === 0) {
       // 原来本来就是空的：那"清空"就不是我们造成的，无需复原
@@ -230,7 +265,17 @@ export async function copyImageToClipboard(file: string): Promise<ClipboardCopyR
      * 原本没有文本时才退回写文件名（否则只接受文本的粘贴目标会毫无反应）。
      */
     const keepText = snap.text && snap.text !== name ? snap.text : name
-    await clipboard.write([new ClipboardItem({ [mime]: blob, 'text/plain': keepText })])
+    /*
+     * V1.5.4：把原剪贴板的富文本格式也放进同一个 ClipboardItem。
+     *
+     * 上一版只保留了纯文本：如果用户复制的是网页里的**带格式文字**或文件列表，
+     * 截图后粘贴出来会变成裸文本（文件列表甚至直接没了），看起来就像"剪贴板被清空"。
+     * 现在 text/html、text/rtf、text/uri-list 等原样带过去；图片与文本仍然一次原子写入。
+     */
+    const payload: Record<string, Blob | string> = { [mime]: blob }
+    for (const [m, value] of Object.entries(snap.rich)) payload[m] = value
+    payload['text/plain'] = keepText
+    await clipboard.write([new ClipboardItem(payload)])
     if (!(await readBackHasImage())) {
       // 图片没真的进去（被静默丢弃）→ 把用户原来的内容放回去，再报失败
       const restored = await restoreClipboard(snap)

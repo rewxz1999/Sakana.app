@@ -1,5 +1,5 @@
 import 'axios'
-import type { NetPriority } from '@shared/types'
+import type { NetPriority, TrafficDetailId } from '@shared/types'
 import { log } from './log'
 import { recordTraffic } from './services/traffic'
 
@@ -220,7 +220,11 @@ export function netConcurrency(): number {
  * `label` 只能是**不含主机名**的接口标识；调用方负责（日志里也还有一层 maskLogText 兜底）。
  * 第一个参数仅为兼容旧调用点保留，**不参与日志**。
  */
-export function beginNetTrace(level: NetPriority, label: string): (status: number | 'error', bytes?: number) => void {
+export function beginNetTrace(
+  level: NetPriority,
+  label: string,
+  detail?: TrafficDetailId
+): (status: number | 'error', bytes?: number) => void {
   const at = Date.now()
   traceActive += 1
   let done = false
@@ -239,6 +243,7 @@ export function beginNetTrace(level: NetPriority, label: string): (status: numbe
      */
     recordTraffic({
       source: 'bangumi',
+      detail,
       bytes,
       requests: 1,
       errors: status === 'error' || (typeof status === 'number' && status >= 400) ? 1 : 0

@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { CH } from '@shared/channels'
 import type { OverlayAction } from '@shared/api'
 import type { DanmakuSettings } from '@shared/types'
+import { resolveDanmakuSettings } from '@shared/types'
 import { anime4kChain } from '@shared/anime4k'
 import { themePalette, resolveThemeId } from '@shared/themePalette'
 import { buildUoscColorLine, renderUoscConf, resolveUoscAppearance, type UoscAppearance } from '@shared/uoscTheme'
@@ -1930,6 +1931,22 @@ function uoscScriptOpts(): string {
     if (typeof d.maxCount === 'number' && d.maxCount > 0) opts.push(`uosc_danmaku-max_screen_danmaku=${d.maxCount}`)
     if (typeof d.speedSec === 'number' && d.speedSec > 0) opts.push(`uosc_danmaku-scrolltime=${d.speedSec}`)
     if (typeof d.area === 'number') opts.push(`uosc_danmaku-displayarea=${clamp01(d.area)}`)
+    /*
+     * V1.5.4：补齐之前漏掉的样式项。
+     *
+     * 之前只有 opacity / fontsize / max / scrolltime / displayarea 五项走 script-opts，
+     * 加粗、描边、阴影、特殊弹幕停留、去重误差改完不生效 —— 用户看到的就是「调了样式没变化」。
+     * 这里与运行时的 `mpvApplyDanmakuStyle` 使用同一份映射，保证首次起播与后来修改结果一致。
+     */
+    opts.push(`uosc_danmaku-bold=${d.bold === true ? 'true' : 'false'}`)
+    opts.push(`uosc_danmaku-outline=${d.outline !== false ? 1 : 0}`)
+    opts.push(`uosc_danmaku-shadow=${d.shadow === true ? 1 : 0}`)
+    if (typeof d.specialDurationSec === 'number' && d.specialDurationSec > 0) {
+      opts.push(`uosc_danmaku-fixtime=${d.specialDurationSec}`)
+    }
+    if (typeof d.errorToleranceMs === 'number' && d.errorToleranceMs >= 0) {
+      opts.push(`uosc_danmaku-merge_tolerance=${(d.errorToleranceMs / 1000).toFixed(2)}`)
+    }
     if (d.showTop === false && d.showBottom === false && d.showScroll === false) {
       opts.push('uosc_danmaku-opacity=0')
     }
@@ -2063,6 +2080,19 @@ function loadUoscPlugins(
     log.append('warn', 'mpv', `加载 uosc 异常: ${String((err as Error)?.message ?? err)}`)
   }
   uoscBarLoaded = ok
+  /*
+   * V1.5.4：插件脚本刚 load-script 时可能还没执行完初始化，样式消息太早会丢。
+   * 800ms 后补发一次（同一份设置第一次会真正下发；重复 attach 由指纹去重）。
+   */
+  if (wantDanmaku && uoscDanmakuLoaded) {
+    setTimeout(() => {
+      try {
+        mpvApplyDanmakuStyle()
+      } catch {
+        /* ignore */
+      }
+    }, 800)
+  }
   log.append(
     ok ? 'info' : 'warn',
     'mpv',
@@ -2603,6 +2633,59 @@ export function mpvSetUoscDanmakuVisible(on: boolean): boolean {
     return native.command(['script-message-to', 'uosc_danmaku', 'set', 'show_danmaku', on ? 'on' : 'off'])
   } catch {
     return false
+  }
+}
+
+/**
+ * 弹幕样式指纹（V1.5.4）：见 `mpvApplyDanmakuStyle` 的去重说明。
+ * 内核重建（`mpvDestroyEngine`）时清空，保证新内核会重新收到一次样式。
+ */
+let lastDanmakuStyleKey = ''
+
+/**
+ * 把当前设置里的弹幕样式**实时**下发给 uosc_danmaku（V1.5.4）。
+ *
+ * 为什么需要它：内核现在是常驻复用的，改设置不会重建 mpv 实例，而插件的样式只在
+ * `script-opts` 加载时读一次 —— 所以以前「在设置页改了字号/透明度，播放器里没变化」。
+ * 这里通过插件的 `sakana-apply-style` 消息把值写回它的 options 并重新渲染当前集。
+ *
+ * 只下发插件真实支持的键（与 `uoscScriptOpts` 同一套映射）；不支持的旧画布选项
+ * （按类型过滤、特殊弹幕倍率）已经从设置页移除，避免「改了也没用」。
+ */
+export function mpvApplyDanmakuStyle(): void {
+  if (!ready || !native || !uoscDanmakuLoaded) return
+  const d = resolveDanmakuSettings(getSettings().danmaku)
+  const payload: Record<string, string | number | boolean> = {
+    fontsize: Math.round(d.fontSize * 2.2),
+    scrolltime: d.speedSec,
+    fixtime: d.specialDurationSec ?? 4,
+    opacity: clamp01(d.opacity),
+    displayarea: clamp01(d.area),
+    outline: d.outline !== false ? 1 : 0,
+    shadow: d.shadow === true ? 1 : 0,
+    bold: d.bold === true,
+    max_screen_danmaku: d.maxCount > 0 ? d.maxCount : 0,
+    merge_tolerance: Math.max(0, d.errorToleranceMs ?? 100) / 1000
+  }
+  /*
+   * 指纹去重：设置页每次保存都会走 storeSet 钩子（改主题、改音频也会），
+   * 而插件收到样式消息会重新渲染当前一集 —— 不做去重就是"改任何设置都闪一下弹幕"。
+   */
+  const styleKey = JSON.stringify({ payload, enabled: d.enabled !== false, offsetMs: d.offsetMs })
+  if (styleKey === lastDanmakuStyleKey) return
+  lastDanmakuStyleKey = styleKey
+  try {
+    native.command([
+      'script-message-to',
+      'uosc_danmaku',
+      'sakana-apply-style',
+      JSON.stringify(payload)
+    ])
+    // 弹幕总开关也一起同步：设置里关掉"显示弹幕"应当当场生效
+    mpvSetUoscDanmakuVisible(d.enabled !== false)
+    mpvPushDanmakuDelay(d.offsetMs)
+  } catch {
+    /* 插件未就绪时忽略，下一次起播会带上新的 script-opts */
   }
 }
 
@@ -4292,6 +4375,8 @@ export function mpvDestroyEngine(): void {
   uoscBarLoaded = false
   uoscDanmakuLoaded = false
   uoscCtrlLoaded = false
+  // 新内核里没有插件状态：样式指纹必须作废，下一次设置保存/起播才会重新下发
+  lastDanmakuStyleKey = ''
   const t = Date.now()
   try {
     inst.destroy()

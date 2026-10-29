@@ -24,11 +24,27 @@ function file(): string {
   return join(app.getPath('userData'), 'data', 'danmakuFetchLog.json')
 }
 
+/**
+ * 旧版外部源的记录只保留在磁盘上，不再展示（V1.5.4）。
+ *
+ * 用户反馈「现在数据源不是 danmu_api 吗？怎么 E站、巴哈姆特还保留着」——
+ * 数据源早就只剩 danmu_api，但磁盘里的历史记录还留着旧源，设置页一打开就像旧源还在。
+ * 这里在读入时过滤掉；下一次写入会把过滤后的列表落盘，相当于自动迁移。
+ */
+const LEGACY_SOURCE_IDS = new Set(['bahamut', 'danmubox', 'tucao', 'ezdmw', 'link'])
+const LEGACY_NAME_RE = /巴哈|彈幕盒子|弹幕盒子|E站|Tucao|直链|动画疯/i
+
+function isLegacyRecord(rec: DanmakuFetchRecord): boolean {
+  if (LEGACY_SOURCE_IDS.has(String(rec.sourceId ?? ''))) return true
+  return LEGACY_NAME_RE.test(String(rec.sourceName ?? ''))
+}
+
 export function readFetchLog(): DanmakuFetchRecord[] {
   try {
     const raw = readFileSync(file(), 'utf-8')
     const parsed = JSON.parse(raw) as { records?: DanmakuFetchRecord[] }
-    return Array.isArray(parsed.records) ? parsed.records : []
+    const list = Array.isArray(parsed.records) ? parsed.records : []
+    return list.filter((rec) => !isLegacyRecord(rec))
   } catch {
     return []
   }

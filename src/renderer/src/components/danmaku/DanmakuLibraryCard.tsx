@@ -31,6 +31,20 @@ const FORMAT_LABEL: Record<DanmakuLibraryItem['format'], string> = {
   'simple-json': '简单 JSON'
 }
 
+/**
+ * 旧版外部弹幕源（V1.5.4 起不再使用）的缓存文件不展示。
+ *
+ * 数据源已经只剩 danmu_api，但本地库里还留着以前从巴哈/弹幕盒子/E站下回来的 XML。
+ * 它们不会再被读取，列出来只会让用户以为"旧源还在"；这里直接隐藏（文件不动，
+ * 需要的话仍可从缓存目录手动清理）。
+ */
+const LEGACY_SOURCE_IDS = new Set(['bahamut', 'danmubox', 'tucao', 'ezdmw', 'link'])
+const LEGACY_SOURCE_RE = /巴哈|彈幕盒子|弹幕盒子|E站|ezdmw|Tucao|直链|动画疯/i
+
+function isLegacySource(it: DanmakuLibraryItem): boolean {
+  return LEGACY_SOURCE_IDS.has(String(it.sourceId ?? '')) || LEGACY_SOURCE_RE.test(String(it.sourceName ?? ''))
+}
+
 export function DanmakuLibraryCard({ catalog }: { catalog: SourceCatalogState }): React.ReactElement {
   const { registry, reload } = catalog
   const lib: DanmakuLibraryInfo | undefined = registry?.library
@@ -43,7 +57,8 @@ export function DanmakuLibraryCard({ catalog }: { catalog: SourceCatalogState })
   const [confirmSelected, setConfirmSelected] = useState(false)
   const [busy, setBusy] = useState(false)
 
-  const items = lib?.items ?? []
+  const allItems = lib?.items ?? []
+  const items = useMemo(() => allItems.filter((it) => !isLegacySource(it)), [allItems])
 
   /** 来源下拉的可选值（从现有条目里去重，避免硬编码源列表） */
   const sources = useMemo(() => {

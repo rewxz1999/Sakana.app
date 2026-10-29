@@ -443,7 +443,7 @@ export function registerMediaProtocols(): void {
       }
       return await fetchImageWithCache(target, { ifNoneMatch: req.headers.get('if-none-match') })
     } catch (err) {
-      log.append('warn', 'img', `图片加载失败 (${target}): ${String(err)}`)
+      log.appendThrottled('img-proto', 'warn', 'img', `图片加载失败 (${target}): ${String(err)}`, 60_000)
       return new Response('error', { status: 502 })
     }
   })
@@ -797,7 +797,7 @@ async function serveFallbackImage(
     }
     return imageResponse(buf, ct, imageETag(hash, buf.length), opts?.ifNoneMatch)
   } catch (err) {
-    log.append('warn', 'img', `备用图片源取图失败：${String((err as Error)?.message ?? err).slice(0, 90)}`)
+    log.appendThrottled('img-fallback', 'warn', 'img', `备用图片源取图失败：${String((err as Error)?.message ?? err).slice(0, 90)}`, 60_000)
     recordTraffic({ source: 'image', requests: 1, errors: 1 })
     return null
   }
@@ -872,7 +872,7 @@ async function fetchImageWithCache(
           await new Promise((r) => setTimeout(r, 500 + i * 700))
         } catch (err) {
           const msg = String((err as Error)?.message ?? err)
-          log.append('warn', 'img', `取图失败（第 ${i + 1} 次）${url.slice(0, 90)}: ${msg}`)
+          log.appendThrottled('img-fetch', 'warn', 'img', `取图失败（第 ${i + 1} 次）${url.slice(0, 90)}: ${msg}`, 60_000)
           /*
            * V1.4：**超时不重试**。
            * 8 秒还没拿到一张 4~15KB 的缩略图，基本就是这条请求废了（反代冷启动 / 网络抖动），
@@ -899,7 +899,7 @@ async function fetchImageWithCache(
         if (alt === target) continue
         res = await attempt(alt)
         if (res) {
-          log.append('info', 'img', `封面原尺寸取不到，已改用缩放变体（${alt.slice(0, 80)}）`)
+          log.appendThrottled('img-variant', 'info', 'img', `封面原尺寸取不到，已改用缩放变体（${alt.slice(0, 80)}）`, 120_000)
           break
         }
       }
@@ -907,7 +907,7 @@ async function fetchImageWithCache(
         // 缩放路径可能没被反代支持：退回原图路径再试一次（宁可慢一点也要有图）
         const plain = unresizedImageUrl(target)
         if (plain !== target) {
-          log.append('info', 'img', `缩放路径不可用，改取原图: ${plain.slice(0, 90)}`)
+          log.appendThrottled('img-variant', 'info', 'img', `缩放路径不可用，改取原图: ${plain.slice(0, 90)}`, 120_000)
           res = await attempt(plain)
         }
       }
@@ -918,7 +918,7 @@ async function fetchImageWithCache(
       if (!res) {
         const alt = onlineImageTo8443(target)
         if (alt !== target) {
-          log.append('info', 'img', `在线图床 443 失败，改试 8443: ${alt.slice(0, 90)}`)
+          log.appendThrottled('img-variant', 'info', 'img', `在线图床 443 失败，改试 8443: ${alt.slice(0, 90)}`, 120_000)
           res = await attempt(alt)
         }
       }
@@ -938,7 +938,7 @@ async function fetchImageWithCache(
         if (fb) {
           const served = await serveFallbackImage(fb.url, opts)
           if (served) {
-            log.append('info', 'img', `封面已改用 ${fb.source}（条目 #${subjectId}）`)
+            log.appendThrottled('img-source-switch', 'info', 'img', `封面已改用 ${fb.source}（条目 #${subjectId}）`, 120_000)
             return served
           }
         }

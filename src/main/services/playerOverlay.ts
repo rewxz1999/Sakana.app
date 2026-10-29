@@ -804,18 +804,18 @@ function applyRegions(regions: HitRegion[], opts: { allowHide?: boolean; reason?
        例外：主窗口最小化/隐藏到托盘时不允许显示（见 mayShowOverlay）。 */
     if (!win.isVisible() && !minimized && mayShowOverlay()) {
       win.showInactive()
-      log.append('info', 'overlay', `控制栏窗口已显示（形状 ${rects.length} 块矩形）`)
+      // V1.5.4：控制栏每次显示/隐藏都各打一条会把日志刷满；同一状态 30 秒只记一次
+      log.appendThrottled('overlay-show', 'info', 'overlay', `控制栏窗口已显示（形状 ${rects.length} 块矩形）`, 30_000)
     }
     regionsDegraded = degraded
     regionsDegradedReason = degraded ? degradeReason : ''
-    log.append(
-      degraded ? 'warn' : 'info',
-      'overlay',
+    const shapeMsg =
       (degraded ? `⚠️ 形状退化兜底：${degradeReason}；` : '') +
-        `控制栏窗口形状已更新：${rects.length} 块矩形（CSS 区域 ${effective.length} 块 = 渲染层 ${regions.length} 块，` +
-        `单位解释=${SHAPE_UNITS.join('+')}，缩放=${sf}，` +
-        `示例=${JSON.stringify(rects.map((r) => [Math.round(r.x), Math.round(r.y), Math.round(r.w), Math.round(r.h)]).slice(0, 4))}）`
-    )
+      `控制栏窗口形状已更新：${rects.length} 块矩形（CSS 区域 ${effective.length} 块 = 渲染层 ${regions.length} 块，` +
+      `单位解释=${SHAPE_UNITS.join('+')}，缩放=${sf}，` +
+      `示例=${JSON.stringify(rects.map((r) => [Math.round(r.x), Math.round(r.y), Math.round(r.w), Math.round(r.h)]).slice(0, 4))}）`
+    if (degraded) log.append('warn', 'overlay', shapeMsg)
+    else log.appendThrottled('overlay-shape', 'info', 'overlay', shapeMsg, 30_000)
   } catch (err) {
     shapeApplied = false
     regionsDegraded = true

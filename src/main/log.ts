@@ -64,6 +64,8 @@ function maskUrlPath(path: string): string {
 class LogService {
   private entries: LogEntry[] = []
   private targets = new Set<(e: LogEntry) => void>()
+  /** 节流状态：key → 上次真正写入的时间与期间被压掉的条数 */
+  private throttled = new Map<string, { at: number; suppressed: number }>()
 
   init(): void {
     this.entries = store.get<LogEntry[]>('logs', [])
@@ -85,6 +87,33 @@ class LogService {
         /* 忽略监听器异常 */
       }
     }
+  }
+
+  /**
+   * 同一类高频日志的「浓缩」写入（V1.5.4）。
+   *
+   * 起因：一张封面在失败路径上会依次打「取图失败（第 1 次）」「缩放变体失败」「备用源失败」，
+   * 一屏十几张图能刷出几十条，把真正有用的行挤掉；播放器控制栏每次显示/隐藏也会各打一条。
+   *
+   * 规则：同一 key 在窗口期内只写一条；被压掉的条数会累计，并在下一条里写明
+   * 「另有 N 条同类记录已省略」——既不刷屏，也不假装什么都没发生。
+   */
+  appendThrottled(
+    key: string,
+    level: LogEntry['level'],
+    source: string,
+    message: string,
+    windowMs = 60_000
+  ): void {
+    const now = Date.now()
+    const prev = this.throttled.get(key)
+    if (prev && now - prev.at < windowMs) {
+      prev.suppressed += 1
+      return
+    }
+    const tail = prev && prev.suppressed > 0 ? `（此前 ${prev.suppressed} 条同类记录已省略）` : ''
+    this.throttled.set(key, { at: now, suppressed: 0 })
+    this.append(level, source, `${message}${tail}`)
   }
 
   onPush(cb: (e: LogEntry) => void): () => void {
